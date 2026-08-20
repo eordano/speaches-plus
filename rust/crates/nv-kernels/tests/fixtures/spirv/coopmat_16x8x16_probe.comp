@@ -1,0 +1,54 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer BufA { float16_t a[]; };
+layout(set = 0, binding = 1) readonly buffer BufB { float16_t b[]; };
+layout(set = 0, binding = 2) buffer BufD { float d[]; };
+
+shared float16_t sap[16 * 16];
+shared float16_t san[16 * 16];
+shared float16_t sbp[16 * 16];
+shared float16_t sbn[16 * 16];
+shared float sd[4 * 16 * 16];
+
+void main() {
+    for (uint i = gl_LocalInvocationID.x; i < 256u; i += 32u) {
+        uint r = i >> 4u;
+        uint c = i & 15u;
+        float av = float(a[i]);
+        sap[i] = float16_t(max(av, 0.0));
+        san[i] = float16_t(max(-av, 0.0));
+        float bv = (c < 8u) ? float(b[r * 8u + c]) : 0.0;
+        sbp[i] = float16_t(max(bv, 0.0));
+        sbn[i] = float16_t(max(-bv, 0.0));
+    }
+    barrier();
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> map;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> man;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mbp;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mbn;
+    coopMatLoad(map, sap, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(man, san, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mbp, sbp, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(mbn, sbn, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> zero =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopMatStore(coopMatMulAdd(map, mbp, zero), sd, 0u, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(coopMatMulAdd(man, mbn, zero), sd, 256u, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(coopMatMulAdd(map, mbn, zero), sd, 512u, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(coopMatMulAdd(man, mbp, zero), sd, 768u, 16,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint i = gl_LocalInvocationID.x; i < 128u; i += 32u) {
+        uint r = i >> 3u;
+        uint c = i & 7u;
+        uint e = r * 16u + c;
+        d[i] = (sd[e] + sd[256u + e]) - (sd[512u + e] + sd[768u + e]);
+    }
+}

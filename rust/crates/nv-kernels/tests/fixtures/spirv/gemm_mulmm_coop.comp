@@ -1,0 +1,216 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#ifndef BM
+#define BM 64
+#endif
+#ifndef BN
+#define BN 64
+#endif
+#ifndef BK
+#define BK 32
+#endif
+#ifndef WM
+#define WM 32
+#endif
+#ifndef WN
+#define WN 32
+#endif
+
+#define NSG ((BM / WM) * (BN / WN))
+#define WG (NSG * 32)
+#define TM (WM / 16)
+#define TN (WN / 16)
+#define SA (BK + 8)
+#define SB (BK + 8)
+
+layout(local_size_x = WG, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer BufW { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer BufX { uint x[]; };
+#ifdef OUT_BF16
+layout(set = 0, binding = 2) buffer BufY { uint y[]; };
+#else
+layout(set = 0, binding = 2) buffer BufY { float y[]; };
+#endif
+layout(set = 0, binding = 3, std140) uniform Params {
+    uint n_rows;
+    uint k_elems;
+    uint m_rows;
+    uint y_stride;
+    float alpha;
+} p;
+#ifdef WQ_FP8
+layout(set = 0, binding = 4) readonly buffer BufS { float sf[]; };
+#else
+layout(set = 0, binding = 4) readonly buffer BufS { uint sf[]; };
+#endif
+
+shared float16_t sha[BM * SA];
+shared float16_t shb[BN * SB];
+#ifdef OUT_BF16
+shared float shy[NSG * 256];
+#endif
+
+float e2m1_decode(uint n) {
+    uint s = (n & 8u) << 28u;
+    uint e = (n >> 1u) & 3u;
+    uint m = n & 1u;
+    uint mag = (e == 0u) ? (m * 0x3f000000u) : (((126u + e) << 23u) | (m << 22u));
+    return uintBitsToFloat(s | mag);
+}
+
+float ue4m3_decode(uint b) {
+    uint e = (b >> 3u) & 15u;
+    uint m = b & 7u;
+    if (e == 0u) {
+        return float(m) * 0.001953125;
+    }
+    return uintBitsToFloat(((e + 120u) << 23u) | (m << 20u));
+}
+
+float e4m3_plain(uint b) {
+    float s = ((b & 128u) != 0u) ? -1.0 : 1.0;
+    uint e = (b >> 3u) & 15u;
+    uint m = b & 7u;
+    if (e == 0u) {
+        return s * float(m) * 0.001953125;
+    }
+    return s * (8.0 + float(m)) * exp2(float(e) - 10.0);
+}
+
+#ifdef OUT_BF16
+uint bf16_encode(float v) {
+    if (isnan(v)) {
+        return 0x7fc0u;
+    }
+    uint b = floatBitsToUint(v);
+    uint r = 0x7fffu + ((b >> 16u) & 1u);
+    return (b + r) >> 16u;
+}
+#endif
+
+void main() {
+    uint bm0 = gl_WorkGroupID.y * uint(BM);
+    uint bn0 = gl_WorkGroupID.x * uint(BN);
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint warp_r = sg % uint(BM / WM);
+    uint warp_c = sg / uint(BM / WM);
+    uint K = p.k_elems;
+    uint kw = K >> 1u;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> sums[TM * TN];
+    [[unroll]] for (uint i = 0u; i < uint(TM * TN); i++) {
+        sums[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    for (uint kb = 0u; kb < K; kb += uint(BK)) {
+        barrier();
+        [[unroll]] for (uint idx = tid; idx < uint(BM * (BK / 2)); idx += uint(WG)) {
+            uint r = idx / uint(BK / 2);
+            uint wi = idx % uint(BK / 2);
+            uint gm = bm0 + r;
+            uint word = 0u;
+            if (gm < p.m_rows) {
+                word = x[gm * kw + (kb >> 1u) + wi];
+            }
+            f16vec2 v = unpackFloat2x16(word);
+            sha[r * uint(SA) + wi * 2u] = v.x;
+            sha[r * uint(SA) + wi * 2u + 1u] = v.y;
+        }
+#ifdef WQ_FP8
+        [[unroll]] for (uint idx = tid; idx < uint(BN * (BK / 4)); idx += uint(WG)) {
+            uint r = idx / uint(BK / 4);
+            uint wi = idx % uint(BK / 4);
+            uint gn = bn0 + r;
+            float s = 0.0;
+            uint word = 0u;
+            if (gn < p.n_rows) {
+                word = w[gn * (K >> 2u) + (kb >> 2u) + wi];
+                s = sf[gn];
+            }
+            uint b0 = r * uint(SB) + wi * 4u;
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                shb[b0 + j] = float16_t(e4m3_plain((word >> (8u * j)) & 255u) * s);
+            }
+        }
+#else
+        [[unroll]] for (uint idx = tid; idx < uint(BN * (BK / 16)); idx += uint(WG)) {
+            uint r = idx / uint(BK / 16);
+            uint blk = idx % uint(BK / 16);
+            uint gn = bn0 + r;
+            float s = 0.0;
+            uint w0 = 0u;
+            uint w1 = 0u;
+            if (gn < p.n_rows) {
+                uint base = gn * (K >> 3u) + ((kb + blk * 16u) >> 3u);
+                w0 = w[base];
+                w1 = w[base + 1u];
+                uint sbi = gn * (K >> 4u) + (kb >> 4u) + blk;
+                s = ue4m3_decode((sf[sbi >> 2u] >> (8u * (sbi & 3u))) & 255u);
+            }
+            uint b0 = r * uint(SB) + blk * 16u;
+            [[unroll]] for (uint j = 0u; j < 8u; j++) {
+                shb[b0 + j] = float16_t(e2m1_decode((w0 >> (4u * j)) & 15u) * s);
+                shb[b0 + 8u + j] = float16_t(e2m1_decode((w1 >> (4u * j)) & 15u) * s);
+            }
+        }
+#endif
+        barrier();
+        [[unroll]] for (uint ik = 0u; ik < uint(BK / 16); ik++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> ca[TM];
+            [[unroll]] for (uint i = 0u; i < uint(TM); i++) {
+                coopMatLoad(ca[i], sha, (warp_r * uint(WM) + i * 16u) * uint(SA) + ik * 16u,
+                            uint(SA), gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < uint(TN); j++) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> cb;
+                coopMatLoad(cb, shb, (warp_c * uint(WN) + j * 16u) * uint(SB) + ik * 16u,
+                            uint(SB), gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < uint(TM); i++) {
+                    sums[i * uint(TN) + j] = coopMatMulAdd(ca[i], cb, sums[i * uint(TN) + j]);
+                }
+            }
+        }
+    }
+
+#ifdef OUT_BF16
+    uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint i = 0u; i < uint(TM); i++) {
+        [[unroll]] for (uint j = 0u; j < uint(TN); j++) {
+            uint gr = bm0 + warp_r * uint(WM) + i * 16u;
+            uint gc = bn0 + warp_c * uint(WN) + j * 16u;
+            coopMatStore(sums[i * uint(TN) + j], shy, sg * 256u, 16u,
+                         gl_CooperativeMatrixLayoutRowMajor);
+            subgroupBarrier();
+            if (gr + 16u <= p.m_rows && gc + 16u <= p.n_rows) {
+                [[unroll]] for (uint q = lane; q < 128u; q += 32u) {
+                    uint rr = q >> 3u;
+                    uint pc = (q & 7u) << 1u;
+                    float v0 = shy[sg * 256u + rr * 16u + pc];
+                    float v1 = shy[sg * 256u + rr * 16u + pc + 1u];
+                    y[((gr + rr) * p.y_stride + gc + pc) >> 1u] =
+                        bf16_encode(v0 * p.alpha) | (bf16_encode(v1 * p.alpha) << 16u);
+                }
+            }
+            subgroupBarrier();
+        }
+    }
+#else
+    [[unroll]] for (uint i = 0u; i < uint(TM); i++) {
+        [[unroll]] for (uint j = 0u; j < uint(TN); j++) {
+            uint gr = bm0 + warp_r * uint(WM) + i * 16u;
+            uint gc = bn0 + warp_c * uint(WN) + j * 16u;
+            if (gr + 16u <= p.m_rows && gc + 16u <= p.n_rows) {
+                coopMatStore(sums[i * uint(TN) + j], y, gr * p.y_stride + gc,
+                             p.y_stride, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+#endif
+}

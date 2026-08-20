@@ -1,0 +1,58 @@
+{
+  "name": "040-align-en-words",
+  "family": "040-align",
+  "description": "English forced alignment: audio + transcript -> per-word SRT. Asserts SRT structure (valid timestamps, monotonic segment numbers, expected segment count) but not exact word timings.",
+  "input_artifacts": [
+    {
+      "path": "audio.wav",
+      "kind": "wav",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration_ms": 2000,
+      "synthesized_by": "generate_audio.py",
+      "notes": "3 short sine bursts at 440/523.25/659.25 Hz. Placeholder audio — the aligner accepts any decodable WAV; transcript-vs-audio agreement isn't asserted in placeholder mode."
+    }
+  ],
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/audio/transcriptions"
+  },
+  "request_multipart": {
+    "file@": "audio.wav",
+    "language": "en",
+    "response_format": "srt",
+    "timestamp_granularities[]": ["word", "segment"],
+    "prompt": "hello world greetings"
+  },
+  "expected_response": {
+    "status": 200,
+    "content_type": "text/plain; charset=utf-8",
+    "body_kind": "srt",
+    "srt": {
+      "min_segments": 1,
+      "max_segments": 8,
+      "segment_count_target": 3,
+      "segment_count_tolerance": 1,
+      "timestamps_format_regex": "^\\d{2}:\\d{2}:\\d{2},\\d{3}$",
+      "segment_numbers_monotonic": true,
+      "start_end_monotonic_per_segment": true,
+      "first_segment_starts_within_ms": 100,
+      "last_segment_ends_within_ms_of_audio_duration": 100,
+      "timing_tolerance_ms": 100
+    }
+  },
+  "comparison_strategy": "structural_srt+timing_tolerance",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "reference_srt_skeleton": "1\n00:00:00,100 --> 00:00:00,550\nhello\n\n2\n00:00:00,700 --> 00:00:01,200\nworld\n\n3\n00:00:01,300 --> 00:00:01,850\ngreetings\n\n",
+    "expected_words": [
+      {"word": "hello", "start_ms": 0, "end_ms": 526},
+      {"word": "world", "start_ms": 526, "end_ms": 1053},
+      {"word": "greetings", "start_ms": 1053, "end_ms": 2000}
+    ],
+    "word_timing_tolerance_ms": 100,
+    "expected_words_audio_burst_onsets_ms": [100, 700, 1300],
+    "notes": "Per-word ±100ms tolerance band is now active on `expected_words`. `expected_words` encodes the proportional-fallback baseline (whitespace-split prompt distributed across audio duration by character length). The `_audio_burst_onsets_ms` array preserves the original sine-burst onsets for the day a real Whisper backend is wired up; once that path is live, both bands must be ±100ms (i.e. real STT timings should also fit `expected_words` since the proportional centre-of-mass differs by <100ms only when words are short — here they aren't, and the burst onsets fall outside the fallback band). Until then, the conformance runner builds an `AlignedSegment` whose words come from `stt::proportional_word_timings(prompt, 0, audio_duration_ms)`, then asserts each emitted word's start time is within ±100ms of `expected_words[i].start_ms`."
+  },
+  "skip_when_no_model": true
+}

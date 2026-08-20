@@ -1,0 +1,21 @@
+{
+  "name": "070-ocr-realscan-1892",
+  "family": "070-ocr",
+  "description": "Crop of a real 1892 book scan (public domain), not a rendered PNG: grey paper, JPEG artifacts and tight leading. Regression fixture for center-band line segmentation. Gates 4 lines and CER <= 2%. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "cient to absorb all my attention; while Holmes, who loathed\nevery form of society with his whole Bohemian soul, remained\nin our lodgings in Baker Street, buried among his old books,\nand alternating from week to week between cocaine and am-",
+  "source": {
+    "description": "Real 1892 book scan crop (The Adventures of Sherlock Holmes, page 17, public domain): grey paper background, JPEG artifacts, tight leading where descenders nearly touch the next line's ascenders",
+    "crop": "966x174+80+108 of sherlock-p17.jpg"
+  },
+  "gates": {
+    "cer_max": 0.02,
+    "line_count": 4
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 6
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

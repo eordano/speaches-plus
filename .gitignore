@@ -1,0 +1,56 @@
+.claude/
+.DS_Store
+*.log
+
+# editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# environment / secrets
+.env
+.env.*
+!.env.example
+
+# large model / fixture artifacts
+*.npy
+*.bin
+*.onnx
+*.gguf
+client/fixtures/*.wav
+
+# go / rust build outputs
+go/server
+go/coverage.out
+target/
+
+# working temporary files
+temp/
+
+# dev-shell snapshots (direnv + scripts/dev-env.sh)
+.direnv/
+go/bin/
+rust/models/
+
+# macOS AppleDouble sidecars
+._*
+
+# realtime session audio dumps (inspect audio_store writes these to CWD)
+sess_*.raw
+sess_*.ndjson
+sess_*.audio.json
+rocq/.nia.cache

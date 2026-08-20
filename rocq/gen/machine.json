@@ -1,0 +1,9 @@
+{
+  "_comment": "Machine constants for the roofline generator. hbm_bw is the nominal part peak used as the bandwidth UPPER-bound hypothesis of every floor theorem (a sound floor needs B >= anything achievable; measured achieved is 1.42-1.50 TB/s). l2_resident_bytes is a deliberately GENEROUS upper bound on cross-forward on-chip weight residency - a larger value only weakens (never invalidates) every generated lower bound.",
+  "hbm_bw_bytes_per_s": 1790000000000,
+  "hbm_bw_provenance": "1.79 TB/s nominal part peak, used as the UPPER-bound physics hypothesis; measured achieved read BW recorded separately below and checked <= this at generation time",
+  "l2_resident_bytes": 268435456,
+  "l2_provenance": "256 MiB placeholder upper bound on cross-forward weight residency (same convention as core Roofline.v Measured.L2)",
+  "measured_read_bw_bytes_per_s": 1501639356000,
+  "measured_read_bw_provenance": "util-formal lane, in-tree sol_roofline phase A on main @ 4c70177 (utilf/sol-draft.out, 2026-07-28): best contiguous-read 1501.6 GB/s across 3 same-session runs (1420-1502; GPU shared with ~5 GiB foreign tenants); sol-roofline run3 measured 1491. All <= the 1.79 TB/s hypothesis - soundness direction validated."
+}

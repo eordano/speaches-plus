@@ -1,0 +1,42 @@
+{
+  "name": "020-chat-greedy-basic",
+  "family": "020-chat-completions",
+  "description": "Greedy (temperature=0) chat-completions call against a small instruction-tuned model. Asserts the exact decoded string for a fixed prompt under deterministic decode.",
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/chat/completions"
+  },
+  "request_body": {
+    "model": "Qwen/Qwen3-4B-Instruct",
+    "messages": [
+      {"role": "system", "content": "You answer in exactly one short sentence."},
+      {"role": "user", "content": "What is the capital of France?"}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 16,
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "object": "chat.completion",
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason": "stop",
+        "message": {
+          "role": "assistant",
+          "content_regex": "(?i)^.*paris.*$"
+        }
+      }
+    ],
+    "usage": {
+      "completion_tokens_range": [1, 16]
+    }
+  },
+  "comparison_strategy": "structural+regex",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "notes": "While the model isn't loaded the assertion is structural only: the response must be a valid ChatCompletionResponse with object='chat.completion', exactly one choice, finish_reason in {stop,length}, and a non-empty assistant message. When the model is wired, the content_regex above (case-insensitive 'paris') becomes the canonical assertion."
+  },
+  "skip_when_no_model": true
+}

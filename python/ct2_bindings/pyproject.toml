@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "pybind11>=2.13"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ct2_bindings"
+version = "0.1.0"
+description = "pybind11 bindings around CTranslate2's Whisper model (port of speaches-plus/go/internal/stt/ct2_cgo.cc)."
+requires-python = ">=3.10"
+license = { text = "MPL-2.0" }
+readme = "README.md"

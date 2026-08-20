@@ -1,0 +1,54 @@
+{
+  "name": "040-align-zh-segments",
+  "family": "040-align",
+  "description": "Mandarin diarized-segments alignment: audio + transcript -> diarized_json. Asserts the JSON skeleton (segment count, key ordering, language='zh'); exact text is not asserted.",
+  "input_artifacts": [
+    {
+      "path": "audio.wav",
+      "kind": "wav",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration_ms": 3000,
+      "synthesized_by": "generate_audio.py"
+    }
+  ],
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/audio/diarization"
+  },
+  "request_multipart": {
+    "file@": "audio.wav",
+    "language": "zh",
+    "response_format": "diarized_json",
+    "prompt": "你好 世界"
+  },
+  "expected_response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body_kind": "diarized_json",
+    "json_skeleton": {
+      "required_top_level_fields": ["segments"],
+      "segments_min_count": 1,
+      "segments_max_count": 6,
+      "segments_target_count": 2,
+      "segments_target_count_tolerance": 1,
+      "per_segment_required_fields": ["id", "start", "end", "text"],
+      "segments_ordered_by_start": true,
+      "segments_start_end_monotonic": true
+    },
+    "language": "zh"
+  },
+  "comparison_strategy": "structural_diarized_json",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "reference_skeleton": {
+      "segments": [
+        {"id": 0, "start": 0.20, "end": 1.20, "text": "<...>"},
+        {"id": 1, "start": 1.50, "end": 2.80, "text": "<...>"}
+      ],
+      "language": "zh"
+    },
+    "notes": "Diarized JSON shape is asserted structurally; the actual transcript text is opaque (placeholder audio is sine bursts, not real Mandarin). When a real STT+aligner is wired with a Mandarin-capable model the per-segment text becomes the canonical assertion under T5 tolerance from §10.1."
+  },
+  "skip_when_no_model": true
+}

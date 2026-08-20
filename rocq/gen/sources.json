@@ -1,0 +1,240 @@
+{
+ "_doc": [
+  "Declared inputs for the rocq/gen/extract/* CUDA extractors.",
+  "Both directions are checked: a declared path that is missing is a refusal,",
+  "and a .cu under corpus_root that is not declared here is also a refusal.",
+  "A file genuinely out of scope must be listed with \"extract\": \"none\" and a",
+  "reason, so exclusions are reviewable data rather than a smaller number.",
+  "Toolchain paths are machine pins: either set the env var named in each",
+  "entry, or repin \"path\" to a local store path matching expect_substring."
+ ],
+ "toolchain": {
+  "libclang": {
+   "env": "NV_LIBCLANG",
+   "path": "",
+   "expect_substring": "clang-21.1.8"
+  },
+  "cuda": {
+   "env": "CUDA_PATH",
+   "path": "",
+   "expect_substring": "cuda-merged-12.9"
+  },
+  "cutlass": {
+   "env": "CUTLASS_DIR",
+   "path": "",
+   "expect_substring": "-source"
+  },
+  "flashinfer": {
+   "env": "FLASHINFER_DIR",
+   "path": "",
+   "expect_substring": "-source"
+  },
+  "gcc": {
+   "env": "NV_GCC_DIR",
+   "path": "",
+   "expect_substring": "gcc-15.3.0"
+  },
+  "glibc": {
+   "env": "NV_GLIBC_DEV",
+   "path": "",
+   "expect_substring": "glibc-2.42"
+  }
+ },
+ "offload_arch": "sm_120",
+ "cxx_std": "c++17",
+ "include_roots": [
+  "$REPO/rust/crates/nv-kernels/include",
+  "$REPO/rust/crates/nv-kernels/cuda",
+  "$REPO/rust/crates/nv-kernels/cuda/marlin",
+  "$REPO/rust/crates/nv-kernels/cuda/marlin/generated",
+  "$CUTLASS/include",
+  "$FLASHINFER/include"
+ ],
+ "system_include_roots": [
+  "$GCC/include/c++/15.3.0",
+  "$GCC/include/c++/15.3.0/x86_64-unknown-linux-gnu",
+  "$GLIBC/include"
+ ],
+ "corpus_root": "rust/crates/nv-kernels/cuda",
+ "corpus_subdirs": [
+  "marlin"
+ ],
+ "files": [
+  {
+   "path": "rust/crates/nv-kernels/cuda/attention_fp8_decode.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/attn_decode.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/capture_copy.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/cutlass_probe.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/depthwise_conv1d_silu_bf16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/dflash_accept.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/dflash_gate.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gather_rows_bf16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gdn_decode.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gdn_gating.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gdn_recurrent.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gelu_tanh_mul.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gemv_bf16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gemv_nvfp4.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gemv_w4a16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gemv_w4a16_m1_proto.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/gqa_verify_hd512.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/graph_decode.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/hello.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/kv_fp8.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/kv_fp8_paged.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/kv_ring.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/laguna_step.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/lora_fused.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/lora_grouped.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/moe_gemv.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/moe_grouped_fp4_gemv.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/moe_permute.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/moe_route.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/moe_unpermute_scatter.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/quantize_nvfp4_bf16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/residual_scale.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/rmsnorm_quantize_nvfp4_bf16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/rmsnorm_residual.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/rope.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/rope_bf16.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/sampler.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/silu.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/tree_verify_attn.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/tree_verify_fp8.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/verify_fused_norms.cu",
+   "extract": "launches"
+  },
+  {
+   "path": "rust/crates/nv-kernels/cuda/marlin/entry.cu",
+   "extract": "launches"
+  }
+ ]
+}

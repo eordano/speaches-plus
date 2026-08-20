@@ -1,0 +1,660 @@
+{
+ "files": {
+  "rust/crates/nv-kernels/cuda/flash_decode.cu": "45b30793c3f7d84d7a0453198024561add432bbc96c59b211c25d7e5a862fa59",
+  "rust/crates/nv-kernels/cuda/gemv_bf16.cu": "3cde1fd680cf99ebc9de7912295a63805fcc379fb5e45035350a79994f75eb84",
+  "rust/crates/nv-kernels/cuda/kv_fp8.cu": "7377c398b510476c74dc51ff37a0c93a99670fb6331130e6c019df42f05302f9",
+  "rust/crates/nv-kernels/cuda/residual_scale.cu": "7a75a134077d2c5f2762fd6ede050f8e56a4e4efeb561efa022b94795c8ce8bc",
+  "rust/crates/nv-kernels/cuda/rmsnorm.cu": "f4701eb1e7b3e028a96bf2fc2cadb6be0bb7ad77bdb51152c04798c4b6c0e49d",
+  "rust/crates/nv-kernels/cuda/rope_bf16.cu": "0377c3cf07b21f1b9caf19c136b9035469199f2700bdff38ab72f0bbe75356ab"
+ },
+ "generator": "rocq/gen/extract/pdl_sites.py",
+ "kernels": [
+  {
+   "body_close_line": 26,
+   "body_open_line": 16,
+   "consumes": [],
+   "deref_lines": [
+    21,
+    22,
+    23
+   ],
+   "epilog_line": 25,
+   "explicit_epilog": true,
+   "file": "rust/crates/nv-kernels/cuda/residual_scale.cu",
+   "k_id": 0,
+   "pdl_launched": true,
+   "produces": [
+    "b_resid"
+   ],
+   "prolog_line": 17,
+   "rocq": "kResidual",
+   "signature_line": 10,
+   "store_lines": [
+    23
+   ],
+   "symbol": "residual_add_scale_bf16_kernel",
+   "witnesses": {
+    "produces b_resid": [
+     {
+      "line": 12,
+      "pin": "__nv_bfloat16*        __restrict__ y"
+     }
+    ]
+   }
+  },
+  {
+   "body_close_line": 72,
+   "body_open_line": 51,
+   "consumes": [
+    "b_resid"
+   ],
+   "deref_lines": [
+    60,
+    67,
+    68
+   ],
+   "epilog_line": 71,
+   "explicit_epilog": true,
+   "file": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "k_id": 1,
+   "pdl_launched": true,
+   "produces": [
+    "b_norm"
+   ],
+   "prolog_line": 56,
+   "rocq": "kRmsnorm",
+   "signature_line": 47,
+   "store_lines": [
+    68
+   ],
+   "symbol": "rmsnorm_kernel",
+   "witnesses": {
+    "consumes b_resid": [
+     {
+      "line": 47,
+      "pin": "const T* __restrict__ x"
+     }
+    ],
+    "produces b_norm": [
+     {
+      "line": 48,
+      "pin": "T* __restrict__ y"
+     }
+    ]
+   }
+  },
+  {
+   "body_close_line": 74,
+   "body_open_line": 27,
+   "consumes": [
+    "b_norm"
+   ],
+   "deref_lines": [
+    30,
+    33,
+    49,
+    54,
+    57,
+    58,
+    60,
+    61,
+    71
+   ],
+   "epilog_line": 73,
+   "explicit_epilog": true,
+   "file": "rust/crates/nv-kernels/cuda/gemv_bf16.cu",
+   "k_id": 2,
+   "pdl_launched": true,
+   "produces": [
+    "b_gemv"
+   ],
+   "prolog_line": 28,
+   "rocq": "kGemv",
+   "signature_line": 21,
+   "store_lines": [
+    33,
+    71
+   ],
+   "symbol": "gemv_bf16_kernel",
+   "witnesses": {
+    "consumes b_norm": [
+     {
+      "line": 22,
+      "pin": "const __nv_bfloat16* __restrict__ x"
+     }
+    ],
+    "produces b_gemv": [
+     {
+      "line": 23,
+      "pin": "__nv_bfloat16* __restrict__ y"
+     }
+    ]
+   }
+  },
+  {
+   "body_close_line": 123,
+   "body_open_line": 87,
+   "consumes": [
+    "b_gemv"
+   ],
+   "deref_lines": [
+    97,
+    101,
+    102,
+    109,
+    110,
+    111,
+    112,
+    116,
+    117,
+    118,
+    119
+   ],
+   "epilog_line": 122,
+   "explicit_epilog": true,
+   "file": "rust/crates/nv-kernels/cuda/rope_bf16.cu",
+   "k_id": 3,
+   "pdl_launched": true,
+   "produces": [
+    "b_k",
+    "b_q"
+   ],
+   "prolog_line": 88,
+   "rocq": "kRope",
+   "signature_line": 76,
+   "store_lines": [
+    111,
+    112,
+    118,
+    119
+   ],
+   "symbol": "rope_bf16_oop_kernel",
+   "witnesses": {
+    "consumes b_gemv": [
+     {
+      "line": 76,
+      "pin": "const __nv_bfloat16* __restrict__ q_in"
+     },
+     {
+      "line": 77,
+      "pin": "const __nv_bfloat16* __restrict__ k_in"
+     }
+    ],
+    "produces b_k": [
+     {
+      "line": 79,
+      "pin": "__nv_bfloat16* __restrict__ k_out"
+     }
+    ],
+    "produces b_q": [
+     {
+      "line": 78,
+      "pin": "__nv_bfloat16* __restrict__ q_out"
+     }
+    ]
+   }
+  },
+  {
+   "body_close_line": 81,
+   "body_open_line": 32,
+   "consumes": [
+    "b_k"
+   ],
+   "deref_lines": [
+    39,
+    48,
+    54,
+    57,
+    61,
+    63,
+    66,
+    71,
+    75,
+    77
+   ],
+   "epilog_line": 80,
+   "explicit_epilog": true,
+   "file": "rust/crates/nv-kernels/cuda/kv_fp8.cu",
+   "k_id": 4,
+   "pdl_launched": true,
+   "produces": [
+    "b_fp8",
+    "b_scales"
+   ],
+   "prolog_line": 33,
+   "rocq": "kKvFp8",
+   "signature_line": 23,
+   "store_lines": [
+    57,
+    63,
+    71,
+    77
+   ],
+   "symbol": "quantize_kv_fp8_kernel",
+   "witnesses": {
+    "consumes b_k": [
+     {
+      "line": 23,
+      "pin": "const __nv_bfloat16* __restrict__ x_bf16"
+     }
+    ],
+    "produces b_fp8": [
+     {
+      "line": 24,
+      "pin": "uint8_t* __restrict__ x_fp8_base"
+     }
+    ],
+    "produces b_scales": [
+     {
+      "line": 25,
+      "pin": "float* __restrict__ scales_base"
+     }
+    ]
+   }
+  },
+  {
+   "body_close_line": 1249,
+   "body_open_line": 1003,
+   "consumes": [
+    "b_fp8",
+    "b_q",
+    "b_scales"
+   ],
+   "deref_lines": [
+    1010,
+    1018,
+    1020,
+    1023,
+    1025,
+    1039,
+    1040,
+    1041,
+    1042,
+    1047,
+    1052,
+    1057,
+    1063,
+    1064,
+    1065,
+    1066,
+    1077,
+    1082,
+    1083,
+    1084,
+    1085,
+    1086,
+    1087,
+    1088,
+    1089,
+    1097,
+    1103,
+    1109,
+    1110,
+    1111,
+    1112,
+    1116,
+    1117,
+    1128,
+    1134,
+    1139,
+    1140,
+    1141,
+    1142,
+    1143,
+    1144,
+    1145,
+    1146,
+    1153,
+    1154,
+    1155,
+    1162,
+    1163,
+    1164,
+    1166,
+    1167,
+    1173,
+    1179,
+    1188,
+    1192,
+    1194,
+    1195,
+    1201,
+    1206,
+    1207,
+    1213,
+    1219,
+    1225,
+    1230,
+    1231,
+    1232,
+    1243,
+    1244,
+    1246
+   ],
+   "epilog_line": 1248,
+   "explicit_epilog": true,
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "k_id": 5,
+   "pdl_launched": true,
+   "produces": [
+    "b_out"
+   ],
+   "prolog_line": 1008,
+   "rocq": "kFlash",
+   "signature_line": 985,
+   "store_lines": [
+    1020,
+    1025,
+    1047,
+    1052,
+    1082,
+    1083,
+    1084,
+    1085,
+    1086,
+    1087,
+    1088,
+    1089,
+    1139,
+    1140,
+    1141,
+    1142,
+    1143,
+    1144,
+    1145,
+    1146,
+    1153,
+    1166,
+    1167,
+    1173,
+    1179,
+    1194,
+    1195,
+    1207,
+    1231,
+    1244,
+    1246
+   ],
+   "symbol": "flash_splitk_fused_fp8_kernel",
+   "witnesses": {
+    "consumes b_fp8": [
+     {
+      "line": 986,
+      "pin": "const uint8_t* __restrict__ k_fp8"
+     }
+    ],
+    "consumes b_q": [
+     {
+      "line": 985,
+      "pin": "const __nv_bfloat16* __restrict__ q"
+     }
+    ],
+    "consumes b_scales": [
+     {
+      "line": 988,
+      "pin": "const float* __restrict__ k_scales"
+     }
+    ],
+    "produces b_out": [
+     {
+      "line": 992,
+      "pin": "__nv_bfloat16* __restrict__ outp"
+     }
+    ]
+   }
+  },
+  {
+   "body_close_line": 982,
+   "body_open_line": 769,
+   "consumes": [
+    "b_fp8",
+    "b_q",
+    "b_scales"
+   ],
+   "deref_lines": [
+    776,
+    784,
+    786,
+    789,
+    791,
+    805,
+    809,
+    813,
+    815,
+    818,
+    823,
+    824,
+    825,
+    826,
+    833,
+    834,
+    835,
+    836,
+    853,
+    856,
+    857,
+    870,
+    871,
+    879,
+    881,
+    891,
+    892,
+    893,
+    894,
+    897,
+    898,
+    904,
+    905,
+    906,
+    908,
+    909,
+    915,
+    923,
+    927,
+    929,
+    930,
+    936,
+    941,
+    942,
+    948,
+    954,
+    960,
+    965,
+    966,
+    967,
+    978,
+    979,
+    981
+   ],
+   "epilog_line": 982,
+   "explicit_epilog": false,
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "k_id": 6,
+   "pdl_launched": false,
+   "produces": [
+    "b_out"
+   ],
+   "prolog_line": 774,
+   "rocq": "kFlashDeriveV",
+   "signature_line": 749,
+   "store_lines": [
+    786,
+    791,
+    813,
+    823,
+    824,
+    825,
+    826,
+    856,
+    857,
+    870,
+    871,
+    897,
+    898,
+    908,
+    909,
+    915,
+    929,
+    930,
+    942,
+    966,
+    979,
+    981
+   ],
+   "symbol": "flash_splitk_fused_fp8_derivev_kernel",
+   "witnesses": {
+    "consumes b_fp8": [
+     {
+      "line": 750,
+      "pin": "const uint8_t* __restrict__ k_fp8"
+     }
+    ],
+    "consumes b_q": [
+     {
+      "line": 749,
+      "pin": "const __nv_bfloat16* __restrict__ q"
+     }
+    ],
+    "consumes b_scales": [
+     {
+      "line": 751,
+      "pin": "const float* __restrict__ k_scales"
+     }
+    ],
+    "produces b_out": [
+     {
+      "line": 757,
+      "pin": "__nv_bfloat16* __restrict__ outp"
+     }
+    ]
+   }
+  }
+ ],
+ "launch_sites": [
+  {
+   "callee": "flash_splitk_fused_fp8_kernel",
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "line": 1552
+  },
+  {
+   "callee": "flash_splitk_fused_fp8_kernel",
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "line": 1559
+  },
+  {
+   "callee": "flash_splitk_fused_fp8_kernel",
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "line": 1566
+  },
+  {
+   "callee": "gemv_bf16_kernel",
+   "file": "rust/crates/nv-kernels/cuda/gemv_bf16.cu",
+   "line": 438
+  },
+  {
+   "callee": "quantize_kv_fp8_kernel",
+   "file": "rust/crates/nv-kernels/cuda/kv_fp8.cu",
+   "line": 134
+  },
+  {
+   "callee": "residual_add_scale_bf16_kernel",
+   "file": "rust/crates/nv-kernels/cuda/residual_scale.cu",
+   "line": 68
+  },
+  {
+   "callee": "rmsnorm_kernel",
+   "file": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "line": 87
+  },
+  {
+   "callee": "rmsnorm_kernel",
+   "file": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "line": 107
+  },
+  {
+   "callee": "rope_bf16_oop_kernel",
+   "file": "rust/crates/nv-kernels/cuda/rope_bf16.cu",
+   "line": 146
+  }
+ ],
+ "macro_sites": [
+  {
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "inside_modelled_kernel": true,
+   "line": 774,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "inside_modelled_kernel": true,
+   "line": 1008,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "inside_modelled_kernel": true,
+   "line": 1248,
+   "macro": "NVK_PDL_EPILOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/gemv_bf16.cu",
+   "inside_modelled_kernel": true,
+   "line": 28,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/gemv_bf16.cu",
+   "inside_modelled_kernel": true,
+   "line": 73,
+   "macro": "NVK_PDL_EPILOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/kv_fp8.cu",
+   "inside_modelled_kernel": true,
+   "line": 33,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/kv_fp8.cu",
+   "inside_modelled_kernel": true,
+   "line": 80,
+   "macro": "NVK_PDL_EPILOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/residual_scale.cu",
+   "inside_modelled_kernel": true,
+   "line": 17,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/residual_scale.cu",
+   "inside_modelled_kernel": true,
+   "line": 25,
+   "macro": "NVK_PDL_EPILOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "inside_modelled_kernel": true,
+   "line": 56,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "inside_modelled_kernel": true,
+   "line": 71,
+   "macro": "NVK_PDL_EPILOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/rope_bf16.cu",
+   "inside_modelled_kernel": true,
+   "line": 88,
+   "macro": "NVK_PDL_PROLOG"
+  },
+  {
+   "file": "rust/crates/nv-kernels/cuda/rope_bf16.cu",
+   "inside_modelled_kernel": true,
+   "line": 122,
+   "macro": "NVK_PDL_EPILOG"
+  }
+ ]
+}

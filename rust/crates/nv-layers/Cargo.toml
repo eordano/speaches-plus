@@ -1,0 +1,28 @@
+[package]
+name = "nv-layers"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+half = { workspace = true }
+bytemuck = { workspace = true }
+float8 = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-flash-attn = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+nv-config = { workspace = true }
+nv-kernels = { workspace = true }
+nv-quant = { workspace = true }
+nv-weights = { workspace = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc", "dep:candle-flash-attn", "candle-core/cuda", "candle-nn/cuda", "nv-kernels/cuda", "nv-quant/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+wgpu = ["nv-kernels/wgpu"]
+
+[lints]
+workspace = true

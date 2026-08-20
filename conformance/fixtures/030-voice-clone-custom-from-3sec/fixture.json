@@ -1,0 +1,71 @@
+{
+  "name": "030-voice-clone-custom-from-3sec",
+  "family": "030-voice-clone",
+  "description": "Voice profile from a 3-second reference WAV. Asserts the resulting profile carries a real 1024-d ECAPA-TDNN x-vector (embedding_state == 'encoded'). Requires a Qwen3-TTS Base checkpoint (the speaker encoder lives in its model.safetensors under speaker_encoder.*).",
+  "input_artifacts": [
+    {
+      "path": "reference_440hz_3s_16k_mono.wav",
+      "kind": "wav",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration_ms": 3000,
+      "synthesized_by": "generate_reference_wav.py",
+      "notes": "440 Hz sine, amplitude 0.5, 16-bit PCM mono @ 16kHz. Used as the speaker-encoder input; we do not assert anything about the audio content, only that the encoder accepts the format and produces a non-zero embedding. The server resamples to 24 kHz and computes a 128-mel spectrogram before encoding; reference audio must be >= 0.5 s."
+    }
+  ],
+  "steps": [
+    {
+      "step": 1,
+      "kind": "create_voice_profile",
+      "endpoint": {
+        "method": "POST",
+        "path": "/v1/voice-profiles"
+      },
+      "request_multipart": {
+        "name": "test-custom-from-3sec",
+        "file@": "reference_440hz_3s_16k_mono.wav"
+      },
+      "expected_response": {
+        "status": 201,
+        "body": {
+          "name": "test-custom-from-3sec",
+          "schema_version": 2,
+          "embedding_state": "encoded",
+          "embedding_dim": 1024
+        }
+      }
+    },
+    {
+      "step": 2,
+      "kind": "get_voice_profile",
+      "endpoint": {
+        "method": "GET",
+        "path": "/v1/voice-profiles/test-custom-from-3sec"
+      },
+      "expected_response": {
+        "status": 200,
+        "body": {
+          "name": "test-custom-from-3sec",
+          "embedding_state": "encoded"
+        }
+      }
+    },
+    {
+      "step": 3,
+      "kind": "cleanup",
+      "endpoint": {
+        "method": "DELETE",
+        "path": "/v1/voice-profiles/test-custom-from-3sec"
+      },
+      "expected_response": {
+        "status_in": [200, 204]
+      }
+    }
+  ],
+  "comparison_strategy": "structural",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "notes": "The embedding is the raw ECAPA-TDNN fc output (the reference implementation does NOT L2-normalize; the old norm ~= 1.0 assertion described a scaffold that no longer exists). Without a speaker encoder — i.e. when NV_TTS_TALKER_DIR points at a CustomVoice/VoiceDesign checkpoint, whose safetensors carry no speaker_encoder.* tensors — the server refuses enrollment with 503 code 'no_speaker_encoder' instead of storing a zero vector; there is no placeholder-zeros mode anymore. In that configuration this fixture is skipped."
+  },
+  "skip_when_no_model": true
+}

@@ -1,0 +1,240 @@
+<!doctype html>
+<html data-theme="dark" lang="en">
+<head>
+<meta charset="utf-8">
+<title>Realtime Session Inspector · speaches</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="design/colors_and_type.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body data-screen-label="01 Inspector">
+<div class="app">
+
+  <div class="topbar">
+    <div class="brand-stack">
+      <div class="brand">
+        <span class="mark">speaches</span>
+        <span class="sub">Inspector</span>
+      </div>
+      <div class="session-pill" id="sessionPill" title="Switch session">
+        <span id="sessionIdText">--</span>
+        <span class="chev">▾</span>
+      </div>
+    </div>
+
+    <span class="state-pill state-replay" id="statePill" title="Current mode">
+      <span class="dot"></span>
+      <span id="stateText">Replay</span>
+    </span>
+
+    <div class="btngroup" id="transportCluster" aria-label="Playback transport">
+      <button class="btn btn-primary" id="btnPlay" title="Play from selection or cursor (space)">
+        ▶ Play <span class="glyph">space</span>
+      </button>
+      <button class="btn btn-stop" id="btnReplayStop" title="Stop playback (esc)" style="display:none">
+        ■ Stop <span class="glyph">esc</span>
+      </button>
+      <span class="ctrl-sep"></span>
+      <select class="speed-select" id="speedSelect" title="Replay speed (applies on next play)">
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
+      </select>
+    </div>
+
+    <div class="btngroup" id="audioChannelsWrap" aria-label="Audio channels" style="display:none">
+      <span class="group-label">channels</span>
+      <button class="btn" id="btnChMic" aria-pressed="true" title="Mic-in channel">
+        <span class="dot inline-dot inline-dot--user"></span>mic
+      </button>
+      <button class="btn" id="btnChTts" aria-pressed="true" title="TTS-out channel">
+        <span class="dot inline-dot inline-dot--agent"></span>tts
+      </button>
+    </div>
+
+    <div class="btngroup tb-hide" id="liveFollowWrap" aria-label="Live mode">
+      <button class="btn" id="btnFollow" aria-pressed="true" title="Auto-scroll to follow new events (f)">
+        ↓ Tail <span class="glyph">f</span>
+      </button>
+      <button class="btn" id="btnPause" title="Freeze view (kept for compatibility)" style="display:none">⏸</button>
+    </div>
+
+    <span class="spacer"></span>
+
+    <button class="btn client-badge" id="btnNewSession" title="Start a new realtime session (mic + TTS)">● New session</button>
+
+    <div class="btngroup">
+      <span class="group-label">download</span>
+      <button class="btn" id="btnExport" title="Download .ndjson event log">⤓ ndjson</button>
+      <button class="btn" id="btnExportAudio" title="Download .wav for mic_in and tts_out">⤓ audio</button>
+    </div>
+
+    <button class="btn icon-btn" id="btnSettings" title="Live session settings" aria-pressed="false">⚙</button>
+  </div>
+
+  <div class="main">
+    <div class="timeline-wrap">
+      <div class="ruler" id="ruler"><canvas id="rulerCanvas"></canvas></div>
+
+      <div class="lanes">
+        <div class="lane-gutter" id="laneGutter"></div>
+        <div class="tl-canvas-wrap" id="tlWrap"><canvas id="tlCanvas"></canvas></div>
+      </div>
+
+      <div class="minimap">
+        <div class="legend">Minimap · full session</div>
+        <div class="mm-wrap"><canvas id="mmCanvas"></canvas></div>
+      </div>
+
+      <div class="statusbar">
+        <span>events <b id="stEvents">0</b></span>
+        <span class="sep"></span>
+        <span>lanes <b>6</b></span>
+        <span class="sep"></span>
+        <span>dropped <b id="stDropped">0</b></span>
+        <span class="sep"></span>
+        <span>seq <b id="stSeq">--</b></span>
+        <span class="sep"></span>
+        <span id="stTips" class="fg-faint"></span>
+        <span class="right">
+          <span id="stCursor">cursor --</span>
+          <span id="stSelection">selection --</span>
+          <span id="stAudio" class="fg-faint">audio ○ idle</span>
+        </span>
+      </div>
+    </div>
+
+    <aside class="inspector">
+      <div class="insp-head">
+        <div class="eyebrow" id="iEyebrow">Selected event</div>
+        <div class="title" id="iTitle">No event selected</div>
+        <div class="subline" id="iSubline">
+          <span class="tag">pick an event on the timeline</span>
+        </div>
+      </div>
+      <div class="insp-tabs" role="tablist">
+        <div class="insp-tab" role="tab" aria-selected="true" data-tab="pretty">Structured</div>
+        <div class="insp-tab" role="tab" aria-selected="false" data-tab="raw">Raw JSON</div>
+        <div class="insp-tab" role="tab" aria-selected="false" data-tab="related">Related <span class="fg-faint--spaced">0</span></div>
+      </div>
+      <div class="insp-body pretty" id="inspBody">
+        <div class="insp-empty">Click a block on the timeline to inspect it.</div>
+        <div class="insp-hint">
+          Hover any event for a quick preview. Click-drag across lanes to measure a time range. Shift-click two events to diff.
+        </div>
+      </div>
+      <div class="insp-foot">
+        <div class="nav">
+          <button title="Previous in lane (⇧,)">◂ prev</button>
+          <button title="Next in lane (⇧.)">next ▸</button>
+        </div>
+        <button class="copy" id="btnCopy">copy JSON</button>
+      </div>
+    </aside>
+
+    <aside class="settings-panel" id="settingsPanel" aria-label="Session settings">
+      <div class="settings-header">
+        <div>
+          <div class="eyebrow">Live settings</div>
+          <div class="title">Session</div>
+        </div>
+        <button class="x" id="settingsClose" aria-label="close">✕</button>
+      </div>
+      <div class="settings-body">
+
+        <section class="sset">
+          <h5>Devices</h5>
+          <div class="field stack">
+            <label for="deviceMic">Microphone</label>
+            <select id="deviceMic"></select>
+          </div>
+          <div class="field stack">
+            <label for="deviceSpk">Speaker</label>
+            <select id="deviceSpk"></select>
+          </div>
+        </section>
+
+        <section class="sset" id="ssetAudio" data-mode="stt">
+          <h5>Audio mode</h5>
+          <div class="field row-full">
+            <div class="radio-group" id="audioModeGroup">
+              <label><input type="radio" name="audio_mode" value="stt" checked><span>STT -> LLM</span></label>
+              <label><input type="radio" name="audio_mode" value="audio_direct"><span>Direct WAV</span></label>
+            </div>
+          </div>
+          <div class="prompt-wrap">
+            <div class="field stack">
+              <label for="audioDirectModel">Audio model <span class="unit">session.audio_direct_model</span></label>
+              <input type="text" id="audioDirectModel" value="gemma-4-e4b-it" spellcheck="false">
+            </div>
+            <div class="field row-full">
+              <label for="audioDirectPrompt">Direct-audio prompt <span class="unit">session.audio_direct_prompt</span></label>
+              <textarea id="audioDirectPrompt" rows="3" placeholder="Leave empty to send audio only (no text prompt)."></textarea>
+            </div>
+          </div>
+        </section>
+
+        <section class="sset">
+          <h5>Voice activity detection</h5>
+          <div class="field">
+            <label for="vadThreshold">Threshold <span class="unit">0-1</span></label>
+            <span class="val" id="vadThresholdVal">0.80</span>
+            <input type="range" id="vadThreshold" min="0.5" max="1" step="0.05" value="0.80">
+          </div>
+          <div class="field">
+            <label for="vadMinSpeech">Min speech <span class="unit">ms</span></label>
+            <input type="number" id="vadMinSpeech" min="0" max="5000" step="10" value="120">
+          </div>
+          <div class="field">
+            <label for="vadSilence">Silence to end <span class="unit">ms</span></label>
+            <input type="number" id="vadSilence" min="0" max="5000" step="10" value="350">
+          </div>
+          <div class="field">
+            <label for="vadBargeIn">Barge-in delay <span class="unit">ms</span></label>
+            <input type="number" id="vadBargeIn" min="0" max="5000" step="10" value="400">
+          </div>
+        </section>
+
+        <section class="sset">
+          <h5>Models</h5>
+          <div class="field stack">
+            <label for="modelLlm">LLM <span class="unit">session.model</span></label>
+            <input type="text" id="modelLlm" value="" spellcheck="false" placeholder="loading...">
+          </div>
+          <div class="field stack">
+            <label for="modelStt">STT <span class="unit">input_audio_transcription.model</span></label>
+            <select id="modelStt"></select>
+          </div>
+          <div class="field stack">
+            <label for="modelTts">TTS <span class="unit">session.speech_model</span></label>
+            <select id="modelTts"></select>
+          </div>
+          <div class="field stack">
+            <label for="modelVoice">Voice <span class="unit">session.voice</span></label>
+            <select id="modelVoice"></select>
+          </div>
+        </section>
+
+        <section class="sset">
+          <h5>Instructions</h5>
+          <div class="field row-full">
+            <label for="instructions">System prompt <span class="unit">session.instructions</span></label>
+            <textarea id="instructions" rows="6" placeholder="You are a helpful assistant..."></textarea>
+          </div>
+        </section>
+
+      </div>
+      <div class="sset-footer" id="ssetFooter">
+        <span class="dot"></span>
+        <span id="ssetFooterText">Edits apply immediately via session.update</span>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>

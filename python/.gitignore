@@ -1,0 +1,50 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Nix
+result
+result-*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
+
+# Agent-tool local state
+.claude/
+
+# Local work
+temp/
+speaches-plus/
+speaches-plus
+review_fixes_flamegraph.html
+
+# Test capture artifacts (inspect_api audio_store leaks these into cwd
+# when INSPECT_SESSION_DIR isn't set during test runs)
+sess_*.raw
+sess_*.ndjson
+sess_*.audio.json

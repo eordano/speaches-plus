@@ -1,0 +1,1 @@
+Four words composed at measured offsets; word_rects in fixture.json are exact ink bounding boxes from magick %@ trim geometry. Gates: every reported word rect IoU >= 0.6 against word_rects; token offsets slice expected_text to the exact word.

@@ -1,0 +1,9 @@
+{"op": "markActive"}
+{"op": "vad_speech_start", "item_id": "user_a", "start_ms": 100}
+{"op": "vad_speech_end", "end_ms": 1500}
+{"op": "commit_fire"}
+{"op": "transcription_complete", "item_id": "user_a", "transcript": "hello"}
+{"op": "response_create", "resp_id": "resp_a", "item_id": "asst_a"}
+{"op": "audio_delta", "resp_id": "resp_a", "audio_bytes": 4096}
+{"op": "llm_complete", "epoch": 1, "transcript": "hi", "planned_ms": 600}
+{"op": "audio_drained", "epoch": 1, "played_ms": 600}

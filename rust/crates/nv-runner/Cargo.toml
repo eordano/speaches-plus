@@ -1,0 +1,38 @@
+[package]
+name = "nv-runner"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+half = { workspace = true }
+cudarc = { workspace = true, optional = true }
+nv-config = { workspace = true }
+nv-tokenizer = { workspace = true }
+nv-weights = { workspace = true }
+nv-models = { workspace = true }
+nv-kernels = { workspace = true }
+nv-layers = { workspace = true }
+
+[features]
+default = []
+cuda = [
+    "dep:cudarc",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "nv-models/cuda",
+    "nv-kernels/cuda",
+    "nv-layers/cuda",
+]
+
+[[example]]
+name = "qwen3_greedy"
+path = "examples/qwen3_greedy.rs"
+
+[lints]
+workspace = true

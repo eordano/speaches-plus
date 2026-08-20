@@ -1,0 +1,4 @@
+{"type": "session.created", "session": {"id": "sess_1"}}
+{"type": "response.created", "response": {"id": "resp_a"}}
+{"type": "response.output_audio.delta", "response_id": "resp_a", "audio": {"audio_bytes": 2048}}
+{"type": "response.done", "response": {"id": "resp_a", "status": "incomplete", "audio_end_ms": 1200, "status_details": {"reason": "drain_cap"}, "output": [{"id": "asst_a"}]}}

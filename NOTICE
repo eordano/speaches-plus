@@ -1,0 +1,71 @@
+speaches-plus
+=============
+
+Source code: AGPL-3.0-or-later. See LICENSE for the full text.
+
+Exception: the `python/` directory is licensed Apache-2.0 (see
+python/LICENSE and the license declaration in python/pyproject.toml).
+It derives from the upstream speaches project, which is Apache-2.0,
+and keeps that license. Everything outside `python/` is
+AGPL-3.0-or-later.
+
+This product bundles or downloads at runtime several third-party model
+weights, each governed by its own license. Operators are responsible for
+complying with the terms below for any deployment.
+
+----------------------------------------------------------------------
+Speaker diarization -- segmentation
+----------------------------------------------------------------------
+
+Model:    DiariZen-Large-s80-v2 (BUT-FIT/diarizen-wavlm-large-s80-md-v2)
+Authors:  Brno University of Technology, Speech@FIT
+Source:   https://huggingface.co/BUT-FIT/diarizen-wavlm-large-s80-md-v2
+License:  CC-BY-NC-4.0 (NON-COMMERCIAL ONLY)
+
+  The DiariZen segmentation weights are released under CC-BY-NC-4.0
+  because the training mixture includes datasets (RAMC, MSDWild,
+  DIHARD-3) that prohibit commercial use. By downloading and using
+  these weights you agree to:
+
+    - Use them for research, academic, personal, or other
+      non-commercial purposes only.
+    - Not redistribute or use the weights -- directly or as a derivative
+      -- in any commercial product or service.
+
+  speaches-plus does not bundle these weights. They are downloaded
+  by `rust/scripts/fetch-models.sh` from the upstream Hugging Face
+  repository and converted to ONNX by `rust/scripts/export-diarizen-onnx.py`.
+  Operators who require commercial use must:
+
+    a) Replace the segmentation model with one carrying a permissive
+       license (e.g. pyannote-segmentation-3.0 under MIT), or
+    b) Train an equivalent on commercially-licensed data.
+
+  See `rust/src/realtime/diarization/` for the integration surface;
+  the wrapper accepts any ONNX with the same `(B, 1, samples) -> (B, T, C)`
+  powerset shape.
+
+----------------------------------------------------------------------
+Speaker diarization -- embedding
+----------------------------------------------------------------------
+
+Model:    WeSpeaker ResNet293-LM (Wespeaker/wespeaker-voxceleb-resnet293-LM)
+Authors:  Wespeaker project
+Source:   https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM
+License:  CC-BY-4.0 (commercial use OK with attribution)
+
+  These weights may be used commercially provided the attribution
+  requirements of CC-BY-4.0 are met.
+
+----------------------------------------------------------------------
+Other models
+----------------------------------------------------------------------
+
+Silero VAD          -- silero-vad / MIT
+Whisper large-v3    -- openai/whisper / MIT (CT2 conversion: deepdml/* / MIT)
+Kokoro TTS          -- speaches-ai/Kokoro-82M-v1.0-ONNX / Apache-2.0
+Smart Turn v3       -- pipecat-ai/smart-turn-v3 / BSD-2-Clause
+
+The Whisper, Kokoro, Silero, and Smart-Turn weights are commercial-use-
+compatible. The DiariZen weights are not. Configure your deployment
+accordingly.

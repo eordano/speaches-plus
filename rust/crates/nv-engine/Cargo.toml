@@ -1,0 +1,27 @@
+[package]
+name = "nv-engine"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+half = { workspace = true }
+tracing = { workspace = true }
+xxhash-rust = { workspace = true }
+rand_pcg = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+candle-core = { workspace = true }
+cudarc = { workspace = true, optional = true }
+nv-config = { workspace = true }
+nv-layers = { workspace = true }
+nv-weights = { workspace = true }
+nv-tokenizer = { workspace = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc", "candle-core/cuda", "nv-layers/cuda"]
+metal = ["candle-core/metal", "nv-layers/metal"]
+
+[lints]
+workspace = true

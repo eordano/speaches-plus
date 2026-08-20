@@ -1,0 +1,42 @@
+{
+  "generated": "2026-08-10 06:35",
+  "verify_weight_bytes": 31481767960,
+  "verify_weight_bytes_formula": 31479103488,
+  "misc_small_bytes": 2664472,
+  "draft_step_weight_bytes": 1478141952,
+  "verify_min_traffic_at_256": 31701968920,
+  "verify_min_traffic_at_full_ctx": 43057227800,
+  "floor_verify_ms": 17.437615924022346,
+  "floor_verify_full_ctx_ms": 23.90435326480447,
+  "floor_draft_step_us": 675.8136849162012,
+  "token_ceiling_tok_s": 153.11726165053125,
+  "round_serial_ceiling_tok_s": 132.5662651125534,
+  "measured": {
+    "verify_ms": [
+      27.47,
+      27.86
+    ],
+    "draft_ms_round": [
+      3.21,
+      3.23
+    ],
+    "tokens_per_round": [
+      2.46,
+      2.67
+    ],
+    "agg_tok_s": 83.17737575379496
+  },
+  "ratios": {
+    "verify_vs_light": 1.6,
+    "draft_vs_light": 1.2,
+    "e2e_ceiling_vs_measured": 1.86
+  },
+  "gap_ms": {
+    "round_hi": 31.2113,
+    "floor_round": 20.14087066368715,
+    "verify_gap": 10.422384075977654,
+    "draft_gap": 0.5267452603351955,
+    "host_hi": 0.1213,
+    "verify_share_pct": 94
+  }
+}

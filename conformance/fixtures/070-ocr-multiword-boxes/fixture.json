@@ -1,0 +1,52 @@
+{
+  "name": "070-ocr-multiword-boxes",
+  "family": "070-ocr",
+  "description": "Four words composed at measured offsets; word_rects are exact ink bounding boxes from magick trim geometry. Gates every reported word rect at IoU >= 0.6 against word_rects. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "alpha bravo charlie delta",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 44,
+    "extra_ops": [
+      "composed word labels at known offsets, inter-word gap 28px"
+    ]
+  },
+  "word_rects": [
+    {
+      "left": 42,
+      "top": 47,
+      "right": 158,
+      "bottom": 90
+    },
+    {
+      "left": 195,
+      "top": 47,
+      "right": 315,
+      "bottom": 82
+    },
+    {
+      "left": 348,
+      "top": 47,
+      "right": 493,
+      "bottom": 82
+    },
+    {
+      "left": 526,
+      "top": 47,
+      "right": 632,
+      "bottom": 82
+    }
+  ],
+  "gates": {
+    "cer_max": 0.0,
+    "line_count": 1,
+    "word_count": 4,
+    "iou_min": 0.6
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 7
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

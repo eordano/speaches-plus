@@ -1,0 +1,47 @@
+{
+  "name": "020-chat-sampled-temp07",
+  "family": "020-chat-completions",
+  "description": "Sampled chat-completions with temperature=0.7 and a fixed seed. Asserts that the same (seed, prompt, params) deterministically produces the same top-1 first-token id and the same final string.",
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/chat/completions"
+  },
+  "request_body": {
+    "model": "Qwen/Qwen3-4B-Instruct",
+    "messages": [
+      {"role": "user", "content": "Give me one playful three-word phrase about cats."}
+    ],
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "seed": 1337,
+    "max_tokens": 12,
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "object": "chat.completion",
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason_in": ["stop", "length"],
+        "message": {
+          "role": "assistant",
+          "content_non_empty": true,
+          "content_token_count_range": [1, 12]
+        }
+      }
+    ]
+  },
+  "comparison_strategy": "structural+seed_determinism",
+  "determinism_check": {
+    "kind": "double_run",
+    "notes": "Issue the identical request twice; the assistant string must be byte-identical across runs (verifies seed plumbing + deterministic sampler). Recorded golden string lives in `ref_outputs.first_token_id` once the real model is wired."
+  },
+  "ref_outputs": {
+    "mode": "placeholder",
+    "first_token_id": null,
+    "final_content": null,
+    "notes": "When NvEngineChat is wired with the real Qwen3 4B instruct weights, fill `first_token_id` and `final_content` with the values produced under seed=1337, temp=0.7, top_p=0.9. The assertion at that point is exact-match on `final_content` and `first_token_id` from the first streamed delta."
+  },
+  "skip_when_no_model": true
+}

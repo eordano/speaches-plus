@@ -1,0 +1,27 @@
+{
+  "name": "050-diarization-multispeaker",
+  "family": "050-diarization",
+  "description": "Four-speaker, 12-turn synthetic conversation with two deliberate overlaps, plus the recorded ground-truth layout. Exists so the DIAR_HOP_RATIO sweep exercises real speaker discrimination instead of collapsing to one cluster. Consumed directly by a Rust test, not by an HTTP endpoint runner.",
+  "input_artifacts": [
+    {
+      "path": "audio.wav",
+      "kind": "wav",
+      "sample_rate": 16000,
+      "channels": 1,
+      "duration_ms": 39722,
+      "synthesized_by": "rust/src/diarization/hop_sweep.rs::diar_build_multispeaker_fixture",
+      "notes": "Kokoro-82M v1.0 ONNX voice bank, four voices (af_heart, am_michael, bf_emma, bm_george). Turns are laid out by measuring each synthesized utterance, so the ground truth is the actual layout."
+    },
+    {
+      "path": "ground_truth.json",
+      "kind": "json",
+      "notes": "Per-turn speaker label, Kokoro voice, start/end in ms, source text, plus the computed overlap intervals."
+    }
+  ],
+  "consumed_by": [
+    "rust/src/diarization/hop_sweep.rs::diar_hop_ratio_sweep"
+  ],
+  "comparison_strategy": "der_sweep",
+  "notes": "Synthetic TTS speakers separate far more cleanly than real recordings. A clean sweep here is necessary but not sufficient to move the DIAR_HOP_RATIO default off 0.1.",
+  "skip_when_no_model": true
+}

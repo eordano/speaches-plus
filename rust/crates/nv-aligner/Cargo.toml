@@ -1,0 +1,24 @@
+[package]
+name = "nv-aligner"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+nv-config = { workspace = true }
+nv-layers = { workspace = true }
+nv-weights = { workspace = true }
+nv-tokenizer = { workspace = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "nv-layers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "nv-layers/metal"]
+
+[lints]
+workspace = true

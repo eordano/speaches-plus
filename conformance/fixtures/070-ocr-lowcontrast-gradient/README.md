@@ -1,0 +1,1 @@
+Black text over a horizontal luminance gradient (gray 32% to 100%). Sauvola local binarization must win where global Otsu fails; a unit test asserts Otsu is strictly worse on this image. Gate: CER <= 2%.

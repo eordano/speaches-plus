@@ -1,0 +1,27 @@
+{
+  "name": "071-ocr-layout-invoice",
+  "family": "071-ocr-layout",
+  "description": "Rendered full-page layout: Invoice: header blocks, ruled item table, totals column. Scored as raw CER and as markup-neutral CER (the gating number). Classical gates require the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA); model gates require DeepSeek-OCR weights.",
+  "input": "input.png",
+  "expected_text": "NORTHWIND SUPPLY CO.\n1454 Harbor Street, Portsmouth, NH 03801\nbilling@northwindsupply.example\nINVOICE #2041\nDate: 2026-07-18\nDue: 2026-08-17\nBill To: Meridian Labs, 22 Quay Road, Boston, MA 02110\nItem Qty Unit Price Amount\nSteel brackets (large) 40 3.25 130.00\nHex bolts M8 500 0.12 60.00\nPowder coating service 1 220.00 220.00\nDelivery surcharge 1 35.50 35.50\nSubtotal: 445.50\nTax (8%): 35.64\nTotal: 481.14\nPayment is due within 30 days. Late payments accrue 1.5% monthly interest.\nPlease reference invoice number 2041 on all correspondence.",
+  "render": {
+    "generator": "render_pages.py (PIL, DejaVu fonts, 1400x1900)",
+    "case": "real-01-invoice"
+  },
+  "gates": {
+    "cer_max_model": 0.35,
+    "cer_max_model_neutral": 0.02,
+    "cer_max_classical": 0.36,
+    "cer_max_classical_neutral": 0.18
+  },
+  "oracle": {
+    "enabled": false
+  },
+  "comparison_strategy": "cer_markup_neutral+layout_gates",
+  "skip_when_no_model": true,
+  "scoring": {
+    "raw": "character edit distance against expected_text verbatim",
+    "neutral": "same distance after nv-ocr tests/markup_neutral.rs::markup_neutral (port of real5/score.py::strip_markup + whitespace collapse); this is the gating number"
+  },
+  "notes": "invoice: header blocks, ruled item table, totals column"
+}

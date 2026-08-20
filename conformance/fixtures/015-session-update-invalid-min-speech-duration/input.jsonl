@@ -1,0 +1,2 @@
+{"op": "markActive"}
+{"op": "session_update_invalid", "code": "session_update_invalid", "message": "turn_detection.min_speech_duration_ms: must be in [0,60000]"}

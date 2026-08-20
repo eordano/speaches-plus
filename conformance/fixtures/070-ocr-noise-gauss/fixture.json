@@ -1,0 +1,26 @@
+{
+  "name": "070-ocr-noise-gauss",
+  "family": "070-ocr",
+  "description": "Clean render plus additive Gaussian noise, sigma ~12 grey levels. Gates CER <= 2%. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "Noise resistant text",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 44,
+    "extra_ops": [
+      "-attenuate 0.6 +noise Gaussian"
+    ]
+  },
+  "noise_sigma": 12,
+  "gates": {
+    "cer_max": 0.02,
+    "line_count": 1,
+    "word_count": 3
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 7
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

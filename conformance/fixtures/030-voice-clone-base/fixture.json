@@ -1,0 +1,34 @@
+{
+  "name": "030-voice-clone-base",
+  "family": "030-voice-clone",
+  "description": "Synthesize a known short utterance via the Qwen3-TTS Base voice. Reference output is an expected token count range (not byte-exact audio) because the audio codec is non-deterministic in the bit-domain even when the symbol stream is identical.",
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/audio/speech"
+  },
+  "request_body": {
+    "model": "qwen3-tts-12hz",
+    "input": "The quick brown fox jumps over the lazy dog.",
+    "voice": "Base",
+    "response_format": "wav",
+    "speed": 1.0
+  },
+  "expected_response": {
+    "status": 200,
+    "content_type": "audio/wav",
+    "wav_header": {
+      "valid_riff": true,
+      "sample_rate": 24000,
+      "channels": 1,
+      "bits_per_sample_in": [16, 24, 32]
+    },
+    "expected_token_count_range": [40, 220],
+    "expected_duration_ms_range": [1500, 5500]
+  },
+  "comparison_strategy": "structural+audio_envelope",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "notes": "We do not byte-compare audio: the codec is permitted to introduce non-determinism in PCM least-significant bits across runs / hardware. Comparison strategy: (1) WAV header sanity (`crate::oapi::audio_speech::write_wav_header` shape); (2) duration in [1.5s, 5.5s] for the given utterance + speed=1.0; (3) approximate token-count range derived from the BPE tokenizer at 12 Hz frame rate (see `nv_tts::tokenizer`). Real-model T5 tolerance from §10.1 applies once weights are loaded."
+  },
+  "skip_when_no_model": true
+}

@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# gpuq — single-flight GPU job gate. Replaces N competing `nvidia-smi ... sleep 30` loops.
+#
+# Serialization is by blocking flock(1) on one lock file, so admission is atomic:
+# two waiters can NEVER co-launch (the 30s-poll race that produced the q95
+# co-tenancy campaign is impossible by construction). After acquiring the lock it
+# additionally waits for external (non-gpuq) consumers to release VRAM.
+#
+#   gpuq run  [-t SECS] [-n NAME] [-m MAX_MIB] -- CMD ARGS...   run CMD under the GPU lock
+#   gpuq status                                                  who holds it, who waits
+#   gpuq log [N]                                                 tail the admission log
+#
+# Exit code: the command's own exit code. 124 = command timeout, 125 = lock/idle
+# timeout. Every admission logs WAIT/START/DONE with durations to $GPUQ_LOG.
+#
+# Env: GPUQ_LOCK (default /tmp/gpuq.lock), GPUQ_LOG (default
+# /tmp/gpuq.log), GPUQ_SKIP_SMI=1 to skip the VRAM check (dry runs,
+# hostless tests).
+set -u
+LOCK="${GPUQ_LOCK:-/tmp/gpuq.lock}"
+LOG="${GPUQ_LOG:-/tmp/gpuq.log}"
+STATE="$LOCK.holder"
+
+now() { date -Is; }
+log() { echo "[$(now)] $*" >> "$LOG"; }
+
+vram_used() {
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+}
+
+cmd_status() {
+  if [ -s "$STATE" ] && read -r hpid hname hsince < "$STATE" 2>/dev/null && kill -0 "$hpid" 2>/dev/null; then
+    echo "HELD by pid=$hpid name=$hname since=$hsince"
+  else
+    echo "FREE"
+  fi
+  waiters=$(fuser "$LOCK" 2>/dev/null | wc -w)
+  echo "waiters-on-lock: $waiters"
+  if [ -z "${GPUQ_SKIP_SMI:-}" ]; then
+    u=$(vram_used); [ -n "$u" ] && echo "vram-used-mib: $u"
+  fi
+}
+
+cmd_run() {
+  local tmo=0 name="job-$$" maxmib=600 locktmo=21600
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t) tmo="$2"; shift 2 ;;
+      -n) name="$2"; shift 2 ;;
+      -m) maxmib="$2"; shift 2 ;;
+      -L) locktmo="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) echo "gpuq run: unknown arg $1" >&2; return 2 ;;
+    esac
+  done
+  [ $# -gt 0 ] || { echo "gpuq run: no command" >&2; return 2; }
+  mkdir -p "$(dirname "$LOCK")"
+  local t0=$SECONDS
+  exec 9>"$LOCK"
+  log "WAIT  name=$name pid=$$ cmd=$1"
+  if ! flock -w "$locktmo" 9; then
+    log "LOCK-TIMEOUT name=$name waited=$((SECONDS-t0))s"
+    return 125
+  fi
+  # Lock held. Wait out external consumers (things not using gpuq).
+  if [ -z "${GPUQ_SKIP_SMI:-}" ]; then
+    local idle_t0=$SECONDS u
+    while :; do
+      u=$(vram_used)
+      [ -z "$u" ] && break              # no nvidia-smi -> don't gate on it
+      [ "$u" -le "$maxmib" ] && break
+      if [ $((SECONDS-idle_t0)) -ge "$locktmo" ]; then
+        log "IDLE-TIMEOUT name=$name vram=$u waited=$((SECONDS-t0))s"
+        return 125
+      fi
+      sleep 15
+    done
+  fi
+  echo "$$ $name $(now)" > "$STATE"
+  log "START name=$name waited=$((SECONDS-t0))s"
+  local t1=$SECONDS rc
+  if [ "$tmo" -gt 0 ]; then
+    timeout --signal=TERM --kill-after=30 "$tmo" "$@"; rc=$?
+  else
+    "$@"; rc=$?
+  fi
+  log "DONE  name=$name rc=$rc ran=$((SECONDS-t1))s"
+  : > "$STATE"
+  return "$rc"
+}
+
+case "${1:-}" in
+  run)    shift; cmd_run "$@" ;;
+  status) cmd_status ;;
+  log)    tail -n "${2:-20}" "$LOG" 2>/dev/null ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
+esac

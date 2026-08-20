@@ -1,0 +1,6 @@
+/bin/
+/models/
+/share/
+*.bin
+*.onnx
+*.log

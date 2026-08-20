@@ -1,0 +1,27 @@
+{
+  "name": "070-ocr-photo-noise-surround",
+  "family": "070-ocr",
+  "description": "The paragraph page at 150% scale composited onto a grainy mid-grey surround under a vertical shadow gradient. Gates at least 4 of the 6 expected lines recovered with per-line CER <= 0.1. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "The quick brown fox jumps over 13 lazy dogs.\nPack my box with five dozen liquor jugs; costs 42.\nHow vexingly quick daft zebras jump!\nSphinx of black quartz, judge my vow.\nAmazingly few discotheques provide 8 jukeboxes.\nMr. Jock, TV quiz PhD, bags few lynx.",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 44,
+    "extra_ops": [
+      "-resize 150%",
+      "tile:128x128 gray(45%) +noise Gaussian surround",
+      "page composited at +192+192",
+      "gradient gray(100%)-gray(78%) multiply"
+    ]
+  },
+  "gates": {
+    "lines_recovered_min": 4,
+    "line_cer_max": 0.1
+  },
+  "oracle": {
+    "enabled": false,
+    "psm": 6
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

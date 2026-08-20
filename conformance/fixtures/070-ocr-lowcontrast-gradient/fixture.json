@@ -1,0 +1,27 @@
+{
+  "name": "070-ocr-lowcontrast-gradient",
+  "family": "070-ocr",
+  "description": "Black text over a horizontal luminance gradient (grey 32% to 100%). Sauvola local binarization must beat global Otsu, which a unit test asserts separately. Gates CER <= 2%. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "Gradient shadows persist",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 44,
+    "extra_ops": [
+      "gradient:gray(32%)-gray(100%) -rotate 90",
+      "-annotate +40+95"
+    ]
+  },
+  "gates": {
+    "cer_max": 0.02,
+    "line_count": 1,
+    "word_count": 3,
+    "otsu_must_lose": true
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 7
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

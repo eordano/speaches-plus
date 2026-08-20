@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The speed of light — decode drag race</title>
+<link rel="stylesheet" href="race.css">
+</head>
+<body data-palette="#f5a83e,#8fa8d0,#5f7396">
+
+<header class="masthead">
+  <div class="masthead-rule"></div>
+  <h1>THE SPEED OF LIGHT</h1>
+  <p class="sub">qwen3.8-27B &middot; 4-bit weights &middot; one card &middot; decode is a memory-bandwidth problem</p>
+  <div class="mode-badge" id="modeBadge" role="status" title="click to toggle demo replay">
+    <span class="mode-dot"></span><span id="modeText">PROBING /v1&hellip;</span>
+  </div>
+</header>
+
+<section class="panel hero" aria-label="Effective decode bandwidth versus the device memory ceiling">
+  <div class="panel-head">
+    <span class="panel-no">01</span>
+    <h2>EFFECTIVE DECODE BANDWIDTH</h2>
+    <span class="panel-note">GB read per emitted token &divide; wall-clock per token</span>
+  </div>
+
+  <div class="axis-scroll" id="axisScroll">
+  <div class="axis-stage">
+    <div class="pin tier3 pin-vllm" style="left:65.4%">
+      <div class="pin-label">
+        <span class="pin-name ghost-name">VLLM &middot; FP8</span>
+        <span class="pin-val">&asymp;1.18 TB/s</span>
+        <span class="pin-tag pending">decode rows being measured &middot; position from prefill ratio</span>
+      </div>
+      <div class="pin-line dashed"></div>
+    </div>
+    <div class="pin tier2 pin-plain" style="left:67.4%">
+      <div class="pin-label">
+        <span class="pin-name ours-name">OURS &middot; PLAIN</span>
+        <span class="pin-val">1.213 TB/s</span>
+        <span class="pin-tag">16.9 ms/tok</span>
+      </div>
+      <div class="pin-line"></div>
+    </div>
+    <div class="pin tier1 pin-llama" style="left:69.9%">
+      <div class="pin-label">
+        <span class="pin-name ghost-name">LLAMA.CPP &middot; Q4_K_M</span>
+        <span class="pin-val">1.259 TB/s</span>
+        <span class="pin-tag">16.28 ms/tok</span>
+      </div>
+      <div class="pin-line"></div>
+    </div>
+
+    <div class="wall" style="left:81.67%">
+      <div class="wall-bar"></div>
+      <div class="wall-label">SPEED OF LIGHT<br><b>1.47 TB/s</b><br>practical D2D</div>
+    </div>
+
+    <div class="pin tier2 pin-mtp" style="left:92.6%">
+      <div class="pin-label">
+        <span class="pin-name ours-name">OURS &middot; MTP</span>
+        <span class="pin-val hot">1.667 TB/s</span>
+        <span class="pin-tag">12.3 ms/tok</span>
+      </div>
+      <div class="pin-line hot"></div>
+    </div>
+
+    <div class="axis-bar">
+      <div class="axis-fill"></div>
+      <div class="axis-ticks" aria-hidden="true">
+        <span style="left:0%"><i></i>0</span>
+        <span style="left:13.9%"><i></i>0.25</span>
+        <span style="left:27.8%"><i></i>0.50</span>
+        <span style="left:41.7%"><i></i>0.75</span>
+        <span style="left:55.6%"><i></i>1.00</span>
+        <span style="left:69.4%"><i></i>1.25</span>
+        <span style="left:83.3%"><i></i>1.50</span>
+        <span style="left:97.2%"><i></i>1.75&nbsp;TB/s</span>
+      </div>
+    </div>
+  </div>
+  </div>
+
+  <div class="hero-plaques">
+    <div class="plaque">
+      <span class="plaque-stamp">BASIS</span>
+      <p>Every pin uses the same numerator: <b>&asymp;20.5&thinsp;GB</b> weights-resident read per token
+      (qwen3.8-27B at 4-bit), divided by that engine's measured decode ms/token at depth 256.
+      Same model, same card, same formula &mdash; apples to apples. vLLM's decode rows are still being
+      measured; its pin is the llama.cpp decode position scaled by the measured prefill ratio
+      (2404&thinsp;/&thinsp;2569) and drawn dashed until real rows land.</p>
+    </div>
+    <div class="plaque callout">
+      <span class="plaque-stamp hot-stamp">PAST THE WALL</span>
+      <p>The bus cannot move more than 1.47&thinsp;TB/s, and no single-token decoder can beat that.
+      MTP speculative decode emits <b>more than one accepted token per weight pass</b>, so the
+      per-token <i>effective</i> read rate lands at 1.67&thinsp;TB/s &mdash; past the physical wall.
+      You don't break physics; you amortize it.</p>
+    </div>
+  </div>
+</section>
+
+<section class="panel race" aria-label="Live drag race against recorded engine paces">
+  <div class="panel-head">
+    <span class="panel-no">02</span>
+    <h2>THE RACE</h2>
+    <span class="panel-note">finish line = <span id="finishTok">128</span> tokens &middot; ghosts run their recorded pace</span>
+  </div>
+
+  <form class="controls" id="controls" autocomplete="off">
+    <div class="chip-row" role="radiogroup" aria-label="context depth">
+      <span class="ctl-label">DEPTH</span>
+      <button type="button" class="chip on" data-depth="256">256</button>
+      <button type="button" class="chip" data-depth="8k">8K</button>
+      <button type="button" class="chip" data-depth="196k">196K</button>
+    </div>
+    <input id="promptBox" class="prompt" type="text" spellcheck="false"
+      value="Why is single-stream decode bound by memory bandwidth, not FLOPs?">
+    <button type="submit" class="run" id="runBtn">RUN</button>
+  </form>
+
+  <div class="track" id="track">
+    <div class="startline" aria-hidden="true"></div>
+    <div class="finishline" aria-hidden="true"><span>FINISH</span></div>
+
+    <div class="lane lane-ours" id="lane-ours">
+      <div class="lane-head">
+        <span class="lane-name">OURS</span>
+        <span class="lane-sub" id="sub-ours">MTP &middot; live SSE</span>
+      </div>
+      <div class="lane-road">
+        <div class="car" id="car-ours"><div class="streak" id="streak-ours"></div><div class="head"></div>
+          <div class="readout" id="ro-ours">&mdash;</div></div>
+        <div class="lane-bar" id="bar-ours"></div>
+      </div>
+    </div>
+
+    <div class="lane lane-ghost" id="lane-llama">
+      <div class="lane-head">
+        <span class="lane-name">LLAMA.CPP</span>
+        <span class="lane-sub" id="sub-llama">recorded 16.28 ms/tok</span>
+      </div>
+      <div class="lane-road">
+        <div class="dnf-barrier" id="dnf-llama"><span>NO RECORDED FINISH</span></div>
+        <div class="car" id="car-llama"><div class="streak" id="streak-llama"></div><div class="head"></div>
+          <div class="readout" id="ro-llama">&mdash;</div></div>
+        <div class="lane-bar" id="bar-llama"></div>
+      </div>
+    </div>
+
+    <div class="lane lane-ghost lane-vllm" id="lane-vllm">
+      <div class="lane-head">
+        <span class="lane-name">VLLM</span>
+        <span class="lane-sub" id="sub-vllm">pace borrowed &middot; decode rows pending</span>
+      </div>
+      <div class="lane-road">
+        <div class="dnf-barrier" id="dnf-vllm"><span>NO RECORDED FINISH</span></div>
+        <div class="car" id="car-vllm"><div class="streak" id="streak-vllm"></div><div class="head"></div>
+          <div class="readout" id="ro-vllm">&mdash;</div></div>
+        <div class="lane-bar" id="bar-vllm"></div>
+      </div>
+    </div>
+  </div>
+
+  <p class="track-note">clock starts at OURS' first streamed token; recorded paces are decode-only
+  (prefill is raced separately &mdash; row 01 below).</p>
+
+  <div class="telemetry" id="telemetry" aria-live="off" hidden>
+    <span class="tele-tag">STREAM</span><span id="teleText"></span><span class="caret"></span>
+  </div>
+
+  <div class="results" id="results" hidden>
+    <div class="panel-head slim"><span class="panel-no">&#9646;</span><h3>RESULTS PLAQUE</h3></div>
+    <table class="results-table">
+      <thead><tr><th>lane</th><th class="num">ms/tok</th><th class="num">tok/s</th><th>basis</th></tr></thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel receipts" aria-label="Record table with measurement basis">
+  <div class="panel-head">
+    <span class="panel-no">03</span>
+    <h2>RECEIPTS</h2>
+    <span class="panel-note">every number measured on this card &middot; 2026-08 &middot; logs on box</span>
+  </div>
+
+  <div class="table-scroll">
+  <table class="record-table">
+    <thead>
+      <tr><th>metric</th><th class="num ours-col">OURS</th><th class="num">LLAMA.CPP</th><th class="num">VLLM</th><th class="stamp-col">basis</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>prefill pp512 <span class="unit">tok/s</span></td>
+        <td class="num ours-col">5500</td><td class="num">2569</td><td class="num">&asymp;2404</td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+      <tr>
+        <td>decode @256 <span class="unit">ms/tok</span></td>
+        <td class="num ours-col">16.9 <span class="unit">plain</span> &middot; 12.24&ndash;12.41 <span class="unit">MTP</span></td>
+        <td class="num">16.28</td><td class="num pending-cell">pending</td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+      <tr>
+        <td>decode @8k <span class="unit">ms/tok</span></td>
+        <td class="num ours-col">&asymp;12.4 <span class="unit">MTP</span></td>
+        <td class="num">16.70</td><td class="num pending-cell">pending</td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+      <tr>
+        <td>decode @32k <span class="unit">ms/tok</span></td>
+        <td class="num ours-col">12.24&ndash;12.41 <span class="unit">MTP</span></td>
+        <td class="num">17.87</td><td class="num pending-cell">pending</td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+      <tr>
+        <td>decode @196k <span class="unit">ms/tok</span></td>
+        <td class="num ours-col">40.8 <span class="unit">only engine</span></td>
+        <td class="num dnf-cell">DNF</td><td class="num dnf-cell">DNF</td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+      <tr>
+        <td>perplexity wikitext-2 <span class="unit">same method</span></td>
+        <td class="num ours-col">7.085</td><td class="num">6.988 <span class="unit">Q4_K_M</span></td><td class="num">6.974 <span class="unit">FP8</span></td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+      <tr>
+        <td>4-way concurrency <span class="unit">aggregate tok/s</span></td>
+        <td class="num ours-col">79.2 <span class="unit">2.14&times; single</span></td><td class="num">&mdash;</td><td class="num">&mdash;</td>
+        <td class="stamp-col"><span class="stamp" tabindex="0">2026-08<i>measured on this card &middot; logs on box</i></span></td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="receipts-foot">checkpoint qwen3.8-27B &middot; ours 4-bit NVFP4-class &middot; llama.cpp Q4_K_M &middot; vLLM FP8 &middot;
+  vLLM decode rows are pending measurement and are never substituted with invented numbers.</p>
+</section>
+
+<footer class="foot">
+  <a href="/metal.html">/metal</a>
+  <span class="foot-sep">&middot;</span>
+  <a href="/city.html">/city</a>
+  <span class="foot-sep">&middot;</span>
+  <span class="foot-dim">same card, same logs</span>
+</footer>
+
+<script src="race.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+{
+  "name": "070-ocr-sparse-illustration-1892",
+  "family": "070-ocr",
+  "description": "Sparse real-scan page: one large halftone engraving, wide margins, and a two-line caption as the only text. Gates both caption lines recovered with per-line CER <= 0.1. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "‘‘ THE GENTLEMAN IN THE PEW HANDED IT UP TO HER”\n[Page 238",
+  "source": {
+    "description": "Real 1892 book scan (The Adventures of Sherlock Holmes, illustration plate facing page 238, public domain): a sparse page - one large halftone engraving that owns two thirds of the page ink, wide blank margins, and a two-line caption as the only text",
+    "crop": "860x1100+195+460 of sherlock-title.jpg, -colorspace Gray -posterize 8 (quantisation keeps the fixture at 265 KB; it raises the component count rather than lowering it, so the signature under test is unaffected)"
+  },
+  "gates": {
+    "lines_recovered_min": 2,
+    "line_cer_max": 0.1
+  },
+  "oracle": {
+    "enabled": false,
+    "psm": 6
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

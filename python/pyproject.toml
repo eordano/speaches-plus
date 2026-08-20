@@ -1,0 +1,158 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speaches-plus-python"
+version = "0.2.0"
+description = "Minimal Qwen3-Omni multimodal HTTP server (chat + ASR + TTS), vllm-omni-compatible on the wire."
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+readme = "NOTICE.md"
+dependencies = [
+    "fastapi>=0.128",
+    "uvicorn[standard]>=0.40",
+    "python-multipart>=0.0.20",
+    "pydantic>=2.10",
+    "soundfile>=0.13",
+    "librosa>=0.11",
+    "torch>=2.5",
+    "numpy>=2.0",
+    "transformers>=5.5",
+    "accelerate>=1.0",
+    "huggingface_hub>=1.0",
+    "pillow>=12",
+    "torchvision>=0.20",
+    "onnxruntime>=1.20",
+    "phonemizer>=3.3",
+    "xxhash>=3.0",
+    "imageio>=2.35",
+    "av>=14",
+    "xgrammar>=0.1.30",
+    "aiortc>=1.9",
+    "opuslib>=3.0",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp>=1.27",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "flash-attn>=2.8",
+    "triton>=3.0",
+]
+ct2 = [
+    "ctranslate2>=4.5",
+]
+whisper_cpp = [
+]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "opuslib>=3.0",
+    "ctranslate2>=4.5",
+]
+
+[project.scripts]
+speaches-plus-python = "server:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["test_review_fixes.py"]
+markers = ["native: requires native pybind11 extension"]
+
+[tool.setuptools]
+py-modules = ["server", "ids", "errors", "otel", "trace", "env"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "aligner*",
+    "audio*",
+    "conversation*",
+    "diarization*",
+    "eou*",
+    "inspect_api*",
+    "nano_vllm*",
+    "oapi*",
+    "omni*",
+    "realtime*",
+    "stt*",
+    "tts*",
+    "vad*",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [
+    "aligner",
+    "omni/qwen3/_mps_compat.py",
+    "tts",
+    "result",
+    "__pycache__",
+    ".claude",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",
+    "F",
+    "I",
+    "B",
+    "UP",
+    "SIM",
+    "TCH",
+    "PT",
+    "RUF",
+    "PERF",
+    "S",
+]
+ignore = [
+    "E501",
+    "B008",
+    "S101",
+    "S301",
+    "S311",
+    "B904",
+    "SIM108",
+    "PERF401",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_review_fixes.py" = ["S", "E402", "F401"]
+"server.py" = ["S110", "S112", "S603"]
+
+[tool.ty.src]
+exclude = [
+    "aligner",
+    "audio",
+    "omni",
+    "tts",
+    "result",
+    "__pycache__",
+    ".claude",
+    "nano_vllm/layers/attention.py",
+    "nano_vllm/layers/linear.py",
+    "nano_vllm/layers/quantization/utils/marlin.py",
+    "nano_vllm/layers/quantization/schemes/wna16.py",
+    "nano_vllm/layers/quantization/compressed_tensors.py",
+    "nano_vllm/layers/quantization/fp8.py",
+    "nano_vllm/models/gemma4_moe.py",
+    "nano_vllm/models/qwen3.py",
+    "nano_vllm/utils/loader.py",
+    "test_review_fixes.py",
+]
+
+[tool.ty.rules]
+invalid-return-type = "error"
+invalid-assignment = "warn"
+unsupported-operator = "error"
+unresolved-import = "warn"
+unresolved-attribute = "warn"
+possibly-unbound-attribute = "warn"
+no-matching-overload = "warn"
+invalid-argument-type = "warn"
+call-non-callable = "warn"
+not-subscriptable = "warn"
+too-many-positional-arguments = "warn"

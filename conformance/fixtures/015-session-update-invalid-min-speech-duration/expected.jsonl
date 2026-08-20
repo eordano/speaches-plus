@@ -1,0 +1,3 @@
+{"type": "session.created", "session": {"id": "sess_1"}}
+{"type": "error", "code": "session_update_invalid", "message": "turn_detection.min_speech_duration_ms: must be in [0,60000]"}
+{"type": "session.updated", "session": {"id": "sess_1"}}

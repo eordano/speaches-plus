@@ -1,0 +1,28 @@
+{
+  "name": "070-ocr-skew-12deg",
+  "family": "070-ocr",
+  "description": "The paragraph page rotated +12.0 deg, outside the legacy +/-5 deg deskew sweep. Gates the deskew estimate within 0.5 deg of 12.0 in magnitude, 6 lines and CER <= 2%. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "The quick brown fox jumps over 13 lazy dogs.\nPack my box with five dozen liquor jugs; costs 42.\nHow vexingly quick daft zebras jump!\nSphinx of black quartz, judge my vow.\nAmazingly few discotheques provide 8 jukeboxes.\nMr. Jock, TV quiz PhD, bags few lynx.",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 44,
+    "extra_ops": [
+      "-interline-spacing 10",
+      "-border 40",
+      "-rotate 12"
+    ]
+  },
+  "applied_rotation_deg": 12.0,
+  "gates": {
+    "cer_max": 0.02,
+    "line_count": 6,
+    "deskew_abs_err_max": 0.5
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 6
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

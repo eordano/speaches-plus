@@ -1,0 +1,27 @@
+[package]
+name = "nv-quant"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+half = { workspace = true }
+float8 = { workspace = true }
+candle-core = { workspace = true }
+cudarc = { workspace = true, optional = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nv-kernels = { workspace = true }
+nv-config = { workspace = true }
+
+[features]
+default = []
+cuda = ["dep:cudarc", "candle-core/cuda", "nv-kernels/cuda"]
+
+[dev-dependencies]
+nv-weights = { workspace = true }
+
+[lints]
+workspace = true

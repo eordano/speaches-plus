@@ -1,0 +1,10 @@
+{"type": "session.created", "session": {"id": "sess_1"}}
+{"type": "input_audio_buffer.speech_started", "item_id": "user_a", "audio_start_ms": 100}
+{"type": "input_audio_buffer.speech_stopped", "item_id": "user_a", "audio_end_ms": 1500}
+{"type": "input_audio_buffer.committed", "item_id": "user_a"}
+{"type": "conversation.item.added", "item": {"id": "user_a", "role": "user"}}
+{"type": "conversation.item.input_audio_transcription.completed", "item_id": "user_a", "transcript": "hello"}
+{"type": "response.created", "response": {"id": "resp_a"}}
+{"type": "response.output_audio.delta", "response_id": "resp_a", "audio": {"audio_bytes": 4096}}
+{"type": "response.output_audio.done", "response": {"id": "resp_a", "audio_end_ms": 600}}
+{"type": "response.done", "response": {"id": "resp_a", "status": "completed", "audio_end_ms": 600}}

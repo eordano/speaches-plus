@@ -1,0 +1,18 @@
+{
+  "diarizen": "sha256-wmoGrw9Tv/gyeFluTz01wjqcY0YUND+rPFpsnYt+BJQ=",
+  "gemma431B": "sha256-h0fUT2ARobpEQ+Nd/3+o/o2o78jK8sUGzZBmCkHIUYg=",
+  "gemma4E4B": "sha256-AmPZEGw8zwCHy1PbcOL2/Yx2Fx82Xw4IN9EIye1rkNc=",
+  "gemma4E4Bw4a16": "sha256-n74kIlGfk9du7jdBt9u308kgZ9BrdG66NilUM95+NRM=",
+  "kokoroOnnxCommunity": "sha256-u3qg+gR1eS8s2PJxwG0T2p3P3L76vYy1l6bfNjayN3s=",
+  "kokoroSpeaches": "sha256-uY2qbemnWdxJKDNnMTX9ZaFnDirGqTHYC0WUicwY/AM=",
+  "qwenAligner": "sha256-YaOiGkZTpCsg+t8LO62Xn7Qb1W93lPGxT6cve6x4+4M=",
+  "qwenOmni30B": "sha256-zWUdfkaHSLlM5CT4SwX5xH+rbHfb0G1E9xgCWU12sSQ=",
+  "qwenTts06B": "sha256-gtE10+ImoEY3Gy3MajT22G+NEbNxVE5pkTDwwJ1rl7w=",
+  "qwenTts06Cv": "sha256-81CoSSs8ord1//Je8Z3in13UQVyab4juXUuBqE8LT5w=",
+  "qwenTts17Cv": "sha256-7gq3XqaBTtAwtGX5obHMTn15K7uawuy566V7LlmXSGw=",
+  "qwenTts17Vd": "sha256-pMWvqsfyWhvivb1gsXyOSV0Hxo4K5VHZ6EzpO/uEUnk=",
+  "smartTurnV3": "sha256-5JF6/Je9yWoTqw4GlvmrB3diYtdaGHD78maaG6ri7aM=",
+  "wespeaker": "sha256-gCpNXkpEWxC3uHVieDZXGNTLSDhPYskw7rC/J30x3jQ=",
+  "whisperCt2": "sha256-OnaSbak1ZUF8r13SZ/0qcSPROr8hWbzorPGsRT6RO74=",
+  "whisperGgml": "sha256-Ag/YAChVkdF6RrnfLpUD96DcfAjJHW4qrrldU/Kuxtw="
+}

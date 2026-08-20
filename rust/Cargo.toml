@@ -1,0 +1,202 @@
+[workspace]
+members = [".", "crates/*"]
+exclude = ["third-party/wgpu-hal-30.0.0"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+large_enum_variant = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+missing_safety_doc = "allow"
+field_reassign_with_default = "allow"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[workspace.dependencies]
+float8 = "0.7"
+hound = "3"
+nv-config = { path = "crates/nv-config" }
+nv-tokenizer = { path = "crates/nv-tokenizer" }
+nv-weights = { path = "crates/nv-weights" }
+nv-kernels = { path = "crates/nv-kernels" }
+nv-layers = { path = "crates/nv-layers" }
+nv-quant = { path = "crates/nv-quant" }
+nv-engine = { path = "crates/nv-engine" }
+nv-lookup = { path = "crates/nv-lookup" }
+nv-specdecode = { path = "crates/nv-specdecode" }
+nv-models = { path = "crates/nv-models" }
+nv-train = { path = "crates/nv-train" }
+nv-runner = { path = "crates/nv-runner" }
+nv-omni = { path = "crates/nv-omni" }
+nv-ocr = { path = "crates/nv-ocr" }
+nv-imgdec = { path = "crates/nv-imgdec" }
+nv-tts = { path = "crates/nv-tts" }
+nv-punkt = { path = "crates/nv-punkt" }
+nv-aligner = { path = "crates/nv-aligner" }
+nv-grammar = { path = "crates/nv-grammar" }
+
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ts-rs = { version = "12", features = ["serde-json-impl"] }
+tracing = "0.1"
+half = "2"
+bytemuck = { version = "1", features = ["derive"] }
+rand_pcg = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+minijinja = { version = "2", features = ["json", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+safetensors = "0.7"
+memmap2 = "0.9"
+tokenizers = "0.22"
+candle-core = { version = "0.10", default-features = false }
+candle-nn = { version = "0.10", default-features = false }
+candle-flash-attn = "0.10"
+cudarc = { version = "0.19", default-features = false, features = ["std", "cublas", "cublaslt", "cudnn", "curand", "nccl", "driver", "runtime", "nvrtc", "f16", "dynamic-linking", "cuda-12090"] }
+tokio = { version = "1", default-features = false }
+futures-util = "0.3"
+bindgen = "0.72"
+cc = "1"
+
+[package]
+name = "speaches-plus"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "speaches_plus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "speaches-plus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytemuck = { workspace = true }
+memmap2 = "0.9"
+minijinja = { workspace = true }
+xxhash-rust = { workspace = true }
+minijinja-contrib = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "tracing", "query", "multipart", "json", "ws"] }
+hound = "3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+nv-imgdec = { workspace = true }
+ogg = "0.9"
+leptess = { version = "0.14", optional = true }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "isomp4", "aac", "alac", "wav", "pcm"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+futures-util = { workspace = true }
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "net", "test-util", "process"] }
+tokio-stream = "0.1"
+tokio-util = "0.7"
+tower = "0.5"
+async-trait = "0.1"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+webrtc = "0.17"
+opus = "0.3"
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-24"] }
+ndarray = "0.16"
+rubato = "0.16"
+realfft = "3"
+ct2rs = { version = "0.9", default-features = false, features = ["whisper", "ruy"] }
+whisper-rs = { version = "0.16", default-features = false }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+regex = "1"
+libc = "0.2"
+
+nv-config = { workspace = true }
+nv-tokenizer = { workspace = true }
+nv-weights = { workspace = true }
+nv-kernels = { workspace = true }
+nv-engine = { workspace = true }
+nv-layers = { workspace = true }
+nv-models = { workspace = true }
+nv-ocr = { workspace = true }
+nv-specdecode = { workspace = true }
+nv-omni = { workspace = true }
+nv-tts = { workspace = true }
+nv-punkt = { workspace = true }
+nv-aligner = { workspace = true }
+nv-grammar = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+tokenizers = { workspace = true }
+rand_core = "0.10"
+rand_pcg = { workspace = true }
+ts-rs = { workspace = true, optional = true }
+
+[features]
+default = []
+ts-bindings = ["dep:ts-rs", "nv-ocr/ts-bindings"]
+metal = [
+    "whisper-rs/metal",
+    "ct2rs/accelerate",
+    "nv-engine/metal",
+    "nv-models/metal",
+    "nv-omni/metal",
+    "nv-tts/metal",
+    "nv-aligner/metal",
+    "candle-core/metal",
+    "candle-nn/metal",
+]
+cuda = [
+    "whisper-rs/cuda",
+    "ct2rs/cuda-dynamic-loading",
+    "nv-kernels/cuda",
+    "nv-engine/cuda",
+    "nv-models/cuda",
+    "nv-specdecode/cuda",
+    "nv-omni/cuda",
+    "nv-tts/cuda",
+    "nv-aligner/cuda",
+    "candle-core/cuda",
+    "candle-nn/cuda",
+]
+wgpu = [
+    "nv-kernels/wgpu",
+    "nv-layers/wgpu",
+    "nv-models/wgpu",
+    "nv-models/laguna-wip",
+]
+tesseract = ["leptess"]
+
+[build-dependencies]
+cc = { workspace = true }
+
+[dev-dependencies]
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
+http-body-util = "0.1"
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[lints]
+workspace = true
+
+[patch.crates-io]
+wgpu-hal = { path = "third-party/wgpu-hal-30.0.0" }

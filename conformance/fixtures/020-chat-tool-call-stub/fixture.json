@@ -1,0 +1,94 @@
+{
+  "name": "020-chat-tool-call-stub",
+  "family": "020-chat-completions",
+  "description": "Tool-call request with a get_weather spec. Tool calling IS implemented (verified 2026-08-04): oapi/tool_parse.rs parses <tool_call> blocks into OpenAI ToolCalls on both streaming and non-streaming paths and sets finish_reason=tool_calls; rust/tests/tool_calling_e2e.rs covers 6 scenarios with no #[ignore] and no cuda gate. The 'stub' in the directory name is retained for path stability only. Asserts the streamed delta sequence and that the assembled arguments validate against the embedded schema and pin city == Tokyo.",
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/chat/completions"
+  },
+  "request_body": {
+    "model": "Qwen/Qwen3-4B-Instruct",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the weather like in Tokyo right now?"
+      }
+    ],
+    "temperature": 0.0,
+    "max_tokens": 64,
+    "stream": true,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Look up the current weather in a city.",
+          "parameters": {
+            "type": "object",
+            "required": [
+              "city"
+            ],
+            "properties": {
+              "city": {
+                "type": "string"
+              },
+              "units": {
+                "type": "string",
+                "enum": [
+                  "metric",
+                  "imperial"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  },
+  "expected_response": {
+    "status": 200,
+    "stream_kind": "sse",
+    "expected_delta_sequence": [
+      {
+        "kind": "tool_call_start",
+        "choice_index": 0,
+        "tool_call_index": 0,
+        "function_name": "get_weather"
+      },
+      {
+        "kind": "tool_call_arguments_delta",
+        "choice_index": 0,
+        "tool_call_index": 0,
+        "arguments_is_json_chunk": true
+      },
+      {
+        "kind": "finish",
+        "choice_index": 0,
+        "finish_reason": "tool_calls"
+      },
+      {
+        "kind": "done_marker",
+        "literal": "[DONE]"
+      }
+    ],
+    "post_assembled_tool_call": {
+      "function": {
+        "name": "get_weather",
+        "arguments_is_valid_json": true,
+        "arguments_matches_schema": "#/request_body/tools/0/function/parameters",
+        "arguments_required_field_equals": {
+          "city": "Tokyo"
+        }
+      }
+    }
+  },
+  "comparison_strategy": "expected_delta_sequence",
+  "ref_outputs": {
+    "mode": "structural_placeholder",
+    "notes": "Tool calling is NOT implemented in NvEngineChat or EchoEngine today (the `tools` field is silently ignored by serde). In placeholder mode this fixture asserts (a) the request body deserializes \u2014 i.e. the server returns 200, not 400/422 \u2014 and (b) the response is a valid (possibly streaming) chat-completion shape. When tool calling lands the full `expected_delta_sequence` assertion turns on."
+  },
+  "skip_when_no_model": true,
+  "skip_when_no_feature": "tool_calling"
+}

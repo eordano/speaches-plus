@@ -1,0 +1,35 @@
+{
+  "name": "060-eou-heuristic-parity",
+  "family": "060-eou",
+  "description": "Cross-implementation parity corpus for the rule-based text-EOU heuristic. Rust is canonical; Go and Python must return identical scores for every case. Realigned 2026-08-04 after the three implementations were found to disagree on 5 of 6 branches while a docstring claimed lockstep.",
+  "canonical_impl": "rust/src/eou/heuristic.rs::HeuristicEouModel::score_text",
+  "also_implemented_by": [
+    "go/internal/eou/heuristic.go::Heuristic.score",
+    "client/eou_lib/heuristic.py::heuristic_score"
+  ],
+  "comparison_strategy": "exact_f32_equality",
+  "language": "en",
+  "notes": "Scores are in lockstep; branch SELECTION is not. Go carries per-language hesitation/continuation tables (es/fr/de/it/pt) and CJK terminators that Rust and Python lack, and the three HESITATIONS word lists still differ ('well', 'ah', 'ugh', 'ehm', 'uhm'). Every case below is chosen to avoid those divergences, so it gates the numeric contract only. The threshold is 0.55 for every language, so the soft_terminator case straddles it: 0.25 means a comma-terminated partial does NOT end the turn.",
+  "skip_when_no_model": false,
+  "cases": [
+    { "text": "", "score": 0.1, "branch": "empty" },
+    { "text": "   ", "score": 0.1, "branch": "empty" },
+    { "text": "done.", "score": 0.95, "branch": "strong_terminator" },
+    { "text": "wow!", "score": 0.95, "branch": "strong_terminator" },
+    { "text": "are you sure?", "score": 0.95, "branch": "strong_terminator" },
+    { "text": "she said,", "score": 0.25, "branch": "soft_terminator" },
+    { "text": "first;", "score": 0.25, "branch": "soft_terminator" },
+    { "text": "note:", "score": 0.25, "branch": "soft_terminator" },
+    { "text": "wait-", "score": 0.25, "branch": "soft_terminator" },
+    { "text": "hello @", "score": 0.3, "branch": "empty_last_word" },
+    { "text": "hello ***", "score": 0.3, "branch": "empty_last_word" },
+    { "text": "I think um", "score": 0.15, "branch": "hesitation" },
+    { "text": "hmm", "score": 0.15, "branch": "hesitation" },
+    { "text": "uh", "score": 0.15, "branch": "hesitation" },
+    { "text": "the cat is on the", "score": 0.2, "branch": "continuation" },
+    { "text": "apples and", "score": 0.2, "branch": "continuation" },
+    { "text": "because", "score": 0.2, "branch": "continuation" },
+    { "text": "the weather is nice", "score": 0.6, "branch": "default" },
+    { "text": "paris", "score": 0.6, "branch": "default" }
+  ]
+}

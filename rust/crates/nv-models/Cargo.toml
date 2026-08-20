@@ -1,0 +1,52 @@
+[package]
+name = "nv-models"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nv-config = { workspace = true }
+nv-tokenizer = { workspace = true }
+tokenizers = { workspace = true }
+nv-layers = { workspace = true }
+nv-lookup = { workspace = true }
+nv-weights = { workspace = true }
+nv-ocr = { workspace = true }
+nv-imgdec = { workspace = true }
+nv-quant = { workspace = true }
+nv-kernels = { workspace = true }
+nv-train = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+cudarc = { workspace = true, optional = true }
+half = { workspace = true }
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"], optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { workspace = true, optional = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "nv-layers/cuda", "nv-weights/cuda", "nv-quant/cuda", "nv-kernels/cuda", "dep:cudarc"]
+metal = ["candle-core/metal", "candle-nn/metal", "nv-layers/metal", "nv-weights/metal"]
+wgpu = ["nv-kernels/wgpu", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
+laguna-wip = ["wgpu"]
+
+[[bin]]
+name = "nvk-train"
+path = "src/bin/nvk-train.rs"
+
+[dev-dependencies]
+libc = "0.2"
+naga = { version = "=30.0.0", features = ["wgsl-in", "msl-out"] }
+nv-omni = { workspace = true }
+half = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[lints]
+workspace = true

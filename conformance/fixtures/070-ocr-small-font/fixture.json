@@ -1,0 +1,25 @@
+{
+  "name": "070-ocr-small-font",
+  "family": "070-ocr",
+  "description": "One rendered line at ~16 px cap height (pointsize 22). Gates CER <= 3%. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "small print reads fine",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 22,
+    "extra_ops": [
+      "-border 24"
+    ]
+  },
+  "gates": {
+    "cer_max": 0.03,
+    "line_count": 1,
+    "word_count": 4
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 7
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

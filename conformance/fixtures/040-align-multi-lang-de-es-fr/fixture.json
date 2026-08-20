@@ -1,0 +1,78 @@
+{
+  "name": "040-align-multi-lang-de-es-fr",
+  "family": "040-align",
+  "description": "Smoke test that /v1/audio/transcriptions accepts non-English language hints (de, es, fr) and returns SRT for each. Three short clips, one per language. Asserts SRT *structure*, not transcription correctness.",
+  "input_artifacts": [
+    {"path": "audio_de.wav", "kind": "wav", "language": "de", "duration_ms": 1500},
+    {"path": "audio_es.wav", "kind": "wav", "language": "es", "duration_ms": 1500},
+    {"path": "audio_fr.wav", "kind": "wav", "language": "fr", "duration_ms": 1500}
+  ],
+  "steps": [
+    {
+      "step": 1,
+      "endpoint": {"method": "POST", "path": "/v1/audio/transcriptions"},
+      "request_multipart": {
+        "file@": "audio_de.wav",
+        "language": "de",
+        "response_format": "srt"
+      },
+      "expected_response": {
+        "status": 200,
+        "content_type": "text/plain; charset=utf-8",
+        "body_kind": "srt",
+        "srt": {
+          "min_segments": 0,
+          "max_segments": 4,
+          "timestamps_format_regex": "^\\d{2}:\\d{2}:\\d{2},\\d{3}$",
+          "segment_numbers_monotonic": true
+        }
+      }
+    },
+    {
+      "step": 2,
+      "endpoint": {"method": "POST", "path": "/v1/audio/transcriptions"},
+      "request_multipart": {
+        "file@": "audio_es.wav",
+        "language": "es",
+        "response_format": "srt"
+      },
+      "expected_response": {
+        "status": 200,
+        "content_type": "text/plain; charset=utf-8",
+        "body_kind": "srt",
+        "srt": {
+          "min_segments": 0,
+          "max_segments": 4,
+          "timestamps_format_regex": "^\\d{2}:\\d{2}:\\d{2},\\d{3}$",
+          "segment_numbers_monotonic": true
+        }
+      }
+    },
+    {
+      "step": 3,
+      "endpoint": {"method": "POST", "path": "/v1/audio/transcriptions"},
+      "request_multipart": {
+        "file@": "audio_fr.wav",
+        "language": "fr",
+        "response_format": "srt"
+      },
+      "expected_response": {
+        "status": 200,
+        "content_type": "text/plain; charset=utf-8",
+        "body_kind": "srt",
+        "srt": {
+          "min_segments": 0,
+          "max_segments": 4,
+          "timestamps_format_regex": "^\\d{2}:\\d{2}:\\d{2},\\d{3}$",
+          "segment_numbers_monotonic": true
+        }
+      }
+    }
+  ],
+  "comparison_strategy": "structural_srt_multi_request",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "notes": "Each request asserts 200 + parseable SRT only. The point of the fixture is that the non-English `language` hint (`de`/`es`/`fr`) is accepted by the route without 400/422 — this is a regression gate against accidentally hard-coding English-only language handling. Per-language transcription correctness moves into 040-align-<lang>-* once real STT lands."
+  },
+  "skip_when_no_model": true
+}

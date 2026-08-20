@@ -1,0 +1,5 @@
+{"type": "session.created", "session": {"id": "sess_1"}}
+{"type": "response.created", "response": {"id": "resp_a", "instructions": "Answer in haiku."}}
+{"type": "response.output_audio.delta", "response_id": "resp_a", "audio": {"audio_bytes": 4096}}
+{"type": "response.output_audio.done", "response": {"id": "resp_a", "audio_end_ms": 800}}
+{"type": "response.done", "response": {"id": "resp_a", "status": "completed", "audio_end_ms": 800}}

@@ -1,0 +1,387 @@
+:root {
+  --sky-hi: #04060c;
+  --sky-lo: #0c101c;
+  --panel: #0a0d16;
+  --ink: #d8d2c4;
+  --ink-dim: #8b8577;
+  --ink-faint: #57534a;
+  --sodium: #ffb454;
+  --sodium-hot: #ffd9a0;
+  --sodium-dim: #8a6a3a;
+  --alarm: #ff6b4a;
+  --hairline: rgba(255, 180, 84, 0.16);
+  --hairline-dim: rgba(255, 180, 84, 0.07);
+  --mono: ui-monospace, "Iosevka", "JetBrains Mono", "Cascadia Mono",
+    "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow-x: hidden;
+  background: var(--sky-hi);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+.num { font-variant-numeric: tabular-nums; }
+
+#topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 1.6em;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+#topbar h1 {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.28em;
+  color: var(--sodium);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+#topbar h1 span { color: var(--ink-faint); letter-spacing: 0.1em; }
+
+.stat {
+  color: var(--ink-dim);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat b {
+  color: var(--ink);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+#modeChip {
+  margin-left: auto;
+  border: 1px solid var(--hairline);
+  color: var(--sodium-dim);
+  padding: 1px 8px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: 10px;
+  align-self: center;
+  white-space: nowrap;
+}
+
+#modeChip.live { color: var(--sodium); border-color: var(--sodium-dim); }
+
+#cityWrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 320px;
+  overflow: hidden;
+}
+
+#city { display: block; width: 100%; height: 100%; }
+
+#banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 1px solid var(--sodium-dim);
+  background: rgba(10, 13, 22, 0.92);
+  color: var(--sodium);
+  padding: 4px 14px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  display: none;
+}
+
+#craneReadout {
+  position: absolute;
+  border: 1px solid var(--sodium-dim);
+  background: rgba(10, 13, 22, 0.92);
+  color: var(--sodium-hot);
+  padding: 3px 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  display: none;
+  pointer-events: none;
+}
+
+#craneReadout small {
+  display: block;
+  color: var(--ink-dim);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+#plaque {
+  position: absolute;
+  min-width: 240px;
+  max-width: 330px;
+  border: 1px solid var(--hairline);
+  border-top: 2px solid var(--sodium);
+  background: rgba(8, 10, 18, 0.95);
+  padding: 10px 12px;
+  display: none;
+  pointer-events: none;
+  z-index: 4;
+}
+
+#plaque h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--sodium-hot);
+  letter-spacing: 0.04em;
+  margin-bottom: 2px;
+}
+
+#plaque .size {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 7px;
+}
+
+#plaque dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  font-size: 12px;
+}
+
+#plaque dt {
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  align-self: baseline;
+  padding-top: 2px;
+}
+
+#plaque dd { color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+
+#evictionOverlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(3, 4, 9, 0.72);
+  z-index: 8;
+}
+
+#evictionOverlay.open { display: flex; }
+
+#evictionCard {
+  border: 1px solid var(--sodium-dim);
+  border-top: 2px solid var(--alarm);
+  background: var(--panel);
+  padding: 16px 20px 14px;
+  max-width: 480px;
+  width: calc(100% - 48px);
+}
+
+#evictionCard h3 {
+  color: var(--alarm);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
+#evictionMath {
+  white-space: pre;
+  overflow-x: auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  line-height: 1.7;
+}
+
+#evictionMath .dim { color: var(--ink-dim); }
+#evictionMath .bad { color: var(--alarm); }
+#evictionMath .ok { color: var(--sodium); }
+
+#evictionClose {
+  margin-top: 12px;
+  background: none;
+  border: 1px solid var(--hairline);
+  color: var(--sodium);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  padding: 4px 14px;
+  cursor: pointer;
+}
+
+#evictionClose:hover { border-color: var(--sodium); }
+
+#harbor {
+  border-top: 1px solid var(--hairline);
+  background: linear-gradient(#070a12, #05070d);
+  padding: 6px 16px 10px;
+}
+
+#harborLabel {
+  color: var(--ink-faint);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+#harborLabel b { color: var(--sodium-dim); font-weight: 500; }
+
+#quay {
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--sodium-dim) transparent;
+}
+
+.ship {
+  flex: 0 0 auto;
+  position: relative;
+  border: 1px solid var(--hairline);
+  border-bottom: none;
+  background:
+    repeating-linear-gradient(90deg,
+      rgba(255, 180, 84, 0.05) 0 14px,
+      rgba(255, 180, 84, 0.02) 14px 28px),
+    #0b0e18;
+  padding: 6px 10px 10px;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - 7px), calc(100% - 14px) 100%, 14px 100%, 0 calc(100% - 7px));
+}
+
+.ship:hover { border-color: var(--sodium-dim); }
+.ship.dragging { opacity: 0.35; cursor: grabbing; }
+
+.ship .name {
+  color: var(--ink);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ship .cargo {
+  color: var(--sodium-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ship .hint {
+  color: var(--ink-faint);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+}
+
+#dragGhost {
+  position: fixed;
+  z-index: 20;
+  pointer-events: none;
+  display: none;
+  border: 1px dashed var(--sodium);
+  background: rgba(255, 180, 84, 0.08);
+  color: var(--sodium);
+  padding: 3px 8px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+#chatDock {
+  border-top: 1px solid var(--hairline);
+  background: var(--panel);
+  padding: 8px 16px;
+}
+
+#kvLabel {
+  color: var(--ink-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 5px;
+}
+
+#kvLabel b { color: var(--sodium); font-weight: 500; }
+
+#reply {
+  display: none;
+  max-height: 72px;
+  overflow-y: auto;
+  color: var(--ink-dim);
+  border-left: 2px solid var(--sodium-dim);
+  padding: 2px 10px;
+  margin-bottom: 7px;
+  font-size: 12px;
+}
+
+#chatForm { display: flex; gap: 8px; }
+
+#chatInput {
+  flex: 1;
+  background: #060810;
+  border: 1px solid var(--hairline);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 6px 10px;
+  outline: none;
+}
+
+#chatInput:focus { border-color: var(--sodium-dim); }
+#chatInput::placeholder { color: var(--ink-faint); }
+
+#chatForm button, #resetBtn {
+  background: none;
+  border: 1px solid var(--hairline);
+  color: var(--sodium);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  padding: 6px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#chatForm button:hover, #resetBtn:hover { border-color: var(--sodium); }
+#chatForm button:disabled { color: var(--ink-faint); cursor: default; }
+#resetBtn { color: var(--ink-dim); }
+
+footer {
+  display: flex;
+  gap: 2em;
+  padding: 6px 16px;
+  border-top: 1px solid var(--hairline-dim);
+  background: var(--sky-hi);
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+footer a { color: var(--sodium-dim); text-decoration: none; letter-spacing: 0.08em; }
+footer a:hover { color: var(--sodium); }
+footer .right { margin-left: auto; }
+
+@media (max-width: 720px) {
+  #topbar { gap: 0.9em; }
+  .stat.optional { display: none; }
+}

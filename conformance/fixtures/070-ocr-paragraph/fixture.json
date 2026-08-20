@@ -1,0 +1,33 @@
+{
+  "name": "070-ocr-paragraph",
+  "family": "070-ocr",
+  "description": "Six rendered lines with mixed case, digits and punctuation. Gates CER <= 0.5%, exact line count and exact reading order. Requires the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA).",
+  "input": "input.png",
+  "expected_text": "The quick brown fox jumps over 13 lazy dogs.\nPack my box with five dozen liquor jugs; costs 42.\nHow vexingly quick daft zebras jump!\nSphinx of black quartz, judge my vow.\nAmazingly few discotheques provide 8 jukeboxes.\nMr. Jock, TV quiz PhD, bags few lynx.",
+  "render": {
+    "font": "DejaVuSans",
+    "pointsize": 44,
+    "extra_ops": [
+      "-interline-spacing 10",
+      "-border 40"
+    ]
+  },
+  "gates": {
+    "cer_max": 0.005,
+    "line_count": 6,
+    "word_counts": [
+      9,
+      10,
+      6,
+      7,
+      6,
+      8
+    ]
+  },
+  "oracle": {
+    "enabled": true,
+    "psm": 6
+  },
+  "comparison_strategy": "cer+layout_gates",
+  "skip_when_no_model": true
+}

@@ -1,0 +1,5 @@
+{"op": "markActive"}
+{"op": "vad_speech_start", "item_id": "user_a", "start_ms": 100}
+{"op": "vad_speech_end", "end_ms": 350}
+{"op": "commit_fire"}
+{"op": "transcription_complete", "item_id": "user_a", "transcript": "uh-huh", "auto_response": false}

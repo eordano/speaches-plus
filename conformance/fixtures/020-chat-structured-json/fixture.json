@@ -1,0 +1,57 @@
+{
+  "name": "020-chat-structured-json",
+  "family": "020-chat-completions",
+  "description": "Chat-completions request with response_format=json_object plus a JSON schema. Asserts the assistant's content parses as JSON and conforms to the supplied schema.",
+  "endpoint": {
+    "method": "POST",
+    "path": "/v1/chat/completions"
+  },
+  "request_body": {
+    "model": "Qwen/Qwen3-4B-Instruct",
+    "messages": [
+      {"role": "system", "content": "Reply with a JSON object only. No prose."},
+      {"role": "user", "content": "Return an object with fields city (string), country (string), population (integer >= 0) for Paris, France."}
+    ],
+    "temperature": 0.0,
+    "max_tokens": 64,
+    "response_format": {
+      "type": "json_object",
+      "schema": {
+        "type": "object",
+        "required": ["city", "country", "population"],
+        "properties": {
+          "city": {"type": "string"},
+          "country": {"type": "string"},
+          "population": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+      }
+    },
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "object": "chat.completion",
+    "choices": [
+      {
+        "index": 0,
+        "finish_reason_in": ["stop", "length"],
+        "message": {
+          "role": "assistant",
+          "content_is_json": true,
+          "content_json_matches_schema": "#/request_body/response_format/schema",
+          "content_json_field_equals": {
+            "city": "Paris",
+            "country": "France"
+          }
+        }
+      }
+    ]
+  },
+  "comparison_strategy": "structural+jsonschema",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "notes": "Today `response_format` is not yet honored by NvEngineChat (it falls through to free-form decode). The structural assertion in placeholder mode is: route accepts the request body without rejecting `response_format` as an unknown field (serde permits unknown keys via #[serde(default)] on other fields; this fixture is the regression gate for that). When grammar-constrained decode lands the schema-match assertion turns on."
+  },
+  "skip_when_no_model": true
+}

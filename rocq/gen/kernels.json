@@ -1,0 +1,226 @@
+{
+ "_comment": "Per-kernel byte-traffic manifest for the verify/draft path, main @ 45facc9. Every formula is a LOWER bound on compulsory HBM bytes for that kernel per forward pass, expressed over the shape environment that gen.py builds from the model config.json. Integer division // is exact for all shapes here. 'ctx' is the committed context length. Citations give the code the formula is derived from; checkpoint witnesses are safetensors tensors whose recorded shapes/dtypes pin the byte counts. gen.py cross-checks the formula sums against an independent scan of the safetensors headers and emits both into Rocq, where the equality is re-proved by vm_compute. Each verify phase carries a `witness` selector (layer class + tensor-name regex, or an exact name); gen.py sums the ACTUAL safetensors bytes those selectors match and asserts formula == matched per phase, that the selectors are pairwise disjoint, and that the unmatched residual equals misc_small_bytes. Before 2026-08-10 the only check was misc := lang_bytes - sum(formulas) plus a range assert, which is satisfied identically by construction and lets per-phase errors cancel.",
+ "shapes": {
+  "h": {
+   "value_from": "text_config.hidden_size",
+   "cite": "config.json text_config.hidden_size = 5376"
+  },
+  "inter": {
+   "value_from": "text_config.intermediate_size",
+   "cite": "config.json text_config.intermediate_size = 21504"
+  },
+  "nlayers": {
+   "value_from": "text_config.num_hidden_layers",
+   "cite": "config.json text_config.num_hidden_layers = 60"
+  },
+  "n_slide": {
+   "value_from": "count(layer_types == sliding_attention)",
+   "cite": "config.json text_config.layer_types (50 sliding)"
+  },
+  "n_full": {
+   "value_from": "count(layer_types == full_attention)",
+   "cite": "config.json text_config.layer_types (10 full, every 6th)"
+  },
+  "nh": {
+   "value_from": "text_config.num_attention_heads",
+   "cite": "config.json = 32"
+  },
+  "hd": {
+   "value_from": "text_config.head_dim",
+   "cite": "config.json = 256 (sliding layers); gemma4.rs:134-139 head_dim_for"
+  },
+  "nkv": {
+   "value_from": "text_config.num_key_value_heads",
+   "cite": "config.json = 16 (sliding layers); gemma4.rs:141-148 num_kv_heads_for"
+  },
+  "ghd": {
+   "value_from": "text_config.global_head_dim",
+   "cite": "config.json = 512 (full-attention layers)"
+  },
+  "gnkv": {
+   "value_from": "text_config.num_global_key_value_heads",
+   "cite": "config.json = 4 (full-attention layers)"
+  },
+  "window": {
+   "value_from": "text_config.sliding_window",
+   "cite": "config.json = 1024"
+  },
+  "vocab": {
+   "value_from": "text_config.vocab_size",
+   "cite": "config.json = 262144"
+  },
+  "draft_vocab": {
+   "value_from": "draft config.json draft_vocab_size",
+   "cite": "drafter config.json = 32000"
+  }
+ },
+ "verify_weight_phases": [
+  {
+   "coq_name": "qkv_sliding_bytes",
+   "kernel": "fused [q;k;v] bf16 TN GEMM, 50 sliding layers",
+   "formula": "n_slide * (nh*hd + 2*(nkv*hd)) * h * 2",
+   "cite": [
+    "gemma4.rs:193-200 (row-concatenated [q;k;v] Linear, fused at load)",
+    "gemma4.rs:2137 (attention_tree -> attn.qkv_forward)",
+    "gemma4.rs:3127-3153 (load_qkv_fused: weights.get(name, dtype) at model dtype bf16 -- no quantization path exists for attention)",
+    "config.json quantization_config.ignore lists every layers.N.self_attn* -- attention is NOT NVFP4",
+    "checkpoint witness: layers.6.self_attn.{q,k,v}_proj.weight BF16 [8192,5376]/[4096,5376]/[4096,5376]"
+   ],
+   "witness": {
+    "layers": "sliding",
+    "name_re": "self_attn\\.(q|k|v)_proj\\.weight$"
+   }
+  },
+  {
+   "coq_name": "qkv_full_bytes",
+   "kernel": "fused [q;k] bf16 TN GEMM, 10 full-attention layers (k_eq_v: no V block)",
+   "formula": "n_full * (nh*ghd + gnkv*ghd) * h * 2",
+   "cite": [
+    "gemma4.rs:196-200 (k_eq_v full layers have no V block; V reuses the pre-norm K slice -- we read LESS weight than vLLM here)",
+    "gemma4.rs:3146-3151 (has_v=false concatenates only [q;k])",
+    "config.json text_config.attention_k_eq_v = true",
+    "checkpoint witness: layers.5.self_attn.q_proj BF16 [16384,5376], k_proj [2048,5376], NO v_proj tensor"
+   ],
+   "witness": {
+    "layers": "full",
+    "name_re": "self_attn\\.(q|k|v)_proj\\.weight$"
+   }
+  },
+  {
+   "coq_name": "o_sliding_bytes",
+   "kernel": "o_proj bf16 TN GEMM, sliding layers",
+   "formula": "n_slide * h * (nh*hd) * 2",
+   "cite": [
+    "gemma4.rs:2254 (attention_tree -> attn.o_proj.forward)",
+    "gemma4.rs:3155-3176 (load_attn_proj: bf16, Linear::new)",
+    "checkpoint witness: layers.6.self_attn.o_proj.weight BF16 [5376,8192]"
+   ],
+   "witness": {
+    "layers": "sliding",
+    "name_re": "self_attn\\.o_proj\\.weight$"
+   }
+  },
+  {
+   "coq_name": "o_full_bytes",
+   "kernel": "o_proj bf16 TN GEMM, full-attention layers",
+   "formula": "n_full * h * (nh*ghd) * 2",
+   "cite": [
+    "gemma4.rs:2254",
+    "checkpoint witness: layers.5.self_attn.o_proj.weight BF16 [5376,16384]"
+   ],
+   "witness": {
+    "layers": "full",
+    "name_re": "self_attn\\.o_proj\\.weight$"
+   }
+  },
+  {
+   "coq_name": "mlp_gate_up_bytes",
+   "kernel": "fused gate_up NVFP4 GEMM (packed u4 pairs + fp8 scale factors), all 60 layers",
+   "formula": "nlayers * 2 * ((inter*h)//2 + (inter*h)//16)",
+   "cite": [
+    "gemma4.rs:2380-2381 (mlp_forward -> gate_up_proj.forward)",
+    "gemma4.rs:1838-1849 (load_mlp_proj_fused_pair -> NVFP4 path)",
+    "gemma4.rs:3178-3223 (load_mlp_proj: NVFP4 unless ignored; MLP is not in the ignore list)",
+    "checkpoint witness: layers.N.mlp.gate_proj.weight U8 [21504,2688] (=inter*h/2 bytes) + weight_scale F8_E4M3 [21504,336] (=inter*h/16 bytes), same for up_proj"
+   ],
+   "witness": {
+    "layers": "all",
+    "name_re": "mlp\\.(gate|up)_proj\\.(weight|weight_scale)$"
+   }
+  },
+  {
+   "coq_name": "mlp_down_bytes",
+   "kernel": "down_proj NVFP4 GEMM, all 60 layers",
+   "formula": "nlayers * ((h*inter)//2 + (h*inter)//16)",
+   "cite": [
+    "gemma4.rs:2387,2396 (mlp_forward -> down_proj.forward)",
+    "checkpoint witness: layers.N.mlp.down_proj.weight U8 [5376,10752] + weight_scale F8_E4M3 [5376,1344]"
+   ],
+   "witness": {
+    "layers": "all",
+    "name_re": "mlp\\.down_proj\\.(weight|weight_scale)$"
+   }
+  },
+  {
+   "coq_name": "lm_head_bytes",
+   "kernel": "dense bf16 lm_head GEMM over all k rows (tied embedding matrix, read in full every verify forward)",
+   "formula": "vocab * h * 2",
+   "cite": [
+    "gemma4.rs:2361,2366 (default path: lm_head.forward_dense(final_norm(hidden)); the int8 variant is DEFAULT-ON since 2026-08-11 via NV_VERIFY_LMHEAD_INT8 (=0 reverts); it measured slower only as v1, which was STAGE-bound at K=5376; the v2 normx_mk + gemv_i8_prenormed_mk kernel gives -0.82 ms/round served with 48/48 argmax agreement)",
+    "gemma4.rs:421-428 (tie_word_embeddings -> lm_head = embed matrix)",
+    "config.json quantization_config.ignore includes lm_head",
+    "checkpoint witness: model.language_model.embed_tokens.weight BF16 [262144,5376]"
+   ],
+   "witness": {
+    "exact": "model.language_model.embed_tokens.weight"
+   }
+  }
+ ],
+ "verify_kv_read": {
+  "coq_name": "kv_read_bytes",
+  "kernel": "tree_verify_attn committed-prefix K/V stream (bf16 verify cache at HEAD; NV_GEMMA4_FP8_KV opt-in halves this)",
+  "formula_full": "n_full * ctx * (gnkv*ghd) * 2",
+  "formula_sliding": "n_slide * min(ctx, window - 1) * (nkv*hd) * 2 * 2",
+  "cite": [
+   "tree_verify_attn.cu:92-108 (per position p in [win_start, nc): one K row and one V row of HD bf16 per kv head)",
+   "tree_verify_attn.cu:73-79 (win_start = max(0, qpos-(window-1)); WindowClamp.committed_range_exact proves this equals the attention-set semantics)",
+   "gemma4.rs:828 (verify cache is bf16 unless NV_GEMMA4_FP8_KV set)",
+   "full layers: K counted once and V not counted (k_eq_v layers share K/V content; unique-byte lower bound)",
+   "sliding layers: union over the K tree queries of the clamped ranges covers min(ctx, window-1) positions (query 0 at qpos=nc attends [nc-window+1, nc)); K and V are distinct buffers -> *2"
+  ],
+  "note": "This is a UNIQUE-BYTE lower bound: each counted byte must cross HBM at least once per forward. The kernel actually re-reads per kv-head-group and per query (diag-budget measured ~20x once-read on the ctx slope), so the true traffic is far above this floor."
+ },
+ "draft_step_weight_phases": [
+  {
+   "coq_name": "draft_qkv_bytes",
+   "kernel": "drafter q/k/v bf16 GEMMs over block_in = [embed(token); hidden] (input width 2h)",
+   "formula": "((nh*hd) + 2*(nkv*hd)) * (2*h) * 2",
+   "cite": [
+    "eagle3_loader.rs:525 (q_proj.forward(block_in)) and adjacent k/v",
+    "eagle3_loader.rs:600-620 (step_block_in_dev: concat embed+hidden -> 2h input width)",
+    "drafter checkpoint witness: layers.0.self_attn.q_proj.weight BF16 [8192,10752], k/v [4096,10752]"
+   ]
+  },
+  {
+   "coq_name": "draft_o_bytes",
+   "kernel": "drafter o_proj bf16 GEMM",
+   "formula": "h * (nh*hd) * 2",
+   "cite": [
+    "eagle3_loader.rs:552",
+    "drafter checkpoint: o_proj BF16 [5376,8192]"
+   ]
+  },
+  {
+   "coq_name": "draft_mlp_bytes",
+   "kernel": "drafter gate/up/down bf16 GEMMs",
+   "formula": "3 * inter * h * 2",
+   "cite": [
+    "eagle3_loader.rs:555-558",
+    "drafter checkpoint: gate/up [21504,5376], down [5376,21504] BF16"
+   ]
+  },
+  {
+   "coq_name": "draft_head_bytes",
+   "kernel": "drafter lm_head bf16 GEMM (draft vocab)",
+   "formula": "draft_vocab * h * 2",
+   "cite": [
+    "eagle3_loader.rs:564",
+    "drafter checkpoint: lm_head.weight BF16 [32000,5376]"
+   ]
+  },
+  {
+   "coq_name": "draft_norm_bytes",
+   "kernel": "drafter RMSNorm gammas (hidden_norm, input_layernorm, post_attention_layernorm, final norm)",
+   "formula": "4 * h * 2",
+   "cite": [
+    "drafter checkpoint: four [5376] BF16 norm tensors"
+   ]
+  }
+ ],
+ "excluded_from_step": {
+  "embed_tokens": "shared with target (server log: 'sharing target embedding'); per-step access is a single-row gather (h*2 bytes), counted as slack",
+  "fc": "fc.weight [5376,16128] maps the 3 concatenated aux hiddens once per ROUND (context-row encode, chain_draft_cached_cond eagle3_loader.rs:738+), not per chain step; omitting it only weakens the draft floor",
+  "d2t_t2d": "256 KiB + 256 KiB lookup tables, slack",
+  "activations_and_writes": "all activation reads/writes, KV appends, rope/rmsnorm traffic are uncounted slack in every floor"
+ }
+}

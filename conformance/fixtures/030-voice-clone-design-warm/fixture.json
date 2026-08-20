@@ -1,0 +1,74 @@
+{
+  "name": "030-voice-clone-design-warm",
+  "family": "030-voice-clone",
+  "description": "VoiceDesign profile with warm=1.0. Creates the profile then uses it for /v1/audio/speech synthesis. Asserts the design_params round-trip through the profile store and the resulting audio passes the same envelope check as 030-voice-clone-base.",
+  "steps": [
+    {
+      "step": 1,
+      "kind": "create_voice_profile",
+      "endpoint": {
+        "method": "POST",
+        "path": "/v1/voice-profiles"
+      },
+      "request_multipart": {
+        "name": "test-design-warm",
+        "design_params": {
+          "warm": 1.0
+        }
+      },
+      "expected_response": {
+        "status": 201,
+        "body": {
+          "name": "test-design-warm",
+          "schema_version": 1,
+          "embedding_state_in": ["encoded", "no_encoder"],
+          "design_params": {
+            "warm": 1.0
+          }
+        }
+      }
+    },
+    {
+      "step": 2,
+      "kind": "synthesize_with_profile",
+      "endpoint": {
+        "method": "POST",
+        "path": "/v1/audio/speech"
+      },
+      "request_body": {
+        "model": "qwen3-tts-12hz",
+        "input": "Hello, this is a warm test voice.",
+        "voice": "test-design-warm",
+        "response_format": "wav",
+        "speed": 1.0
+      },
+      "expected_response": {
+        "status": 200,
+        "content_type": "audio/wav",
+        "wav_header": {
+          "valid_riff": true,
+          "sample_rate": 24000,
+          "channels": 1
+        },
+        "expected_duration_ms_range": [1000, 4000]
+      }
+    },
+    {
+      "step": 3,
+      "kind": "cleanup",
+      "endpoint": {
+        "method": "DELETE",
+        "path": "/v1/voice-profiles/test-design-warm"
+      },
+      "expected_response": {
+        "status_in": [200, 204]
+      }
+    }
+  ],
+  "comparison_strategy": "structural+audio_envelope",
+  "ref_outputs": {
+    "mode": "placeholder",
+    "notes": "design_params is currently passed through opaquely (see `VoiceProfile::design_params` in nv_tts and `oapi::voice_profiles::handle_create`). The placeholder assertion is round-trip: the profile we POST must come back from GET with identical design_params. Once a VoiceDesign conditioning head is wired the audio envelope assertion in step 2 becomes the canonical check."
+  },
+  "skip_when_no_model": true
+}

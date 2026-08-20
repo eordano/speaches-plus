@@ -1,0 +1,4 @@
+{"op": "markActive"}
+{"op": "response_create", "resp_id": "resp_a", "item_id": "asst_a"}
+{"op": "audio_delta", "resp_id": "resp_a", "audio_bytes": 2048}
+{"op": "response_drain_cap_expired", "epoch": 1, "transcript": "partial answer", "planned_ms": 5000, "played_ms": 1200}

@@ -1,0 +1,772 @@
+{
+  "_doc": [
+    "Declared numeric range of every free identifier that reaches a CUDA grid axis.",
+    "",
+    "This table is the HAND-MAINTAINED half of GenLaunch.v and it is an ASSUMPTION,",
+    "not a derivation. Whether n_tokens is a whole context or one prefill chunk is a",
+    "property of the Rust caller; no amount of CUDA parsing recovers it. What makes",
+    "the assumption safe to hold is that extract/launch_geometry.py REFUSES on any",
+    "identifier reaching an axis that is absent here -- so a new launcher cannot",
+    "quietly inherit someone else's bound.",
+    "",
+    "lo/hi          the declared inclusive range. lo must be >= 0.",
+    "why            where the bound comes from, in words.",
+    "cite           file:line of the guard or config field, when there is one.",
+    "input_scaled   true when the bound is a property of the caller rather than of a",
+    "               guard in the CUDA. Every input_scaled identifier that lands on",
+    "               gridDim.y or .z gets a machine-checked _unlaunchable_at_ theorem",
+    "               in GenLaunch.v showing where it breaks.",
+    "unenforced     what is MISSING: no assert, no clamp, no early return. These are",
+    "               listed by the generator on every run. An `unenforced` note that the",
+    "               guard scanner contradicts is reported beside the ENFORCED line, so",
+    "               a note cannot outlive the gap it described.",
+    "",
+    "Enforcement is NOT declared here: extract/launch_geometry.py reads guards out of the",
+    "host launcher's AST (early return, then-branch, else-branch) and accepts one only if",
+    "it bounds the same DECLARATION that reaches the axis, dominates the launch, and keeps",
+    "the axis inside the CUDA limit. Anything less stays a counterexample.",
+    "",
+    "A key may be scoped 'rust/.../file.cu:ident', 'file.cu:ident' or bare 'ident';",
+    "the most specific wins. Every entry today is fully scoped on purpose: an",
+    "unscoped bound would let one file's 'N' silently license another file's.",
+    "",
+    "Model constants cited above: config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144"
+  ],
+  "excluded_launches": [
+    {
+      "file": "rust/crates/nv-kernels/cuda/marlin/entry.cu",
+      "kernel_expr": "kernel",
+      "why": "vendored vLLM Marlin. The launched callee is a FUNCTION POINTER returned by get_marlin_kernel(...), a 14-argument dispatch over (a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8, has_act_order, has_zp, group_blocks, num_threads, is_zp_float, stages). It does not resolve to a __global__ FunctionDecl, so there is no kernel to state an obligation about. This is the only launch in the corpus that is genuinely unanalyzable. The generator refuses if this entry ever stops matching, so the exclusion cannot outlive the code it excuses."
+    }
+  ],
+  "symbols": {
+    "rust/crates/nv-kernels/cuda/attention_fp8_decode.cu:n_q": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/attn_decode.cu:NH": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/capture_copy.cu:hidden": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/capture_copy.cu:rows": {
+      "cite": "capture_copy.cu guards rows <= 0",
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/capture_copy.cu:width": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/depthwise_conv1d_silu_bf16.cu:B": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "batch of conv sequences; a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/depthwise_conv1d_silu_bf16.cu:C": {
+      "hi": 65535,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing asserts C <= 65535; a channel count past that is an invalid launch, same shape as the kv_fp8_paged defect.",
+      "why": "conv channel count, landing on gridDim.y"
+    },
+    "rust/crates/nv-kernels/cuda/depthwise_conv1d_silu_bf16.cu:T": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing asserts T <= 262144; it is tiled onto gridDim.z so the ceiling that matters is 65535*tile_t.",
+      "why": "conv sequence length; max_position_embeddings=262144"
+    },
+    "rust/crates/nv-kernels/cuda/depthwise_conv1d_silu_bf16.cu:tile_t": {
+      "cite": "depthwise_conv1d_silu_bf16.cu:78-82",
+      "hi": 256,
+      "lo": 32,
+      "why": "the if-chain at depthwise_conv1d_silu_bf16.cu:78-82 assigns exactly one of 32/64/128/256"
+    },
+    "rust/crates/nv-kernels/cuda/dflash_accept.cu:m": {
+      "cite": "rust/crates/nv-kernels/cuda/dflash_accept.cu:117",
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "the launcher refuses m > 65535 at dflash_accept.cu:117, which is exactly what gridDim.y needs and is detected mechanically; the tighter 1024 declared here is still only the caller's convention and nothing checks it.",
+      "why": "draft rows; lands on gridDim.y of dflash_row_argmax_stage1"
+    },
+    "rust/crates/nv-kernels/cuda/dflash_gate.cu:groups": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/flash_decode.cu:NH": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/flash_decode.cu:NKV": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/flash_decode.cu:sp": {
+      "cite": "flash_decode.cu:848-876",
+      "hi": 32,
+      "lo": 8,
+      "why": "split-k count from splitk::flash_splits_pick, which returns 8, 16 or 32; the NV_E4B_FLASH_SPLITS override is clamped to the same set"
+    },
+    "rust/crates/nv-kernels/cuda/flash_decode.cu:splits": {
+      "cite": "flash_decode.cu:1408-1450",
+      "hi": 128,
+      "lo": 16,
+      "why": "split count for nv_kernels_flash_decode_gqa_fp8kv_paged, chosen by the caller rather than by flash_splits_pick because one block per KV head makes the split count the only source of parallelism. The launcher switches over it and returns -13 on anything else, so 16/32/64/128 are the only values that reach a launch; 128 is the largest instantiated template and is well inside maxGridDimY."
+    },
+    "rust/crates/nv-kernels/cuda/gather_rows_bf16.cu:m_total_padded": {
+      "cite": "gather_rows_bf16.cu:38,:43",
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "padded row count launched one block per row by nv_kernels_gather_rows_bf16; guarded only by m_total_padded <= 0"
+    },
+    "rust/crates/nv-kernels/cuda/gather_rows_bf16.cu:n_tiles": {
+      "cite": "gather_rows_bf16.cu:63-64",
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "m_total_padded / row_stride; the entry point returns early unless m_total_padded > 0 and row_stride divides it exactly, so the quotient is >= 1"
+    },
+    "rust/crates/nv-kernels/cuda/gdn_decode.cu:conv_dim": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gdn_decode.cu:n_v": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/gdn_gating.cu:num_heads": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/gdn_gating.cu:tokens": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/gdn_recurrent.cu:B": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "batch; a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/gdn_recurrent.cu:H": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/gelu_tanh_mul.cu:n": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/gelu_tanh_mul.cu:tot_pairs": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:K": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:M": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:N": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:Ng": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:Nk": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:Nq": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:Nv": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:blocks": {
+      "cite": "gemv_bf16.cu:870-872",
+      "hi": 262144,
+      "lo": 1,
+      "why": "persistent-CTA count, clamped to n_tiles at gemv_bf16.cu:871"
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:grid_x": {
+      "cite": "gemv_bf16.cu:400-425",
+      "hi": 2147483647,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "this wrapper takes the geometry as a parameter and checks nothing; the obligation belongs to each caller.",
+      "why": "extent of the dim3 that nvk_launch_gemv_bf16 receives from its caller"
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:grid_y": {
+      "cite": "gemv_bf16.cu:400-425",
+      "hi": 65535,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "this wrapper takes the geometry as a parameter and checks nothing; a caller passing y > 65535 is an invalid launch the wrapper will not catch.",
+      "why": "extent of the dim3 that nvk_launch_gemv_bf16 receives from its caller"
+    },
+    "rust/crates/nv-kernels/cuda/gemv_bf16.cu:grid_z": {
+      "cite": "gemv_bf16.cu:400-425",
+      "hi": 65535,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "as grid_y.",
+      "why": "extent of the dim3 that nvk_launch_gemv_bf16 receives from its caller"
+    },
+    "rust/crates/nv-kernels/cuda/gemv_nvfp4.cu:N": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_w4a16.cu:N": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_w4a16_m1_proto.cu:N": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/gemv_w4a16_m1_proto.cu:kRows": {
+      "cite": "gemv_w4a16_m1_proto.cu:173-180",
+      "hi": 16,
+      "lo": 2,
+      "why": "kWarps/kSplit over the eight instantiations at gemv_w4a16_m1_proto.cu:173-180: (8,1),(4,1),(16,1),(8,2),(16,2),(8,4),(16,4) give kRows in {2,4,8,16}"
+    },
+    "rust/crates/nv-kernels/cuda/gqa_verify_hd512.cu:M": {
+      "cite": "gqa_verify_hd512.cu:441",
+      "hi": 8,
+      "lo": 1,
+      "why": "the entry point rejects M > 8"
+    },
+    "rust/crates/nv-kernels/cuda/gqa_verify_hd512.cu:NH": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/gqa_verify_hd512.cu:NKV": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/gqa_verify_hd512.cu:splits": {
+      "cite": "gqa_verify_hd512.cu:442-443, :18",
+      "hi": 128,
+      "lo": 1,
+      "why": "clamped into [1, gqa512::kMaxSplits] where kMaxSplits = 128"
+    },
+    "rust/crates/nv-kernels/cuda/graph_decode.cu:NH": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/graph_decode.cu:NKV": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/graph_decode.cu:blocks": {
+      "hi": 8388608,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "ceil(n / kBlock) for a flat element count"
+    },
+    "rust/crates/nv-kernels/cuda/graph_decode.cu:n": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/graph_decode.cu:rows": {
+      "cite": "rust/crates/nv-kernels/cuda/graph_decode.cu:395",
+      "hi": 65535,
+      "input_scaled": true,
+      "lo": 1,
+      "why": "row count; lands on gridDim.y of argmax_f32_rows_stage1. The whole declared range is enforced: the launcher refuses rows > 65535 at graph_decode.cu:395."
+    },
+    "rust/crates/nv-kernels/cuda/hello.cu:n": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/kv_fp8.cu:n_kv": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/kv_fp8.cu:n_tokens": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "token count; here it is on gridDim.X, which is why the non-paged pair is not the one that broke"
+    },
+    "rust/crates/nv-kernels/cuda/kv_fp8_paged.cu:block_size": {
+      "hi": 65536,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "paged KV block size"
+    },
+    "rust/crates/nv-kernels/cuda/kv_fp8_paged.cu:len": {
+      "cite": "kv_fp8_paged.cu:192",
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "context length on gridDim.x after 7dcb094c9 flipped grid(n_kv, len) to grid(len, n_kv)"
+    },
+    "rust/crates/nv-kernels/cuda/kv_fp8_paged.cu:n_kv": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/kv_fp8_paged.cu:n_tokens": {
+      "cite": "rust/crates/nv-models/src/paged_fp8.rs:431,:450; rust/crates/nv-models/src/gemma4.rs:2946",
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "NOTHING asserts n_tokens <= 65535. kv_fp8_paged.cu:163 puts it on gridDim.y -- the same orientation that killed the dequantize path at position 64512 and was fixed at :192 but not here. Raising the chunk, removing chunking, or appending a whole prompt in one call reproduces cudaErrorInvalidConfiguration.",
+      "why": "append count for ONE forward pass. The only production caller is nv-models/src/paged_fp8.rs:431 via append_layer at :450, which passes the per-pass count, i.e. VERIFY_PREFILL_CHUNK = 1024 (gemma4.rs:2946)"
+    },
+    "rust/crates/nv-kernels/cuda/kv_ring.cu:n_q": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/kv_ring.cu:rows": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/kv_ring.cu:t": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/laguna_step.cu:groups": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/laguna_step.cu:n_kv": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/laguna_step.cu:n_q": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/laguna_step.cu:sp": {
+      "cite": "laguna_step.cu:330-338",
+      "hi": 32,
+      "lo": 8,
+      "why": "laguna_m1_splits_env returns 16 by default and clamps NV_LAGUNA_M1_SPLITS to {8,16,32}"
+    },
+    "rust/crates/nv-kernels/cuda/laguna_step.cu:t": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/lora_fused.cu:grid_loras": {
+      "hi": 128,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing bounds grid_loras above; 128 is the declared ceiling for concurrently-resident adapters.",
+      "why": "adapter count on gridDim.z; guarded only by grid_loras <= 0"
+    },
+    "rust/crates/nv-kernels/cuda/lora_fused.cu:m": {
+      "hi": 65536,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "token rows for this LoRA batch"
+    },
+    "rust/crates/nv-kernels/cuda/lora_fused.cu:max_n": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/lora_fused.cu:n_slices": {
+      "hi": 8,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing bounds n_slices above; 8 is the declared ceiling for a fused qkv/gate-up slicing.",
+      "why": "slice count on gridDim.y; guarded only by n_slices <= 0"
+    },
+    "rust/crates/nv-kernels/cuda/lora_grouped.cu:grid_loras": {
+      "hi": 128,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing bounds grid_loras above; 128 is the declared ceiling for concurrently-resident adapters.",
+      "why": "adapter count on gridDim.z; guarded only by grid_loras <= 0"
+    },
+    "rust/crates/nv-kernels/cuda/lora_grouped.cu:m": {
+      "hi": 65536,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "token rows for this LoRA batch"
+    },
+    "rust/crates/nv-kernels/cuda/lora_grouped.cu:max_n": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/lora_grouped.cu:n_slices": {
+      "hi": 8,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing bounds n_slices above; 8 is the declared ceiling for a fused qkv/gate-up slicing.",
+      "why": "slice count on gridDim.y; guarded only by n_slices <= 0"
+    },
+    "rust/crates/nv-kernels/cuda/lora_grouped.cu:rank": {
+      "cite": "lora_fused.cu:5,:147",
+      "hi": 512,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "lora_grouped.cu:123 guards only rank <= 0.",
+      "why": "LoRA rank; lora_fused rejects rank > FUSED_MAX_RANK = 64, lora_grouped does not"
+    },
+    "rust/crates/nv-kernels/cuda/marlin/entry.cu:blocks": {
+      "cite": "rust/crates/nv-kernels/cuda/marlin/entry.cu:534",
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "vendored code; no bound is asserted on the repack tile count.",
+      "why": "repack tile count computed in gptq_marlin_repack from size_k/size_n; vendored vLLM Marlin"
+    },
+    "rust/crates/nv-kernels/cuda/moe_gemv.cu:b": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "guarded only by b <= 0 at moe_gemv.cu:272; 1024 is the declared ceiling.",
+      "why": "batch on gridDim.z"
+    },
+    "rust/crates/nv-kernels/cuda/moe_gemv.cu:hidden": {
+      "cite": "moe_gemv.cu:11,:246,:273",
+      "hi": 4096,
+      "lo": 1,
+      "why": "the entry points reject hidden > kMaxSharedK = 4096"
+    },
+    "rust/crates/nv-kernels/cuda/moe_gemv.cu:inter": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/moe_gemv.cu:k": {
+      "hi": 64,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "guarded only by k <= 0 at moe_gemv.cu:245; 64 is the declared ceiling.",
+      "why": "top-k experts per token, on gridDim.y"
+    },
+    "rust/crates/nv-kernels/cuda/moe_grouped_fp4_gemv.cu:n": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/moe_grouped_fp4_gemv.cu:num_groups": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "guarded only by num_groups <= 0 at moe_grouped_fp4_gemv.cu:127.",
+      "why": "expert-group count on gridDim.y"
+    },
+    "rust/crates/nv-kernels/cuda/moe_permute.cu:k": {
+      "hi": 64,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "top-k experts per token"
+    },
+    "rust/crates/nv-kernels/cuda/moe_permute.cu:n_tokens": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/moe_route.cu:n": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/moe_route.cu:n_tokens": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/moe_unpermute_scatter.cu:hidden": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/moe_unpermute_scatter.cu:n_tokens": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/quantize_nvfp4_bf16.cu:m_padded": {
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/quantize_nvfp4_bf16.cu:m_rows": {
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/quantize_nvfp4_bf16.cu:m_total": {
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/quantize_nvfp4_bf16.cu:n_tiles": {
+      "cite": "quantize_nvfp4_bf16.cu:262-264, :311-313",
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "m_total / m_per_expert; both entry points return early unless m_total > 0, m_per_expert > 0 and m_per_expert divides m_total, so the quotient is >= 1"
+    },
+    "rust/crates/nv-kernels/cuda/residual_scale.cu:n": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/rmsnorm.cu:batch": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/rmsnorm_quantize_nvfp4_bf16.cu:m_padded": {
+      "hi": 1048576,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/rmsnorm_residual.cu:batch": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/rope.cu:batch": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/rope.cu:n_heads": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/rope.cu:n_kv_heads": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/rope_bf16.cu:batch": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/rope_bf16.cu:n_heads": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/rope_bf16.cu:n_kv_heads": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/sampler.cu:batch": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/silu.cu:n": {
+      "hi": 1073741823,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a flat element count tiled 1 block per 128-256 elements; declared ceiling 2^30 keeps the tiled quotient inside maxGridDimX."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_attn.cu:A": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_attn.cu:HD": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "per-head dimension; head_dim=256 (sliding), global_head_dim=512 (full). Declared ceiling 1024."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_attn.cu:K": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing asserts K <= 65535; the speculative tree width is the caller's.",
+      "why": "tree/draft token count, on gridDim.y of the tree-verify attention"
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_attn.cu:NH": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_attn.cu:NKV": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_attn.cu:stride": {
+      "hi": 262144,
+      "lo": 1,
+      "why": "a hidden/intermediate/vocab-scale extent; hidden_size=5376, intermediate_size=21504, vocab_size=262144. Declared ceiling 262144."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_fp8.cu:A": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_fp8.cu:HD": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "per-head dimension; head_dim=256 (sliding), global_head_dim=512 (full). Declared ceiling 1024."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_fp8.cu:K": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing asserts K <= 65535; the speculative tree width is the caller's.",
+      "why": "tree/draft token count, on gridDim.y of the tree-verify attention"
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_fp8.cu:NH": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/tree_verify_fp8.cu:NKV": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/verify_fused_norms.cu:K": {
+      "hi": 1024,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "nothing asserts K <= 65535.",
+      "why": "tree/draft token count on gridDim.y"
+    },
+    "rust/crates/nv-kernels/cuda/verify_fused_norms.cu:NKV": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/verify_fused_norms.cu:NQ": {
+      "hi": 1024,
+      "lo": 1,
+      "why": "head count; config.json text_config: hidden_size=5376 intermediate_size=21504 num_attention_heads=32 num_key_value_heads=16 head_dim=256 global_head_dim=512 num_global_key_value_heads=4 vocab_size=262144 max_position_embeddings=262144. Declared ceiling 1024 is far above every head count this stack configures."
+    },
+    "rust/crates/nv-kernels/cuda/verify_fused_norms.cu:batch": {
+      "hi": 262144,
+      "input_scaled": true,
+      "lo": 1,
+      "unenforced": "no assertion anywhere bounds this; it is the caller's per-call row count.",
+      "why": "a row/token count for one launch. NOT derivable from the CUDA: it is whatever the Rust caller passes."
+    }
+  }
+}

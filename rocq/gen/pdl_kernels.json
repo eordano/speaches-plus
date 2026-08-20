@@ -1,0 +1,105 @@
+{
+ "_doc": [
+  "Declared inputs for rocq/gen/extract/pdl_sites.py, which emits rocq/GenPdl.v.",
+  "",
+  "NOTHING HERE IS A LINE NUMBER, and that is the point. PdlKernels.v used to",
+  "carry the prolog, epilog, write and read positions as integer literals; all",
+  "twelve of them were dead within weeks of being written, and a dead literal",
+  "checks clean forever because Rocq cannot read a .cu.",
+  "",
+  "What this file declares is what the CUDA cannot say for itself:",
+  "  symbol         -- WHICH __global__ function each Rocq kernel record models.",
+  "                    The extractor locates `__global__ void <symbol>(` and",
+  "                    refuses unless it occurs exactly once in the declared file.",
+  "  produces/      -- WHICH logical buffer a parameter carries, witnessed by the",
+  "  consumes          exact source text of the parameter declaration (a text",
+  "                    pin, the same device rust/crates/nv-kernels/tests/",
+  "                    cuda_ue4m3_subnormal_codec.rs uses against its .cu). The",
+  "                    extractor requires the pin to occur exactly once inside",
+  "                    that kernel's parameter list, so a rename, a retype or a",
+  "                    reorder is a refusal rather than a silently wrong model.",
+  "",
+  "Everything positional -- prolog, epilog, every store, every dereference -- is",
+  "DERIVED from the file on every run and never declared here."
+ ],
+ "buffers": [
+  "b_resid",
+  "b_norm",
+  "b_gemv",
+  "b_q",
+  "b_k",
+  "b_scales",
+  "b_fp8",
+  "b_out"
+ ],
+ "kernels": [
+  {
+   "rocq": "kResidual",
+   "file": "rust/crates/nv-kernels/cuda/residual_scale.cu",
+   "symbol": "residual_add_scale_bf16_kernel",
+   "produces": {"b_resid": ["__nv_bfloat16*        __restrict__ y"]},
+   "consumes": {}
+  },
+  {
+   "rocq": "kRmsnorm",
+   "file": "rust/crates/nv-kernels/cuda/rmsnorm.cu",
+   "symbol": "rmsnorm_kernel",
+   "produces": {"b_norm": ["T* __restrict__ y"]},
+   "consumes": {"b_resid": ["const T* __restrict__ x"]}
+  },
+  {
+   "rocq": "kGemv",
+   "file": "rust/crates/nv-kernels/cuda/gemv_bf16.cu",
+   "symbol": "gemv_bf16_kernel",
+   "produces": {"b_gemv": ["__nv_bfloat16* __restrict__ y"]},
+   "consumes": {"b_norm": ["const __nv_bfloat16* __restrict__ x"]}
+  },
+  {
+   "rocq": "kRope",
+   "file": "rust/crates/nv-kernels/cuda/rope_bf16.cu",
+   "symbol": "rope_bf16_oop_kernel",
+   "produces": {
+    "b_q": ["__nv_bfloat16* __restrict__ q_out"],
+    "b_k": ["__nv_bfloat16* __restrict__ k_out"]
+   },
+   "consumes": {
+    "b_gemv": [
+     "const __nv_bfloat16* __restrict__ q_in",
+     "const __nv_bfloat16* __restrict__ k_in"
+    ]
+   }
+  },
+  {
+   "rocq": "kKvFp8",
+   "file": "rust/crates/nv-kernels/cuda/kv_fp8.cu",
+   "symbol": "quantize_kv_fp8_kernel",
+   "produces": {
+    "b_scales": ["float* __restrict__ scales_base"],
+    "b_fp8": ["uint8_t* __restrict__ x_fp8_base"]
+   },
+   "consumes": {"b_k": ["const __nv_bfloat16* __restrict__ x_bf16"]}
+  },
+  {
+   "rocq": "kFlash",
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "symbol": "flash_splitk_fused_fp8_kernel",
+   "produces": {"b_out": ["__nv_bfloat16* __restrict__ outp"]},
+   "consumes": {
+    "b_scales": ["const float* __restrict__ k_scales"],
+    "b_fp8": ["const uint8_t* __restrict__ k_fp8"],
+    "b_q": ["const __nv_bfloat16* __restrict__ q"]
+   }
+  },
+  {
+   "rocq": "kFlashDeriveV",
+   "file": "rust/crates/nv-kernels/cuda/flash_decode.cu",
+   "symbol": "flash_splitk_fused_fp8_derivev_kernel",
+   "produces": {"b_out": ["__nv_bfloat16* __restrict__ outp"]},
+   "consumes": {
+    "b_scales": ["const float* __restrict__ k_scales"],
+    "b_fp8": ["const uint8_t* __restrict__ k_fp8"],
+    "b_q": ["const __nv_bfloat16* __restrict__ q"]
+   }
+  }
+ ]
+}

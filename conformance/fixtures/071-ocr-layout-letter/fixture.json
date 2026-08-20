@@ -1,0 +1,27 @@
+{
+  "name": "071-ocr-layout-letter",
+  "family": "071-ocr-layout",
+  "description": "Rendered full-page layout: Business letter, address block + salutation + body. Scored as raw CER and as markup-neutral CER (the gating number). Classical gates require the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA); model gates require DeepSeek-OCR weights.",
+  "input": "input.png",
+  "expected_text": "14 Elm Street\nConcord, MA 01742\nJuly 30, 2026\nDear Dr. Whitfield,\nThank you for hosting our research group last Thursday. The tour of the\nannex facility was illuminating, and the students have not stopped talking\nabout the tidal simulation tank.\nWe would like to schedule a follow-up visit in September to collect water\nsamples for the comparative salinity study. Our equipment list is enclosed,\nalong with the proposed sampling schedule.\nPlease let me know whether the week of September 14 works for your team.\nWith gratitude,\nProf. Elena Marsh\nDepartment of Oceanography, Bayview College",
+  "render": {
+    "generator": "render_pages.py (PIL, DejaVu fonts, 1400x1900)",
+    "case": "real-04-letter"
+  },
+  "gates": {
+    "cer_max_model": 0.05,
+    "cer_max_model_neutral": 0.02,
+    "cer_max_classical": 0.01,
+    "cer_max_classical_neutral": 0.01
+  },
+  "oracle": {
+    "enabled": false
+  },
+  "comparison_strategy": "cer_markup_neutral+layout_gates",
+  "skip_when_no_model": true,
+  "scoring": {
+    "raw": "character edit distance against expected_text verbatim",
+    "neutral": "same distance after nv-ocr tests/markup_neutral.rs::markup_neutral (port of real5/score.py::strip_markup + whitespace collapse); this is the gating number"
+  },
+  "notes": "business letter, address block + salutation + body"
+}

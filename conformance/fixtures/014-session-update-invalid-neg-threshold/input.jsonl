@@ -1,0 +1,2 @@
+{"op": "markActive"}
+{"op": "session_update_invalid", "code": "session_update_invalid", "message": "turn_detection.neg_threshold: must be in [0,1]"}

@@ -1,0 +1,495 @@
+{
+  "_comment": "PAPER-CLAIMS LEDGER. One entry per quantitative claim that a research note proposed importing into this stack. claims.py turns each entry into either (a) a check against an artifact on disk, or (b) a REFUSAL naming what is missing. There is deliberately no third option: a claim with neither a check nor a reason code is a hard error, so the ledger cannot quietly shrink. Coverage is reported as counts by outcome, never as a percentage.",
+
+  "_provenance_warning": "THE SOURCE NOTES ARE NOT IN THIS REPO. The six notes (blackwell-fp4, moe-serving, longctx, decode-systems, specdec, our-models) were supplied to a survey agent in-context on 2026-08-10 and were never written to disk; `grep -rl 'SwiftSpec|AcceptMoE|RocketKV|BitsMoE|SageAttention3' <repo>` returns nothing. Every `claim_text` below is therefore RELAYED, not quoted from an artifact, and `note_artifact` is null for all 30 entries. claims.py prints this as a standing refusal (NOTE-CORPUS-ABSENT) on every run. What the ledger can still check with teeth is the subset of claims that are assertions ABOUT OUR OWN pinned artifacts -- those are decidable from disk no matter who said them, and they are where four of the five contradictions live.",
+
+  "_outcomes": {
+    "CONTRADICTED": "the claim, evaluated at our operating point against an artifact on disk, is false",
+    "BOUNDED_BELOW_CLAIM": "the claim's mechanism is capped by an artifact-derived bound that is strictly below the claimed factor",
+    "CONSISTENT": "the claim survives every bound the artifacts support; NOT an endorsement",
+    "NOT_COMPARABLE": "different hardware / model / batch regime / unformalized phase -- no comparison is manufactured",
+    "REFUSED": "the ledger cannot decide because a named artifact is missing; exit non-zero"
+  },
+
+  "_reason_codes": {
+    "NO_CHECKPOINT": "the checkpoint the claim is anchored to is not pinned on this box",
+    "NO_EVAL_ARTIFACT": "a quality/accuracy claim with no committed eval output to compare against",
+    "DIFFERENT_HARDWARE": "measured on a part we do not have; no transfer argument exists",
+    "PHASE_NOT_FORMALIZED": "the phase has no traffic manifest or measured wall in this repo",
+    "TRAINING_GATED": "requires retraining; not evaluable from an inference artifact",
+    "NEEDS_MEASURED_ARTIFACT": "bound exists but its measured constant's artifact is deleted",
+    "NEEDS_MACHINE_CONSTANT": "bound needs a datasheet constant absent from machine.json",
+    "NEEDS_MOE_PHASE_MANIFEST": "bound needs expert-aware phases in kernels.json; gen.py die()s on MoE today"
+  },
+
+  "models": {
+    "qwen3.6-35b-a3b-nvfp4": {
+      "dir_candidates": [
+        "~/.cache/huggingface/hub/models--RedHatAI--Qwen3.6-35B-A3B-NVFP4/snapshots/e850c696e6d75f965367e816c16bc7dacd955ffa"
+      ],
+      "weights": "model.safetensors",
+      "config_section": "text_config",
+      "expect_config": {
+        "num_hidden_layers": 40,
+        "num_experts": 256,
+        "num_experts_per_tok": 8,
+        "moe_intermediate_size": 512,
+        "hidden_size": 2048,
+        "max_position_embeddings": 262144
+      },
+      "m1_groups": [
+        {"name": "routed_expert", "re": "\\.mlp\\.experts\\.", "per_step": "topk_of_num_experts"},
+        {"name": "shared_expert", "re": "\\.mlp\\.shared_expert", "per_step": "all"},
+        {"name": "router", "re": "\\.mlp\\.gate\\.", "per_step": "all"},
+        {"name": "linear_attn", "re": "\\.linear_attn\\.", "per_step": "all"},
+        {"name": "self_attn", "re": "\\.self_attn\\.", "per_step": "all"},
+        {"name": "lm_head", "re": "^lm_head\\.weight$", "per_step": "all"},
+        {"name": "embed", "re": "embed_tokens\\.weight$", "per_step": "none"},
+        {"name": "norms_and_biases", "re": ".", "per_step": "all"}
+      ]
+    },
+    "gemma-4-31b-it-nvfp4": {
+      "dir_candidates": [
+        "~/.cache/huggingface/hub/models--nvidia--Gemma-4-31B-IT-NVFP4/snapshots/e5ef03afa233c35cb000323ff098d4291e1dd07c"
+      ],
+      "weights": null,
+      "config_section": "text_config",
+      "expect_config": {
+        "num_hidden_layers": 60,
+        "max_position_embeddings": 262144
+      },
+      "m1_groups": []
+    }
+  },
+
+  "measured_basis": {
+    "_comment": "Every phase-Amdahl bound below is keyed on THIS tuple and is void outside it. Importing a phase share measured on Gemma+eagle3+K=4 into a Qwen or Laguna claim is the exact category error this ledger exists to catch.",
+    "model": "gemma-4-31b-it-nvfp4",
+    "drafter": "RedHatAI/gemma-4-31B-it-speculator.eagle3",
+    "k_chain": 4,
+    "artifacts": [
+      "../../docs/measurements/2026-08-10-rocq-repoint/server-prof.txt",
+      "../../docs/measurements/2026-08-10-rocq-repoint/bench.json"
+    ],
+    "constants_recorded_in": "rocq/GenRoofline.v",
+    "constants": {
+      "verify_hi_s": [1393, 50000],
+      "draft_hi_s": [323, 100000],
+      "host_hi_s": [1213, 10000000],
+      "tokens_per_round_hi": [267, 100],
+      "verify_weight_floor_s": [2014087, 100000000]
+    },
+    "status_note": "The artifacts were committed by d4ffa76bf on 2026-08-10 expressly so this tripwire could not go dark, and deleted 21h later by 6557eba90. The constants above are transcribed from GenRoofline.v so this file is readable, but claims.py DOES NOT USE THEM: any claim whose check needs a measured constant is REFUSED while the artifact is absent. Falling back to the literal is the failure mode the ledger exists to prevent."
+  },
+
+  "claims": [
+    {
+      "id": "T1.1a-nvfp4-kv-half",
+      "note": "blackwell-fp4",
+      "paper": "NVFP4 KV cache (note item #1)",
+      "note_artifact": null,
+      "claim_text": "NVFP4 KV gives ~50% KV memory vs FP8.",
+      "stated_operating_point": "format arithmetic, hardware-independent",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "kv", "drafter": null, "k": null},
+      "lever_class": "cuts_kv_bytes",
+      "claimed": {"kind": "byte_reduction_fraction", "value": [1, 2]},
+      "check": "block_format_bytes",
+      "check_args": {
+        "model": "qwen3.6-35b-a3b-nvfp4",
+        "packed_tensor": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_packed",
+        "scale_tensor": "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale",
+        "logical_elems": 1048576,
+        "baseline_bytes_per_elem": [1, 1],
+        "why_this_tensor": "the pinned NVFP4 checkpoint is the only in-tree witness of the E2M1+E4M3-per-16 convention; the KV cache would use the same block format, so its bytes/elem is the same number"
+      },
+      "reason_code": null
+    },
+    {
+      "id": "T1.1b-nvfp4-kv-500k-ceiling",
+      "note": "blackwell-fp4",
+      "paper": "NVFP4 KV cache (note item #1)",
+      "note_artifact": null,
+      "claim_text": "NVFP4 KV doubles the 254K fp8-KV capacity ceiling to ~500K in the same VRAM.",
+      "stated_operating_point": "our 76 GiB box, Gemma-4-31B hybrid KV",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "kv", "drafter": null, "k": null},
+      "lever_class": "cuts_kv_bytes",
+      "claimed": {"kind": "context_tokens", "value": 500000},
+      "check": "declared_context_ceiling",
+      "check_args": {
+        "model": "gemma-4-31b-it-nvfp4",
+        "note": "the 254K figure it doubles is not derivable from KvBudget.kv_bytes_hybrid either; the ledger refuses to compare against it and instead checks the reachable side"
+      },
+      "reason_code": null
+    },
+    {
+      "id": "T1.2-moet-2bit-experts",
+      "note": "moe-serving",
+      "paper": "vLLM-Moet (note item #2)",
+      "note_artifact": null,
+      "claim_text": "2-bit routed experts halve the dominant M=1 term (expert-weight bytes), up to ~2x on the weight-read-bound M=1 decode term.",
+      "stated_operating_point": "DS-V4-Flash 159B, batch-1 decode",
+      "our_context": {"model": "qwen3.6-35b-a3b-nvfp4", "phase": "m1_decode", "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes",
+      "claimed": {"kind": "ratio", "value": [2, 1]},
+      "check": "m1_weight_amdahl",
+      "check_args": {"model": "qwen3.6-35b-a3b-nvfp4", "cut_group": "routed_expert", "cut_fraction": [1, 2]},
+      "reason_code": null
+    },
+    {
+      "id": "T1.2b-bitsmoe-3bit-experts",
+      "note": "moe-serving",
+      "paper": "BitsMoE (note item #4)",
+      "note_artifact": null,
+      "claim_text": "Average ~3.0-3.3 bit routed experts give ~1.2-1.3x on the weight-read term.",
+      "stated_operating_point": "large-expert-share MoE, batch-1 decode",
+      "our_context": {"model": "qwen3.6-35b-a3b-nvfp4", "phase": "m1_decode", "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes",
+      "claimed": {"kind": "ratio", "value": [12, 10]},
+      "check": "m1_weight_amdahl",
+      "check_args": {"model": "qwen3.6-35b-a3b-nvfp4", "cut_group": "routed_expert", "cut_fraction": [85, 400]},
+      "reason_code": null
+    },
+    {
+      "id": "T1.3-mtp-tensors-on-disk",
+      "note": "our-models",
+      "paper": "our-models Finding 1 (MTP drafter)",
+      "note_artifact": null,
+      "claim_text": "Load the MTP tensors already present in models--RedHatAI--Qwen3.6-35B-A3B-NVFP4 on-disk today.",
+      "stated_operating_point": "this box, this pin",
+      "our_context": {"model": "qwen3.6-35b-a3b-nvfp4", "phase": "m1_decode", "drafter": "mtp", "k": null},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "predicate", "value": "model_mtp.safetensors holds real weights"},
+      "check": "checkpoint_tensor_file_real",
+      "check_args": {"model": "qwen3.6-35b-a3b-nvfp4", "file": "model_mtp.safetensors"},
+      "reason_code": null
+    },
+    {
+      "id": "T1.4-not-gated-deltanet",
+      "note": "our-models",
+      "paper": "our-models scope note (exclusion of the Qwen3-Next paper family)",
+      "note_artifact": null,
+      "claim_text": "Deliberately EXCLUDED Qwen3-Next Gated DeltaNet: our Qwen3.6-35B-A3B is standard MoE attention, not the hybrid-linear Next variant.",
+      "stated_operating_point": "this box, this pin",
+      "our_context": {"model": "qwen3.6-35b-a3b-nvfp4", "phase": "m1_decode", "drafter": null, "k": null},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "predicate", "value": "zero linear-attention layers"},
+      "check": "tensor_prefix_census",
+      "check_args": {
+        "model": "qwen3.6-35b-a3b-nvfp4",
+        "patterns": {
+          "linear_attn_layers": "layers\\.(\\d+)\\.linear_attn\\.",
+          "self_attn_layers": "layers\\.(\\d+)\\.self_attn\\."
+        },
+        "expect_zero": ["linear_attn_layers"]
+      },
+      "reason_code": null
+    },
+    {
+      "id": "T1.5a-rocketkv-3.7x-decode",
+      "note": "longctx",
+      "paper": "RocketKV (note item #4)",
+      "note_artifact": null,
+      "claim_text": "3.7x decode speedup.",
+      "stated_operating_point": "their KV-sparsity benchmark",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "verify", "drafter": "eagle3", "k": 4},
+      "lever_class": "cuts_kv_bytes",
+      "claimed": {"kind": "ratio", "value": [37, 10]},
+      "check": "verify_weight_floor_ratio",
+      "check_args": {},
+      "reason_code": null
+    },
+    {
+      "id": "T1.5b-clusterkv-2x-decode",
+      "note": "longctx",
+      "paper": "ClusterKV (note item #7)",
+      "note_artifact": null,
+      "claim_text": "Up to 2x decode throughput.",
+      "stated_operating_point": "their KV-clustering benchmark",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "verify", "drafter": "eagle3", "k": 4},
+      "lever_class": "cuts_kv_bytes",
+      "claimed": {"kind": "ratio", "value": [2, 1]},
+      "check": "verify_weight_floor_ratio",
+      "check_args": {},
+      "reason_code": null
+    },
+    {
+      "id": "T1.5c-ssv-3.49x-e2e",
+      "note": "longctx",
+      "paper": "SSV (note item #2)",
+      "note_artifact": null,
+      "claim_text": "Up to 3.49x end-to-end.",
+      "stated_operating_point": "their long-context serving benchmark",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "verify", "drafter": "eagle3", "k": 4},
+      "lever_class": "cuts_kv_bytes",
+      "claimed": {"kind": "ratio", "value": [349, 100]},
+      "check": "verify_weight_floor_ratio",
+      "check_args": {},
+      "reason_code": null
+    },
+    {
+      "id": "T1.6-conditional-graph-nodes",
+      "note": "decode-systems",
+      "paper": "device-side conditional CUDA graph nodes (note item #2)",
+      "note_artifact": null,
+      "claim_text": "Removes the per-round host relaunch and the loop-control D2H sync from the critical path.",
+      "stated_operating_point": "generic CUDA-graph decode loop",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "host_residue", "drafter": "eagle3", "k": 4},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "ratio", "value": null},
+      "check": "phase_share_amdahl",
+      "check_args": {"phase": "host_hi_s"},
+      "reason_code": null
+    },
+    {
+      "id": "T1.7-swiftspec-1.75x",
+      "note": "decode-systems",
+      "paper": "SwiftSpec (note item #3)",
+      "note_artifact": null,
+      "claim_text": "1.75x average over SOTA speculative systems, by running the draft asynchronously under verify.",
+      "stated_operating_point": "their multi-GPU spec-decode harness",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "draft", "drafter": "eagle3", "k": 4},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "ratio", "value": [175, 100]},
+      "check": "phase_share_amdahl",
+      "check_args": {"phase": "draft_hi_s"},
+      "reason_code": null
+    },
+    {
+      "id": "T1.8-relaxed-acceptance",
+      "note": "specdec",
+      "paper": "relaxed/fuzzy acceptance (note item F2)",
+      "note_artifact": null,
+      "claim_text": "~1.2-2.5x depending on the acceptance threshold delta.",
+      "stated_operating_point": "their acceptance-rate study",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "accept_rate", "drafter": "eagle3", "k": 4},
+      "lever_class": "accept_rate_only",
+      "claimed": {"kind": "ratio", "value": [25, 10]},
+      "check": "accept_rate_ceiling",
+      "check_args": {},
+      "reason_code": null
+    },
+    {
+      "id": "T1.5d-pdl-griddepcontrol",
+      "note": "decode-systems",
+      "paper": "programmatic dependent launch (note item #1)",
+      "note_artifact": null,
+      "claim_text": "Overlapping kernel prolog with the predecessor's epilog removes launch-tail bubbles from the decode critical path.",
+      "stated_operating_point": "generic dependent-kernel decode chain",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "verify", "drafter": "eagle3", "k": 4},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "ratio", "value": null},
+      "check": "verify_weight_floor_ratio",
+      "check_args": {},
+      "reason_code": null
+    },
+    {
+      "id": "T1.5e-rope-q-kv-fusion",
+      "note": "decode-systems",
+      "paper": "fused RoPE + Q projection + KV write (note item #4)",
+      "note_artifact": null,
+      "claim_text": "Fusing RoPE, the Q projection and the KV write removes intermediate round-trips from the decode step.",
+      "stated_operating_point": "generic decode step",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "verify", "drafter": "eagle3", "k": 4},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "ratio", "value": null},
+      "check": "verify_weight_floor_ratio",
+      "check_args": {},
+      "reason_code": null
+    },
+    {
+      "id": "T2.1-tcgen05-fp4-mma",
+      "note": "blackwell-fp4",
+      "paper": "tcgen05 block-scaled MMA (#3) and SageAttention3 (#4)",
+      "note_artifact": null,
+      "claim_text": "2-4x Hopper WGMMA throughput on FP4; 1038 TOPS / 5x FlashAttention.",
+      "stated_operating_point": "RTX 5090 microbenchmarks",
+      "our_context": {"model": "gemma-4-31b-it-nvfp4", "phase": "verify", "drafter": "eagle3", "k": 4},
+      "lever_class": "cuts_compute",
+      "claimed": {"kind": "ratio", "value": [4, 1]},
+      "check": null,
+      "check_args": null,
+      "reason_code": "NEEDS_MACHINE_CONSTANT"
+    },
+    {
+      "id": "T2.2-moe-sm-occupancy",
+      "note": "moe-serving",
+      "paper": "MoE launch occupancy (note item #1)",
+      "note_artifact": null,
+      "claim_text": "Only 1 block, 99.3% of SMs idle at batch-1/32-expert; 1.78x per MoE layer.",
+      "stated_operating_point": "batch-1, 32 experts",
+      "our_context": {"model": "qwen3.6-35b-a3b-nvfp4", "phase": "m1_decode", "drafter": null, "k": null},
+      "lever_class": "schedule_only",
+      "claimed": {"kind": "ratio", "value": [178, 100]},
+      "check": null,
+      "check_args": null,
+      "reason_code": "NEEDS_MACHINE_CONSTANT"
+    },
+    {
+      "id": "T2.3-acceptmoe",
+      "note": "specdec",
+      "paper": "AcceptMoE (note item F1)",
+      "note_artifact": null,
+      "claim_text": "23-34 experts/layer at 0.27pp quality cost, 1.29x in the all-resident regime.",
+      "stated_operating_point": "their MoE spec-decode harness",
+      "our_context": {"model": "qwen3.6-35b-a3b-nvfp4", "phase": "verify", "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes",
+      "claimed": {"kind": "ratio", "value": [129, 100]},
+      "check": null,
+      "check_args": null,
+      "reason_code": "NEEDS_MOE_PHASE_MANIFEST"
+    },
+    {
+      "id": "T3.01-sparsespec-l",
+      "note": "specdec", "paper": "SparseSpec-L (F5)", "note_artifact": null,
+      "claim_text": "2.79x.", "stated_operating_point": "Laguna-XS-2.1 / DFlash",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes", "claimed": {"kind": "ratio", "value": [279, 100]},
+      "check": null, "check_args": null, "reason_code": "NO_CHECKPOINT"
+    },
+    {
+      "id": "T3.02-ml-specqd",
+      "note": "blackwell-fp4", "paper": "ML-SpecQD (#5)", "note_artifact": null,
+      "claim_text": "2.72x.", "stated_operating_point": "Laguna-anchored",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes", "claimed": {"kind": "ratio", "value": [272, 100]},
+      "check": null, "check_args": null, "reason_code": "NO_CHECKPOINT"
+    },
+    {
+      "id": "T3.03-fast-dllm",
+      "note": "our-models", "paper": "Fast-dLLM (#7)", "note_artifact": null,
+      "claim_text": "2.5x.", "stated_operating_point": "Laguna-anchored",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "schedule_only", "claimed": {"kind": "ratio", "value": [25, 10]},
+      "check": null, "check_args": null, "reason_code": "NO_CHECKPOINT"
+    },
+    {
+      "id": "T3.04-laguna-operating-point",
+      "note": "our-models", "paper": "the Laguna operating point itself", "note_artifact": null,
+      "claim_text": "Laguna 5.9 ms/round, floor 3.25 ms, 169 -> 220-254 tok/s.",
+      "stated_operating_point": "Laguna-XS-2.1 + DFlash",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "schedule_only", "claimed": {"kind": "ratio", "value": [254, 169]},
+      "check": null, "check_args": null, "reason_code": "NO_CHECKPOINT"
+    },
+    {
+      "id": "T3.05-acceptmoe-quality",
+      "note": "specdec", "paper": "AcceptMoE (F1) quality term", "note_artifact": null,
+      "claim_text": "0.27pp accuracy cost.", "stated_operating_point": "their eval suite",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "accept_rate_only", "claimed": {"kind": "quality_delta_pp", "value": [27, 100]},
+      "check": null, "check_args": null, "reason_code": "NO_EVAL_ARTIFACT"
+    },
+    {
+      "id": "T3.06-f2-perplexity",
+      "note": "specdec", "paper": "relaxed acceptance (F2) quality term", "note_artifact": null,
+      "claim_text": "<5% perplexity increase.", "stated_operating_point": "their eval suite",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "accept_rate_only", "claimed": {"kind": "quality_delta_pct", "value": [5, 100]},
+      "check": null, "check_args": null, "reason_code": "NO_EVAL_ARTIFACT"
+    },
+    {
+      "id": "T3.07-selfjudge",
+      "note": "specdec", "paper": "SelfJudge (F3)", "note_artifact": null,
+      "claim_text": "+46.3% speed / -1.6% accuracy.", "stated_operating_point": "their eval suite",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "accept_rate_only", "claimed": {"kind": "ratio", "value": [1463, 1000]},
+      "check": null, "check_args": null, "reason_code": "NO_EVAL_ARTIFACT"
+    },
+    {
+      "id": "T3.08-specreason",
+      "note": "specdec", "paper": "SpecReason (F6)", "note_artifact": null,
+      "claim_text": "+9.9%.", "stated_operating_point": "their eval suite",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "accept_rate_only", "claimed": {"kind": "ratio", "value": [1099, 1000]},
+      "check": null, "check_args": null, "reason_code": "NO_EVAL_ARTIFACT"
+    },
+    {
+      "id": "T3.09-dynaexq",
+      "note": "our-models", "paper": "DynaExq (#6)", "note_artifact": null,
+      "claim_text": "+4.5 points.", "stated_operating_point": "their eval suite",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes", "claimed": {"kind": "quality_delta_pt", "value": [45, 10]},
+      "check": null, "check_args": null, "reason_code": "NO_EVAL_ARTIFACT"
+    },
+    {
+      "id": "T3.10-adamas-quality",
+      "note": "longctx", "paper": "Adamas (#3) quality term", "note_artifact": null,
+      "claim_text": "<= full-attention perplexity.", "stated_operating_point": "their eval suite",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_kv_bytes", "claimed": {"kind": "quality_delta_pct", "value": [0, 1]},
+      "check": null, "check_args": null, "reason_code": "NO_EVAL_ARTIFACT"
+    },
+    {
+      "id": "T3.11-sageattention3-tops",
+      "note": "blackwell-fp4", "paper": "SageAttention3 (#4) raw throughput", "note_artifact": null,
+      "claim_text": "1038 TOPS.", "stated_operating_point": "RTX 5090",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_compute", "claimed": {"kind": "tops", "value": [1038, 1]},
+      "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"
+    },
+    {
+      "id": "T3.12-mpk",
+      "note": "decode-systems", "paper": "MPK megakernel", "note_artifact": null,
+      "claim_text": "A100 14.5 -> 12.5 ms/tok.", "stated_operating_point": "A100",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "schedule_only", "claimed": {"kind": "ratio", "value": [145, 125]},
+      "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"
+    },
+    {
+      "id": "T3.13-ada-mk",
+      "note": "decode-systems", "paper": "Ada-MK", "note_artifact": null,
+      "claim_text": "+23.6% over TRT-LLM.", "stated_operating_point": "their box and baseline",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "schedule_only", "claimed": {"kind": "ratio", "value": [1236, 1000]},
+      "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"
+    },
+    {
+      "id": "T3.14-apple-npu-accelerator",
+      "note": "decode-systems", "paper": "Apple Neural Accelerator (#5)", "note_artifact": null,
+      "claim_text": "vendor throughput figures.", "stated_operating_point": "newest-generation Apple silicon",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_compute", "claimed": {"kind": "ratio", "value": null},
+      "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"
+    },
+    {
+      "id": "T3.15-seerattention-r",
+      "note": "longctx", "paper": "SeerAttention-R", "note_artifact": null,
+      "claim_text": "9x over FlashAttention-3.", "stated_operating_point": "H100 / TileLang",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_compute", "claimed": {"kind": "ratio", "value": [9, 1]},
+      "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"
+    },
+    {
+      "id": "T3.16-xattention-prefill",
+      "note": "longctx", "paper": "XAttention (#6)", "note_artifact": null,
+      "claim_text": "13.5x prefill.", "stated_operating_point": "their long-prefill benchmark",
+      "our_context": {"model": null, "phase": "prefill", "drafter": null, "k": null},
+      "lever_class": "cuts_compute", "claimed": {"kind": "ratio", "value": [135, 10]},
+      "check": null, "check_args": null, "reason_code": "PHASE_NOT_FORMALIZED"
+    },
+    {
+      "id": "T3.17-prefill-dominated-term",
+      "note": "longctx", "paper": "the note's own prefill term", "note_artifact": null,
+      "claim_text": "12.75 ms prefill-dominated term.", "stated_operating_point": "unstated",
+      "our_context": {"model": null, "phase": "prefill", "drafter": null, "k": null},
+      "lever_class": "cuts_compute", "claimed": {"kind": "ms", "value": [1275, 100]},
+      "check": null, "check_args": null, "reason_code": "PHASE_NOT_FORMALIZED"
+    },
+    {
+      "id": "T3.18-set-block-decoding",
+      "note": "our-models", "paper": "Set Block Decoding (#4)", "note_artifact": null,
+      "claim_text": "3-5x.", "stated_operating_point": "requires retraining",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "schedule_only", "claimed": {"kind": "ratio", "value": [5, 1]},
+      "check": null, "check_args": null, "reason_code": "TRAINING_GATED"
+    },
+    {
+      "id": "T3.19-nvfp4-qad",
+      "note": "our-models", "paper": "NVFP4 quantization-aware distillation (#5)", "note_artifact": null,
+      "claim_text": "quality recovery via QAD.", "stated_operating_point": "requires retraining",
+      "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
+      "lever_class": "cuts_weight_bytes", "claimed": {"kind": "ratio", "value": null},
+      "check": null, "check_args": null, "reason_code": "TRAINING_GATED"
+    }
+  ]
+}

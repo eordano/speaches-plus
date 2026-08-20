@@ -1,0 +1,27 @@
+{
+  "name": "071-ocr-layout-report",
+  "family": "071-ocr-layout",
+  "description": "Rendered full-page layout: Single-column numbered report with bullet metrics. Scored as raw CER and as markup-neutral CER (the gating number). Classical gates require the tessdata_best eng.traineddata cache (NV_OCR_TESSDATA); model gates require DeepSeek-OCR weights.",
+  "input": "input.png",
+  "expected_text": "Quarterly Engineering Report\nQ2 2026 - Platform Infrastructure Team\n1. Summary\nService availability held at 99.97% across all regions this quarter.\nThe migration to the new scheduler completed two weeks ahead of plan.\n2. Key Metrics\n- Median API latency: 41 ms (down from 58 ms)\n- Error budget consumed: 22 percent\n- Deployments per week: 134\n- Mean time to recovery: 11 minutes\n3. Incidents\nTwo SEV-2 incidents occurred in May, both traced to a faulty rollout of\nthe connection pooler. A full postmortem is linked in the appendix.\n4. Next Quarter\nWe will pilot zonal failover drills and finish the IPv6 rollout.\nPrepared by: R. Alvarez, approved by the infrastructure steering group.",
+  "render": {
+    "generator": "render_pages.py (PIL, DejaVu fonts, 1400x1900)",
+    "case": "real-03-report"
+  },
+  "gates": {
+    "cer_max_model": 0.2,
+    "cer_max_model_neutral": 0.02,
+    "cer_max_classical": 0.01,
+    "cer_max_classical_neutral": 0.01
+  },
+  "oracle": {
+    "enabled": false
+  },
+  "comparison_strategy": "cer_markup_neutral+layout_gates",
+  "skip_when_no_model": true,
+  "scoring": {
+    "raw": "character edit distance against expected_text verbatim",
+    "neutral": "same distance after nv-ocr tests/markup_neutral.rs::markup_neutral (port of real5/score.py::strip_markup + whitespace collapse); this is the gating number"
+  },
+  "notes": "single-column numbered report with bullet metrics"
+}
