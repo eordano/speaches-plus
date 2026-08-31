@@ -1,0 +1,31 @@
+{
+  "ladder": "e4b-graph-deep",
+  "mode": "ours",
+  "base_args": {
+    "build-name": "e4b graph-deep",
+    "model": "gemma-4-E4B-it",
+    "backend": "cuda",
+    "pkg": "nv-models",
+    "features": "cuda,wgpu",
+    "suite": "e4b_wgpu_prefill_session_phases",
+    "exact": "e4b_wgpu_serving_session_phase_walls_cold_then_warm",
+    "parse": "ctx-scaling",
+    "timeout": "3600"
+  },
+  "base_env": {
+    "NV_E4B_SERVING_TEST": "1"
+  },
+  "depth_env": "NV_CTX_TOKENS",
+  "depths": [
+    120000
+  ],
+  "depths_per_run": false,
+  "notes": "the E4B graph's missing deep cell: e4b cupf covered 8192/32768 (~201/163 tok/s cuda) and the fleet three-depth convention wants a deep point; llama.cpp metal comparator exists at 74.0 shallow (different box class -- annotate, do not ratio); low priority, runs in any idle gap after the sibling's windows",
+  "baseline_arm": "bare-defaults",
+  "arms": [
+    {
+      "name": "bare-defaults",
+      "env": {}
+    }
+  ]
+}

@@ -2,7 +2,7 @@
   description = "speaches-plus -- Rust/Go realtime servers + Python nano-vLLM (chat / ASR / TTS / image+video)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-  inputs.nix-hug.url = "github:eordano/nix-hug";
+  inputs.nix-hug.url = "path:../nix-hug";
   inputs.nix-hug.inputs.nixpkgs.follows = "nixpkgs";
   inputs.nixpkgs-pyannote3.url = "github:NixOS/nixpkgs/nixos-24.05";
   inputs.crane.url = "github:ipetkov/crane";
@@ -67,6 +67,16 @@
             (_pyFinal: pyPrev: {
 
               httpcore2 = pyPrev.httpcore2.overridePythonAttrs (_: {
+                doCheck = false;
+                doInstallCheck = false;
+              });
+
+              httpx2 = pyPrev.httpx2.overridePythonAttrs (_: {
+                doCheck = false;
+                doInstallCheck = false;
+              });
+
+              django = pyPrev.django.overridePythonAttrs (_: {
                 doCheck = false;
                 doInstallCheck = false;
               });
@@ -709,7 +719,10 @@
             export PATH="$SPEACHES_CMAKE_SHIM_DIR:$PATH"
           ''
           + pkgs.lib.optionalString isLinux ''
-            export LD_LIBRARY_PATH="/run/opengl-driver/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            if [ -z "''${VK_ICD_FILENAMES:-}" ] && [ -e /run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json ]; then
+              export VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json
+            fi
           ''
           + pkgs.lib.optionalString (!isLinux) ''
             export CC="${pkgs.stdenv.cc}/bin/cc"
@@ -917,11 +930,6 @@
             version = "0.0.1";
             src = ./rust;
 
-            # mkDummySrc stubs every path-dependency crate, but
-            # third-party/wgpu-hal-30.0.0 is a [patch.crates-io] override that
-            # wgpu-core compiles against during buildDepsOnly: a stubbed lib.rs
-            # there fails the whole deps build on unresolved hal imports, so the
-            # real sources are restored into the dummy tree.
             extraDummyScript = ''
               rm -rf $out/third-party
               cp -r --no-preserve=mode,ownership ${./rust/third-party} $out/third-party
@@ -1185,6 +1193,63 @@
 
       cpuPythonPackages = forAllSystems (system: mkPythonPackages system (mkPkgs system));
       cudaPythonPackages = forAllSystems (system: mkPythonPackages system (mkCudaPkgs system));
+
+      mkDiarizenExporter =
+        system:
+        let
+          pkgs3 = import nixpkgs-pyannote3 { inherit system; };
+          diarizenCkpt = (cpuPythonPackages.${system}).models.diarizen;
+          diarizenSrc = pkgs3.fetchFromGitHub {
+            owner = "BUTSpeechFIT";
+            repo = "DiariZen";
+            rev = "a60b18151dbbe246e4199d8ef5cd2ece3872ea94";
+            hash = "sha256-i6IsyJz63vshkXmOqWZjZ+nPHe6i9YKLu5nzE+NtLgA=";
+          };
+          pyannoteFork = pkgs3.python3Packages.pyannote-audio.overridePythonAttrs (_: {
+            version = "3.1.1-diarizen";
+            src = diarizenSrc;
+            sourceRoot = "${diarizenSrc.name}/pyannote-audio";
+            doCheck = false;
+            dontCheckRuntimeDeps = true;
+            pythonImportsCheck = [ ];
+          });
+          diarizen = pkgs3.python3Packages.buildPythonPackage {
+            pname = "diarizen";
+            version = "0.0.1-unstable-2026-06-17";
+            format = "pyproject";
+            src = diarizenSrc;
+            nativeBuildInputs = with pkgs3.python3Packages; [ flit-core ];
+            propagatedBuildInputs = with pkgs3.python3Packages; [
+              torch
+              torchaudio
+              einops
+              accelerate
+              onnx
+              pyannoteFork
+            ];
+            pythonImportsCheck = [ ];
+            dontCheckRuntimeDeps = true;
+            doCheck = false;
+          };
+          env = pkgs3.python3.withPackages (_: [
+            diarizen
+            pkgs3.python3Packages.toml
+          ]);
+        in
+        {
+          inherit env;
+          onnx =
+            pkgs3.runCommand "diarizen-segmentation.onnx"
+              {
+                nativeBuildInputs = [ env ];
+              }
+              ''
+                export HOME="$TMPDIR" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+                # --chunk-seconds 16 must match DiarConfig.chunk_seconds in the
+                # rust/go backends (the ONNX sample axis is static).
+                python3 ${./rust/scripts/export-diarizen-onnx.py} --chunk-seconds 16 ${diarizenCkpt} "$out"
+              '';
+        };
     in
     {
       devShells = forAllSystems (
@@ -1264,6 +1329,7 @@
                 _ln ${pyModels.smartTurnV3}/smart-turn-v3.2-gpu.onnx      "$tree/smart-turn-v3.onnx"
                 _ln ${pyModels.diarizen}                                  "$tree/diarizen-large-s80-v2"
                 _ln ${pyModels.wespeaker}/voxceleb_resnet293_LM.onnx      "$tree/wespeaker-resnet293-LM.onnx"
+                ${nixpkgs.lib.optionalString pyPkgs.stdenv.isLinux ''_ln ${(mkDiarizenExporter system).onnx} "$tree/diarizen-segmentation.onnx"''}
               done
               # Linux-only: ct2_bindings/_ct2.so + whisper_bindings/_whisper.so
               # don't have rpath baked in (setuptools doesn't auto-emit -Wl,-rpath
@@ -1387,60 +1453,7 @@
           py = cpuPythonPackages.${system};
           pyCuda = cudaPythonPackages.${system};
 
-          diarizenExporter =
-            let
-              pkgs3 = import nixpkgs-pyannote3 { inherit system; };
-              diarizenSrc = pkgs3.fetchFromGitHub {
-                owner = "BUTSpeechFIT";
-                repo = "DiariZen";
-                rev = "a60b18151dbbe246e4199d8ef5cd2ece3872ea94";
-                hash = "sha256-i6IsyJz63vshkXmOqWZjZ+nPHe6i9YKLu5nzE+NtLgA=";
-              };
-              pyannoteFork = pkgs3.python3Packages.pyannote-audio.overridePythonAttrs (_: {
-                version = "3.1.1-diarizen";
-                src = diarizenSrc;
-                sourceRoot = "${diarizenSrc.name}/pyannote-audio";
-                doCheck = false;
-                dontCheckRuntimeDeps = true;
-                pythonImportsCheck = [ ];
-              });
-              diarizen = pkgs3.python3Packages.buildPythonPackage {
-                pname = "diarizen";
-                version = "0.0.1-unstable-2026-06-17";
-                format = "pyproject";
-                src = diarizenSrc;
-                nativeBuildInputs = with pkgs3.python3Packages; [ flit-core ];
-                propagatedBuildInputs = with pkgs3.python3Packages; [
-                  torch
-                  torchaudio
-                  einops
-                  accelerate
-                  onnx
-                  pyannoteFork
-                ];
-                pythonImportsCheck = [ ];
-                dontCheckRuntimeDeps = true;
-                doCheck = false;
-              };
-              env = pkgs3.python3.withPackages (_: [
-                diarizen
-                pkgs3.python3Packages.toml
-              ]);
-            in
-            {
-              inherit env;
-              onnx =
-                pkgs3.runCommand "diarizen-segmentation.onnx"
-                  {
-                    nativeBuildInputs = [ env ];
-                  }
-                  ''
-                    export HOME="$TMPDIR" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-                    # --chunk-seconds 16 must match DiarConfig.chunk_seconds in the
-                    # rust/go backends (the ONNX sample axis is static).
-                    python3 ${./rust/scripts/export-diarizen-onnx.py} --chunk-seconds 16 ${py.models.diarizen} "$out"
-                  '';
-            };
+          diarizenExporter = mkDiarizenExporter system;
         in
         {
           speaches-plus = mkPkg false "full";

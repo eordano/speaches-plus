@@ -1,7 +1,6 @@
 #![cfg(feature = "wgpu")]
 
 mod common;
-use common::wgpu_allow_skip;
 use half::{bf16, f16};
 use nv_kernels::wgpu_backend::device::WgpuContext;
 use nv_kernels::wgpu_backend::{compose, dispatch};
@@ -362,9 +361,12 @@ fn gpu_quantize_feeding_gpu_gemv_tracks_the_f64_dequant_oracle_at_serving_shapes
     let Some(ctx) = ctx_or_skip("q8dot_e2e") else {
         return;
     };
-    for &(n, k, group_elems, seed) in
-        &[(5120usize, 5120usize, 128usize, 61u64), (12288, 5120, 128, 62)]
-    {
+    for &(n, k, group_elems, seed) in &[
+        (5120usize, 5120usize, 128usize, 61u64),
+        (12288, 5120, 128, 62),
+        (17408, 5120, 128, 63),
+        (5120, 17408, 128, 64),
+    ] {
         let w = gen_weights(n, k, group_elems, seed);
         let x = gen_x_bf16(k, seed ^ 0xe2e);
         let acts = run_quantize(ctx, "q8d-e2e-quant", &x);
@@ -430,9 +432,11 @@ fn planted_group_index_swap_is_caught_by_the_parity_harness() {
     }
 }
 
+const DRAM_HONEST_WEIGHT_REPLICAS_OVERFLOW_THE_128MB_BLACKWELL_L2: usize = 8;
+
 struct StepPass {
     pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    bind_group: wgpu::BindGroup,
+    bind_groups: Vec<wgpu::BindGroup>,
     groups: (u32, u32, u32),
 }
 
@@ -444,8 +448,10 @@ fn time_steps(ctx: &WgpuContext, passes: &[StepPass], steps: usize) -> f64 {
             for _ in 0..count {
                 for p in passes {
                     pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind_group, &[]);
-                    pass.dispatch_workgroups(p.groups.0, p.groups.1, p.groups.2);
+                    for bg in &p.bind_groups {
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(p.groups.0, p.groups.1, p.groups.2);
+                    }
                 }
             }
         }
@@ -461,14 +467,18 @@ fn time_steps(ctx: &WgpuContext, passes: &[StepPass], steps: usize) -> f64 {
 
 #[test]
 #[ignore]
-fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match_bench() {
+fn w8a8_int_dot_edges_w8a16_at_dram_but_loses_to_nvfp4_which_streams_half_the_weight_bytes_bench() {
     let Some(ctx) = ctx_or_skip("q8dot_bench") else {
         return;
     };
-    let k = 5120usize;
-    let k_blocks = k / 32;
     let group_elems = 128usize;
-    for &(n, steps) in &[(5120usize, 400usize), (12288, 200)] {
+    for &(n, k, steps) in &[
+        (5120usize, 5120usize, 400usize),
+        (12288, 5120, 200),
+        (17408, 5120, 200),
+        (5120, 17408, 200),
+    ] {
+        let k_blocks = k / 32;
         let w = gen_weights(n, k, group_elems, 0xd0 ^ n as u64);
         let x = gen_x_bf16(k, 0xd1 ^ n as u64);
         let acts = host_quantize(&x);
@@ -484,7 +494,9 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
             group_blocks: w.group_blocks as u32,
             groups_x: q8_groups.0,
         };
-        let q8_wb = dispatch::storage_from_slice(ctx, "q8b-w", &wq_words);
+        let wbs: Vec<wgpu::Buffer> = (0..DRAM_HONEST_WEIGHT_REPLICAS_OVERFLOW_THE_128MB_BLACKWELL_L2)
+            .map(|r| dispatch::storage_from_slice(ctx, &format!("q8b-w{r}"), &wq_words))
+            .collect();
         let q8_sb = dispatch::storage_from_slice(ctx, "q8b-s", &scales);
         let q8_qb = dispatch::storage_from_slice(ctx, "q8b-xq", &acts.q_words);
         let q8_dsb = dispatch::storage_from_slice(ctx, "q8b-xds", &acts.ds_words);
@@ -493,18 +505,23 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
         let q8_pipeline =
             dispatch::cached_compute_pipeline(ctx, "q8b-gemv", Q8DOT_WGSL, GEMV_ENTRY)
                 .expect("q8dot pipeline");
-        let q8_bind = dispatch::bind_group(
-            ctx,
-            &q8_pipeline,
-            &[
-                (4, &q8_wb),
-                (5, &q8_sb),
-                (6, &q8_qb),
-                (7, &q8_dsb),
-                (8, &q8_ub),
-                (9, &q8_yb),
-            ],
-        );
+        let q8_binds: Vec<wgpu::BindGroup> = wbs
+            .iter()
+            .map(|wb| {
+                dispatch::bind_group(
+                    ctx,
+                    &q8_pipeline,
+                    &[
+                        (4, wb),
+                        (5, &q8_sb),
+                        (6, &q8_qb),
+                        (7, &q8_dsb),
+                        (8, &q8_ub),
+                        (9, &q8_yb),
+                    ],
+                )
+            })
+            .collect();
 
         let smem_groups = gemv_groups(ctx, GEMV_SMEM_ENTRY, n);
         let smem_params = GemvParams {
@@ -515,18 +532,23 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
         let smem_pipeline =
             dispatch::cached_compute_pipeline(ctx, "q8b-gemv-smem", Q8DOT_WGSL, GEMV_SMEM_ENTRY)
                 .expect("q8dot smem pipeline");
-        let smem_bind = dispatch::bind_group(
-            ctx,
-            &smem_pipeline,
-            &[
-                (4, &q8_wb),
-                (5, &q8_sb),
-                (6, &q8_qb),
-                (7, &q8_dsb),
-                (8, &smem_ub),
-                (9, &q8_yb),
-            ],
-        );
+        let smem_binds: Vec<wgpu::BindGroup> = wbs
+            .iter()
+            .map(|wb| {
+                dispatch::bind_group(
+                    ctx,
+                    &smem_pipeline,
+                    &[
+                        (4, wb),
+                        (5, &q8_sb),
+                        (6, &q8_qb),
+                        (7, &q8_dsb),
+                        (8, &smem_ub),
+                        (9, &q8_yb),
+                    ],
+                )
+            })
+            .collect();
 
         let sg_groups = gemv_groups(ctx, GEMV_SG_ENTRY, n);
         let sg_params = GemvParams {
@@ -538,18 +560,23 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
         let sg_pipeline =
             dispatch::cached_compute_pipeline(ctx, "q8b-gemv-sg", Q8DOT_WGSL, GEMV_SG_ENTRY)
                 .expect("q8dot sg pipeline");
-        let sg_bind = dispatch::bind_group(
-            ctx,
-            &sg_pipeline,
-            &[
-                (4, &q8_wb),
-                (5, &q8_sb),
-                (6, &q8_qb),
-                (8, &sg_ub),
-                (9, &q8_yb),
-                (11, &sg_dfb),
-            ],
-        );
+        let sg_binds: Vec<wgpu::BindGroup> = wbs
+            .iter()
+            .map(|wb| {
+                dispatch::bind_group(
+                    ctx,
+                    &sg_pipeline,
+                    &[
+                        (4, wb),
+                        (5, &q8_sb),
+                        (6, &q8_qb),
+                        (8, &sg_ub),
+                        (9, &q8_yb),
+                        (11, &sg_dfb),
+                    ],
+                )
+            })
+            .collect();
 
         let quant_params = QuantParams {
             k_blocks: k_blocks as u32,
@@ -563,11 +590,16 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
         let quant_pipeline =
             dispatch::cached_compute_pipeline(ctx, "q8b-quant-df", Q8DOT_WGSL, "q8d_quantize_x_df")
                 .expect("quant pipeline");
-        let quant_bind = dispatch::bind_group(
-            ctx,
-            &quant_pipeline,
-            &[(0, &quant_xb), (1, &q8_qb), (3, &quant_ub), (10, &sg_dfb)],
-        );
+        let quant_binds: Vec<wgpu::BindGroup> = wbs
+            .iter()
+            .map(|_| {
+                dispatch::bind_group(
+                    ctx,
+                    &quant_pipeline,
+                    &[(0, &quant_xb), (1, &q8_qb), (3, &quant_ub), (10, &sg_dfb)],
+                )
+            })
+            .collect();
 
         let w16_words_per_row = k / 4;
         let group_shift_words = 5u32;
@@ -582,7 +614,6 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
         let w16_scales: Vec<f32> = (0..n * (w16_words_per_row >> group_shift_words))
             .map(|i| 0.004 + (i % 7) as f32 * 0.001)
             .collect();
-        let w16_wb = dispatch::storage_from_slice(ctx, "w16b-w", &wq_words);
         let w16_sb = dispatch::storage_from_slice(ctx, "w16b-s", &w16_scales);
         let w16_xb = dispatch::storage_from_slice(ctx, "w16b-x", &pack_u16(&x));
         let w16_yb = dispatch::storage_from_slice(ctx, "w16b-y", &vec![0u32; n.div_ceil(2)]);
@@ -594,53 +625,63 @@ fn w8a8_int_dot_loses_to_w8a16_float_fma_here_because_weight_bytes_already_match
             Q3D_I8_ENTRY,
         )
         .expect("q3d i8 pipeline");
-        let w16_bind = dispatch::bind_group(
-            ctx,
-            &w16_pipeline,
-            &[
-                (0, &w16_wb),
-                (1, &w16_sb),
-                (2, &w16_xb),
-                (3, &w16_yb),
-                (4, &w16_ub),
-            ],
-        );
+        let w16_binds: Vec<wgpu::BindGroup> = wbs
+            .iter()
+            .map(|wb| {
+                dispatch::bind_group(
+                    ctx,
+                    &w16_pipeline,
+                    &[
+                        (0, wb),
+                        (1, &w16_sb),
+                        (2, &w16_xb),
+                        (3, &w16_yb),
+                        (4, &w16_ub),
+                    ],
+                )
+            })
+            .collect();
 
         let w16_pass = StepPass {
             pipeline: w16_pipeline,
-            bind_group: w16_bind,
+            bind_groups: w16_binds,
             groups: (w16_params.groups_x, 1, 1),
         };
         let q8_pass = StepPass {
             pipeline: q8_pipeline,
-            bind_group: q8_bind,
+            bind_groups: q8_binds,
             groups: q8_groups,
         };
         let quant_pass = StepPass {
             pipeline: quant_pipeline,
-            bind_group: quant_bind,
+            bind_groups: quant_binds,
             groups: (k_blocks.div_ceil(64) as u32, 1, 1),
         };
         let smem_pass = StepPass {
             pipeline: smem_pipeline,
-            bind_group: smem_bind,
+            bind_groups: smem_binds,
             groups: smem_groups,
         };
         let sg_pass = StepPass {
             pipeline: sg_pipeline,
-            bind_group: sg_bind,
+            bind_groups: sg_binds,
             groups: sg_groups,
         };
 
-        let t_w16 = time_steps(ctx, std::slice::from_ref(&w16_pass), steps) / steps as f64;
-        let t_q8 = time_steps(ctx, std::slice::from_ref(&q8_pass), steps) / steps as f64;
-        let t_smem = time_steps(ctx, std::slice::from_ref(&smem_pass), steps) / steps as f64;
-        let t_sg = time_steps(ctx, std::slice::from_ref(&sg_pass), steps) / steps as f64;
+        let denom = (steps * DRAM_HONEST_WEIGHT_REPLICAS_OVERFLOW_THE_128MB_BLACKWELL_L2) as f64;
+        let t_w16 = time_steps(ctx, std::slice::from_ref(&w16_pass), steps) / denom;
+        let t_q8 = time_steps(ctx, std::slice::from_ref(&q8_pass), steps) / denom;
+        let t_smem = time_steps(ctx, std::slice::from_ref(&smem_pass), steps) / denom;
+        let t_sg = time_steps(ctx, std::slice::from_ref(&sg_pass), steps) / denom;
         let quant_then_gemv = [quant_pass, sg_pass];
-        let t_q8_full = time_steps(ctx, &quant_then_gemv, steps) / steps as f64;
+        let t_q8_full = time_steps(ctx, &quant_then_gemv, steps) / denom;
 
         let gbps = |t: f64| weight_bytes / t / 1e9;
-        eprintln!("-- n={n} k={k} i8 weight={:.1} MB", weight_bytes / 1e6);
+        eprintln!(
+            "-- n={n} k={k} i8 weight={:.1} MB x{} dram-honest replicas",
+            weight_bytes / 1e6,
+            DRAM_HONEST_WEIGHT_REPLICAS_OVERFLOW_THE_128MB_BLACKWELL_L2
+        );
         eprintln!(
             "   w8a16 float-fma      {:8.4} ms  eff {:7.1} GB/s",
             t_w16 * 1e3,

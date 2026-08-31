@@ -152,8 +152,13 @@ fn wait_for_idle(min_pct: u32, timeout: std::time::Duration) -> bool {
 #[ignore]
 fn bench_verify_chain_sp_attn_vs_smallm() {
     if std::env::var("NV_SMALLM_BENCH").as_deref() != Ok("1") {
-        eprintln!("bench_verify_chain_sp_attn_vs_smallm: SKIP set NV_SMALLM_BENCH=1 to run");
-        return;
+        panic!(
+            "NV_SMALLM_BENCH is not 1, so bench_verify_chain_sp_attn_vs_smallm executed nothing. \
+             It is already #[ignore]d, which makes --ignored the opt-in; a second env gate behind \
+             that can only make an --ignored run print `1 passed` for a bench that measured \
+             nothing. A suite whose precondition is absent must fail or be ignored, never return \
+             green."
+        );
     }
     let Some(c) = ctx("bench_verify_chain_sp_attn_vs_smallm") else {
         return;

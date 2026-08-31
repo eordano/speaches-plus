@@ -1,4 +1,4 @@
-# CLAUDE.md -- conventions for contributors and agents
+# CLAUDE.md -- context for future sessions
 
 `docs/book/01.4-STATUS.md` is the canonical what's-implemented / what's-open list;
 skim it first, never copy it here. Read `docs/book/05.7-apple-silicon-inference-architecture.md`
@@ -19,22 +19,18 @@ before any performance or kernel work; `docs/book/08.4-PERFORMANCE.md` governs q
 
 ## Working conventions
 
-- **Never add comments, and know why: nothing in a comment is durable.**
-  `strip-comments.py` deletes every comment form a reader would call
-  documentation -- `//`, `///` and `//!` alike -- so a comment is a note to
-  whoever is looking right now and to nobody after. Writing one is not merely
-  against convention, it is writing something with a scheduled deletion date.
-  Rationale that must survive goes in one of three places, all of which a build
-  or a test reads: a **name**, an **assertion message**, or **`docs/`**. Encode
-  restrictions in constants and put the reason in the constant's name --
-  `COOP_LADDER_SPEEDUPS_ON_RECORD_ARE_FROM_AN_APPLE_SILICON_ADAPTER` and `RING_REWIND_RESERVED_SLOTS`
-  are the pattern; a `///` above `const N = 61` is not, because the next format
-  pass removes it and the number is left looking arbitrary.
+- **Never add comments.** `strip-comments.py` deletes every documentation-form
+  comment -- `//`, `///` and `//!` alike. Rationale that must survive goes in
+  one of three places a build or a test reads: a **name**, an **assertion
+  message**, or **`docs/`**. Encode restrictions in constants and put the
+  reason in the constant's name --
+  `COOP_LADDER_SPEEDUPS_ON_RECORD_ARE_M2_ULTRA` and `RING_REWIND_RESERVED_SLOTS`
+  are the pattern; a `///` above `const N = 61` is not.
 - The one exception is a doc comment containing a fence cargo builds or runs
   (```` ``` ````, ```` ```no_run ````, ```` ```compile_fail ````): that is a
-  **test**, the stripper preserves it, and deleting it would drop coverage no
-  test count reports missing. ```` ```text ```` and ```` ```ignore ```` are prose
-  and go. Do not reach for a doctest as a way to smuggle prose past the stripper.
+  **test**, the stripper preserves it, and deleting it drops coverage.
+  ```` ```text ```` and ```` ```ignore ```` are prose and go. Do not use a
+  doctest to smuggle prose past the stripper.
 - Always optimize for small code.
 - Add knobs sparingly. When a new path is proven, remove the code it supersedes.
   CUDA and wgpu are parallel backends, not a ladder: a CUDA improvement
@@ -56,15 +52,13 @@ before any performance or kernel work; `docs/book/08.4-PERFORMANCE.md` governs q
   or planned to do. "X was measured at N", "this note records", "before any of
   this is built" are all the changelog voice: rewrite to the rule, or delete the
   page. When a doc's subject ships, the doc becomes a description of the shipped
-  thing or it goes; a plan kept past its build is a false map. Prefer deleting a
-  record to patching it, and grep for inbound references before you delete.
-- **Cite code by symbol, not by line number.** `file.rs:2299` rots within hours
-  in this repo and then points at a `}` or, worse, at an unrelated call that
-  reads as if it were the subject. Name the function, constant, test or env var
-  and give the file without a line. Before quoting any existing `path:line`,
-  open it -- a citation you did not check is a claim you did not make. (Line
-  numbers are still how you enumerate *published numbers inside documents*, per
-  the performance-default rule below.)
+  thing or it goes. Prefer deleting a record to patching it, and grep for inbound
+  references before you delete.
+- **Cite code by symbol, not by line number.** `file.rs:2299` rots within hours.
+  Name the function, constant, test or env var and give the file without a line.
+  Before quoting any existing `path:line`, open it. (Line numbers are still how
+  you enumerate *published numbers inside documents*, per the
+  performance-default rule below.)
 - Never flip a performance default. A correctness default may change only to fix a
   demonstrated defect: keep the old path behind an env var, state the cost, and
   list every published number measured on the old path, by document and line.
@@ -72,7 +66,7 @@ before any performance or kernel work; `docs/book/08.4-PERFORMANCE.md` governs q
 ## Building: always `rust/scripts/nvk.sh`
 
 Never bare `cargo` or per-command `nix develop` for Rust. The wrapper owns the
-cached devshell, `TMPDIR`, `CUDA_ARCH_LIST=12.0` (a Blackwell sm_120 target),
+cached devshell, `TMPDIR`, `CUDA_ARCH_LIST=12.0` (single Blackwell sm_120 box),
 per-lane `CARGO_TARGET_DIR`, ccache, and the Vulkan loader wgpu tests need.
 
 ```sh
@@ -90,8 +84,9 @@ NVK_LANE=x NVK_PKG=nv-models rust/scripts/nvk.sh test --test laguna_wgpu_model
 - To run a prebuilt test binary directly (profiler, interposer), first
   `source $HOME/.cache/cargo-tmp/devenv-__cuda.sh`.
 - Wait on builds by redirecting to a per-lane build log outside the source tree,
-  then ONE `until grep -qE '^(error|    Finished)' <log>; do sleep 15; done` --
-  never bare sleep-then-read polls, and never pipe build output into head/tail.
+  then ONE `until grep -qE '^(error|    Finished)' <log>; do sleep 15; done` or
+  `run_in_background`. Hooks deny bare sleep-then-read polls and deny piping
+  build commands into head/tail.
 - Non-Rust work uses `nix develop` directly (Go's cgo needs the live shell).
   Prefer `nix develop --offline` unless a flake input actually changed.
 
@@ -110,8 +105,11 @@ Baseline before claiming a fix or a break. A number without its basis tuple (che
 batch, token count, sha, log path) is not a number. `NV_DRAFTER=dflash` runs
 non-speculative if `NV_DFLASH_DRAFT_DIR` is unset. Discover model ids from
 `/v1/models`; idle-gate on `memory.used` and `uptime`, not `utilization.gpu`.
-Keep build artifacts and logs out of the source tree.
-Reuse `NVK_LANE` names -- stale lane target dirs dominate disk use. The cached
-cuda devenv exports `NV_CHAT_MODEL_DIR`/`HF_HUB_CACHE` over caller env (verify the
-`loading ... from` boot line); check `model-*.safetensors` exists before planning
-around a checkpoint.
+Keep build artifacts and logs out of the source tree. Disk truth is `zpool
+list` + `zfs get usedbysnapshots`, never `df`; never destroy snapshots unasked.
+Reuse `NVK_LANE` names -- stale lane target dirs dominate disk use; audit with
+`nvk.sh lanes`; reclaim stays manual via `nvk.sh lanes --reap DAYS [--dry-run]`. nvk.sh restores
+caller-set `NV_CHAT_MODEL_DIR(S)`/`NV_WGPU_CHAT_MODEL_DIRS`/`HF_HUB_CACHE` over the
+cached devenv, but sourcing `devenv-__cuda.sh` directly still overrides caller env
+(verify the `loading ... from` boot line); check `model-*.safetensors` exists before
+planning around a checkpoint.

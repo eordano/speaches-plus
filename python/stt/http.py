@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import numpy as np
 
 from .constants import WHISPER_SAMPLING_HZ
 from .segments import transcribe_long
-from .whisper import TranscriptionResult, WhisperBackend, join_segments
+from .whisper import TranscriptionResult, WhisperBackend
 
 MULTIPART_PARSE_LIMIT = 100 * 1024 * 1024
 FILE_READ_LIMIT = 200 * 1024 * 1024

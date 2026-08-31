@@ -43,8 +43,12 @@ fn lg4_xs_decode_true_times_2pow24_lands_bs_at_2powm96(bits: u32) -> f32 {
 }
 
 fn lg4_dot8_true_times_2pow96(ww: u32, xw: u32, dot_in: f32) -> f32 {
-    let d = dot4I8Packed(gemv_i8map(ww), gemv_i8map(xw))
-        + dot4I8Packed(gemv_i8map(ww >> 4u), gemv_i8map(xw >> 4u));
+    let lo_w = gemv_i8map(ww);
+    let lo_x = gemv_i8map(xw);
+    let hi_w = gemv_i8map(ww >> 4u);
+    let hi_x = gemv_i8map(xw >> 4u);
+    let d = gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together(
+        lo_w, lo_x, hi_w, hi_x);
     return dot_in + f32(d) * LG4_QUARTER_TIMES_2POW96_RESTORES_BS_CARRY;
 }
 

@@ -2,4 +2,4 @@
 import type { LayoutPageResult } from "./LayoutPageResult";
 import type { OcrToken } from "./OcrToken";
 
-export type DotsPageResult = { layout: LayoutPageResult, text: string, tokens: Array<OcrToken>, };
+export type DotsPageResult = { layout: LayoutPageResult, text: string, tokens: Array<OcrToken>, truncated: boolean, looped: boolean, };

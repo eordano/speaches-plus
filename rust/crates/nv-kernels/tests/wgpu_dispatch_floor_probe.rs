@@ -20,8 +20,12 @@ fn probe_b(@builtin(global_invocation_id) gid: vec3<u32>) {
             anyone builds it"]
 fn what_one_dispatch_costs_inside_a_single_pass() {
     if std::env::var("NV_DISPATCH_FLOOR_PROBE").is_err() {
-        eprintln!("skip: NV_DISPATCH_FLOOR_PROBE not set");
-        return;
+        panic!(
+            "NV_DISPATCH_FLOOR_PROBE is unset, so this dispatch floor probe executed nothing. It \
+             is already #[ignore]d, which makes --ignored the opt-in; a second env gate behind \
+             that can only make an --ignored run print `1 passed` for a floor nobody measured. A \
+             suite whose precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = WgpuContext::shared().expect("wgpu adapter required");
     let module = ctx

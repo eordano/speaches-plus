@@ -31,6 +31,7 @@ pub struct GptOssConfig {
     pub yarn_beta_fast: f32,
     pub yarn_beta_slow: f32,
     pub yarn_original_max: usize,
+    pub yarn_truncate_correction_dims: bool,
     pub tie_word_embeddings: bool,
 }
 
@@ -94,6 +95,10 @@ impl GptOssConfig {
             yarn_beta_fast: sub_f("beta_fast", 32.0) as f32,
             yarn_beta_slow: sub_f("beta_slow", 1.0) as f32,
             yarn_original_max: sub_u("original_max_position_embeddings", 0),
+            yarn_truncate_correction_dims: scaling
+                .and_then(|s| s.get("truncate"))
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
             tie_word_embeddings: v
                 .get("tie_word_embeddings")
                 .and_then(|x| x.as_bool())
@@ -129,8 +134,12 @@ pub fn yarn_inv_freq(cfg: &GptOssConfig) -> Vec<f32> {
     let find_correction_dim = |num_rot: f64| -> f64 {
         (dim as f64) * (orig / (num_rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln())
     };
-    let mut low = find_correction_dim(beta_fast).floor();
-    let mut high = find_correction_dim(beta_slow).ceil();
+    let mut low = find_correction_dim(beta_fast);
+    let mut high = find_correction_dim(beta_slow);
+    if cfg.yarn_truncate_correction_dims {
+        low = low.floor();
+        high = high.ceil();
+    }
     low = low.max(0.0);
     high = high.min(dim as f64 - 1.0);
     if (high - low).abs() < f64::EPSILON {

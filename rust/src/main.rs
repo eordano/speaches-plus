@@ -94,12 +94,26 @@ async fn main() -> anyhow::Result<()> {
 
     audio_eou_boot_gate()?;
 
+    let warming_listener = bind_listener(addr).await?;
+    info!(%addr, "listening (loading models, routes answer 503)");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut warming = tokio::spawn(async move {
+        let _ = axum::serve(warming_listener, warming_router())
+            .with_graceful_shutdown(async {
+                let _ = ready_rx.await;
+            })
+            .await;
+    });
+
     let models = models::Models::get_or_init().context("load models")?;
     #[cfg(feature = "wgpu")]
     let chat_registry = oapi::chat_engine_wgpu::registry_from_env_with_wgpu();
     #[cfg(not(feature = "wgpu"))]
     let chat_registry = oapi::chat_engine::registry_from_env();
     let chat_engine = chat_registry.as_ref().map(|r| r.default_engine());
+    if let Some(reg) = chat_registry.as_ref() {
+        oapi::chat_engine::publish_live_registry(reg);
+    }
     if let Some(eng) = chat_engine.as_ref() {
         warm_chat_engine(eng.clone()).await;
     }
@@ -114,10 +128,12 @@ async fn main() -> anyhow::Result<()> {
         speaker_encoder: speaker_encoder.clone(),
     };
 
+    oapi::vram_plan::reconcile_boot_plans_against_nvidia_smi_once();
+
     let _ = CHAT_MODEL_IDS.set(
         chat_registry
             .as_ref()
-            .map(|r| r.model_ids().to_vec())
+            .map(|r| r.model_ids())
             .unwrap_or_default(),
     );
 
@@ -151,10 +167,28 @@ async fn main() -> anyhow::Result<()> {
                 get(oapi::responses::handle_get_response)
                     .delete(oapi::responses::handle_delete_response),
             )
+            .merge(oapi::lora_runtime::routes())
             .with_state(chat_state)
     });
     if chat_router.is_none() {
-        info!("NV_CHAT_MODEL_DIR(S) not set -- /v1/chat/completions and /v1/completions disabled");
+        let configured_chat_env: Vec<&str> = CHAT_MODEL_ENV_VARS
+            .iter()
+            .filter(|v| std::env::var_os(v).is_some())
+            .copied()
+            .collect();
+        if configured_chat_env.is_empty() {
+            info!(
+                "NV_CHAT_MODEL_DIR(S) not set -- /v1/chat/completions and /v1/completions disabled"
+            );
+        } else {
+            warn!(
+                configured = ?configured_chat_env,
+                cuda_feature = cfg!(feature = "cuda"),
+                wgpu_feature = cfg!(feature = "wgpu"),
+                "chat model env is set but no chat engine loaded -- see the load/feature \
+                 messages above; /v1/chat/completions and /v1/completions disabled"
+            );
+        }
     }
 
     let audio_speech_router = Router::new()
@@ -273,16 +307,25 @@ async fn main() -> anyhow::Result<()> {
         app
     };
     let app = app.merge(ocr_router);
-    let app = app.merge(oapi::fine_tuning::router());
+    let app = app.merge(oapi::fine_tuning::router()).route(
+        "/v1/trajectory/label",
+        post(oapi::trajectory::handle_label),
+    );
     let app = app
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .layer(middleware::from_fn(auth_mw))
         .layer(middleware::from_fn(metrics_mw))
         .layer(middleware::from_fn(cors_mw));
 
-    let listener = tokio::net::TcpListener::bind(addr)
+    let _ = ready_tx.send(());
+    if tokio::time::timeout(WARMING_HANDOFF_DRAIN, &mut warming)
         .await
-        .with_context(|| format!("bind {addr}"))?;
+        .is_err()
+    {
+        warming.abort();
+        let _ = warming.await;
+    }
+    let listener = bind_listener(addr).await?;
     let _ = speaches_plus::oapi::SELF_ADDR.set(addr);
     info!(%addr, "listening");
     let serve_result = axum::serve(listener, app)
@@ -296,6 +339,56 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+const WARMING_RETRY_AFTER_SECONDS: &str = "5";
+const WARMING_HANDOFF_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+const REBIND_RETRIES_COVER_THE_HANDOFF_BETWEEN_WARMING_AND_SERVING_SOCKET: u32 = 40;
+const REBIND_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(25);
+
+async fn bind_listener(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    let mut last = None;
+    for _ in 0..REBIND_RETRIES_COVER_THE_HANDOFF_BETWEEN_WARMING_AND_SERVING_SOCKET {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) => {
+                last = Some(err);
+                tokio::time::sleep(REBIND_RETRY_GAP).await;
+            }
+        }
+    }
+    Err(anyhow::Error::from(last.expect("bind attempted at least once")))
+        .with_context(|| format!("bind {addr}"))
+}
+
+fn warming_router() -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/health/ready", get(readiness))
+        .route("/version", get(version_handler))
+        .route("/metrics", get(metrics_handler))
+        .fallback(warming_unavailable)
+}
+
+async fn warming_unavailable() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "speaches-plus is loading models; this route is not ready yet. \
+                        Poll /health/ready for the per-subsystem report.",
+            "type": "service_unavailable",
+            "code": "model_load_in_progress",
+        },
+        "status": "starting",
+    });
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::RETRY_AFTER, WARMING_RETRY_AFTER_SECONDS),
+        ],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 fn audio_eou_boot_gate() -> anyhow::Result<()> {
@@ -344,6 +437,12 @@ fn audio_eou_boot_gate() -> anyhow::Result<()> {
 
 static CHAT_MODEL_IDS: OnceLock<Vec<String>> = OnceLock::new();
 
+const CHAT_MODEL_ENV_VARS: [&str; 3] = [
+    "NV_CHAT_MODEL_DIR",
+    "NV_CHAT_MODEL_DIRS",
+    "NV_WGPU_CHAT_MODEL_DIRS",
+];
+
 #[cfg(feature = "wgpu")]
 fn wgpu_served_ids() -> Vec<String> {
     oapi::chat_engine_wgpu::registered_wgpu_model_ids()
@@ -355,7 +454,10 @@ fn wgpu_served_ids() -> Vec<String> {
 }
 
 async fn chat_engines_handler() -> Response {
-    let ids = CHAT_MODEL_IDS.get().cloned().unwrap_or_default();
+    let ids = oapi::chat_engine::live_registry()
+        .map(|r| r.model_ids())
+        .or_else(|| CHAT_MODEL_IDS.get().cloned())
+        .unwrap_or_default();
     let wgpu = wgpu_served_ids();
     let engines: Vec<serde_json::Value> = ids
         .iter()
@@ -415,7 +517,10 @@ fn process_wired_gib() -> Option<f64> {
 }
 
 async fn version_handler() -> Response {
-    let body = serde_json::json!({ "version": env!("CARGO_PKG_VERSION") });
+    let body = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": env!("NV_BUILD_GIT_SHA"),
+    });
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
@@ -709,14 +814,12 @@ fn api_key() -> Option<&'static str> {
         .as_deref()
 }
 
-use oapi::constant_time_eq;
-
 async fn auth_mw(req: Request, next: Next) -> Response {
     if let Some(key) = api_key() {
         let path = req.uri().path();
         let exempt = matches!(path, "/health" | "/health/ready" | "/metrics" | "/version");
-        if !exempt {
-            if !oapi::request_key_ok(req.headers(), key) {
+        if !exempt
+            && !oapi::request_key_ok(req.headers(), key) {
                 if path.starts_with("/v1/messages") {
                     return oapi::messages::anthropic_error(
                         StatusCode::UNAUTHORIZED,
@@ -726,7 +829,6 @@ async fn auth_mw(req: Request, next: Next) -> Response {
                 }
                 return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response();
             }
-        }
     }
     next.run(req).await
 }
@@ -1108,29 +1210,25 @@ async fn text_embeddings_handler(request: axum::extract::Request) -> Response {
 
 fn check_stt_params(
     language: Option<&str>,
-    prompt: Option<&str>,
     temperature: Option<&str>,
-) -> Result<(), (&'static str, String)> {
+) -> Result<Option<String>, (&'static str, String)> {
+    let mut resolved_language: Option<String> = None;
     if let Some(v) = language {
         let v = v.trim();
         if !v.is_empty() && !v.eq_ignore_ascii_case("auto") {
-            return Err((
-                "language",
-                format!(
-                    "language={v:?} is not supported by this build: the STT backend always \
-                     auto-detects the spoken language. Omit the field or send \"auto\"."
-                ),
-            ));
-        }
-    }
-    if let Some(v) = prompt {
-        if !v.trim().is_empty() {
-            return Err((
-                "prompt",
-                "prompt is not supported by this build: the STT backend takes no decoder prompt. \
-                 Omit the field."
-                    .to_string(),
-            ));
+            let code = v.to_ascii_lowercase();
+            if !oapi::WHISPER_LANGUAGES.contains(&code.as_str()) {
+                return Err((
+                    "language",
+                    format!(
+                        "language={v:?} is not a whisper language code ({} supported, e.g. en, \
+                         de, ja -- the full list is the `languages` array on the ASR entry of \
+                         GET /v1/models). Omit the field or send \"auto\" to auto-detect.",
+                        oapi::WHISPER_LANGUAGES.len()
+                    ),
+                ));
+            }
+            resolved_language = Some(code);
         }
     }
     if let Some(v) = temperature {
@@ -1156,7 +1254,7 @@ fn check_stt_params(
             }
         }
     }
-    Ok(())
+    Ok(resolved_language)
 }
 
 fn stt_failure_response(err: &anyhow::Error) -> Response {
@@ -1167,6 +1265,16 @@ fn stt_failure_response(err: &anyhow::Error) -> Response {
             err.to_string(),
             oapi::kind::INVALID_REQUEST,
             Some("model"),
+            Some("unsupported_parameter"),
+        );
+    }
+    if let Some(unsupported) = speaches_plus::stt::stt_param_unsupported(err) {
+        warn!(error = %err, param = unsupported.param, "STT parameter unsupported by the loaded backend");
+        return oapi::openai_error(
+            StatusCode::BAD_REQUEST,
+            unsupported.message.clone(),
+            oapi::kind::INVALID_REQUEST,
+            Some(unsupported.param),
             Some("unsupported_parameter"),
         );
     }
@@ -1188,6 +1296,7 @@ async fn do_stt_post(
     let mut audio_bytes: Option<Vec<u8>> = None;
     let mut audio_content_type: Option<String> = None;
     let mut response_format = "text".to_string();
+    let mut model: Option<String> = None;
     let mut language: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut temperature: Option<String> = None;
@@ -1214,6 +1323,7 @@ async fn do_stt_post(
                     response_format = v;
                 }
             }
+            "model" => model = field.text().await.ok(),
             "language" => language = field.text().await.ok(),
             "prompt" => prompt = field.text().await.ok(),
             "temperature" => temperature = field.text().await.ok(),
@@ -1222,19 +1332,22 @@ async fn do_stt_post(
             }
         }
     }
-    if let Err((param, message)) = check_stt_params(
-        language.as_deref(),
-        prompt.as_deref(),
-        temperature.as_deref(),
-    ) {
-        return oapi::openai_error(
-            StatusCode::BAD_REQUEST,
-            message,
-            oapi::kind::INVALID_REQUEST,
-            Some(param),
-            Some("unsupported_parameter"),
-        );
-    }
+    let opts_language = match check_stt_params(language.as_deref(), temperature.as_deref()) {
+        Ok(lang) => lang,
+        Err((param, message)) => {
+            return oapi::openai_error(
+                StatusCode::BAD_REQUEST,
+                message,
+                oapi::kind::INVALID_REQUEST,
+                Some(param),
+                Some("unsupported_parameter"),
+            );
+        }
+    };
+    let opts = speaches_plus::stt::SttRequestOptions {
+        language: opts_language,
+        initial_prompt: prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+    };
     let Some(bytes) = audio_bytes else {
         return oapi::fastapi_validation_error(vec![oapi::missing_field(&["body", "file"])]);
     };
@@ -1265,13 +1378,29 @@ async fn do_stt_post(
             );
         }
     };
+    if let Some(requested) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        if !whisper.matches_requested_model(requested) {
+            return oapi::openai_error(
+                StatusCode::NOT_FOUND,
+                format!(
+                    "unknown speech-to-text model {requested:?}: this server serves {:?} (see \
+                     GET /v1/models?task=automatic-speech-recognition). The request was refused \
+                     rather than transcribed by whichever model happened to be loaded",
+                    whisper.model_id()
+                ),
+                oapi::kind::NOT_FOUND,
+                Some("model"),
+                Some("model_not_found"),
+            );
+        }
+    }
     let samples_for_diar = if response_format == "diarized_json" {
         Some(samples.clone())
     } else {
         None
     };
     let stt = match tokio::task::spawn_blocking(move || {
-        whisper.transcribe_full_with_task(&samples, task)
+        whisper.transcribe_full_with_opts(&samples, task, &opts)
     })
     .await
     {
@@ -1729,6 +1858,7 @@ mod serving_tests {
 
     #[test]
     fn constant_time_eq_matches_semantics_of_plain_eq() {
+        use speaches_plus::oapi::constant_time_eq;
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secrez", b"secret"));
         assert!(!constant_time_eq(b"secre", b"secret"));
@@ -1789,35 +1919,33 @@ mod serving_tests {
 
     #[test]
     fn stt_params_accept_absent_and_neutral_values() {
-        assert!(check_stt_params(None, None, None).is_ok());
-        assert!(check_stt_params(Some(""), Some(""), Some("")).is_ok());
-        assert!(check_stt_params(Some("auto"), None, None).is_ok());
-        assert!(check_stt_params(Some("AUTO"), None, None).is_ok());
-        assert!(check_stt_params(None, None, Some("0")).is_ok());
-        assert!(check_stt_params(None, None, Some("0.0")).is_ok());
+        assert_eq!(check_stt_params(None, None).unwrap(), None);
+        assert_eq!(check_stt_params(Some(""), Some("")).unwrap(), None);
+        assert_eq!(check_stt_params(Some("auto"), None).unwrap(), None);
+        assert_eq!(check_stt_params(Some("AUTO"), None).unwrap(), None);
+        assert_eq!(check_stt_params(None, Some("0")).unwrap(), None);
+        assert_eq!(check_stt_params(None, Some("0.0")).unwrap(), None);
     }
 
     #[test]
-    fn stt_params_reject_unsupported_language() {
-        let (param, msg) = check_stt_params(Some("de"), None, None).unwrap_err();
+    fn stt_params_pass_through_known_language_codes_lowercased() {
+        assert_eq!(check_stt_params(Some("de"), None).unwrap().as_deref(), Some("de"));
+        assert_eq!(check_stt_params(Some("EN"), None).unwrap().as_deref(), Some("en"));
+        assert_eq!(check_stt_params(Some(" ja "), None).unwrap().as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn stt_params_reject_unknown_language_naming_the_param() {
+        let (param, msg) = check_stt_params(Some("klingon"), None).unwrap_err();
         assert_eq!(param, "language");
         assert!(msg.contains("auto"), "{msg}");
+        assert!(msg.contains("klingon"), "{msg}");
     }
 
     #[test]
-    fn stt_params_reject_prompt_and_nonzero_temperature() {
-        assert_eq!(
-            check_stt_params(None, Some("hello"), None).unwrap_err().0,
-            "prompt"
-        );
-        assert_eq!(
-            check_stt_params(None, None, Some("0.8")).unwrap_err().0,
-            "temperature"
-        );
-        assert_eq!(
-            check_stt_params(None, None, Some("hot")).unwrap_err().0,
-            "temperature"
-        );
+    fn stt_params_reject_nonzero_temperature() {
+        assert_eq!(check_stt_params(None, Some("0.8")).unwrap_err().0, "temperature");
+        assert_eq!(check_stt_params(None, Some("hot")).unwrap_err().0, "temperature");
     }
 
     #[test]

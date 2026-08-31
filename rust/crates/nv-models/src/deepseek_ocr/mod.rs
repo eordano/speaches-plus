@@ -31,7 +31,10 @@ pub use decoder_graph::{graph_supported, DsocrDecodeGraph};
 pub use decoder_graph_batch::{buckets_from_env, DsocrBatchDecodeGraph};
 
 #[cfg(feature = "wgpu")]
-pub use decoder_wgpu::DeepseekOcrDecoderWgpu;
+pub use decoder_wgpu::{
+    wgpu_quant_from_env_value, DeepseekOcrDecoderWgpu, WgpuDecQuant,
+    DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED,
+};
 
 pub fn default_snapshot_dir() -> Option<std::path::PathBuf> {
     if let Ok(d) = std::env::var("NV_DSOCR_DIR") {
@@ -70,9 +73,7 @@ pub(crate) mod h2d {
     }
 
     pub fn enabled() -> bool {
-        std::env::var("NV_DSOCR_H2D_PINNED")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_H2D_PINNED")
     }
 
     pub(crate) fn cache_budget_bytes() -> usize {

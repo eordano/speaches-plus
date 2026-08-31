@@ -1,10 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "httpx>=0.28",
-# ]
-# ///
 """
 Smoke-test the /v1/audio/speech endpoint behavior against an arbitrary
 target server, comparing it to the Python speaches reference contract.

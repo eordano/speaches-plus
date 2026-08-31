@@ -4,7 +4,7 @@ import asyncio
 import enum
 from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable
+from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
     from aiortc import RTCPeerConnection

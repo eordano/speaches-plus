@@ -20,8 +20,8 @@ import os
 import re
 import sys
 
-FEAT = "/tmp/eot-scratch/fusion-features"
-WEIGHTS = "/tmp/eot-scratch/fusion-weights-new.json"
+FEAT = "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/fusion-features"
+WEIGHTS = "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/fusion-weights-new.json"
 
 CURRENT = dict(bias=0.866202, w_p_text=0.283641, w_p_audio=0.018662,
                w_audio_log_sec=0.560501, w_partial_log_chars=1.195453,

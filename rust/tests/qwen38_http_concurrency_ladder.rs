@@ -63,17 +63,23 @@ const NV_Q38_BATCH_GEMM_1_IS_REQUIRED_BY_THE_SIXTEEN_LANE_POOL_AND_HELD_FOR_EVER
             ladder whose c=16 row runs a different GEMM arm than its c=8 row is two ladders \
             spliced together";
 
-const THE_GROUP_ARM_IS_BIT_IDENTICAL_TO_EAGER_M1_STEPPING_ONLY_UNDER_NV_Q38_BATCH_ROWWISE_FFN: &str =
-    "the nvfp4 MLP m-row route is the sole non-twin kernel in the batch step, so the lane group \
-     is byte-class against eager m=1 stepping only when NV_Q38_BATCH_ROWWISE=ffn splits the ffn \
-     back into per-row m=1 twins; without it the group is tolerance-class and no byte assertion \
-     is honest";
+const A_GROUP_UP_TO_M4_IS_BYTE_CLASS_UNDER_ROWWISE_FFN_AND_AT_M8_ONLY_ROWWISE_ALL_IS: &str =
+    "at m<=4 the nvfp4 MLP m-row route is the only non-twin kernel in the batch step, so \
+     NV_Q38_BATCH_ROWWISE=ffn splits the ffn back into per-row m=1 twins and the lane group is \
+     byte-class against eager m=1 stepping; at m=8 the ffn pin diverges on record (request 1 \
+     char 243) and only rowwise=all reproduces the solo bytes, so at m=8 a rowwise group beyond \
+     the ffn also stops being a per-row twin; the default batched-GEMM m-row route (rowwise \
+     unset, NV_Q38_BATCH_GEMM=1) is argmax-class by design and is classified by drift_class, \
+     never byte-gated";
 
 const MTP_IS_OFF_FOR_THE_WHOLE_LADDER_SO_ONE_EAGER_REFERENCE_SERVES_THE_SOLO_AND_THE_GROUP_ARM:
     &str = "NV_DRAFTER is unset for every engine in this suite: the batch scheduler's solo route \
             and the flag-off engine then run the same run_qwen38_dense_solo_body with mtp=None, \
             so a single eager sequential reference set is the oracle for c=1 and for every lane \
             of every group, instead of the two reference classes an MTP-on run would need";
+
+const SOLO_REFERENCES_PIN_THE_EAGER_SESSION_BECAUSE_UNSET_NOW_BOOTS_THE_GRAPHED_ENGINE_AND_EVERY_BYTE_AND_DRIFT_BASELINE_HERE_IS_DEFINED_AGAINST_EAGER_M1_STEPPING:
+    &str = "0";
 
 const SCHEDULER_GROUP_FORMED_EVENT_IS_THE_PER_WAVE_MARKER_THE_SERVING_PATH_ALREADY_EMITS: &str =
     "qwen3.8 batch group formed";
@@ -207,11 +213,13 @@ fn formed_sizes(events: &[WaveEvent]) -> Vec<usize> {
 }
 
 fn expected_wave_shape_for(concurrency: usize, lanes: usize) -> Vec<usize> {
+    let a_leftover_single_request_forms_a_one_lane_group_instead_of_running_solo =
+        std::env::var("NV_Q38_SOLO_VIA_LANES").ok().as_deref() == Some("1");
     let mut left = concurrency;
     let mut out = Vec::new();
-    while left > 1 {
+    while left > 0 {
         let take = left.min(lanes);
-        if take == 1 {
+        if take == 1 && !a_leftover_single_request_forms_a_one_lane_group_instead_of_running_solo {
             break;
         }
         out.push(take);
@@ -426,7 +434,7 @@ fn assert_same_stream(context: &str, got: &RunOut, want: &RunOut) {
             .unwrap_or_else(|| g.chars().count().min(w.chars().count()));
         panic!(
             "[{}] {context} diverged from its solo sequential reference at char {at}. \
-             {THE_GROUP_ARM_IS_BIT_IDENTICAL_TO_EAGER_M1_STEPPING_ONLY_UNDER_NV_Q38_BATCH_ROWWISE_FFN}\n \
+             {A_GROUP_UP_TO_M4_IS_BYTE_CLASS_UNDER_ROWWISE_FFN_AND_AT_M8_ONLY_ROWWISE_ALL_IS}\n \
              got: {g:?}\nwant: {w:?}",
             got.label
         );
@@ -535,6 +543,10 @@ fn ladder_env_common(sizes: &str) {
     std::env::remove_var("NV_Q38_BATCH_GEMM");
     std::env::set_var("NV_Q38_BATCH_SIZES", sizes);
     std::env::set_var("NV_Q38_BATCH_ROWWISE", "ffn");
+    std::env::set_var(
+        "NV_Q38_SERVE_GRAPHED",
+        SOLO_REFERENCES_PIN_THE_EAGER_SESSION_BECAUSE_UNSET_NOW_BOOTS_THE_GRAPHED_ENGINE_AND_EVERY_BYTE_AND_DRIFT_BASELINE_HERE_IS_DEFINED_AGAINST_EAGER_M1_STEPPING,
+    );
 }
 
 static THE_ONE_INSTALLED_SINK: std::sync::OnceLock<SchedulerEventSink> = std::sync::OnceLock::new();
@@ -707,8 +719,8 @@ fn an_eight_wide_group_under_nv_q38_batch_sizes_1_2_4_8_holds_byte_identity_or_r
         assert!(
             wall_s < WALL_BOUND_S_FOR_A_WHOLE_LEVEL_240_IS_TWENTY_TIMES_THE_EXPECTED_TWO_WAVE_DECODE_SO_ONLY_A_STARVED_REQUEST_TRIPS_IT,
             "the 8-wide attempt under rowwise={pin} took {wall_s:.1}s: a refusal must be \
-             immediate and a success must not be slower than two 4-wide waves, so this is a hang \
-             either way"
+             immediate and a success is two 8-wide waves well inside the bound, so this is a \
+             hang either way"
         );
 
         let failures: Vec<&RunOut> = outs.iter().filter(|o| o.error.is_some()).collect();
@@ -740,16 +752,17 @@ fn an_eight_wide_group_under_nv_q38_batch_sizes_1_2_4_8_holds_byte_identity_or_r
             return;
         }
 
-        assert_every_request_completed(8, &outs);
+        assert_every_request_completed(16, &outs);
         assert_eq!(
             sizes,
-            vec![8],
+            vec![8, 8],
             "every request returned a completion under rowwise={pin}, so the engine claims it \
-             served an 8-wide group; the scheduler must then have formed exactly one group of 8. \
-             Two groups of 4 here would be a silent fallback lying about the batch size. \
-             events={events:?}"
+             served true 8-wide groups; sixteen requests over eight closed-at-formation lanes \
+             must then drain as exactly two full 8-wide waves. Any narrower formation here \
+             (4+4 inside a wave slot) is a silent fallback lying about the batch size, which is \
+             the property this gate protects. events={events:?}"
         );
-        emit_machine_line(&format!("sizes=1,2,4,8 rowwise={pin}"), 8, &outs, wall_s, &sizes);
+        emit_machine_line(&format!("sizes=1,2,4,8 rowwise={pin}"), 16, &outs, wall_s, &sizes);
         match first_divergence(&outs, &refs) {
             None => byte_exact_pins.push(pin),
             Some((req, at)) => diverged_pins.push(format!("{pin}(request {req} char {at})")),
@@ -767,10 +780,10 @@ fn an_eight_wide_group_under_nv_q38_batch_sizes_1_2_4_8_holds_byte_identity_or_r
     );
     assert!(
         !byte_exact_pins.is_empty(),
-        "an 8-wide group was formed and served under every pin tried ({:?}), and none of them \
-         reproduced the solo bytes. Qwen38BatchLanes::new admits buckets up to the m<=8 row-twin \
-         kernel ceiling, so at m=8 some kernel outside the rowwise groups has stopped being a \
-         per-row m=1 twin; the engine neither refused nor warned, so an 8-lane deployment would \
+        "8-wide groups were formed and served under every pin tried ({:?}), and none of them \
+         reproduced the solo bytes. rowwise=all is the m=8 byte-identity pin on record \
+         ({A_GROUP_UP_TO_M4_IS_BYTE_CLASS_UNDER_ROWWISE_FFN_AND_AT_M8_ONLY_ROWWISE_ALL_IS}); if \
+         even it diverges, the engine neither refused nor warned, so an 8-lane deployment would \
          quietly serve different text than the same request served alone. diverged: {diverged_pins:?}",
         ROWWISE_PINS_TRIED_FOR_AN_EIGHT_WIDE_GROUP_NARROWEST_FIRST
     );
@@ -780,8 +793,8 @@ const THE_SERVING_BAR_IS_GREEDY_ARGMAX_CLASS_NOT_BYTE_IDENTITY: &str =
     "byte-identity-to-solo is a debug bar for the rowwise pins; the serving bar for the default \
      m-row route is the greedy argmax drift CLASS vs the solo eager reference, reported as a \
      count of differing decode steps, never gated on zero, because the nvfp4 padded-TC non-twin \
-     is a deterministic 1-2e-2 logit delta that is argmax-equal at small m and may drift at \
-     larger m";
+     is a deterministic 1-2e-2 logit delta that is argmax-equal at m<=2 and drifts from m=4 \
+     upward on record";
 
 fn ladder_env_default_m_row_route(sizes: &str) {
     ladder_env_common(sizes);
@@ -789,11 +802,65 @@ fn ladder_env_default_m_row_route(sizes: &str) {
     std::env::set_var("NV_Q38_BATCH_GEMM", "1");
 }
 
-fn gdn_prefill_scan_arm_because_the_group_formation_wall_is_the_gdn_prefill_scan_not_the_gemms() -> &'static str {
-    if std::env::var("NV_Q38_GDN_CHUNK_PREFILL").ok().as_deref() == Some("1") {
-        "gdn_chunk"
-    } else {
+fn gdn_prefill_scan_arm_labels_by_the_opt_out_polarity_because_chunk_is_the_unset_default_and_0_restores_the_candle_scan() -> &'static str {
+    if std::env::var("NV_Q38_GDN_CHUNK_PREFILL").ok().as_deref() == Some("0") {
         "gdn_candle_token_sequential"
+    } else {
+        "gdn_chunk"
+    }
+}
+
+fn form_pack_arm_label_packed_formation_needs_both_nv_q38_form_pack_1_and_nv_q38_batch_gemm_1() -> &'static str {
+    if std::env::var("NV_Q38_FORM_PACK").ok().as_deref() == Some("1")
+        && std::env::var("NV_Q38_BATCH_GEMM").ok().as_deref() == Some("1")
+    {
+        "packed"
+    } else {
+        "serial"
+    }
+}
+
+fn step_overlap_arm_label_nv_q38_step_overlap_1() -> &'static str {
+    if std::env::var("NV_Q38_STEP_OVERLAP").ok().as_deref() == Some("1") {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+const THE_SIX_ARM_SOLO_DECODE_STACK_THE_16_90_MS_TOK_GRAPHED_SERVING_PROBE_RAN_AND_THIS_LADDER_HISTORICALLY_DID_NOT_SET: [&str; 6] = [
+    "NV_Q36_GRAPHED_DECODE_FIX",
+    "NV_Q38_GDN_SPLIT",
+    "NV_Q38_NORM_WRITEOUT",
+    "NV_Q38_MLP_W4A8",
+    "NV_Q38_SILUQ_SPLIT",
+    "NV_Q38_NORM_QUANT_FOLD",
+];
+
+fn solo_decode_arm_stack_label_counting_how_many_of_the_six_the_ambient_env_actually_sets() -> String {
+    let on: Vec<&str> = THE_SIX_ARM_SOLO_DECODE_STACK_THE_16_90_MS_TOK_GRAPHED_SERVING_PROBE_RAN_AND_THIS_LADDER_HISTORICALLY_DID_NOT_SET
+        .iter()
+        .filter(|k| std::env::var(k).ok().as_deref() == Some("1"))
+        .copied()
+        .collect();
+    format!("{}/6", on.len())
+}
+
+#[allow(non_snake_case)]
+fn A_GDN_SPLIT_ROW_IS_UNQUOTABLE_WITHOUT_ITS_LANE_CAP_BECAUSE_THE_ARM_WINS_NARROW_AND_LOSES_WIDE_AND_THE_CAP_IS_WHAT_DECIDES_WHICH(
+) -> String {
+    if std::env::var("NV_Q38_GDN_SPLIT").ok().as_deref() != Some("1") {
+        return "off".into();
+    }
+    nv_layers::linear_attn::gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
+        .to_string()
+}
+
+fn one_char_arm_label(key: &str) -> &'static str {
+    if std::env::var(key).ok().as_deref() == Some("1") {
+        "1"
+    } else {
+        "0"
     }
 }
 
@@ -870,7 +937,11 @@ fn emit_ours_conc_line(
          agg_def=output_tokens_over_batch_wall_incl_ttft_same_as_vllm_bench_serving \
          steady_agg_tok_s={steady_agg_tok_s:.1} p50_tpot_ms={:.2} p50_ttft_ms={:.0} \
          p95_ttft_ms={:.0} tokens={tokens} wall_s={wall_s:.2} group_shape={shape} \
-         sizes={sizes_env} rowwise=unset prefill_scan={} drift_steps={}/{} drift_requests={}/{} \
+         sizes={sizes_env} rowwise=unset prefill_scan={} form={} step_overlap={} \
+         solo_arm_stack={} batch_solo_arms={} solo_via_lanes={} qkv_one={} window_ms={} \
+         gdn_ab_wide={} gdn_split_cap={} gdn_lanes_group={} \
+         e4m3_group={} e4m3_tile_min_m={} \
+         drift_steps={}/{} drift_requests={}/{} \
          drift_class={class} drift_detail={}",
         tokens as f64 / wall_s.max(1e-9),
         percentile(ms_tok, 0.5),
@@ -879,12 +950,104 @@ fn emit_ours_conc_line(
             first_ms,
             P95_NEAREST_RANK_BECAUSE_A_LEVEL_HAS_AT_MOST_SIXTEEN_SAMPLES_AND_INTERPOLATION_INVENTS_VALUES
         ),
-        gdn_prefill_scan_arm_because_the_group_formation_wall_is_the_gdn_prefill_scan_not_the_gemms(),
+        gdn_prefill_scan_arm_labels_by_the_opt_out_polarity_because_chunk_is_the_unset_default_and_0_restores_the_candle_scan(),
+        form_pack_arm_label_packed_formation_needs_both_nv_q38_form_pack_1_and_nv_q38_batch_gemm_1(),
+        step_overlap_arm_label_nv_q38_step_overlap_1(),
+        solo_decode_arm_stack_label_counting_how_many_of_the_six_the_ambient_env_actually_sets(),
+        one_char_arm_label("NV_Q38_BATCH_SOLO_ARMS"),
+        one_char_arm_label("NV_Q38_SOLO_VIA_LANES"),
+        one_char_arm_label("NV_Q38_ATTN_QKV_ONE"),
+        std::env::var("NV_Q38_BATCH_WINDOW_MS").unwrap_or_else(|_| "30".into()),
+        one_char_arm_label("NV_Q38_GDN_AB_WIDE"),
+        A_GDN_SPLIT_ROW_IS_UNQUOTABLE_WITHOUT_ITS_LANE_CAP_BECAUSE_THE_ARM_WINS_NARROW_AND_LOSES_WIDE_AND_THE_CAP_IS_WHAT_DECIDES_WHICH(),
+        one_char_arm_label("NV_Q38_GDN_LANES_GROUP"),
+        std::env::var("NV_Q38_E4M3_GROUP").unwrap_or_else(|_| "off".into()),
+        std::env::var("NV_Q38_E4M3_TILE_MIN_M").unwrap_or_else(|_| "off".into()),
         drift.differing_steps,
         drift.total_steps,
         drift.requests_differing,
         level,
         drift.per_request.join(","),
+    );
+}
+
+const A_ONE_LANE_GROUP_IS_A_ROUTE_CHANGE_NOT_AN_ARITHMETIC_CHANGE_BUT_ITS_PREFILL_TAKES_LOGIT_ROWS_ONE_WHERE_THE_EAGER_SOLO_BODY_TAKES_THE_WHOLE_SEQUENCE_SO_THE_BAR_IS_ARGMAX_CLASS_OVER_SIXTEEN_PROMPTS_NOT_BYTE_IDENTITY_ON_ONE:
+    &str = "run_qwen38_dense_solo_body prefills with logit_rows=None and samples the last row on \
+            the host; prefill_lane narrows to logit_rows=Some(1) before final_norm and lm_head and \
+            exits on the device argmax, so the head GEMM sees m=1 instead of m=prompt_len. That is \
+            a different numeric route at the prefill token by construction, which is why this gate \
+            counts differing greedy steps across all sixteen prompts (1024 paired steps) instead \
+            of asserting byte identity on one 64-step cell";
+
+#[test]
+#[ignore = "loads the Qwen3.8-27B NVFP4 checkpoint twice and runs all sixteen prompts one at a \
+            time, first on the flag-off eager solo body and then under NV_Q38_SOLO_VIA_LANES=1 so \
+            every request forms a one-lane group; reports the greedy argmax drift over 1024 paired \
+            steps and asserts every request formed a group of exactly one; set \
+            NV_Q38_CONC_LADDER_TEST=1"]
+fn a_lone_request_under_solo_via_lanes_forms_a_one_lane_group_and_holds_the_argmax_class_over_sixteen_prompts(
+) {
+    gate_or_panic();
+    let sink = install_scheduler_event_sink();
+    eprintln!("[q38-conc] {A_ONE_LANE_GROUP_IS_A_ROUTE_CHANGE_NOT_AN_ARITHMETIC_CHANGE_BUT_ITS_PREFILL_TAKES_LOGIT_ROWS_ONE_WHERE_THE_EAGER_SOLO_BODY_TAKES_THE_WHOLE_SEQUENCE_SO_THE_BAR_IS_ARGMAX_CLASS_OVER_SIXTEEN_PROMPTS_NOT_BYTE_IDENTITY_ON_ONE}");
+    let dir = qwen38_nvfp4_snapshot_dir_env_override_then_home_hub();
+
+    ladder_env_default_m_row_route(EIGHT_LANE_BUCKET_PLAN_ASKS_THE_ENGINE_FOR_A_TRUE_EIGHT_WIDE_GROUP_AND_TWO_WAVES_AT_SIXTEEN);
+    std::env::remove_var("NV_Q38_BATCH");
+    std::env::remove_var("NV_Q38_SOLO_VIA_LANES");
+    let eager = load_engine(&dir, "solo-lane-eager-reference").expect("flag-off eager engine must load");
+    run_warmup(&eager, "solo-lane-eager-reference");
+    let refs = run_sequential(
+        &eager,
+        "solo-lane-eager-reference",
+        &SIXTEEN_DISTINCT_PROMPTS_SO_NO_TWO_LANES_SHARE_A_PREFIX_AND_A_CROSSED_LANE_SHOWS_AS_A_BYTE_DIFF,
+    );
+    assert_every_request_completed(1, &refs);
+    drop(eager);
+
+    ladder_env_default_m_row_route(EIGHT_LANE_BUCKET_PLAN_ASKS_THE_ENGINE_FOR_A_TRUE_EIGHT_WIDE_GROUP_AND_TWO_WAVES_AT_SIXTEEN);
+    std::env::set_var("NV_Q38_BATCH", "1");
+    std::env::set_var("NV_Q38_SOLO_VIA_LANES", "1");
+    let batch = load_engine(&dir, "solo-lane-group").expect("NV_Q38_BATCH=1 engine must load");
+    run_warmup(&batch, "solo-lane-group");
+    let mark = sink.mark();
+    let outs = run_sequential(
+        &batch,
+        "solo-lane-group",
+        &SIXTEEN_DISTINCT_PROMPTS_SO_NO_TWO_LANES_SHARE_A_PREFIX_AND_A_CROSSED_LANE_SHOWS_AS_A_BYTE_DIFF,
+    );
+    let formed = formed_sizes(&sink.waves_since(mark));
+    assert_every_request_completed(1, &outs);
+    assert_eq!(
+        formed,
+        vec![1usize; SIXTEEN_DISTINCT_PROMPTS_SO_NO_TWO_LANES_SHARE_A_PREFIX_AND_A_CROSSED_LANE_SHOWS_AS_A_BYTE_DIFF.len()],
+        "NV_Q38_SOLO_VIA_LANES=1 must send every lone request down the group route as a group of \
+         exactly one; an empty list means the arm did not engage and this gate measured the eager \
+         solo body against itself. formed={formed:?}"
+    );
+    let drift = greedy_argmax_drift_vs_solo(&outs, &refs);
+    println!(
+        "SOLO-VIA-LANES prompts={} drift_steps={}/{} drift_requests={}/{} \
+         solo_arm_stack={} batch_solo_arms={} drift_detail={}",
+        outs.len(),
+        drift.differing_steps,
+        drift.total_steps,
+        drift.requests_differing,
+        outs.len(),
+        solo_decode_arm_stack_label_counting_how_many_of_the_six_the_ambient_env_actually_sets(),
+        one_char_arm_label("NV_Q38_BATCH_SOLO_ARMS"),
+        drift.per_request.join(","),
+    );
+    assert_eq!(
+        drift.differing_steps, 0,
+        "the one-lane group drifted from the eager solo body on {} of {} greedy steps across {} \
+         prompts. {THE_SERVING_BAR_IS_GREEDY_ARGMAX_CLASS_NOT_BYTE_IDENTITY} A one-lane group runs \
+         the same b=1 arithmetic the eager body runs, so unlike an m>1 group it has no non-twin \
+         kernel to blame and any drift here is a defect, not a class. detail: {}",
+        drift.differing_steps,
+        drift.total_steps,
+        outs.len(),
+        drift.per_request.join(",")
     );
 }
 
@@ -903,7 +1066,7 @@ fn default_m_row_route_ladder_reports_throughput_and_argmax_drift_class_vs_solo(
     eprintln!("[q38-conc] {NV_Q38_BATCH_GEMM_1_IS_REQUIRED_BY_THE_SIXTEEN_LANE_POOL_AND_HELD_FOR_EVERY_LEVEL_SO_ONE_ARM_SPANS_THE_LADDER}");
     eprintln!(
         "[q38-conc] prefill_scan={}",
-        gdn_prefill_scan_arm_because_the_group_formation_wall_is_the_gdn_prefill_scan_not_the_gemms()
+        gdn_prefill_scan_arm_labels_by_the_opt_out_polarity_because_chunk_is_the_unset_default_and_0_restores_the_candle_scan()
     );
     let dir = qwen38_nvfp4_snapshot_dir_env_override_then_home_hub();
 

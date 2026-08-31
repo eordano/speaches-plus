@@ -279,7 +279,27 @@ checkpoint, so ordering and discriminator choice carry real weight:
   and **the capability report must describe exactly what `try_load` will do under
   the same environment**, or an operator gets a green backends-report for a model
   that then fails to load. Standalone w4a16 decode measured faster on cuda than on
-  wgpu (measured on the development box).
+  wgpu (numbers: `perf/runs.jsonl`).
+- **Gemma-4 E4B cuda step logits are softcapped by default.**
+  `Gemma4E4b::forward_step_inner` -- the body behind `forward_step`,
+  `forward_step_embeds`, `forward_step_spec`, `forward_step_fixed` and
+  `forward_step_fp8` -- applies the checkpoint's `final_logit_softcapping` (30.0
+  on the E4B configs) through the same fused `tanh_softcap_bf16_to_f32_op` the
+  31B path uses, matching `Gemma4E4b::trace` and the wgpu decoder's `logits_f32`
+  pipeline. `NV_E4B_STEP_LOGITS_UNCAPPED=1` restores the raw rows. tanh is
+  monotone, so greedy serving output and the graphed argmax decoder
+  (`forward_step_fast*`, which stays raw) are bit-for-bit indifferent -- but
+  temperature sampling, `logprobs` entries, and teacher-forced ppl read the
+  distribution, and the raw rows score the shared chat slice at family ppl ~705
+  against ~16.4 on wgpu: at hard-to-predict positions the raw top logit reaches
+  40-55, wgpu's capped copy of the same row tops out below 30, and per-position
+  NLL diverges by 40-55 nats while top-1 accuracy matches (the cross-backend
+  gate is `nv-models/tests/e4b_ppl_cuda_wgpu_position_diff.rs`). Cost of the cap:
+  one fused elementwise kernel over `[n, vocab]` per step and f32 rows out of the
+  step APIs where bf16 came out before. Numbers measured on the raw path, all
+  superseded by the `"e4b ppl-fix"` rows: `perf/runs.jsonl` lines 1042, 1043,
+  1056, 1057 (families `e4b-chat-cuda-prefill512`/`-w4a8fp8`, values
+  709.676/719.434/705.078/707.070).
 
 ## What is on wgpu, and what stays CUDA-only
 
@@ -310,7 +330,8 @@ nothing splices into a resident pass list. Conversely **speculative decoding on
 wgpu is E4B-only** (`spec_route_eligible` requires
 `kind == WgpuModelKind::Gemma4E4b`), and **chunked prefill is delegated by all
 seven kinds** through `Decoder::prefill_chunk_len` -- though the `Qwen3_5Dense`
-path does not engage on an NVFP4 checkpoint, so **a wgpu serving
+path does not engage on an NVFP4 checkpoint
+(`docs/measurements/2026-08-11-wgpu-prefill-basis-line.md`), so **a wgpu serving
 figure is not a decode figure**.
 
 ## The Vulkan loader, or your wgpu tests run nothing

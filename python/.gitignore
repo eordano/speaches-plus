@@ -34,8 +34,9 @@ result-*
 .env
 .env.*
 
-# Agent-tool local state
-.claude/
+# Claude Code local state (skills + commands under .claude/ ARE committed;
+# this file is per-process locking state)
+.claude/scheduled_tasks.lock
 
 # Local work
 temp/
@@ -48,3 +49,4 @@ review_fixes_flamegraph.html
 sess_*.raw
 sess_*.ndjson
 sess_*.audio.json
+.claude/worktrees

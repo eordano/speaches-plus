@@ -51,9 +51,20 @@ fn gemv_i8map(s: u32) -> u32 {
     return (m ^ (sb * 255u)) + sb;
 }
 
+fn gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together(
+    lo_w: u32, lo_x: u32, hi_w: u32, hi_x: u32) -> i32 {
+    let d_lo = dot4I8Packed(lo_w, lo_x);
+    let d_hi = dot4I8Packed(hi_w, hi_x);
+    return d_lo + d_hi;
+}
+
 fn gemv_dot8(ww: u32, xw: u32, dot_in: f32) -> f32 {
-    let d = dot4I8Packed(gemv_i8map(ww), gemv_i8map(xw))
-        + dot4I8Packed(gemv_i8map(ww >> 4u), gemv_i8map(xw >> 4u));
+    let lo_w = gemv_i8map(ww);
+    let lo_x = gemv_i8map(xw);
+    let hi_w = gemv_i8map(ww >> 4u);
+    let hi_x = gemv_i8map(xw >> 4u);
+    let d = gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together(
+        lo_w, lo_x, hi_w, hi_x);
     return dot_in + f32(d) * 0.25;
 }
 

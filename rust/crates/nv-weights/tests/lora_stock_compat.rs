@@ -341,3 +341,38 @@ fn dora_fails_clearly() {
     eprintln!("DORA_TENSOR_REJECT: {err2}");
     std::fs::remove_dir_all(&dir2).ok();
 }
+
+#[test]
+fn mlx_vlm_spelling_normalizes_to_the_serving_namespace() {
+    let a = ramp(RANK * HIDDEN, 0.5);
+    let b = ramp(HIDDEN * RANK, 1.25);
+    let tensors = vec![
+        (
+            "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+                .to_string(),
+            vec![RANK, HIDDEN],
+            a.clone(),
+        ),
+        (
+            "base_model.model.language_model.model.layers.0.self_attn.q_proj.lora_B.weight"
+                .to_string(),
+            vec![HIDDEN, RANK],
+            b.clone(),
+        ),
+    ];
+    let dir = write_adapter("mlx-spelling", &stock_config(), &tensors);
+    let adapter = LoraAdapter::load(&dir, &Device::Cpu).unwrap();
+
+    assert_eq!(
+        normalize_module_name("language_model.model.layers.0.self_attn.q_proj"),
+        "model.language_model.layers.0.self_attn.q_proj",
+        "the mlx-vlm trunk nesting is a pure rename of the serving namespace"
+    );
+    let w = adapter
+        .loras
+        .get("model.language_model.layers.0.self_attn.q_proj")
+        .expect("a dots/mlx adapter must land on the serving key");
+    assert_eq!(&tensor_to_f32(&w.lora_a), &a);
+    assert_eq!(adapter.loras.len(), 1);
+    std::fs::remove_dir_all(&dir).ok();
+}

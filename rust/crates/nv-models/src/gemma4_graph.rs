@@ -6,7 +6,7 @@ use crate::gemma4::{Gemma4, Gemma4KvCacheFp8};
 #[cfg(feature = "cuda")]
 use crate::gemma4_batch_graph::capture_stream::CaptureStream;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream, PinnedHostSlice};
+use cudarc::driver::{CudaContext, CudaEvent, CudaSlice, CudaStream};
 #[cfg(feature = "cuda")]
 use nv_kernels::graph::CudaGraphRunner;
 #[cfg(feature = "cuda")]
@@ -45,6 +45,9 @@ pub const BOTH_DTOD_ARMS_ARE_SEQ_LEN_1_SO_THE_GRAPH_KEY_MUST_CARRY_THE_ARM: &str
      1 replays whichever was captured first for the other -- a forward_decode_logits that returns \
      a stale logits_buf because the no-logits graph is what actually ran. The gate is \
      nv-models tests/gemma4_graph_dtod_arm_keys.rs";
+
+#[cfg(feature = "cuda")]
+use crate::host_serving_util::CachedPinnedHostStagingViaCuMemHostAllocFlags0BecauseCudarcAllocPinnedIsWriteCombinedAndHostReadsOfWcAreUncachedAndPageableDtohReallocatesEveryStep as CachedPinnedHostStaging;
 
 #[cfg(feature = "cuda")]
 pub const DECODE_GRAPH_KEY_NO_LOGITS_DTOD: u64 = 1;
@@ -138,7 +141,7 @@ pub struct GraphedGemma4Decoder<'m> {
     logits_buf: CudaSlice<f32>,
 
     #[cfg(feature = "cuda")]
-    logits_host: PinnedHostSlice<f32>,
+    logits_host: CachedPinnedHostStaging<f32>,
 
     #[cfg(feature = "cuda")]
     probe_ev: Option<(CudaEvent, CudaEvent)>,
@@ -175,8 +178,10 @@ impl<'m> GraphedGemma4Decoder<'m> {
         let logits_buf = capture_stream
             .alloc_zeros::<f32>(vocab)
             .map_err(|e| anyhow::anyhow!("alloc logits_buf: {e:?}"))?;
-        let logits_host = unsafe { raw_ctx.alloc_pinned::<f32>(vocab) }
-            .map_err(|e| anyhow::anyhow!("alloc pinned logits_host: {e:?}"))?;
+        let logits_host =
+            CachedPinnedHostStaging::alloc_cu_mem_host_alloc_flags0_cached_page_locked(
+                &raw_ctx, vocab,
+            )?;
 
         capture_stream
             .synchronize()
@@ -332,11 +337,12 @@ impl<'m> GraphedGemma4Decoder<'m> {
         self.synchronize()?;
         let stream = self.capture.stream().clone();
         stream
-            .memcpy_dtoh(&self.logits_buf, &mut self.logits_host)
+            .memcpy_dtoh(&self.logits_buf, self.logits_host.as_mut_slice())
             .map_err(|e| anyhow::anyhow!("dtoh logits: {e:?}"))?;
-        self.logits_host
-            .as_slice()
-            .map_err(|e| anyhow::anyhow!("pinned logits slice: {e:?}"))
+        stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!("dtoh logits landed sync: {e:?}"))?;
+        Ok(self.logits_host.as_slice())
     }
 
     #[cfg(feature = "cuda")]
@@ -347,7 +353,7 @@ impl<'m> GraphedGemma4Decoder<'m> {
     #[cfg(feature = "cuda")]
     fn forward_decode_inner(&mut self, token_id: u32, dtod_logits: bool) -> Result<()> {
         use anyhow::Context as _;
-        let dbg = std::env::var_os("NV_DEBUG_GRAPH").is_some();
+        let dbg = nv_config::env_arm_present_at_all_reread_every_call("NV_DEBUG_GRAPH");
         let dbg_call = self.call_count;
         let dbg_pos = self.current_pos;
         if dbg {
@@ -741,7 +747,7 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
 
-        let sol_evt = std::env::var_os("NV_SOL_EVT").is_some();
+        let sol_evt = nv_config::env_arm_present_at_all_reread_every_call("NV_SOL_EVT");
         let evt_pair = if sol_evt {
             let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
             let ctx2 = capture_stream.context().clone();

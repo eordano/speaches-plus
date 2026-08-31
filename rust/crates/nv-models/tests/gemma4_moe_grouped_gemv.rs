@@ -103,7 +103,11 @@ fn tiny_model_w4(
     let loader = WeightLoader::open_file(&st, &Device::Cpu).unwrap();
     let m_s = TINY_PREFILL_M_PINNED.to_string();
     let pins = EnvPins::pin(&[
-        ("NV_G4MOE_GROUPED_GEMV", grouped.then_some("1")),
+        ("NV_G4MOE_GROUPED_GEMV", Some(if grouped { "1" } else { "0" })),
+        ("NV_G4MOE_RPNORM", Some("0")),
+        ("NV_G4MOE_RPFUSE", Some("0")),
+        ("NV_G4MOE_TOPK_NX2", Some("0")),
+        ("NV_G4MOE_GEMV_SGLAT", Some("0")),
         ("NV_G4MOE_FLASH_DECODE", flash.then_some("1")),
         ("NV_G4MOE_FLASH_SLIDING", flash_sliding.then_some("1")),
         ("NV_G4MOE_FLASH_SPLITS", None),
@@ -204,17 +208,18 @@ fn grouped_wgsl_parses_validates_and_exposes_every_fused_entry_without_a_gpu() {
 }
 
 #[test]
-fn grouped_and_flash_sliding_default_off_and_grouped_collapses_the_pass_list() {
+fn grouped_default_on_and_flash_sliding_default_on_and_grouped_collapses_the_pass_list() {
     let _g = env_lock();
     assert!(
-        !G4MOE_GROUPED_GEMV_DEFAULT_ON,
-        "the grouped-gemv arm must stay opt-in: every g4moe-wgpu number on record was \
-         measured on the unfused pass list"
+        G4MOE_GROUPED_GEMV_DEFAULT_ON,
+        "the grouped-gemv arm SHIPS ON with the fusion champion stack (rows 'g4moe fusion' \
+         r1/r2/r2c/r3, 111.1 vs 87.3 tok/s at 256); NV_G4MOE_GROUPED_GEMV=0 restores the \
+         unfused pass list every pre-flip number on record was measured on"
     );
     assert!(
-        !G4MOE_FLASH_SLIDING_DEFAULT_ON,
-        "the sliding flash arm must stay opt-in: gemma4_moe_dispatch_budget prices \
-         g4m-at-decode on the serial arm"
+        G4MOE_FLASH_SLIDING_DEFAULT_ON,
+        "the sliding flash arm SHIPS ON since 681e4a261 (ring+flash+sliding-flash depth \
+         stack, splits knee 32); NV_G4MOE_FLASH_SLIDING=0 restores the serial arm"
     );
     if ctx_or_skip().is_none() {
         return;

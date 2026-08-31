@@ -13,6 +13,24 @@ pub const ACC_FRAGS: u32 = 16;
 
 pub const ACC_LANE_DWORD_BUDGET: u32 = 128;
 
+pub const A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD: &str =
+    "The grid issues ceil(m / (tile*tm)) row blocks and ceil(n / (tile*tn*sg)) column bands, and \
+     every block loads an operand fragment for every one of its rows and columns whether or not \
+     that row exists. Only the store is guarded, so a ragged last block used to stride up to \
+     tile*tm-1 rows past x and a whole band past w. naga's index Restrict clamps the base element \
+     to the end of the binding and then the cooperative load walks 15 more rows from there, so the \
+     overshoot leaves the buffer whatever the bounds-check policy is: harmless while it lands in \
+     mapped memory, and a wedged adapter when the operand is past gpu-allocator's 256 MiB memblock \
+     and owns a VkDeviceMemory sized to itself. Clamping the band base to rows-tile instead moves \
+     no stored lane -- m and n are multiples of tile (check_shape), so a band is wholly inside the \
+     operand or wholly outside it, the clamp is the identity on every band the store guard admits, \
+     and a fragment only ever feeds the accumulator of its own row and column.";
+
+pub const COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP: &str =
+    "The clamped base is multiplied by k once, before the k loop, so the inner loop addresses \
+     cg_x[arow_r + kt + u*tile] where it used to address cg_x[(m0 + r*tile) * kk + kt + u*tile]. \
+     The whole guard is tm + tn scalar min instructions per workgroup.";
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CoopGemmParams {
@@ -97,6 +115,10 @@ impl CoopGemm {
         let blocks_m = m.div_ceil(self.rows_per_block(tm));
         let blocks_n = n.div_ceil(self.cols_per_workgroup(tn, sg));
         (blocks_m, blocks_n)
+    }
+
+    pub fn clamped_fragment_base_row(&self, rows: u32, band_start: u32) -> u32 {
+        band_start.min(rows.wrapping_sub(self.tile))
     }
 
     pub fn zero_elems(&self) -> usize {
@@ -186,6 +208,24 @@ impl CoopGemm {
         b.push_str("    let ys = cg_p.y_stride;\n");
         b.push_str("    let mrows = cg_p.m_rows;\n");
         b.push_str("    let nrows = cg_p.n_rows;\n");
+        let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
+        let _ = COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP;
+        for r in 0..tm {
+            writeln!(
+                b,
+                "    let arow{r} = min(m0 + {}u, mrows - {t}u) * kk;",
+                r * t
+            )
+            .unwrap();
+        }
+        for j in 0..tn {
+            writeln!(
+                b,
+                "    let bcol{j} = min(n0 + {}u, nrows - {t}u) * kk;",
+                j * t
+            )
+            .unwrap();
+        }
 
         for r in 0..tm {
             for j in 0..tn {
@@ -202,8 +242,7 @@ impl CoopGemm {
             for r in 0..tm {
                 writeln!(
                     b,
-                    "        let a{u}_{r} = coopLoadT<CGA>(&cg_x[(m0 + {}u) * kk + kt + {}u], kk);",
-                    r * t,
+                    "        let a{u}_{r} = coopLoadT<CGA>(&cg_x[arow{r} + kt + {}u], kk);",
                     u * t
                 )
                 .unwrap();
@@ -211,8 +250,7 @@ impl CoopGemm {
             for j in 0..tn {
                 writeln!(
                     b,
-                    "        let b{u}_{j} = coopLoad<CGB>(&cg_w[(n0 + {}u) * kk + kt + {}u], kk);",
-                    j * t,
+                    "        let b{u}_{j} = coopLoad<CGB>(&cg_w[bcol{j} + kt + {}u], kk);",
                     u * t
                 )
                 .unwrap();
@@ -258,10 +296,143 @@ impl CoopGemm {
     }
 }
 
+pub const SPLITK_PARTIALS_ANSWER_AN_OCCUPANCY_STARVED_NARROW_N_BIG_K_SHAPE_NOT_A_TRAFFIC_ONE: &str =
+    "A narrow-n big-k GEMM issues blocks_m x 1 workgroups that each walk the whole k axis: the \
+     dots vision attn_ctx shape (m 8192, n 128, k 13600) is 256 workgroups of 1700 serial k \
+     steps, about 430 threads per core on a 76-core adapter, and it runs 11.8 TFLOP/s where the \
+     wide shapes run 15-18. Splitting k into S segments multiplies the workgroup count by S and \
+     divides the serial walk by S; each segment still accumulates in ascending k, partials land \
+     in a per-split slab, and one elementwise pass sums the S slabs in ascending split order. \
+     The reduction is a reassociation -- (seg0)+(seg1) is not the interleaved fragment order -- \
+     so a split arm gates on token equality across the fixture corpus, never on bits, the zmerge \
+     precedent. Operand staging is NOT the lever on these shapes and its variant is deleted: \
+     both-operand workgroup staging priced at 15.67 vs 15.46 TFLOP/s on scores (a wash inside \
+     rep spread) and 4.5 vs 11.8 on attn_ctx (a loss at every k-block depth), so the plain \
+     fragment loads from storage already pipeline as well as this adapter admits and only the \
+     grid width was ever missing.";
+
+pub fn entry_splitk(tm: u32, tn: u32, sg: u32, splits: u32) -> String {
+    format!("gemm_coop_h8k_tm{tm}_tn{tn}_sg{sg}_s{splits}")
+}
+
+pub fn source_splitk(tm: u32, tn: u32, sg: u32, splits: u32) -> String {
+    use std::fmt::Write as _;
+    let _ = SPLITK_PARTIALS_ANSWER_AN_OCCUPANCY_STARVED_NARROW_N_BIG_K_SHAPE_NOT_A_TRAFFIC_ONE;
+    let g = CoopGemm::new(TILE, Operand::F16);
+    assert!(tm >= 1 && tn >= 1 && tm * tn <= 64, "tile too large");
+    assert!((1..=8).contains(&sg), "sg out of range");
+    assert!((2..=32).contains(&splits), "splits out of range");
+    let t = g.tile;
+    let wg = sg * SUBGROUP;
+    let entry = entry_splitk(tm, tn, sg, splits);
+    let cols = g.cols_per_workgroup(tn, sg);
+    let mut b = String::new();
+
+    writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
+    writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
+    writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
+    b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    blocks_mn: u32,\n    kseg: u32,\n};\n\n");
+    b.push_str("@group(0) @binding(0) var<storage, read> cg_w: array<f16>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> cg_x: array<f16>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;\n");
+    b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
+    b.push_str("@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n\n");
+
+    writeln!(b, "@compute @workgroup_size({wg})").unwrap();
+    writeln!(b, "fn {entry}(").unwrap();
+    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
+    b.push_str("    let sgid = lidx / 32u;\n");
+    b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
+    b.push_str("    let sblk = block / cg_p.blocks_mn;\n");
+    b.push_str("    let bmn = block - sblk * cg_p.blocks_mn;\n");
+    b.push_str("    let bm = bmn / cg_p.blocks_n;\n");
+    b.push_str("    let bn = bmn - bm * cg_p.blocks_n;\n");
+    writeln!(b, "    let m0 = bm * {}u;", g.rows_per_block(tm)).unwrap();
+    writeln!(b, "    let n0 = bn * {cols}u + sgid * {}u;", t * tn).unwrap();
+    b.push_str("    let kk = cg_p.k_elems;\n");
+    b.push_str("    let ys = cg_p.y_stride;\n");
+    b.push_str("    let mrows = cg_p.m_rows;\n");
+    b.push_str("    let nrows = cg_p.n_rows;\n");
+    b.push_str("    let k0 = sblk * cg_p.kseg;\n");
+    b.push_str("    let kend = min(kk, k0 + cg_p.kseg);\n");
+    for r in 0..tm {
+        writeln!(
+            b,
+            "    let arow{r} = min(m0 + {}u, mrows - {t}u) * kk;",
+            r * t
+        )
+        .unwrap();
+    }
+    for j in 0..tn {
+        writeln!(
+            b,
+            "    let bcol{j} = min(n0 + {}u, nrows - {t}u) * kk;",
+            j * t
+        )
+        .unwrap();
+    }
+    for r in 0..tm {
+        for j in 0..tn {
+            writeln!(b, "    var c{r}_{j} = coopLoadT<CGC>(&cg_zero[0], {t}u);").unwrap();
+        }
+    }
+    writeln!(b, "    for (var kt = k0; kt < kend; kt = kt + {t}u) {{").unwrap();
+    for r in 0..tm {
+        writeln!(
+            b,
+            "        let a0_{r} = coopLoadT<CGA>(&cg_x[arow{r} + kt], kk);"
+        )
+        .unwrap();
+    }
+    for j in 0..tn {
+        writeln!(
+            b,
+            "        let b0_{j} = coopLoad<CGB>(&cg_w[bcol{j} + kt], kk);"
+        )
+        .unwrap();
+    }
+    for r in 0..tm {
+        for j in 0..tn {
+            writeln!(
+                b,
+                "        c{r}_{j} = coopMultiplyAdd(a0_{r}, b0_{j}, c{r}_{j});"
+            )
+            .unwrap();
+        }
+    }
+    b.push_str("    }\n");
+    b.push_str("    let pbase = sblk * mrows * ys;\n");
+    for r in 0..tm {
+        for j in 0..tn {
+            writeln!(b, "    let sc{r}_{j} = c{r}_{j};").unwrap();
+            writeln!(
+                b,
+                "    let yo{r}_{j} = pbase + (m0 + {}u) * ys + n0 + {}u;",
+                r * t,
+                j * t
+            )
+            .unwrap();
+            writeln!(
+                b,
+                "    if (m0 + {}u < mrows && n0 + {}u < nrows) {{",
+                r * t,
+                j * t
+            )
+            .unwrap();
+            writeln!(b, "        coopStoreT(sc{r}_{j}, &cg_y[yo{r}_{j}], ys);").unwrap();
+            b.push_str("    }\n");
+        }
+    }
+    b.push_str("}\n");
+
+    compose_enabled(&ENABLES, &b)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WqFmt {
     Nvfp4Block16,
     Fp8RowscalePlain,
+    MlxAffineGe16,
 }
 
 impl WqFmt {
@@ -269,9 +440,17 @@ impl WqFmt {
         match self {
             WqFmt::Nvfp4Block16 => "w4",
             WqFmt::Fp8RowscalePlain => "w8",
+            WqFmt::MlxAffineGe16 => "wa4",
         }
     }
 }
+
+pub const MLX_AFFINE_BIAS_SLOT_7_BECAUSE_6_IS_THE_QUANT_ACT_SCALE: u32 = 7;
+
+pub const MLX_AFFINE_GS_RIDES_THE_PAD1_PARAM_SLOT_SO_THE_UNIFORM_LAYOUT_IS_SHARED: &str =
+    "the MlxAffineGe16 arm reads its group size from the CoopGemmParams word that the other \
+     formats leave as pad1, so one Rust-side params struct serves every wq16 entry; the \
+     generated struct spells the field gs for that arm only";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WqAct {
@@ -396,10 +575,15 @@ fn source_wq16_act_inner(
     writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
     writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
     writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
-    if y_bf16 {
-        b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    alpha: f32,\n    pad1: u32,\n};\n\n");
+    let tail_word = if fmt == WqFmt::MlxAffineGe16 {
+        "gs"
     } else {
-        b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    pad0: u32,\n    pad1: u32,\n};\n\n");
+        "pad1"
+    };
+    if y_bf16 {
+        writeln!(b, "struct CoopGemmParams {{\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    alpha: f32,\n    {tail_word}: u32,\n}};\n").unwrap();
+    } else {
+        writeln!(b, "struct CoopGemmParams {{\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    pad0: u32,\n    {tail_word}: u32,\n}};\n").unwrap();
     }
     b.push_str("@group(0) @binding(0) var<storage, read> cg_w4: array<u32>;\n");
     match act {
@@ -420,6 +604,15 @@ fn source_wq16_act_inner(
         }
         WqFmt::Fp8RowscalePlain => {
             b.push_str("@group(0) @binding(5) var<storage, read> cg_sf: array<f32>;\n")
+        }
+        WqFmt::MlxAffineGe16 => {
+            b.push_str("@group(0) @binding(5) var<storage, read> cg_sf: array<u32>;\n");
+            writeln!(
+                b,
+                "@group(0) @binding({}) var<storage, read> cg_bq: array<u32>;",
+                MLX_AFFINE_BIAS_SLOT_7_BECAUSE_6_IS_THE_QUANT_ACT_SCALE
+            )
+            .unwrap();
         }
     }
     match act {
@@ -454,6 +647,17 @@ fn source_wq16_act_inner(
     b.push_str("    let ys = cg_p.y_stride;\n");
     b.push_str("    let mrows = cg_p.m_rows;\n");
     b.push_str("    let nrows = cg_p.n_rows;\n");
+    if act == WqAct::F16 {
+        let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
+        for r in 0..tm {
+            writeln!(
+                b,
+                "    let arow{r} = min(m0 + {}u, mrows - {t}u) * kk;",
+                r * t
+            )
+            .unwrap();
+        }
+    }
     match fmt {
         WqFmt::Nvfp4Block16 => {
             b.push_str("    let row_words = kk >> 3u;\n");
@@ -461,6 +665,10 @@ fn source_wq16_act_inner(
         }
         WqFmt::Fp8RowscalePlain => {
             b.push_str("    let row_words = kk >> 2u;\n");
+        }
+        WqFmt::MlxAffineGe16 => {
+            b.push_str("    let row_words = kk >> 3u;\n");
+            b.push_str("    let sf_row = kk / cg_p.gs;\n");
         }
     }
     match act {
@@ -550,6 +758,34 @@ fn source_wq16_act_inner(
                 b.push_str("            }\n");
             }
         }
+        WqFmt::MlxAffineGe16 => {
+            b.push_str("            var s = 0.0;\n");
+            b.push_str("            var bv = 0.0;\n");
+            b.push_str("            var w0 = 0u;\n");
+            b.push_str("            var w1 = 0u;\n");
+            b.push_str("            if (gr < nrows) {\n");
+            b.push_str("                let base = gr * row_words + (ku16 >> 3u);\n");
+            b.push_str("                w0 = cg_w4[base];\n");
+            b.push_str("                w1 = cg_w4[base + 1u];\n");
+            b.push_str("                let sbi = gr * sf_row + ku16 / cg_p.gs;\n");
+            b.push_str("                s = bf16_decode(cg_sf[sbi]);\n");
+            b.push_str("                bv = bf16_decode(cg_bq[sbi]);\n");
+            b.push_str("            }\n");
+            b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
+            writeln!(
+                b,
+                "                w4bs[tb + j * {t}u + row] = \
+                 f16(fma(f32((w0 >> (j * 4u)) & 0xfu), s, bv));"
+            )
+            .unwrap();
+            writeln!(
+                b,
+                "                w4bs[tb + (j + 8u) * {t}u + row] = \
+                 f16(fma(f32((w1 >> (j * 4u)) & 0xfu), s, bv));"
+            )
+            .unwrap();
+            b.push_str("            }\n");
+        }
     }
     b.push_str("        }\n");
     if act != WqAct::F16 {
@@ -616,8 +852,7 @@ fn source_wq16_act_inner(
             if act == WqAct::F16 {
                 writeln!(
                     b,
-                    "        let a{u}_{r} = coopLoadT<CGA>(&cg_x[(m0 + {}u) * kk + kt + {}u], kk);",
-                    r * t,
+                    "        let a{u}_{r} = coopLoadT<CGA>(&cg_x[arow{r} + kt + {}u], kk);",
                     u * t
                 )
                 .unwrap();
@@ -713,6 +948,41 @@ fn source_wq16_act_inner(
     b.push_str("}\n");
 
     compose_enabled(&ENABLES, &b)
+}
+
+pub const Q38_PF_ROUTE_M256_M512_ADJUDICATED_BY_THE_IN_MODEL_PREFILL_PROFILE_OVER_THE_STANDALONE_LADDER: [(
+    Option<WqFmt>,
+    u32,
+    u32,
+    (u32, u32, u32, u32),
+    (u32, u32, u32, u32),
+); 10] = [
+    (Some(WqFmt::Nvfp4Block16), 17408, 5120, (8, 2, 1, 2), (8, 2, 1, 2)),
+    (Some(WqFmt::Nvfp4Block16), 5120, 17408, (4, 1, 1, 4), (8, 1, 1, 4)),
+    (Some(WqFmt::Fp8RowscalePlain), 17408, 5120, (8, 2, 1, 2), (8, 2, 1, 2)),
+    (Some(WqFmt::Fp8RowscalePlain), 5120, 17408, (4, 1, 1, 4), (8, 1, 1, 4)),
+    (Some(WqFmt::Fp8RowscalePlain), 10240, 5120, (4, 1, 1, 2), (8, 2, 2, 4)),
+    (Some(WqFmt::Fp8RowscalePlain), 6144, 5120, (4, 1, 1, 4), (8, 2, 2, 4)),
+    (Some(WqFmt::Fp8RowscalePlain), 5120, 6144, (4, 1, 1, 4), (8, 1, 1, 4)),
+    (Some(WqFmt::Fp8RowscalePlain), 12288, 5120, (4, 2, 1, 2), (4, 2, 1, 2)),
+    (Some(WqFmt::Fp8RowscalePlain), 1024, 5120, (1, 1, 1, 4), (2, 1, 1, 4)),
+    (None, 96, 5120, (1, 1, 1, 4), (1, 1, 1, 4)),
+];
+
+pub fn q38_pf_route(
+    m_alloc: u32,
+    kind: Option<WqFmt>,
+    n: u32,
+    k: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let row = Q38_PF_ROUTE_M256_M512_ADJUDICATED_BY_THE_IN_MODEL_PREFILL_PROFILE_OVER_THE_STANDALONE_LADDER
+        .iter()
+        .find(|(f, rn, rk, _, _)| *f == kind && *rn == n && *rk == k)?;
+    match m_alloc {
+        256 => Some(row.3),
+        512 => Some(row.4),
+        _ => None,
+    }
 }
 
 pub fn tiles(m: u32, acc: u32) -> (u32, u32) {
@@ -1080,4 +1350,24 @@ mod tests {
     fn a_fragment_shape_wgsl_cannot_spell_is_refused_at_construction() {
         CoopGemm::new(32, Operand::F16);
     }
+
+    #[test]
+    fn splitk_source_parses_validates_and_stores_each_split_into_its_own_partial_slab() {
+        for (tm, tn, sg, s) in [(4u32, 4u32, 4u32, 4u32), (4, 4, 4, 8), (8, 2, 2, 16), (2, 4, 4, 2)] {
+            let src = source_splitk(tm, tn, sg, s);
+            let module = naga::front::wgsl::parse_str(&src)
+                .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: parse: {e}"));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: validate: {e}"));
+            assert!(src.contains(&entry_splitk(tm, tn, sg, s)));
+            assert!(src.contains("let pbase = sblk * mrows * ys;"));
+            assert_eq!(src.matches("coopMultiplyAdd").count() as u32, tm * tn);
+        }
+        assert_eq!(entry_splitk(4, 4, 4, 8), "gemm_coop_h8k_tm4_tn4_sg4_s8");
+    }
+
 }

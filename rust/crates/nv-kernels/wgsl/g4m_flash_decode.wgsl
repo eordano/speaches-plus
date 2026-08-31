@@ -22,14 +22,11 @@ struct GfParams {
 const GF_BLOCK: u32 = 256u;
 const GF_WARPS: u32 = 8u;
 const GF_LANES: u32 = 32u;
-const GF_MAX_HD: u32 = 512u;
 const GF_LOG2E: f32 = 1.4426950408889634;
 
 var<workgroup> gf_qsh: array<f32, 512>;
-var<workgroup> gf_red: array<f32, 256>;
 var<workgroup> gf_sm: array<f32, 8>;
 var<workgroup> gf_sl: array<f32, 8>;
-var<workgroup> gf_sacc: array<f32, 4096>;
 
 fn gf_neg_inf() -> f32 {
     return bitcast<f32>(0xff800000u);
@@ -44,61 +41,12 @@ fn gf_recip(x: f32) -> f32 {
     return fma(fma(-x, r, 1.0), r, r);
 }
 
-fn gf_warp_sum(lid: u32, x: f32) -> f32 {
-    gf_red[lid] = x;
-    workgroupBarrier();
-    for (var o = 16u; o > 0u; o = o >> 1u) {
-        let other = gf_red[lid ^ o];
-        workgroupBarrier();
-        gf_red[lid] = gf_red[lid] + other;
-        workgroupBarrier();
-    }
-    return gf_red[lid];
-}
-
 fn gf_k_bf16(idx: u32) -> f32 {
     return bf16_decode(u16_at(gf_kc[idx >> 1u], idx));
 }
 
 fn gf_v_bf16(idx: u32) -> f32 {
     return bf16_decode(u16_at(gf_vc[idx >> 1u], idx));
-}
-
-fn gf_stage1_epilogue(lid: u32, lane: u32, warp: u32, hd: u32, slot: u32, m: f32, l: f32) {
-    if (lane == 0u) {
-        gf_sm[warp] = m;
-        gf_sl[warp] = l;
-    }
-    workgroupBarrier();
-    if (warp == 0u) {
-        var m_blk = gf_neg_inf();
-        for (var w = 0u; w < GF_WARPS; w = w + 1u) {
-            m_blk = max(m_blk, gf_sm[w]);
-        }
-        var l_blk = 0.0;
-        for (var w = 0u; w < GF_WARPS; w = w + 1u) {
-            if (gf_sm[w] > gf_neg_inf()) {
-                l_blk = l_blk + gf_sl[w] * gf_exp(gf_sm[w] - m_blk);
-            }
-        }
-        if (lane == 0u) {
-            gf_scratch[slot] = m_blk;
-            gf_scratch[slot + 1u] = l_blk;
-        }
-    }
-    var m_blk = gf_neg_inf();
-    for (var w = 0u; w < GF_WARPS; w = w + 1u) {
-        m_blk = max(m_blk, gf_sm[w]);
-    }
-    for (var d = lid; d < hd; d = d + GF_BLOCK) {
-        var a = 0.0;
-        for (var w = 0u; w < GF_WARPS; w = w + 1u) {
-            if (gf_sm[w] > gf_neg_inf()) {
-                a = a + gf_sacc[w * GF_MAX_HD + d] * gf_exp(gf_sm[w] - m_blk);
-            }
-        }
-        gf_scratch[slot + 2u + d] = a;
-    }
 }
 
 @compute @workgroup_size(256)
@@ -288,104 +236,8 @@ fn g4m_flash_stage1_bf16(
         }
     }
 
-    {
-        let d = lane + 0u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc0;
-        }
-    }
-    {
-        let d = lane + 1u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc1;
-        }
-    }
-    {
-        let d = lane + 2u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc2;
-        }
-    }
-    {
-        let d = lane + 3u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc3;
-        }
-    }
-    {
-        let d = lane + 4u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc4;
-        }
-    }
-    {
-        let d = lane + 5u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc5;
-        }
-    }
-    {
-        let d = lane + 6u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc6;
-        }
-    }
-    {
-        let d = lane + 7u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc7;
-        }
-    }
-    {
-        let d = lane + 8u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc8;
-        }
-    }
-    {
-        let d = lane + 9u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc9;
-        }
-    }
-    {
-        let d = lane + 10u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc10;
-        }
-    }
-    {
-        let d = lane + 11u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc11;
-        }
-    }
-    {
-        let d = lane + 12u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc12;
-        }
-    }
-    {
-        let d = lane + 13u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc13;
-        }
-    }
-    {
-        let d = lane + 14u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc14;
-        }
-    }
-    {
-        let d = lane + 15u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc15;
-        }
-    }
-    let slot = (h * gf_p.splits + split) * (hd + 2u);
-    gf_stage1_epilogue(lid, lane, warp, hd, slot, m, l);
+    gf_stage1_tail(lid, lane, warp, hd, (h * gf_p.splits + split) * (hd + 2u), m, l,
+        acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11, acc12, acc13, acc14, acc15);
 }
 
 const GF_E4M3_SHIFT_CARRY_2POW120_RIDES_Q_AND_V_SCALE: f32 = 1329227995784915872903807060280344576.0;
@@ -579,104 +431,8 @@ fn g4m_flash_stage1_fp8(
         }
     }
 
-    {
-        let d = lane + 0u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc0;
-        }
-    }
-    {
-        let d = lane + 1u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc1;
-        }
-    }
-    {
-        let d = lane + 2u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc2;
-        }
-    }
-    {
-        let d = lane + 3u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc3;
-        }
-    }
-    {
-        let d = lane + 4u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc4;
-        }
-    }
-    {
-        let d = lane + 5u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc5;
-        }
-    }
-    {
-        let d = lane + 6u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc6;
-        }
-    }
-    {
-        let d = lane + 7u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc7;
-        }
-    }
-    {
-        let d = lane + 8u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc8;
-        }
-    }
-    {
-        let d = lane + 9u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc9;
-        }
-    }
-    {
-        let d = lane + 10u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc10;
-        }
-    }
-    {
-        let d = lane + 11u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc11;
-        }
-    }
-    {
-        let d = lane + 12u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc12;
-        }
-    }
-    {
-        let d = lane + 13u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc13;
-        }
-    }
-    {
-        let d = lane + 14u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc14;
-        }
-    }
-    {
-        let d = lane + 15u * GF_LANES;
-        if (d < hd) {
-            gf_sacc[warp * GF_MAX_HD + d] = acc15;
-        }
-    }
-    let slot = (h * gf_p.splits + split) * (hd + 2u);
-    gf_stage1_epilogue(lid, lane, warp, hd, slot, m, l);
+    gf_stage1_tail(lid, lane, warp, hd, (h * gf_p.splits + split) * (hd + 2u), m, l,
+        acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7, acc8, acc9, acc10, acc11, acc12, acc13, acc14, acc15);
 }
 
 fn gf_split_scale(base: u32, stride: u32, s: u32, m_glob: f32) -> f32 {

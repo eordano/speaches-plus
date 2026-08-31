@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 mod common;
 use common::cer;
@@ -36,7 +36,19 @@ const GOT_CONFIG_JSON: &str = r#"{
   }
 }"#;
 
-const GOT_CER_GATE_MEASURED_0_0000_ON_070_AND_071_CUDA_BF16_D3017EF: f64 = 0.05;
+const GOT_CER_GATE_MEASURED_0_0000_BF16_0_0266_NVFP4_ON_070_AND_071_CUDA_D3017EF: f64 = 0.05;
+
+fn serving_device() -> Device {
+    #[cfg(feature = "cuda")]
+    if let Ok(d) = Device::new_cuda(0) {
+        return d;
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(d) = Device::new_metal(0) {
+        return d;
+    }
+    Device::Cpu
+}
 
 #[test]
 fn sam_checkpoint_name_maps_every_representative_tensor() {
@@ -102,7 +114,7 @@ fn got_ocr2_full_pipeline_reads_a_rendered_page() {
         return;
     }
     let dir = snapshot_dir().expect("GOT-OCR-2.0-hf snapshot present");
-    let device = Device::new_cuda(0).expect("cuda device 0");
+    let device = serving_device();
     let t0 = Instant::now();
     let pipeline = GotOcrPipeline::load(&dir, &device).expect("load GOT-OCR2 pipeline");
 
@@ -148,14 +160,15 @@ fn got_ocr2_full_pipeline_reads_a_rendered_page() {
         let want = fixture_expected_text(name);
         let e = cer(&res.text, &want);
         eprintln!(
-            "[real] got-ocr2 CER on {name} = {e:.4} (basis: snapshot {}, cuda bf16, 1024 max_new, whitespace-collapsed lowercase vs fixture expected_text)",
-            dir.display()
+            "[real] got-ocr2 CER on {name} = {e:.4} (basis: snapshot {}, cuda precision={:?}, 1024 max_new, whitespace-collapsed lowercase vs fixture expected_text)",
+            dir.display(),
+            pipeline.precision()
         );
         worst = worst.max(e);
     }
     assert!(
-        worst < GOT_CER_GATE_MEASURED_0_0000_ON_070_AND_071_CUDA_BF16_D3017EF,
-        "worst CER {worst:.4} exceeds the pinned gate {GOT_CER_GATE_MEASURED_0_0000_ON_070_AND_071_CUDA_BF16_D3017EF}"
+        worst < GOT_CER_GATE_MEASURED_0_0000_BF16_0_0266_NVFP4_ON_070_AND_071_CUDA_D3017EF,
+        "worst CER {worst:.4} exceeds the pinned gate {GOT_CER_GATE_MEASURED_0_0000_BF16_0_0266_NVFP4_ON_070_AND_071_CUDA_D3017EF}"
     );
     eprintln!("[real] got-ocr2 full pipeline elapsed {:?}", t0.elapsed());
 }

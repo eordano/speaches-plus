@@ -162,3 +162,96 @@ extern "C" int nv_kernels_rope_bf16_oop(
     }
     return (int)cudaGetLastError();
 }
+
+__global__ void rope_bf16_partial_oop_kernel(
+    const __nv_bfloat16* __restrict__ q_in,
+    const __nv_bfloat16* __restrict__ k_in,
+    __nv_bfloat16* __restrict__ q_out,
+    __nv_bfloat16* __restrict__ k_out,
+    const float* __restrict__ cos_tbl,
+    const float* __restrict__ sin_tbl,
+    const int32_t* __restrict__ positions,
+    size_t n_heads,
+    size_t n_kv_heads,
+    size_t head_dim,
+    size_t rotary_dim
+) {
+    NVK_PDL_PROLOG();
+
+    size_t token_idx = blockIdx.x;
+    size_t head_idx = blockIdx.y;
+    size_t col = threadIdx.x;
+    size_t half_rot = rotary_dim / 2;
+    if (col >= head_dim) return;
+
+    bool is_q = head_idx < n_heads;
+    const __nv_bfloat16* src;
+    __nv_bfloat16* dst;
+    size_t base;
+    if (is_q) {
+        base = (token_idx * n_heads + head_idx) * head_dim;
+        src = q_in;
+        dst = q_out;
+    } else {
+        size_t kv_head = head_idx - n_heads;
+        if (kv_head >= n_kv_heads) return;
+        base = (token_idx * n_kv_heads + kv_head) * head_dim;
+        src = k_in;
+        dst = k_out;
+    }
+
+    if (col < half_rot) {
+        int32_t pos = positions[token_idx];
+        float c = cos_tbl[(size_t)pos * half_rot + col];
+        float s = sin_tbl[(size_t)pos * half_rot + col];
+        float a = __bfloat162float(src[base + col]);
+        float b = __bfloat162float(src[base + col + half_rot]);
+        dst[base + col]            = __float2bfloat16(a * c - b * s);
+        dst[base + col + half_rot] = __float2bfloat16(a * s + b * c);
+    } else if (col >= rotary_dim) {
+        dst[base + col] = src[base + col];
+    }
+
+    NVK_PDL_EPILOG();
+}
+
+extern "C" int nv_kernels_rope_bf16_partial_oop(
+    void* stream,
+    const uint16_t* q_in,
+    const uint16_t* k_in,
+    uint16_t* q_out,
+    uint16_t* k_out,
+    const float* cos_tbl,
+    const float* sin_tbl,
+    const int32_t* positions,
+    size_t batch,
+    size_t n_heads,
+    size_t n_kv_heads,
+    size_t head_dim,
+    size_t rotary_dim
+) {
+    cudaStream_t s = (cudaStream_t)stream;
+    if (rotary_dim % 2 != 0 || rotary_dim > head_dim) return -2;
+    dim3 grid((unsigned)batch, (unsigned)(n_heads + n_kv_heads));
+    dim3 block((unsigned)head_dim);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, grid, block, 0, s);
+        cudaLaunchKernelEx(
+            &cfg, rope_bf16_partial_oop_kernel,
+            reinterpret_cast<const __nv_bfloat16*>(q_in),
+            reinterpret_cast<const __nv_bfloat16*>(k_in),
+            reinterpret_cast<__nv_bfloat16*>(q_out),
+            reinterpret_cast<__nv_bfloat16*>(k_out),
+            cos_tbl, sin_tbl, positions,
+            n_heads, n_kv_heads, head_dim, rotary_dim);
+    } else {
+        rope_bf16_partial_oop_kernel<<<grid, block, 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q_in),
+            reinterpret_cast<const __nv_bfloat16*>(k_in),
+            reinterpret_cast<__nv_bfloat16*>(q_out),
+            reinterpret_cast<__nv_bfloat16*>(k_out),
+            cos_tbl, sin_tbl, positions,
+            n_heads, n_kv_heads, head_dim, rotary_dim);
+    }
+    return (int)cudaGetLastError();
+}

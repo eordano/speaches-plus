@@ -333,7 +333,7 @@ impl<'m> SpecState<'m> {
         let k = self.num_spec;
         let adapt = dflash_adapt_enabled();
         let adapt_thresh = dflash_adapt_thresh();
-        let stats_on = std::env::var_os("NV_LAGUNA_SERVE_STATS").is_some();
+        let stats_on = nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_SERVE_STATS");
         let prompt_n = num_ctx;
         let mut rounds = 0usize;
         let mut acc_total = 0usize;

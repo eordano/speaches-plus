@@ -63,8 +63,12 @@ fn nvfp4_scale_bytes(n: usize, k: usize) -> usize {
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- prices one graph-captured stream-ordered alloc+free pair at replay by diffing a 256-iter alloc-kernel-free graph against a prealloc-kernel graph, because the q38 decode graph carries hundreds of per-step scratch alloc nodes"]
 fn q38_graph_alloc_free_node_pair_replay_cost() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run the graph alloc node bench");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the graph alloc node bench executed nothing. It is \
+             already #[ignore]d, which makes --ignored the opt-in; a second env gate behind that \
+             can only make an --ignored run print `1 passed` for a bench that measured nothing. A \
+             suite whose precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.new_stream().expect("capture stream");
@@ -151,8 +155,13 @@ const Q38_VOCAB: usize = 248320;
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- prices the draft lm_head m=1 arms at the exact [248320 x 5120] serving shape: the resident fp8 gemv_e4m3_mk baseline against the nvfp4 candidates (w4a16 full-n, w4a16 dual over row halves, w4a8 dual over row halves), so the NV_Q38_DRAFT_LMHEAD_NVFP4 serving route ships the measured winner"]
 fn q38_draft_lmhead_m1_gemv_arm_floor() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run the draft lm_head arm floor bench");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the draft lm_head arm floor bench executed nothing. It \
+             is already #[ignore]d, which makes --ignored the opt-in; a second env gate behind \
+             that can only make an --ignored run print `1 passed` for a bench that measured \
+             nothing. A suite whose precondition is absent must fail or be ignored, never return \
+             green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();
@@ -344,8 +353,12 @@ fn q38_draft_lmhead_m1_gemv_arm_floor() {
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- solo-runs every kernel in the q38 decode gdn_chain and dense_mlp buckets at exact serving shapes, reporting us and effective GB/s so the bucket totals can be attributed kernel by kernel"]
 fn q38_decode_bucket_floor_solo_kernel_rates() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run the bucket floor bench");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the bucket floor bench executed nothing. It is already \
+             #[ignore]d, which makes --ignored the opt-in; a second env gate behind that can only \
+             make an --ignored run print `1 passed` for a bench that measured nothing. A suite \
+             whose precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();

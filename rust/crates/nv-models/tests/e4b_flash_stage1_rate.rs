@@ -8,10 +8,7 @@ use common::pack_u8;
 use nv_kernels::wgpu_backend::device::WgpuContext;
 use nv_kernels::wgpu_backend::kernels::flash_decode as fd;
 use nv_kernels::wgpu_backend::{compose, dispatch};
-use nv_models::gemma4_e4b_wgpu::{
-    flash1_e4b_entry, flash1_e4b_entry_sd, flash1_e4b_source, flash1_e4b_source_sd,
-    flash1_sg_supported, flash_sd_enabled,
-};
+use nv_models::gemma4_e4b_wgpu::{flash1_sg_supported, flash_sd_enabled};
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -287,9 +284,9 @@ fn arms(ctx: &'static WgpuContext) -> Vec<(String, wgpu::ComputePipeline)> {
             continue;
         }
         let (gen, entry) = if sd {
-            (flash1_e4b_source_sd(hd, sg), flash1_e4b_entry_sd(hd, sg))
+            (fd::fold_stage1_source_sd(hd, sg, 1), fd::fold_stage1_entry_sd(hd, sg, 1))
         } else {
-            (flash1_e4b_source(hd, sg), flash1_e4b_entry(hd, sg))
+            (fd::fold_stage1_source(hd, sg, 1), fd::fold_stage1_entry(hd, sg, 1))
         };
         let src = format!("{}\n{}", stock, gen);
         let pl = dispatch::compute_pipeline_opts(ctx, &entry, &src, &entry, true)
@@ -552,25 +549,41 @@ fn e4b_depth_attribution_per_dispatch() {
     let gpu_ms = median_of(gpu_totals);
     eprintln!("E4B-ATTR depth={depth} gpu-pass-sum median {gpu_ms:.3} ms/tok over {prof_steps} profiled steps");
 
-    let mut by_label: std::collections::BTreeMap<String, (usize, f64)> = Default::default();
+    let mut by_label: std::collections::BTreeMap<String, (usize, f64, u64, u64)> =
+        Default::default();
     let mut pass_med: Vec<(usize, f64)> = Vec::new();
     for i in 0..m.pass_count() {
         let med_ns = median_of(per_pass[i].clone());
         pass_med.push((i, med_ns));
-        let e = by_label.entry(m.pass_label(i).to_string()).or_insert((0, 0.0));
+        let (bound, widest) = m.pass_bound_bytes(i);
+        let e = by_label
+            .entry(format!(
+                "{} w{:.2}MB",
+                m.pass_label(i),
+                widest as f64 / 1e6
+            ))
+            .or_insert((0, 0.0, 0, 0));
         e.0 += 1;
         e.1 += med_ns;
+        e.2 += bound;
+        e.3 += widest;
     }
-    let mut rows: Vec<(String, usize, f64)> =
-        by_label.into_iter().map(|(l, (n, ns))| (l, n, ns)).collect();
+    let mut rows: Vec<(String, usize, f64, u64, u64)> = by_label
+        .into_iter()
+        .map(|(l, (n, ns, bb, wb))| (l, n, ns, bb, wb))
+        .collect();
     rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-    eprintln!("-- per-label (median per pass, summed) --");
-    for (label, n, ns) in &rows {
+    eprintln!("-- per-label (median per pass, summed; widest-bind GB/s = weight-stream rate) --");
+    for (label, n, ns, bound_b, widest_b) in &rows {
         eprintln!(
-            "E4B-ATTR-LABEL depth={depth} {label:<24} x{n:<4} {:>10.4} ms {:>5.1}%",
+            "E4B-ATTR-LABEL depth={depth} {label:<24} x{n:<4} {:>10.4} ms {:>5.1}% us/disp={:>6.2} widest_mb={:>8.2} widest_gbs={:>7.1}",
             ns / 1e6,
-            100.0 * ns / (gpu_ms * 1e6)
+            100.0 * ns / (gpu_ms * 1e6),
+            ns / 1e3 / *n as f64,
+            *widest_b as f64 / 1e6,
+            *widest_b as f64 / ns.max(1.0),
         );
+        let _ = bound_b;
     }
     pass_med.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     eprintln!("-- top 24 single passes --");

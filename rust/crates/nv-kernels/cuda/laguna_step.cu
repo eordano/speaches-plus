@@ -174,13 +174,21 @@ __global__ void laguna_flash_decode_gqa_kernel(
     unsigned int* __restrict__ fan_in,
     int NKV,
     int WINDOW,
-    float scale
+    float scale,
+    int mid_band_splits,
+    int mid_band_hi_total
 ) {
     const int kvh = blockIdx.x;
     const int split = blockIdx.y;
     const int HD = kGqaHD;
 
     const int total = total_ptr[0] + delta;
+    const int scanned = (WINDOW > 0 && total > WINDOW) ? WINDOW : total;
+    const int s_eff =
+        (mid_band_splits > 0 && mid_band_splits <= SPLITS && scanned <= mid_band_hi_total)
+            ? mid_band_splits
+            : SPLITS;
+    if (split >= s_eff) return;
     const int start = (WINDOW > 0 && total > WINDOW) ? (total - WINDOW) : 0;
 
     const int lane = threadIdx.x & (kGqaWarp - 1);
@@ -204,7 +212,7 @@ __global__ void laguna_flash_decode_gqa_kernel(
         for (int j = 0; j < kGqaVc; ++j) acc[g][j] = 0.0f;
     }
 
-    const int stride = SPLITS * kGqaWarps;
+    const int stride = s_eff * kGqaWarps;
     int p = start + split * kGqaWarps + warp;
     uint2 kraw, vraw;
     if (p < total) {
@@ -291,7 +299,7 @@ __global__ void laguna_flash_decode_gqa_kernel(
     __shared__ unsigned int ticket;
     if (threadIdx.x == 0) ticket = atomicAdd(&fan_in[kvh], 1u);
     __syncthreads();
-    if (ticket != SPLITS - 1) return;
+    if (ticket != s_eff - 1) return;
     __threadfence();
 
     const float* base = scratch + (size_t)kvh * SPLITS * GROUP * (kGqaHD + 2);
@@ -300,12 +308,10 @@ __global__ void laguna_flash_decode_gqa_kernel(
     if (warp == 0 && lane < GROUP) {
         const int g = lane;
         float m_glob = -INFINITY;
-        #pragma unroll
-        for (int s = 0; s < SPLITS; ++s)
+        for (int s = 0; s < s_eff; ++s)
             m_glob = fmaxf(m_glob, base[((size_t)s * GROUP + g) * (kGqaHD + 2)]);
         float l_glob = 0.0f;
-        #pragma unroll
-        for (int s = 0; s < SPLITS; ++s) {
+        for (int s = 0; s < s_eff; ++s) {
             const float* pp = base + ((size_t)s * GROUP + g) * (kGqaHD + 2);
             float sc = (pp[0] > -INFINITY) ? __expf(pp[0] - m_glob) : 0.0f;
             ssc[g][s] = sc;
@@ -319,22 +325,72 @@ __global__ void laguna_flash_decode_gqa_kernel(
         int g = i / kGqaHD;
         int d = i - g * kGqaHD;
         float a = 0.0f;
-        #pragma unroll
-        for (int s = 0; s < SPLITS; ++s)
+        for (int s = 0; s < s_eff; ++s)
             a += base[((size_t)s * GROUP + g) * (kGqaHD + 2) + 2 + d] * ssc[g][s];
         outp[(size_t)(kvh * GROUP + g) * kGqaHD + d] = __float2bfloat16(a * sinv_l[g]);
     }
     if (threadIdx.x == 0) fan_in[kvh] = 0u;
 }
 
+constexpr int kLagunaM1SplitsDefault16IsShallowTunedAndIs128WorkgroupsAt8KvHeads = 16;
+
+constexpr int kLagunaM1DepthgateDeepSplits47Is376WorkgroupsTwoPerSmAt8KvHeadsOn188Sms = 47;
+
+constexpr int kLagunaM1DepthgateShallow16WinsThroughScanned16384And47WinsFrom32768Up = 16384;
+
+inline bool laguna_m1_split_is_instantiated(int x) {
+    return x == 8 || x == 16 || x == 24 || x == 32 || x == 47 || x == 64;
+}
+
 inline int laguna_m1_splits_env() {
     static int v = [] {
         const char* e = getenv("NV_LAGUNA_M1_SPLITS");
-        if (e == nullptr) return 16;
+        if (e == nullptr)
+            return kLagunaM1SplitsDefault16IsShallowTunedAndIs128WorkgroupsAt8KvHeads;
         int x = atoi(e);
-        return (x == 8 || x == 16 || x == 32) ? x : 16;
+        return laguna_m1_split_is_instantiated(x)
+                   ? x
+                   : kLagunaM1SplitsDefault16IsShallowTunedAndIs128WorkgroupsAt8KvHeads;
     }();
     return v;
+}
+
+inline int laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count() {
+    static int v = [] {
+        const char* e = getenv("NV_LAGUNA_M1_DEPTHGATE");
+        return (e != nullptr && e[0] == '0') ? 0 : 1;
+    }();
+    return v;
+}
+
+inline int laguna_m1_depthgate_deep_splits_env() {
+    static int v = [] {
+        const char* e = getenv("NV_LAGUNA_M1_DEPTHGATE_SPLITS");
+        if (e == nullptr) return 0;
+        int x = atoi(e);
+        return laguna_m1_split_is_instantiated(x) ? x : 0;
+    }();
+    return v;
+}
+
+inline int laguna_m1_depthgate_knee_env() {
+    static int v = [] {
+        const char* e = getenv("NV_LAGUNA_M1_DEPTHGATE_KNEE");
+        if (e == nullptr) return 0;
+        int x = atoi(e);
+        return (x > 0) ? x : 0;
+    }();
+    return v;
+}
+
+inline int laguna_m1_launch_splits() {
+    if (!laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count())
+        return laguna_m1_splits_env();
+    int deep = laguna_m1_depthgate_deep_splits_env();
+    if (deep == 0)
+        deep = kLagunaM1DepthgateDeepSplits47Is376WorkgroupsTwoPerSmAt8KvHeadsOn188Sms;
+    int shallow = laguna_m1_splits_env();
+    return (deep > shallow) ? deep : shallow;
 }
 
 __global__ void laguna_seqlens_prep_kernel(
@@ -474,7 +530,9 @@ extern "C" int nv_kernels_laguna_qk_normrope_bf16(
 }
 
 extern "C" int nv_kernels_laguna_flash_decode_gqa_scratch_elems(int n_kv) {
-    return n_kv * 32 * 8 * (128 + 2);
+    int sp = laguna_m1_launch_splits();
+    if (sp < 32) sp = 32;
+    return n_kv * sp * 8 * (128 + 2);
 }
 
 extern "C" int nv_kernels_laguna_flash_decode_gqa(
@@ -498,7 +556,15 @@ extern "C" int nv_kernels_laguna_flash_decode_gqa(
     const int group = n_q / n_kv;
     if (group != 1 && group != 6 && group != 8) return -1;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const int sp = laguna_m1_splits_env();
+    const int sp = laguna_m1_launch_splits();
+    const int mid_band_splits =
+        laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count()
+            ? laguna_m1_splits_env()
+            : 0;
+    const int mid_band_hi_total =
+        (laguna_m1_depthgate_knee_env() > 0)
+            ? laguna_m1_depthgate_knee_env()
+            : kLagunaM1DepthgateShallow16WinsThroughScanned16384And47WinsFrom32768Up;
     dim3 grid((unsigned)n_kv, (unsigned)sp);
     const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
     const __nv_bfloat16* kb = reinterpret_cast<const __nv_bfloat16*>(k);
@@ -507,39 +573,93 @@ extern "C" int nv_kernels_laguna_flash_decode_gqa(
     switch (group * 100 + sp) {
         case 108:
             laguna_flash_decode_gqa_kernel<1, 8><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 116:
             laguna_flash_decode_gqa_kernel<1, 16><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 124:
+            laguna_flash_decode_gqa_kernel<1, 24><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 132:
             laguna_flash_decode_gqa_kernel<1, 32><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 147:
+            laguna_flash_decode_gqa_kernel<1, 47><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 164:
+            laguna_flash_decode_gqa_kernel<1, 64><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 608:
             laguna_flash_decode_gqa_kernel<6, 8><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 616:
             laguna_flash_decode_gqa_kernel<6, 16><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 624:
+            laguna_flash_decode_gqa_kernel<6, 24><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 632:
             laguna_flash_decode_gqa_kernel<6, 32><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 647:
+            laguna_flash_decode_gqa_kernel<6, 47><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 664:
+            laguna_flash_decode_gqa_kernel<6, 64><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 808:
             laguna_flash_decode_gqa_kernel<8, 8><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 816:
             laguna_flash_decode_gqa_kernel<8, 16><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 824:
+            laguna_flash_decode_gqa_kernel<8, 24><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         case 832:
             laguna_flash_decode_gqa_kernel<8, 32><<<grid, kGqaThreads, 0, s>>>(
-                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale);
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 847:
+            laguna_flash_decode_gqa_kernel<8, 47><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
+            break;
+        case 864:
+            laguna_flash_decode_gqa_kernel<8, 64><<<grid, kGqaThreads, 0, s>>>(
+                qb, kb, vb, ob, total_ptr, delta, scratch, fan_in, n_kv, window, scale,
+                mid_band_splits, mid_band_hi_total);
             break;
         default:
             return -1;

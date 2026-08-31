@@ -39,7 +39,17 @@ laguna-wip = ["wgpu"]
 name = "nvk-train"
 path = "src/bin/nvk-train.rs"
 
+[[bin]]
+name = "nvk-lora-merge"
+path = "src/bin/nvk-lora-merge.rs"
+
+[[example]]
+name = "nvk-dots-vision-dump"
+required-features = ["wgpu"]
+
+
 [dev-dependencies]
+log = "0.4"
 libc = "0.2"
 naga = { version = "=30.0.0", features = ["wgsl-in", "msl-out"] }
 nv-omni = { workspace = true }

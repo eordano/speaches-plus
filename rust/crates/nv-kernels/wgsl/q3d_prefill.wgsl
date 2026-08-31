@@ -265,6 +265,9 @@ const WY_D: u32 = 128u;
 const WY_VSPLIT: u32 = 4u;
 const WY_G_LOG_CLAMP_KEEPS_LOG_FINITE_WHEN_GATING_UNDERFLOWS: f32 = 1e-30;
 
+@group(0) @binding(39) var<storage, read_write> pdr_ckpt_cl: array<f32>;
+@group(0) @binding(49) var<storage, read_write> pdr_ckpt_s: array<f32>;
+
 var<workgroup> wy_kt: array<vec4<f32>, 1024>;
 var<workgroup> wy_qt: array<vec4<f32>, 1024>;
 var<workgroup> wy_a: array<f32, 1024>;
@@ -477,6 +480,366 @@ fn q3w_delta_scan_wy(
     }
 }
 
+@compute @workgroup_size(128)
+fn q3w_delta_scan_wy_ck(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let h = wid.x;
+    let lane = lid.x;
+    let heads = pdr_p.heads;
+    let sub = lane >> 5u;
+    let col = lane & 31u;
+    let v = wid.y * 32u + col;
+    let jb = sub * 2u;
+    let ostr = heads * WY_D;
+    for (var c0 = 0u; c0 < pdr_ck.m_live; c0 = c0 + WY_C) {
+        let n = min(WY_C, pdr_ck.m_live - c0);
+        let ob = (c0 * heads + h) * WY_D + v;
+        let cb = ((c0 >> 5u) * heads + h) * WY_C;
+        workgroupBarrier();
+        storageBarrier();
+        if (lane < n) {
+            wy_beta[lane] = pdr_beta[(c0 + lane) * heads + h];
+            wy_cl[lane] = log(max(
+                pdr_g[(c0 + lane) * heads + h],
+                WY_G_LOG_CLAMP_KEEPS_LOG_FINITE_WHEN_GATING_UNDERFLOWS
+            ));
+        }
+        workgroupBarrier();
+        if (lane == 0u) {
+            for (var t = 1u; t < n; t = t + 1u) {
+                wy_cl[t] = wy_cl[t] + wy_cl[t - 1u];
+            }
+        }
+        for (var e = lane; e < n * WY_D; e = e + 128u) {
+            let t = e >> 7u;
+            let i = e & 127u;
+            let idx = ((c0 + t) * heads + h) * WY_D + i;
+            wy_kt[i * 8u + (t >> 2u)][t & 3u] = pdr_k[idx];
+        }
+        workgroupBarrier();
+        if (wid.y == 0u && lane < n) {
+            pdr_ckpt_cl[cb + lane] = wy_cl[lane];
+        }
+        for (var e = lane; e < n * n; e = e + 128u) {
+            let t = e / n;
+            let s = e % n;
+            if (s < t) {
+                let se = s >> 2u;
+                let sc = s & 3u;
+                let te = t >> 2u;
+                let tc = t & 3u;
+                var dkk = 0.0;
+                for (var i = 0u; i < WY_D; i = i + 1u) {
+                    dkk = fma(wy_kt[i * 8u + se][sc], wy_kt[i * 8u + te][tc], dkk);
+                }
+                wy_a[t * WY_C + s] = wy_beta[t] * exp(wy_cl[t] - wy_cl[s]) * dkk;
+            }
+        }
+        var ak0 = vec4<f32>();
+        var ak1 = vec4<f32>();
+        for (var i = 0u; i < WY_D; i = i + 1u) {
+            let s4 = vec4<f32>(pdr_state[h * WY_D * WY_D + i * WY_D + v]);
+            let kb = i * 8u + jb;
+            ak0 = fma(s4, wy_kt[kb], ak0);
+            ak1 = fma(s4, wy_kt[kb + 1u], ak1);
+        }
+        workgroupBarrier();
+        let tb = sub * 8u;
+        if (tb + 0u < n) {
+            let t = tb;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak0.x);
+        }
+        if (tb + 1u < n) {
+            let t = tb + 1u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak0.y);
+        }
+        if (tb + 2u < n) {
+            let t = tb + 2u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak0.z);
+        }
+        if (tb + 3u < n) {
+            let t = tb + 3u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak0.w);
+        }
+        if (tb + 4u < n) {
+            let t = tb + 4u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak1.x);
+        }
+        if (tb + 5u < n) {
+            let t = tb + 5u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak1.y);
+        }
+        if (tb + 6u < n) {
+            let t = tb + 6u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak1.z);
+        }
+        if (tb + 7u < n) {
+            let t = tb + 7u;
+            let ge = exp(wy_cl[t]);
+            wy_qt[t * 32u + (col >> 2u)][col & 3u] =
+                wy_beta[t] * (pdr_v[ob + t * ostr] - ge * ak1.w);
+        }
+        workgroupBarrier();
+        if (sub == 0u) {
+            for (var s = 1u; s < n; s = s + 1u) {
+                var acc = 0.0;
+                for (var r = 0u; r < s; r = r + 1u) {
+                    acc = fma(wy_a[s * WY_C + r], wy_uget(r, col), acc);
+                }
+                wy_qt[s * 32u + (col >> 2u)][col & 3u] = wy_uget(s, col) - acc;
+            }
+        }
+        workgroupBarrier();
+        for (var c = 0u; c < 8u; c = c + 1u) {
+            let t = tb + c;
+            if (t >= n) {
+                break;
+            }
+            pdr_out[ob + t * ostr] = wy_uget(t, col);
+        }
+        let clend = wy_cl[n - 1u];
+        let gend = exp(clend);
+        let us0 = vec4<f32>(
+            wy_us(0u, n, clend, col), wy_us(1u, n, clend, col),
+            wy_us(2u, n, clend, col), wy_us(3u, n, clend, col));
+        let us1 = vec4<f32>(
+            wy_us(4u, n, clend, col), wy_us(5u, n, clend, col),
+            wy_us(6u, n, clend, col), wy_us(7u, n, clend, col));
+        let us2 = vec4<f32>(
+            wy_us(8u, n, clend, col), wy_us(9u, n, clend, col),
+            wy_us(10u, n, clend, col), wy_us(11u, n, clend, col));
+        let us3 = vec4<f32>(
+            wy_us(12u, n, clend, col), wy_us(13u, n, clend, col),
+            wy_us(14u, n, clend, col), wy_us(15u, n, clend, col));
+        let us4 = vec4<f32>(
+            wy_us(16u, n, clend, col), wy_us(17u, n, clend, col),
+            wy_us(18u, n, clend, col), wy_us(19u, n, clend, col));
+        let us5 = vec4<f32>(
+            wy_us(20u, n, clend, col), wy_us(21u, n, clend, col),
+            wy_us(22u, n, clend, col), wy_us(23u, n, clend, col));
+        let us6 = vec4<f32>(
+            wy_us(24u, n, clend, col), wy_us(25u, n, clend, col),
+            wy_us(26u, n, clend, col), wy_us(27u, n, clend, col));
+        let us7 = vec4<f32>(
+            wy_us(28u, n, clend, col), wy_us(29u, n, clend, col),
+            wy_us(30u, n, clend, col), wy_us(31u, n, clend, col));
+        for (var ii = 0u; ii < 32u; ii = ii + 1u) {
+            let i = sub * 32u + ii;
+            let sb = h * WY_D * WY_D + i * WY_D + v;
+            let kb = i * 8u;
+            let sold = pdr_state[sb];
+            pdr_ckpt_s[(((c0 >> 5u) * heads + h) * WY_D + i) * WY_D + v] = sold;
+            var sv = fma(gend, sold, dot(wy_kt[kb], us0));
+            sv = sv + dot(wy_kt[kb + 1u], us1) + dot(wy_kt[kb + 2u], us2);
+            sv = sv + dot(wy_kt[kb + 3u], us3) + dot(wy_kt[kb + 4u], us4);
+            sv = sv + dot(wy_kt[kb + 5u], us5) + dot(wy_kt[kb + 6u], us6);
+            sv = sv + dot(wy_kt[kb + 7u], us7);
+            pdr_state[sb] = sv;
+        }
+    }
+}
+
+@compute @workgroup_size(128)
+fn q3w_delta_scan_wy_o(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let h = wid.x;
+    let lane = lid.x;
+    let heads = pdr_p.heads;
+    let sub = lane >> 5u;
+    let col = lane & 31u;
+    let v = wid.y * 32u + col;
+    let jb = sub * 2u;
+    let ostr = heads * WY_D;
+    let c0 = wid.z * WY_C;
+    if (c0 >= pdr_ck.m_live) {
+        return;
+    }
+    let n = min(WY_C, pdr_ck.m_live - c0);
+    let ob = (c0 * heads + h) * WY_D + v;
+    if (lane < n) {
+        wy_cl[lane] = pdr_ckpt_cl[(wid.z * heads + h) * WY_C + lane];
+    }
+    for (var e = lane; e < n * WY_D; e = e + 128u) {
+        let t = e >> 7u;
+        let i = e & 127u;
+        let idx = ((c0 + t) * heads + h) * WY_D + i;
+        wy_kt[i * 8u + (t >> 2u)][t & 3u] = pdr_k[idx];
+        wy_qt[i * 8u + (t >> 2u)][t & 3u] = pdr_q[idx];
+    }
+    for (var e = lane; e < n * 32u; e = e + 128u) {
+        let t = e >> 5u;
+        let cc = e & 31u;
+        wy_a[t * 32u + cc] = pdr_out[((c0 + t) * heads + h) * WY_D + wid.y * 32u + cc];
+    }
+    workgroupBarrier();
+    storageBarrier();
+    for (var e = lane; e < n * n; e = e + 128u) {
+        let t = e / n;
+        let s = e % n;
+        if (s <= t) {
+            let se = s >> 2u;
+            let sc = s & 3u;
+            let te = t >> 2u;
+            let tc = t & 3u;
+            var dqk = 0.0;
+            for (var i = 0u; i < WY_D; i = i + 1u) {
+                dqk = fma(wy_kt[i * 8u + se][sc], wy_qt[i * 8u + te][tc], dqk);
+            }
+            wy_w[t * WY_C + s] = exp(wy_cl[t] - wy_cl[s]) * dqk;
+        }
+    }
+    var aq0 = vec4<f32>();
+    var aq1 = vec4<f32>();
+    for (var i = 0u; i < WY_D; i = i + 1u) {
+        let s4 = vec4<f32>(pdr_ckpt_s[((wid.z * heads + h) * WY_D + i) * WY_D + v]);
+        let kb = i * 8u + jb;
+        aq0 = fma(s4, wy_qt[kb], aq0);
+        aq1 = fma(s4, wy_qt[kb + 1u], aq1);
+    }
+    workgroupBarrier();
+    let tb = sub * 8u;
+    var sum0 = 0.0;
+    var sum1 = 0.0;
+    var sum2 = 0.0;
+    var sum3 = 0.0;
+    var sum4 = 0.0;
+    var sum5 = 0.0;
+    var sum6 = 0.0;
+    var sum7 = 0.0;
+    if (tb + 0u < n) {
+        let t = tb;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum0 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum0);
+        }
+    }
+    if (tb + 1u < n) {
+        let t = tb + 1u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum1 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum1);
+        }
+    }
+    if (tb + 2u < n) {
+        let t = tb + 2u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum2 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum2);
+        }
+    }
+    if (tb + 3u < n) {
+        let t = tb + 3u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum3 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum3);
+        }
+    }
+    if (tb + 4u < n) {
+        let t = tb + 4u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum4 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum4);
+        }
+    }
+    if (tb + 5u < n) {
+        let t = tb + 5u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum5 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum5);
+        }
+    }
+    if (tb + 6u < n) {
+        let t = tb + 6u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum6 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum6);
+        }
+    }
+    if (tb + 7u < n) {
+        let t = tb + 7u;
+        for (var s = 0u; s <= t; s = s + 1u) {
+            sum7 = fma(wy_w[t * WY_C + s], wy_a[s * 32u + col], sum7);
+        }
+    }
+    workgroupBarrier();
+    if (tb + 0u < n) {
+        let t = tb;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq0.x;
+    }
+    if (tb + 1u < n) {
+        let t = tb + 1u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq0.y;
+    }
+    if (tb + 2u < n) {
+        let t = tb + 2u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq0.z;
+    }
+    if (tb + 3u < n) {
+        let t = tb + 3u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq0.w;
+    }
+    if (tb + 4u < n) {
+        let t = tb + 4u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq1.x;
+    }
+    if (tb + 5u < n) {
+        let t = tb + 5u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq1.y;
+    }
+    if (tb + 6u < n) {
+        let t = tb + 6u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq1.z;
+    }
+    if (tb + 7u < n) {
+        let t = tb + 7u;
+        wy_a[t * 32u + col] = exp(wy_cl[t]) * aq1.w;
+    }
+    workgroupBarrier();
+    if (tb + 0u < n) {
+        let t = tb;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum0;
+    }
+    if (tb + 1u < n) {
+        let t = tb + 1u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum1;
+    }
+    if (tb + 2u < n) {
+        let t = tb + 2u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum2;
+    }
+    if (tb + 3u < n) {
+        let t = tb + 3u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum3;
+    }
+    if (tb + 4u < n) {
+        let t = tb + 4u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum4;
+    }
+    if (tb + 5u < n) {
+        let t = tb + 5u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum5;
+    }
+    if (tb + 6u < n) {
+        let t = tb + 6u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum6;
+    }
+    if (tb + 7u < n) {
+        let t = tb + 7u;
+        pdr_out[ob + t * ostr] = wy_a[t * 32u + col] + sum7;
+    }
+}
+
 struct Q3domParams {
     n_v: u32,
     d_v: u32,
@@ -614,6 +977,249 @@ fn q3w_attn_norm_rope_m(
     let o0 = par_rope_at(e0, p);
     let o1 = par_rope_at(e0 + 1u, p);
     par_out[(t * par_p.y_row_elems + r * hd + e0) >> 1u] = bf16_pack(o0, o1);
+}
+
+struct Q3abmParams {
+    n_rows: u32,
+    head_dim: u32,
+    src_stride: u32,
+    rot_half: u32,
+    x_row_elems: u32,
+    y_row_elems: u32,
+    bias_off: u32,
+    pad0: u32,
+};
+
+@group(0) @binding(67) var<storage, read> pab_bias: array<u32>;
+@group(0) @binding(68) var<uniform> pab_p: Q3abmParams;
+
+fn pab_rope_at(d: u32, p: u32) -> f32 {
+    let rh = pab_p.rot_half;
+    if (d < rh) {
+        let c = par_cos[p * rh + d];
+        let s = par_sin[p * rh + d];
+        return par_buf[d] * c - par_buf[d + rh] * s;
+    }
+    if (d < 2u * rh) {
+        let i = d - rh;
+        let c = par_cos[p * rh + i];
+        let s = par_sin[p * rh + i];
+        return par_buf[i] * s + par_buf[d] * c;
+    }
+    return par_buf[d];
+}
+
+@compute @workgroup_size(128)
+fn q3w_attn_bias_rope_m(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let t = wid.y;
+    if (t >= par_ck.m_live) {
+        return;
+    }
+    let r = wid.x;
+    let lane = lid.x;
+    let hd = pab_p.head_dim;
+    let e0 = 2u * lane;
+    if (e0 < hd) {
+        let base = t * pab_p.x_row_elems + r * pab_p.src_stride + e0;
+        let v0 = bf16_decode(u16_at(par_src[base >> 1u], base));
+        let v1 = bf16_decode(u16_at(par_src[(base + 1u) >> 1u], base + 1u));
+        let bb = pab_p.bias_off + r * hd + e0;
+        let b0 = bf16_decode(u16_at(pab_bias[bb >> 1u], bb));
+        let b1 = bf16_decode(u16_at(pab_bias[(bb + 1u) >> 1u], bb + 1u));
+        par_buf[e0] = bf16_decode(bf16_encode(v0 + b0));
+        par_buf[e0 + 1u] = bf16_decode(bf16_encode(v1 + b1));
+    }
+    workgroupBarrier();
+    if (e0 >= hd) {
+        return;
+    }
+    let p = par_ck.base + t;
+    let o0 = pab_rope_at(e0, p);
+    let o1 = pab_rope_at(e0 + 1u, p);
+    par_out[(t * pab_p.y_row_elems + r * hd + e0) >> 1u] = bf16_pack(o0, o1);
+}
+
+struct Q3afmpParams {
+    n_kv: u32,
+    head_dim: u32,
+    group: u32,
+    q_row_elems: u32,
+    y_row_words: u32,
+    pad0: u32,
+    pad1: u32,
+    scale: f32,
+};
+
+@group(0) @binding(95) var<storage, read> afm_q: array<u32>;
+@group(0) @binding(96) var<storage, read> afm_kc: array<u32>;
+@group(0) @binding(97) var<storage, read> afm_vc: array<u32>;
+@group(0) @binding(98) var<storage, read_write> afm_y: array<u32>;
+@group(0) @binding(99) var<uniform> afm_p: Q3afmpParams;
+
+var<workgroup> afm_qs: array<f32, 1024>;
+var<workgroup> afm_acc: array<f32, 1024>;
+var<workgroup> afm_mz: array<f32, 16>;
+
+@compute @workgroup_size(256)
+fn q3w_attn_flash_m_pk(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let h = wid.x;
+    let tile = wid.y;
+    let tid = lid.x;
+    let lane = tid & 31u;
+    let warp = tid >> 5u;
+    let hd = afm_p.head_dim;
+    let kvh = h / afm_p.group;
+    var base = 0u;
+    if (par_ck.base > 0u) {
+        base = par_ck.base;
+    }
+    let ml = par_ck.m_live;
+    let row0 = tile * 8u;
+    if (row0 >= ml) {
+        return;
+    }
+    let live_rows = min(ml - row0, 8u);
+    let bound_max = base + row0 + live_rows;
+
+    for (var e = tid; e < 8u * hd; e = e + 256u) {
+        let r = e / hd;
+        let d = e - r * hd;
+        let qr = min(row0 + r, ml - 1u);
+        let qi = qr * afm_p.q_row_elems + h * hd + d;
+        afm_qs[e] = bf16_decode(u16_at(afm_q[qi >> 1u], qi)) * afm_p.scale;
+    }
+    workgroupBarrier();
+
+    let d0 = lane * 4u;
+    var m0v = vec4<f32>(-3.4028235e38);
+    var m1v = vec4<f32>(-3.4028235e38);
+    var z0v = vec4<f32>(0.0);
+    var z1v = vec4<f32>(0.0);
+    var a00 = vec4<f32>(0.0);
+    var a01 = vec4<f32>(0.0);
+    var a02 = vec4<f32>(0.0);
+    var a03 = vec4<f32>(0.0);
+    var a10 = vec4<f32>(0.0);
+    var a11 = vec4<f32>(0.0);
+    var a12 = vec4<f32>(0.0);
+    var a13 = vec4<f32>(0.0);
+
+    for (var t = warp; t < bound_max; t = t + 8u) {
+        let kb = (t * afm_p.n_kv + kvh) * hd + d0;
+        let kw0 = afm_kc[kb >> 1u];
+        let kw1 = afm_kc[(kb >> 1u) + 1u];
+        let k0 = bf16_lo(kw0);
+        let k1 = bf16_hi(kw0);
+        let k2 = bf16_lo(kw1);
+        let k3 = bf16_hi(kw1);
+        var s0 = vec4<f32>(0.0);
+        var s1 = vec4<f32>(0.0);
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            let qb = r * hd + d0;
+            s0[r] = fma(k0, afm_qs[qb], fma(k1, afm_qs[qb + 1u], fma(k2, afm_qs[qb + 2u], k3 * afm_qs[qb + 3u])));
+            let qb2 = (r + 4u) * hd + d0;
+            s1[r] = fma(k0, afm_qs[qb2], fma(k1, afm_qs[qb2 + 1u], fma(k2, afm_qs[qb2 + 2u], k3 * afm_qs[qb2 + 3u])));
+        }
+        s0 = s0 + subgroupShuffleXor(s0, 16u);
+        s0 = s0 + subgroupShuffleXor(s0, 8u);
+        s0 = s0 + subgroupShuffleXor(s0, 4u);
+        s0 = s0 + subgroupShuffleXor(s0, 2u);
+        s0 = s0 + subgroupShuffleXor(s0, 1u);
+        s1 = s1 + subgroupShuffleXor(s1, 16u);
+        s1 = s1 + subgroupShuffleXor(s1, 8u);
+        s1 = s1 + subgroupShuffleXor(s1, 4u);
+        s1 = s1 + subgroupShuffleXor(s1, 2u);
+        s1 = s1 + subgroupShuffleXor(s1, 1u);
+        for (var r = 0u; r < 4u; r = r + 1u) {
+            if (t + 1u > base + row0 + r + 1u) {
+                s0[r] = -3.4028235e38;
+            }
+            if (t + 1u > base + row0 + r + 5u) {
+                s1[r] = -3.4028235e38;
+            }
+        }
+        let vw0 = afm_vc[kb >> 1u];
+        let vw1 = afm_vc[(kb >> 1u) + 1u];
+        let v0 = bf16_lo(vw0);
+        let v1 = bf16_hi(vw0);
+        let v2 = bf16_lo(vw1);
+        let v3 = bf16_hi(vw1);
+        let nm0 = max(m0v, s0);
+        let r0 = exp(m0v - nm0);
+        let e0 = exp(s0 - nm0);
+        z0v = fma(z0v, r0, e0);
+        a00 = fma(a00, r0, e0 * v0);
+        a01 = fma(a01, r0, e0 * v1);
+        a02 = fma(a02, r0, e0 * v2);
+        a03 = fma(a03, r0, e0 * v3);
+        m0v = nm0;
+        let nm1 = max(m1v, s1);
+        let r1 = exp(m1v - nm1);
+        let e1 = exp(s1 - nm1);
+        z1v = fma(z1v, r1, e1);
+        a10 = fma(a10, r1, e1 * v0);
+        a11 = fma(a11, r1, e1 * v1);
+        a12 = fma(a12, r1, e1 * v2);
+        a13 = fma(a13, r1, e1 * v3);
+        m1v = nm1;
+    }
+
+    for (var e = tid; e < 8u * hd; e = e + 256u) {
+        afm_acc[e] = 0.0;
+    }
+    if (tid < 16u) {
+        afm_mz[tid] = select(0.0, -3.4028235e38, tid < 8u);
+    }
+    workgroupBarrier();
+
+    for (var w = 0u; w < 8u; w = w + 1u) {
+        if (warp == w) {
+            for (var r = 0u; r < 8u; r = r + 1u) {
+                let mw = select(m1v[r - 4u], m0v[r], r < 4u);
+                let zw = select(z1v[r - 4u], z0v[r], r < 4u);
+                if (mw > -3.0e38) {
+                    let gm = afm_mz[r];
+                    let nm = max(gm, mw);
+                    let rg = exp(gm - nm);
+                    let rw = exp(mw - nm);
+                    if (lane == 0u) {
+                        afm_mz[r] = nm;
+                        afm_mz[r + 8u] = afm_mz[r + 8u] * rg + zw * rw;
+                    }
+                    let ab = r * hd + d0;
+                    var av = vec4<f32>(0.0);
+                    if (r < 4u) {
+                        av = vec4<f32>(a00[r], a01[r], a02[r], a03[r]);
+                    } else {
+                        av = vec4<f32>(a10[r - 4u], a11[r - 4u], a12[r - 4u], a13[r - 4u]);
+                    }
+                    afm_acc[ab] = afm_acc[ab] * rg + av.x * rw;
+                    afm_acc[ab + 1u] = afm_acc[ab + 1u] * rg + av.y * rw;
+                    afm_acc[ab + 2u] = afm_acc[ab + 2u] * rg + av.z * rw;
+                    afm_acc[ab + 3u] = afm_acc[ab + 3u] * rg + av.w * rw;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+
+    for (var e = tid; e < 8u * (hd >> 1u); e = e + 256u) {
+        let r = e / (hd >> 1u);
+        if (r >= live_rows) {
+            continue;
+        }
+        let p = e - r * (hd >> 1u);
+        let inv = 1.0 / max(afm_mz[r + 8u], 1e-30);
+        let o0 = afm_acc[r * hd + p * 2u] * inv;
+        let o1 = afm_acc[r * hd + p * 2u + 1u] * inv;
+        afm_y[(row0 + r) * afm_p.y_row_words + (h * hd >> 1u) + p] = bf16_pack(o0, o1);
+    }
 }
 
 struct Q3kvmParams {
@@ -786,4 +1392,172 @@ fn q3w_attn_gate_m(@builtin(global_invocation_id) gid: vec3<u32>) {
     let s0 = bf16_decode(bf16_encode(1.0 / (1.0 + exp(-g0))));
     let s1 = bf16_decode(bf16_encode(1.0 / (1.0 + exp(-g1))));
     pag_out[t * pag_p.n_words + w] = bf16_pack(a0 * s0, a1 * s1);
+}
+
+const WY16_C: u32 = 16u;
+
+var<workgroup> wy16_kt: array<vec4<f32>, 512>;
+var<workgroup> wy16_qt: array<vec4<f32>, 512>;
+var<workgroup> wy16_a: array<f32, 256>;
+var<workgroup> wy16_w: array<f32, 256>;
+var<workgroup> wy16_u_scalar_because_msl_vec4_component_stores_rmw_the_whole_vector: array<f32, 512>;
+var<workgroup> wy16_cl: array<f32, 16>;
+var<workgroup> wy16_beta: array<f32, 16>;
+
+fn wy16_uget(t: u32, col: u32) -> f32 {
+    return wy16_u_scalar_because_msl_vec4_component_stores_rmw_the_whole_vector[t * 32u + col];
+}
+
+fn wy16_uset(t: u32, col: u32, x: f32) {
+    wy16_u_scalar_because_msl_vec4_component_stores_rmw_the_whole_vector[t * 32u + col] = x;
+}
+
+fn wy16_us(s: u32, n: u32, clend: f32, col: u32) -> f32 {
+    return select(
+        0.0,
+        exp(clend - wy16_cl[min(s, n - 1u)]) * wy16_uget(s, col),
+        s < n
+    );
+}
+
+@compute @workgroup_size(128)
+fn q3w_delta_scan_wy16(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let h = wid.x;
+    let lane = lid.x;
+    let heads = pdr_p.heads;
+    let sub = lane >> 5u;
+    let col = lane & 31u;
+    let v = wid.y * 32u + col;
+    let ostr = heads * WY_D;
+    for (var c0 = 0u; c0 < pdr_ck.m_live; c0 = c0 + WY16_C) {
+        let n = min(WY16_C, pdr_ck.m_live - c0);
+        let ob = (c0 * heads + h) * WY_D + v;
+        workgroupBarrier();
+        storageBarrier();
+        if (lane < n) {
+            wy16_beta[lane] = pdr_beta[(c0 + lane) * heads + h];
+            wy16_cl[lane] = log(max(
+                pdr_g[(c0 + lane) * heads + h],
+                WY_G_LOG_CLAMP_KEEPS_LOG_FINITE_WHEN_GATING_UNDERFLOWS
+            ));
+        }
+        workgroupBarrier();
+        if (lane == 0u) {
+            for (var t = 1u; t < n; t = t + 1u) {
+                wy16_cl[t] = wy16_cl[t] + wy16_cl[t - 1u];
+            }
+        }
+        for (var e = lane; e < n * WY_D; e = e + 128u) {
+            let t = e >> 7u;
+            let i = e & 127u;
+            let idx = ((c0 + t) * heads + h) * WY_D + i;
+            wy16_kt[i * 4u + (t >> 2u)][t & 3u] = pdr_k[idx];
+            wy16_qt[i * 4u + (t >> 2u)][t & 3u] = pdr_q[idx];
+        }
+        workgroupBarrier();
+        for (var e = lane; e < n * n; e = e + 128u) {
+            let t = e / n;
+            let s = e % n;
+            if (s <= t) {
+                let se = s >> 2u;
+                let sc = s & 3u;
+                let te = t >> 2u;
+                let tc = t & 3u;
+                var dkk = 0.0;
+                var dqk = 0.0;
+                for (var i = 0u; i < WY_D; i = i + 1u) {
+                    let ks = wy16_kt[i * 4u + se][sc];
+                    dkk = fma(ks, wy16_kt[i * 4u + te][tc], dkk);
+                    dqk = fma(ks, wy16_qt[i * 4u + te][tc], dqk);
+                }
+                let decay = exp(wy16_cl[t] - wy16_cl[s]);
+                if (s < t) {
+                    wy16_a[t * WY16_C + s] = wy16_beta[t] * decay * dkk;
+                }
+                wy16_w[t * WY16_C + s] = decay * dqk;
+            }
+        }
+        var ak = vec4<f32>();
+        var aq = vec4<f32>();
+        for (var i = 0u; i < WY_D; i = i + 1u) {
+            let s4 = vec4<f32>(pdr_state[h * WY_D * WY_D + i * WY_D + v]);
+            let kb = i * 4u + sub;
+            ak = fma(s4, wy16_kt[kb], ak);
+            aq = fma(s4, wy16_qt[kb], aq);
+        }
+        workgroupBarrier();
+        let tb = sub * 4u;
+        if (tb + 0u < n) {
+            let t = tb;
+            let ge = exp(wy16_cl[t]);
+            wy16_uset(t, col, wy16_beta[t] * (pdr_v[ob + t * ostr] - ge * ak.x));
+            pdr_out[ob + t * ostr] = ge * aq.x;
+        }
+        if (tb + 1u < n) {
+            let t = tb + 1u;
+            let ge = exp(wy16_cl[t]);
+            wy16_uset(t, col, wy16_beta[t] * (pdr_v[ob + t * ostr] - ge * ak.y));
+            pdr_out[ob + t * ostr] = ge * aq.y;
+        }
+        if (tb + 2u < n) {
+            let t = tb + 2u;
+            let ge = exp(wy16_cl[t]);
+            wy16_uset(t, col, wy16_beta[t] * (pdr_v[ob + t * ostr] - ge * ak.z));
+            pdr_out[ob + t * ostr] = ge * aq.z;
+        }
+        if (tb + 3u < n) {
+            let t = tb + 3u;
+            let ge = exp(wy16_cl[t]);
+            wy16_uset(t, col, wy16_beta[t] * (pdr_v[ob + t * ostr] - ge * ak.w));
+            pdr_out[ob + t * ostr] = ge * aq.w;
+        }
+        workgroupBarrier();
+        if (sub == 0u) {
+            for (var s = 1u; s < n; s = s + 1u) {
+                var acc = 0.0;
+                for (var r = 0u; r < s; r = r + 1u) {
+                    acc = fma(wy16_a[s * WY16_C + r], wy16_uget(r, col), acc);
+                }
+                wy16_uset(s, col, wy16_uget(s, col) - acc);
+            }
+        }
+        workgroupBarrier();
+        for (var c = 0u; c < 4u; c = c + 1u) {
+            let t = tb + c;
+            if (t >= n) {
+                break;
+            }
+            var sum = 0.0;
+            for (var s = 0u; s <= t; s = s + 1u) {
+                sum = fma(wy16_w[t * WY16_C + s], wy16_uget(s, col), sum);
+            }
+            pdr_out[ob + t * ostr] = pdr_out[ob + t * ostr] + sum;
+        }
+        let clend = wy16_cl[n - 1u];
+        let gend = exp(clend);
+        let us0 = vec4<f32>(
+            wy16_us(0u, n, clend, col), wy16_us(1u, n, clend, col),
+            wy16_us(2u, n, clend, col), wy16_us(3u, n, clend, col));
+        let us1 = vec4<f32>(
+            wy16_us(4u, n, clend, col), wy16_us(5u, n, clend, col),
+            wy16_us(6u, n, clend, col), wy16_us(7u, n, clend, col));
+        let us2 = vec4<f32>(
+            wy16_us(8u, n, clend, col), wy16_us(9u, n, clend, col),
+            wy16_us(10u, n, clend, col), wy16_us(11u, n, clend, col));
+        let us3 = vec4<f32>(
+            wy16_us(12u, n, clend, col), wy16_us(13u, n, clend, col),
+            wy16_us(14u, n, clend, col), wy16_us(15u, n, clend, col));
+        for (var ii = 0u; ii < 32u; ii = ii + 1u) {
+            let i = sub * 32u + ii;
+            let sb = h * WY_D * WY_D + i * WY_D + v;
+            let kb = i * 4u;
+            var sv = fma(gend, pdr_state[sb], dot(wy16_kt[kb], us0));
+            sv = sv + dot(wy16_kt[kb + 1u], us1) + dot(wy16_kt[kb + 2u], us2);
+            sv = sv + dot(wy16_kt[kb + 3u], us3);
+            pdr_state[sb] = sv;
+        }
+    }
 }

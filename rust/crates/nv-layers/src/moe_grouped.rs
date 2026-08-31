@@ -12,13 +12,21 @@ use crate::mlp::Mlp;
 const MIN_TILE: usize = nv_quant::nvfp4::MIN_TILE;
 const BLOCK_SIZE: usize = nv_quant::nvfp4::BLOCK_SIZE;
 
+pub fn moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
+    key: &str,
+) -> bool {
+    !matches!(
+        std::env::var(key).ok().as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
 pub fn folded_shared_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NV_MOE_SHARED_FOLD").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes")
+        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
+            "NV_MOE_SHARED_FOLD",
         )
     })
 }
@@ -27,14 +35,27 @@ pub fn route_fuse_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NV_MOE_ROUTE_FUSE").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes")
+        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
+            "NV_MOE_ROUTE_FUSE",
         )
     })
 }
 
+pub fn chain_slim_launches_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
+            "NV_MOE_CHAIN_SLIM",
+        )
+    })
+}
+
+const ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM: i32 = 8;
+
 const ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_256_EXPERTS: usize = 256;
+
+pub const ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS: usize = 8;
 
 pub struct MoeGroupedWeights {
     pub num_experts: usize,
@@ -272,6 +293,134 @@ impl MoeGroupedWeights {
             down_b_stride_elems: intermediate_size as i64,
             down_c_stride_elems: hidden_size as i64,
             runner,
+            input_globals_gate_up,
+            input_globals_down,
+            input_globals_gate_up_host: globals_gate_up_host,
+            input_globals_down_host: globals_down_host,
+        })
+    }
+
+    pub fn append_shared_expert_as_tile_e_costs_one_extra_expert_copy_on_top_of_the_cached_base(
+        base: &Self,
+        shared: &Mlp,
+        shared_expert_intermediate_size: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Self> {
+        let e = base.num_experts;
+        let hidden = base.hidden_size;
+        let inter = base.intermediate_size;
+        anyhow::ensure!(
+            !base.folded_shared,
+            "base grouped weights already fold the shared expert"
+        );
+        anyhow::ensure!(
+            shared_expert_intermediate_size == inter,
+            "shared fold needs shared_expert_intermediate_size {shared_expert_intermediate_size} \
+             == moe_intermediate_size {inter}"
+        );
+        let (sg_w, sg_s, sg_a, sg_g) = shared
+            .gate_proj()
+            .nvfp4_parts()
+            .context("shared fold: shared gate_proj is not NVFP4")?;
+        let (su_w, su_s, su_a, su_g) = shared
+            .up_proj()
+            .nvfp4_parts()
+            .context("shared fold: shared up_proj is not NVFP4")?;
+        let (sd_w, sd_s, sd_a, sd_g) = shared
+            .down_proj()
+            .nvfp4_parts()
+            .context("shared fold: shared down_proj is not NVFP4")?;
+        anyhow::ensure!(
+            (sg_g - su_g).abs() <= 1e-6,
+            "shared fold: gate/up input_global_scale differ ({sg_g} vs {su_g})"
+        );
+        let gate_bytes = inter * hidden / 2;
+        let gate_scale_bytes = swizzled_scale_bytes(inter, hidden);
+        let down_bytes = hidden * inter / 2;
+        let down_scale_bytes = swizzled_scale_bytes(hidden, inter);
+
+        let append_bytes = |old: &CudaSlice<u8>,
+                            tail: &CudaSlice<u8>,
+                            per: usize,
+                            exact: bool|
+         -> Result<CudaSlice<u8>> {
+            anyhow::ensure!(
+                old.len() == e * per,
+                "shared fold: concat len {} != experts {e} x {per}",
+                old.len()
+            );
+            anyhow::ensure!(
+                !exact || tail.len() == per,
+                "shared fold: shared tensor len {} != per-expert {per}",
+                tail.len()
+            );
+            let mut grown = stream.alloc_zeros::<u8>((e + 1) * per)?;
+            let n = per.min(tail.len());
+            #[allow(deprecated)]
+            {
+                stream.memcpy_dtod(old, &mut grown.slice_mut(0..e * per))?;
+                stream.memcpy_dtod(&tail.slice(0..n), &mut grown.slice_mut(e * per..e * per + n))?;
+            }
+            Ok(grown)
+        };
+        let append_alpha = |old: &CudaSlice<f32>, alpha: f32| -> Result<CudaSlice<f32>> {
+            anyhow::ensure!(old.len() == e, "shared fold: alpha len {} != {e}", old.len());
+            let mut grown = stream.alloc_zeros::<f32>(e + 1)?;
+            #[allow(deprecated)]
+            {
+                stream.memcpy_dtod(old, &mut grown.slice_mut(0..e))?;
+                stream.memcpy_htod(&[alpha], &mut grown.slice_mut(e..e + 1))?;
+            }
+            Ok(grown)
+        };
+
+        let gate_w = append_bytes(&base.gate_w, sg_w, gate_bytes, true)?;
+        let gate_w_scales = append_bytes(&base.gate_w_scales, sg_s, gate_scale_bytes, false)?;
+        let gate_alphas = append_alpha(&base.gate_alphas, sg_a)?;
+        let up_w = append_bytes(&base.up_w, su_w, gate_bytes, true)?;
+        let up_w_scales = append_bytes(&base.up_w_scales, su_s, gate_scale_bytes, false)?;
+        let up_alphas = append_alpha(&base.up_alphas, su_a)?;
+        let down_w = append_bytes(&base.down_w, sd_w, down_bytes, true)?;
+        let down_w_scales = append_bytes(&base.down_w_scales, sd_s, down_scale_bytes, false)?;
+        let down_alphas = append_alpha(&base.down_alphas, sd_a)?;
+
+        let mut globals_gate_up_host = base.input_globals_gate_up_host.clone();
+        globals_gate_up_host.push(sg_g);
+        let mut globals_down_host = base.input_globals_down_host.clone();
+        globals_down_host.push(sd_g);
+        anyhow::ensure!(
+            globals_gate_up_host.len() == e + 1 && globals_down_host.len() == e + 1,
+            "shared fold: globals host vec sized {} / {}, want {}",
+            globals_gate_up_host.len(),
+            globals_down_host.len(),
+            e + 1
+        );
+        #[allow(deprecated)]
+        let input_globals_gate_up = stream.memcpy_stod(&globals_gate_up_host)?;
+        #[allow(deprecated)]
+        let input_globals_down = stream.memcpy_stod(&globals_down_host)?;
+
+        Ok(Self {
+            num_experts: e,
+            hidden_size: hidden,
+            intermediate_size: inter,
+            folded_shared: true,
+            gate_w,
+            gate_w_scales,
+            gate_alphas,
+            gate_a_stride_elems: base.gate_a_stride_elems,
+            gate_b_stride_elems: base.gate_b_stride_elems,
+            gate_c_stride_elems: base.gate_c_stride_elems,
+            up_w,
+            up_w_scales,
+            up_alphas,
+            down_w,
+            down_w_scales,
+            down_alphas,
+            down_a_stride_elems: base.down_a_stride_elems,
+            down_b_stride_elems: base.down_b_stride_elems,
+            down_c_stride_elems: base.down_c_stride_elems,
+            runner: base.runner.clone(),
             input_globals_gate_up,
             input_globals_down,
             input_globals_gate_up_host: globals_gate_up_host,
@@ -558,8 +707,6 @@ pub fn forward_grouped(
         anyhow::ensure!(rc == 0, "moe_unpermute_scatter rc={rc}");
     }
 
-    stream.synchronize()?;
-
     let _ = (plan.real_m_per_active,);
 
     let storage = candle_core::CudaStorage::wrap_cuda_slice(y_acc, dev);
@@ -600,6 +747,7 @@ pub struct GroupedDecodeContext {
     gemm_ws2: CudaSlice<u8>,
     pub x_in: CudaSlice<bf16>,
     pub logits_f32: CudaSlice<f32>,
+    sg_logits_bf16_written_by_the_router_gemv_arm: CudaSlice<bf16>,
     pub y_acc: CudaSlice<f32>,
     pub shared_f32: CudaSlice<f32>,
     pub out_f32: CudaSlice<f32>,
@@ -737,6 +885,8 @@ impl GroupedDecodeContext {
         let gemm_ws2 = unsafe { stream.alloc::<u8>(16 * 1024 * 1024)? };
         let x_in = stream.alloc_zeros::<bf16>(n_tokens * hidden)?;
         let logits_f32 = stream.alloc_zeros::<f32>(n_tokens * num_experts)?;
+        let sg_logits_bf16_written_by_the_router_gemv_arm =
+            stream.alloc_zeros::<bf16>(n_tokens)?;
         let y_acc = stream.alloc_zeros::<f32>(n_tokens * hidden)?;
         let shared_f32 = stream.alloc_zeros::<f32>(n_tokens * hidden)?;
         let out_f32 = stream.alloc_zeros::<f32>(n_tokens * hidden)?;
@@ -772,6 +922,7 @@ impl GroupedDecodeContext {
             gemm_ws2,
             x_in,
             logits_f32,
+            sg_logits_bf16_written_by_the_router_gemv_arm,
             y_acc,
             shared_f32,
             out_f32,
@@ -804,6 +955,160 @@ impl GroupedDecodeContext {
     pub fn top_k(&self) -> usize {
         self.k
     }
+
+    pub fn cast_router_logits_bf16_into_logits_f32_softcap_applied_at_route_not_here(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        router_logits_bf16_dev_ptr: u64,
+    ) -> Result<()> {
+        let n = self.n_tokens * self.num_experts;
+        let (dp, _g) = self.logits_f32.device_ptr_mut(stream);
+        let rc = unsafe {
+            nv_kernels::cuda::tanh_softcap_bf16_to_f32(
+                stream.cu_stream() as *mut c_void,
+                router_logits_bf16_dev_ptr as *const u16,
+                dp as *mut f32,
+                0.0,
+                n,
+            )
+        };
+        anyhow::ensure!(rc == 0, "grouped chain router logits cast rc={rc}");
+        Ok(())
+    }
+
+    pub fn stage_x_bf16_rows_dtod(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x_bf16_dev_ptr: u64,
+    ) -> Result<()> {
+        let bytes = self.n_tokens * self.hidden * std::mem::size_of::<bf16>();
+        let (dst, _g) = self.x_in.device_ptr_mut(stream);
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                dst,
+                x_bf16_dev_ptr,
+                bytes,
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("grouped chain x_in stage dtod: {e:?}"))?;
+        Ok(())
+    }
+
+    pub fn fused_router_gemv_sg_and_x_stage_replacing_gate_gemm_cast_and_dtod(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        x_bf16_dev_ptr: u64,
+        router_w_bf16_dev_ptr: u64,
+        shared_gate_w_bf16_dev_ptr: Option<u64>,
+    ) -> Result<()> {
+        let m = self.n_tokens;
+        anyhow::ensure!(
+            m <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS,
+            "router gemv arm holds to {} rows, got {m}",
+            ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
+        );
+        let (lp, _g1) = self.logits_f32.device_ptr_mut(stream);
+        let (xp, _g2) = self.x_in.device_ptr_mut(stream);
+        let (sp, _g3) = self
+            .sg_logits_bf16_written_by_the_router_gemv_arm
+            .device_ptr_mut(stream);
+        let (wsg, sg_out) = match shared_gate_w_bf16_dev_ptr {
+            Some(w) => (w as *const u16, sp as *mut u16),
+            None => (std::ptr::null(), std::ptr::null_mut()),
+        };
+        let rc = unsafe {
+            nv_kernels::cuda::moe_router_gemv_sg_xstage_small_m(
+                stream.cu_stream() as *mut c_void,
+                x_bf16_dev_ptr as *const u16,
+                router_w_bf16_dev_ptr as *const u16,
+                wsg,
+                lp as *mut f32,
+                sg_out,
+                xp as *mut u16,
+                m as i32,
+                self.num_experts as i32,
+                self.hidden as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "moe_router_gemv_sg_xstage_small_m rc={rc}");
+        Ok(())
+    }
+
+    pub fn unpermute_scatter_tail_reading_the_sg_slot_the_router_gemv_arm_wrote(
+        &self,
+        stream: &Arc<CudaStream>,
+        out_bf16_dev_ptr: u64,
+    ) -> Result<()> {
+        let (sp, _g) = self
+            .sg_logits_bf16_written_by_the_router_gemv_arm
+            .device_ptr(stream);
+        self.unpermute_scatter_tail_weighting_the_folded_shared_tile_by_sigmoid_of_its_gate_logit(
+            stream,
+            sp,
+            out_bf16_dev_ptr,
+        )
+    }
+
+    pub fn unpermute_scatter_tail_weighting_the_folded_shared_tile_by_sigmoid_of_its_gate_logit(
+        &self,
+        stream: &Arc<CudaStream>,
+        shared_gate_logit_bf16_dev_ptr: u64,
+        out_bf16_dev_ptr: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.folds_shared(),
+            "sigmoid-gate scatter tail needs a folded-shared GroupedDecodeContext"
+        );
+        let (yp, _g1) = self.y_down.device_ptr(stream);
+        let (wp, _g2) = self.topk_weights.device_ptr(stream);
+        let (ip, _g3) = self.inv_perm.device_ptr(stream);
+        let rc = unsafe {
+            nv_kernels::cuda::moe_unpermute_scatter_shared_sig_tail(
+                stream.cu_stream() as *mut c_void,
+                yp as *const u16,
+                wp as *const f32,
+                ip as *const i32,
+                shared_gate_logit_bf16_dev_ptr as *const u16,
+                out_bf16_dev_ptr as *mut u16,
+                self.n_tokens as i32,
+                self.tiles_per_token as i32,
+                self.hidden as i32,
+                self.hidden as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "grouped chain shared sig scatter tail rc={rc}");
+        Ok(())
+    }
+
+    pub fn unpermute_scatter_tail_adding_shared_f32_then_resid_bf16(
+        &self,
+        stream: &Arc<CudaStream>,
+        shared_f32_dev_ptr: u64,
+        resid_bf16_dev_ptr: u64,
+        out_bf16_dev_ptr: u64,
+    ) -> Result<()> {
+        let (yp, _g1) = self.y_down.device_ptr(stream);
+        let (wp, _g2) = self.topk_weights.device_ptr(stream);
+        let (ip, _g3) = self.inv_perm.device_ptr(stream);
+        let rc = unsafe {
+            nv_kernels::cuda::moe_unpermute_scatter_tail(
+                stream.cu_stream() as *mut c_void,
+                yp as *const u16,
+                wp as *const f32,
+                ip as *const i32,
+                shared_f32_dev_ptr as *const f32,
+                resid_bf16_dev_ptr as *const u16,
+                out_bf16_dev_ptr as *mut u16,
+                self.n_tokens as i32,
+                self.tiles_per_token as i32,
+                self.hidden as i32,
+                self.hidden as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "grouped chain scatter tail rc={rc}");
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -825,7 +1130,7 @@ pub fn forward_grouped_decode(
     };
     let stream = crate::cuda_stream::current_stream(&dev);
 
-    let prof = std::env::var_os("NV_MOE_DECODE_PROF").is_some();
+    let prof = nv_config::env_arm_present_at_all_reread_every_call("NV_MOE_DECODE_PROF");
     let mut prof_times: Vec<(&'static str, f64)> = Vec::new();
     let mut prof_last = std::time::Instant::now();
     let prof_mark = |label: &'static str,
@@ -1115,10 +1420,10 @@ pub fn forward_grouped_decode(
         eprintln!("[moe_decode_prof] {}", line.join(" "));
     }
 
-    if n_tokens > 1 {
+    if n_tokens > 1 && nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_MOE_MT_STALL") {
         stream.synchronize().map_err(|e| {
             anyhow::anyhow!(
-                "forward_grouped_decode multi_token_host_stall_the_35b_verify_prefill_chain_is_nondeterministic_garbage_without_it_while_single_token_decode_is_clean_and_stays_unsynced: {e:?}"
+                "forward_grouped_decode nv_moe_mt_stall_1_diagnostic_stall_the_m_gt_1_chain_is_bit_identical_and_capture_safe_without_it_since_the_device_side_route_gather_consolidation: {e:?}"
             )
         })?;
     }
@@ -1176,7 +1481,7 @@ pub fn forward_grouped_decode_into(
     );
     let stream = stream.clone();
 
-    let fuse_route = n_tokens == 1
+    let fuse_route = n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
         && route_fuse_enabled()
         && e <= ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_256_EXPERTS;
     if fuse_route {
@@ -1192,7 +1497,7 @@ pub fn forward_grouped_decode_into(
         let (fp, _g9) = ctx.x_fp4.device_ptr_mut(&stream);
         let (sp, _g10) = ctx.x_sf.device_ptr_mut(&stream);
         let rc = unsafe {
-            nv_kernels::cuda::moe_route_gather_quant_m1(
+            nv_kernels::cuda::moe_route_gather_quant_small_m(
                 stream.cu_stream() as *mut c_void,
                 lp as *const f32,
                 bias_ptr as *const f32,
@@ -1205,6 +1510,7 @@ pub fn forward_grouped_decode_into(
                 dm as *mut f32,
                 fp as *mut u8,
                 sp as *mut u8,
+                n_tokens as i32,
                 e as i32,
                 k as i32,
                 mode,
@@ -1214,9 +1520,14 @@ pub fn forward_grouped_decode_into(
                 shared_tail_id,
                 hidden as i32,
                 MIN_TILE as i32,
+                if chain_slim_launches_enabled() {
+                    ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM
+                } else {
+                    1
+                },
             )
         };
-        anyhow::ensure!(rc == 0, "moe_route_gather_quant_m1 rc={rc}");
+        anyhow::ensure!(rc == 0, "moe_route_gather_quant_small_m rc={rc}");
         prof_mark(0, &stream)?;
         prof_mark(1, &stream)?;
     } else {
@@ -1328,7 +1639,54 @@ pub fn forward_grouped_decode_into(
     prof_mark(1, &stream)?;
     }
 
-    if let Some(s2) = aux_stream {
+    let slim = use_decode_gemv()
+        && chain_slim_launches_enabled()
+        && n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
+        && ctx.chunk_meta.len() == 1;
+    if slim {
+        let experts_total_gu = w.gate_w.len() * 2 / (inter * hidden);
+        anyhow::ensure!(
+            w.gate_a_stride_elems == hidden as i64 && w.gate_c_stride_elems == inter as i64,
+            "slim fused gate+up+silu gemv requires contiguous rows"
+        );
+        let (xf, _g1) = ctx.x_fp4.device_ptr(&stream);
+        let (xs, _g2) = ctx.x_sf.device_ptr(&stream);
+        let (gw, _g3) = w.gate_w.device_ptr(&stream);
+        let (gs, _g4) = w.gate_w_scales.device_ptr(&stream);
+        let (ga, _g5) = w.gate_alphas.device_ptr(&stream);
+        let (uw, _g6) = w.up_w.device_ptr(&stream);
+        let (us, _g7) = w.up_w_scales.device_ptr(&stream);
+        let (ua, _g8) = w.up_alphas.device_ptr(&stream);
+        let (dm, _g9) = ctx.input_dn_mini.device_ptr(&stream);
+        let (ip, _g10) = ctx.topk_ids.device_ptr(&stream);
+        let (yf, _g11) = ctx.y_act_fp4.device_ptr_mut(&stream);
+        let (ys, _g12) = ctx.y_act_sf.device_ptr_mut(&stream);
+        let rc = unsafe {
+            nv_kernels::cuda::moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
+                stream.cu_stream() as *mut c_void,
+                xf as *const u8,
+                xs as *const u8,
+                gw as *const u8,
+                gs as *const u8,
+                ga as *const f32,
+                uw as *const u8,
+                us as *const u8,
+                ua as *const f32,
+                dm as *const f32,
+                ip as *const i32,
+                yf as *mut u8,
+                ys as *mut u8,
+                tiles as i32,
+                experts_total_gu as i32,
+                inter as i32,
+                hidden as i32,
+                MIN_TILE as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "moe_grouped_fp4_gemv_gate_up_silu_quant_small_m rc={rc}");
+        prof_mark(2, &stream)?;
+        prof_mark(3, &stream)?;
+    } else if let Some(s2) = aux_stream {
         let ev = stream
             .record_event(None)
             .map_err(|e| anyhow::anyhow!("fork event: {e:?}"))?;
@@ -1418,30 +1776,32 @@ pub fn forward_grouped_decode_into(
             &mut ctx.gemm_ws,
         )?;
     }
-    prof_mark(2, &stream)?;
+    if !slim {
+        prof_mark(2, &stream)?;
 
-    {
-        let (gp_ptr, _g1) = ctx.y_gate.device_ptr(&stream);
-        let (up_ptr, _g2) = ctx.y_up.device_ptr(&stream);
-        let (fp, _g3) = ctx.y_act_fp4.device_ptr_mut(&stream);
-        let (sp, _g4) = ctx.y_act_sf.device_ptr_mut(&stream);
-        let (gl, _g5) = ctx.input_dn_mini.device_ptr(&stream);
-        let rc = unsafe {
-            nv_kernels::cuda::silu_mul_quantize_nvfp4_bf16_per_expert_strided(
-                stream.cu_stream() as *mut c_void,
-                gp_ptr as *const u16,
-                up_ptr as *const u16,
-                fp as *mut u8,
-                sp as *mut u8,
-                gl as *const f32,
-                MIN_TILE as i32,
-                m_total as i32,
-                inter as i32,
-            )
-        };
-        anyhow::ensure!(rc == 0, "silu_mul_quantize_nvfp4_bf16_per_expert rc={rc}");
+        {
+            let (gp_ptr, _g1) = ctx.y_gate.device_ptr(&stream);
+            let (up_ptr, _g2) = ctx.y_up.device_ptr(&stream);
+            let (fp, _g3) = ctx.y_act_fp4.device_ptr_mut(&stream);
+            let (sp, _g4) = ctx.y_act_sf.device_ptr_mut(&stream);
+            let (gl, _g5) = ctx.input_dn_mini.device_ptr(&stream);
+            let rc = unsafe {
+                nv_kernels::cuda::silu_mul_quantize_nvfp4_bf16_per_expert_strided(
+                    stream.cu_stream() as *mut c_void,
+                    gp_ptr as *const u16,
+                    up_ptr as *const u16,
+                    fp as *mut u8,
+                    sp as *mut u8,
+                    gl as *const f32,
+                    MIN_TILE as i32,
+                    m_total as i32,
+                    inter as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "silu_mul_quantize_nvfp4_bf16_per_expert rc={rc}");
+        }
+        prof_mark(3, &stream)?;
     }
-    prof_mark(3, &stream)?;
 
     grouped_gemm_decode(
         &stream,
@@ -1518,9 +1878,8 @@ fn use_decode_gemv() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NV_MOE_FP4_DECODE_GEMV").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes")
+        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
+            "NV_MOE_FP4_DECODE_GEMV",
         )
     })
 }

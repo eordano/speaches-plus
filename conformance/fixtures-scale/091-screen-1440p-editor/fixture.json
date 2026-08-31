@@ -1,0 +1,80 @@
+{
+  "name": "091-screen-1440p-editor",
+  "family": "091-screen",
+  "description": "1440p UI screen (2560x1440, light theme): menu bar, file sidebar, code pane, terminal and status bar at native UI glyph sizes.",
+  "input": "input.png",
+  "expected_text": "File   Edit   View   Terminal   Window   Help\nPROJECT FILES\nflightdeck.rs\ntelemetry.rs\npacket_codec.rs\nground_station.toml\nREADME.md\ntelemetry.rs - flightdeck workspace\npub fn decode_frame(buf: &[u8]) -> Result<Frame, CodecError> {\n    let sync = u16::from_be_bytes([buf[0], buf[1]]);\n    if sync != 0xEB90 { return Err(CodecError::BadSync(sync)); }\n    let apid = u16::from_be_bytes([buf[2], buf[3]]) & 0x07FF;\n    Frame::checked(apid, &buf[6..])\n}\ncargo test --package flightdeck\nrunning 42 tests ... 42 passed, 0 failed in 3.81s\nwarning: field `dropped_frames` is never read\nmain branch  |  UTF-8  |  Ln 214, Col 9  |  rust-analyzer ready",
+  "render": {
+    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "page_px": [
+      2560,
+      1440
+    ],
+    "megapixels": 3.69,
+    "single_pass_downscale_at_default_cap": 1.0
+  },
+  "regions": [
+    {
+      "bbox": [
+        23,
+        13,
+        388,
+        31
+      ],
+      "tier": "menubar",
+      "text": "File   Edit   View   Terminal   Window   Help"
+    },
+    {
+      "bbox": [
+        21,
+        73,
+        211,
+        248
+      ],
+      "tier": "sidebar",
+      "text": "PROJECT FILES\nflightdeck.rs\ntelemetry.rs\npacket_codec.rs\nground_station.toml\nREADME.md"
+    },
+    {
+      "bbox": [
+        452,
+        82,
+        938,
+        109
+      ],
+      "tier": "title",
+      "text": "telemetry.rs - flightdeck workspace"
+    },
+    {
+      "bbox": [
+        452,
+        141,
+        1284,
+        311
+      ],
+      "tier": "code",
+      "text": "pub fn decode_frame(buf: &[u8]) -> Result<Frame, CodecError> {\n    let sync = u16::from_be_bytes([buf[0], buf[1]]);\n    if sync != 0xEB90 { return Err(CodecError::BadSync(sync)); }\n    let apid = u16::from_be_bytes([buf[2], buf[3]]) & 0x07FF;\n    Frame::checked(apid, &buf[6..])\n}"
+    },
+    {
+      "bbox": [
+        452,
+        364,
+        991,
+        438
+      ],
+      "tier": "terminal",
+      "text": "cargo test --package flightdeck\nrunning 42 tests ... 42 passed, 0 failed in 3.81s\nwarning: field `dropped_frames` is never read"
+    },
+    {
+      "bbox": [
+        23,
+        1412,
+        509,
+        1430
+      ],
+      "tier": "statusbar",
+      "text": "main branch  |  UTF-8  |  Ln 214, Col 9  |  rust-analyzer ready"
+    }
+  ],
+  "comparison_strategy": "cer",
+  "skip_when_no_model": true
+}

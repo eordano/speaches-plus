@@ -177,3 +177,71 @@ fn gow_gemv_mx_sg(
         gow_mx_y[slot * gow_mx_p.y_slot_stride + row] = v;
     }
 }
+
+var<workgroup> gow_mx_byte_lut_every_e2m1_value_is_exact_in_f16_so_pack_unpack_roundtrips_bitwise: array<u32, 256>;
+
+fn gow_mx_lut_dot8(word: u32, x0: u32, x1: u32, x2: u32, x3: u32) -> f32 {
+    let p0 = unpack2x16float(gow_mx_byte_lut_every_e2m1_value_is_exact_in_f16_so_pack_unpack_roundtrips_bitwise[extractBits(word, 0u, 8u)]);
+    let p1 = unpack2x16float(gow_mx_byte_lut_every_e2m1_value_is_exact_in_f16_so_pack_unpack_roundtrips_bitwise[extractBits(word, 8u, 8u)]);
+    let p2 = unpack2x16float(gow_mx_byte_lut_every_e2m1_value_is_exact_in_f16_so_pack_unpack_roundtrips_bitwise[extractBits(word, 16u, 8u)]);
+    let p3 = unpack2x16float(gow_mx_byte_lut_every_e2m1_value_is_exact_in_f16_so_pack_unpack_roundtrips_bitwise[extractBits(word, 24u, 8u)]);
+    var a = fma(p0.x, bf16_lo(x0), 0.0);
+    a = fma(p0.y, bf16_hi(x0), a);
+    a = fma(p1.x, bf16_lo(x1), a);
+    a = fma(p1.y, bf16_hi(x1), a);
+    a = fma(p2.x, bf16_lo(x2), a);
+    a = fma(p2.y, bf16_hi(x2), a);
+    a = fma(p3.x, bf16_lo(x3), a);
+    a = fma(p3.y, bf16_hi(x3), a);
+    return a;
+}
+
+fn gow_mx_lut_dot_block(wv: vec4<u32>, xb: u32) -> f32 {
+    var d = gow_mx_lut_dot8(wv.x, gow_mx_x[xb], gow_mx_x[xb + 1u], gow_mx_x[xb + 2u], gow_mx_x[xb + 3u]);
+    d = d + gow_mx_lut_dot8(wv.y, gow_mx_x[xb + 4u], gow_mx_x[xb + 5u], gow_mx_x[xb + 6u], gow_mx_x[xb + 7u]);
+    d = d + gow_mx_lut_dot8(wv.z, gow_mx_x[xb + 8u], gow_mx_x[xb + 9u], gow_mx_x[xb + 10u], gow_mx_x[xb + 11u]);
+    d = d + gow_mx_lut_dot8(wv.w, gow_mx_x[xb + 12u], gow_mx_x[xb + 13u], gow_mx_x[xb + 14u], gow_mx_x[xb + 15u]);
+    return d;
+}
+
+@compute @workgroup_size(256)
+fn gow_gemv_mx_sg_lut(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_invocation_id) lane: u32
+) {
+    let byte = lid.x;
+    gow_mx_byte_lut_every_e2m1_value_is_exact_in_f16_so_pack_unpack_roundtrips_bitwise[byte] =
+        pack2x16float(vec2<f32>(gow_mx_e2m1(byte, 0u), gow_mx_e2m1(byte, 1u)));
+    workgroupBarrier();
+
+    let slot = wid.z;
+    var e = slot;
+    if (gow_mx_p.use_sel == 1u) {
+        e = gow_mx_sel[slot];
+    }
+    let row = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_ROWS + sgid;
+    let live = row < gow_mx_p.n_rows;
+    let blocks = select(0u, gow_mx_p.k_blocks, live);
+    let wbase = e * gow_mx_p.w_e_stride_v4 + select(0u, row * gow_mx_p.k_blocks, live);
+    let sfbase = e * gow_mx_p.sf_e_stride_bytes + select(0u, row * gow_mx_p.k_blocks, live);
+    let xbase = slot * gow_mx_p.x_slot_stride_words;
+
+    var acc = 0.0;
+    for (var kb = lane; kb < blocks; kb = kb + GOW_MX_SG_LANES) {
+        let si = sfbase + kb;
+        let dot = gow_mx_lut_dot_block(gow_mx_w[wbase + kb], xbase + kb * 16u);
+        acc = fma(gow_e8m0(byte_at(gow_mx_sf[si >> 2u], si)), dot, acc);
+    }
+    let total = gow_mx_sg_butterfly32(acc);
+
+    if (lane == 0u && live) {
+        var v = total;
+        if (gow_mx_p.has_bias == 1u) {
+            let bi = e * gow_mx_p.bias_e_stride + row;
+            v = v + bf16_decode(u16_at(gow_mx_b[bi >> 1u], bi));
+        }
+        gow_mx_y[slot * gow_mx_p.y_slot_stride + row] = v;
+    }
+}

@@ -47,20 +47,21 @@ are excluded from feedback.
 
 ## The accept rule, and why the output is unchanged
 
-Everything that makes the greedy arm safe is `verify_greedy`
-(`nv-specdecode/src/verify.rs`):
+Everything that makes the greedy arm safe is one loop, written out most plainly
+in `accept_block_on_host` (`nv-models/src/laguna_dflash.rs`):
 
 ```rust
-for (i, &dtok) in draft.iter().enumerate() {
-    let vtok = logits.argmax_at(pref_last + i);
-    if vtok == dtok { accepted.push(dtok); num_accepted += 1; }
-    else { accepted.push(vtok); return ...; }
+for (i, &d) in drafts.iter().enumerate() {
+    let vtok = vtoks[i];
+    if vtok == d { emitted.push(d); accepted += 1; }
+    else { emitted.push(vtok); break; }
 }
-let bonus = logits.argmax_at(pref_last + draft.len());
+if accepted == k { emitted.push(vtoks[k]); }
 ```
 
-The verify forward runs over `prefix ++ draft`; row `pref_last + i` is the
-target's prediction *for* draft slot `i`. While drafted token and argmax agree,
+The verify forward runs over `block = [anchor] ++ drafts`, so `vtoks[i]` — the
+argmax of verify row `i` — is the target's prediction *for* `drafts[i]`, and row
+`k` is the row past the last draft. While drafted token and argmax agree,
 commit the draft; at the first disagreement, discard the rest and commit the
 target's own token; if every slot agreed, commit one extra token from the row
 past the end — the **bonus token**, free because the forward already computed
@@ -300,21 +301,169 @@ cheaper than falling off the graph.
 
 ### The Qwen MTP head
 
-`nv-models/src/qwen3_5_mtp.rs`: `MtpHead` loads an in-checkpoint
-multi-token-prediction head and runs its full draft forward (fused
-embedding+hidden `fc`, one attention layer, FFN, final norm through the target's
-`lm_head`), with `MtpFfn` covering both checkpoint families — the 3.6-MoE expert
-layout (`from_map`) and the 3.8-dense layout (`from_map_dense`, dims pinned by
-`QWEN38_27B_MTP_DIMS` against the real 15-tensor `model_mtp.safetensors` shard).
-The serving drafter is `nv-specdecode/src/qwen38_mtp.rs`
-(`Qwen38DenseMtpHead::from_checkpoint`, `Qwen38MtpDecodeSession::start`),
+**The two checkpoint families have two separate implementations.** The 3.6-MoE
+head is `nv-models/src/qwen3_5_mtp.rs`: `MtpHead::from_map` loads the
+in-checkpoint multi-token-prediction head with its `MtpMoe` expert layout and
+runs the full draft forward (fused embedding+hidden `fc`, one attention layer,
+FFN, final norm through the target's `lm_head`); `MtpMoeEagerDecodeSession` and
+`MtpMoeGraphedDecodeSession` drive rounds through `MtpSpecEngine`.
+
+The 3.8-dense serving drafter is `nv-specdecode/src/qwen38_mtp.rs`
+(`Qwen38DenseMtpHead::from_checkpoint`, `Qwen38MtpDecodeSession::start`), whose
+shapes are pinned by `Qwen38MtpGeometry` and whose weights come from
+`MTP_WEIGHTS_FILE_NAME` (`model_mtp.safetensors`) under `MTP_TENSOR_PREFIX`
+(`mtp.`). It is
 selected by `NV_DRAFTER=mtp` — the literal value, `mtp_drafter_selected` accepts
 nothing else — with depth from `NV_MTP_K` clamped by
 `MTP_CHAIN_DEPTH_MAX_SO_VERIFY_ROWS_STAY_UNDER_THE_F32_FAST_PATH_HARD_CAP` and
-the checkpoint from `NV_MTP_DRAFT_DIR`. `build.rs` boot-fails when
-`NV_DRAFTER=mtp` and the head is missing; the CUDA loop is
+the checkpoint from `NV_MTP_DRAFT_DIR`. `chat_engine/build.rs` (the engine
+builder, not a cargo build script) boot-fails when `NV_DRAFTER=mtp` and the head
+is missing or misshapen, for the MoE and the dense head alike; the CUDA loop is
 `run_qwen38_mtp_greedy_rounds`, and the wgpu side dispatches on
 `Decoder::Qwen3_5Dense(m) if m.mtp_active()`.
+
+### The Qwen3.8 two-branch verify tree (`NV_Q38_MTP_TREE=1`)
+
+The rows-keyed verify lanes (`ensure_verify_lane` / `forward_verify_chain` in
+`graph_engine.rs`) verify one linear chain per round, and `NV_Q38_MTP_TREE=1`
+adds exactly one non-chain shape beside them: a fixed two-branch m=6 tree,
+rows `[anchor, d1, d2, d3, c2, c2d2]` with parents `[-1, 0, 1, 2, 0, 4]` and
+positions `committed + depth` where depth is `[0, 1, 2, 3, 1, 2]` (the
+`VERIFY_TREE_TWO_BRANCH_M6_*` constants in `qwen3_5_moe.rs`). Branch A is the
+ordinary top-1 draft chain; branch B is the drafter's top-2 token at the first
+draft position plus one continuation drafted from it (one extra drafter step
+per round, its step-0 hidden reused). The env needs `NV_MTP_K=3`,
+`NV_Q38_DRAFT_FAST=1` and refuses the `NV_Q38_MTP_P_MIN` cut; suffix rounds
+bypass the tree, so the sufspec composition rule is unchanged.
+
+Three mechanisms once pinned the verify to chains; each now has a tree arm:
+
+- **GDN row forking.** `gdn_conv_decode_chunk_silu_tree_bf16` and
+  `gdn_decode_chunk_split_tree_bf16` take a device per-row parent index and
+  load each row's conv tail and recurrent state from the parent row's
+  checkpoint slot (parent `-1` reads the live pre-round state). With linear
+  parents they are bitwise the chain chunk kernels, and every tree row is
+  bitwise a re-chained run of its ancestor path — both are gated by
+  `gdn_tree_parity` at the q38 serving shape. The non-mrow row-sequential GDN
+  fallbacks refuse tree rounds (`lin_attn_step` errors instead of committing
+  lossy logits), so the tree requires the mrow chunk path
+  (`NV_Q38_VERIFY_TC=1` or `NV_Q38_MROW_VERIFY=1`).
+- **Attention parent-path masks.** Tree rounds route between the same two
+  mk-verify arms as chains (the `NV_Q38_MK_VERIFY_KVSHARE` knee gate decides),
+  and both arms carry the hole. Each row keeps its chain suffix window
+  (`delta = m-1-qi`, so the window end is always self+1 under the
+  branch-contiguous layout), and the two sibling rows additionally hide the
+  branch-A block through a hole window passed as host deltas from `n_total`,
+  masking `[n_total-5, n_total-2)`: the splitk fan-in takes it as
+  `flash_decode_fused_fp8kv_mk_hole(.., hole_from_row=4, 5, 2)` (one launch,
+  rows at or past `hole_from_row` skip the hole positions), and the kvshare
+  row-sequential loop as per-row deltas on
+  `flash_decode_kvshare_fp8kv_paged(.., 5, 2)`. Disabled holes leave the
+  shipped kernels bit-exact (`kvshare_group6_..._bit_exactly` still gates the
+  kvshare arm against the per-q-head fused kernel; `mk_hole_arm_is_bitwise_...`
+  pins the inert-delta arm), hole rows are excluded bitwise, and the masked
+  kvshare result matches a physically compacted KV within bf16 reorder
+  tolerance (`kvshare_hole_mask_excludes_...`). The kvshare TC arm refuses
+  holes (rc -24), and `verify_attention_fp8_mk` errors rather than falling to
+  the full-KV dequant view for a tree round. Routing tree rounds through the
+  chain's own arm per depth is what keeps tree-on/off streams bitwise under
+  the knee gate — an arm-asymmetric tree surfaces the mk-vs-kvshare bit
+  difference as extra tie flips.
+- **Non-prefix commit.** The branch-contiguous layout makes a branch-A accept
+  a plain prefix commit (the existing `commit_verify_consumed` shape). A
+  branch-B accept is the one memmove-class fix: `commit_verify_tree` compacts
+  KV rows `[pos+4, pos+4+b)` down to `[pos+1, ..)` per layer
+  (`compact_verify_tree_branch_b_rows_down`, four dtod copies per
+  full-attention layer, disjoint ranges), which restores slot==position — the
+  rows were RoPE'd at their tree positions when written, so the moved rows are
+  already correct. Lin state rolls back by checkpoint **row**
+  (`rollback_lin_to(bonus_row + 1)`), which is exact because the forked
+  kernels write each row's checkpoint along its own ancestor path. The
+  drafter KV catch-up pairs branch-B tokens with their path hiddens (rows 0
+  and 4), and the reanchor hidden is the bonus row's.
+
+The tree verify is its own graph lane and key
+(`VERIFY_TREE_GRAPH_SHAPE_TOKEN_BASE...`, 0x52000-based) beside the rows-keyed
+chain lanes; the parent buffer is device data written once, positions ride the
+lane `pos_buf` like every chain verify, and the hole deltas are launch
+constants of the fixed shape, so tree rounds replay without recapture
+(`precapture_verify_tree_graph_...` captures it at session start).
+
+Losslessness is gated by the suite covering tree-on/off emitted-stream
+identity (`qwen38_tree_gate`), on the champion basis with the knee gate live:
+at least two of the three workload classes must be bitwise over the common
+prefix (through dozens of branch-B commits), and any divergence must be the
+documented cross-shape tie band (one arm's argmax margin under 1 bf16 logit
+unit — the same band `ADAPTIVE_TIE_MARGIN_MAX_...` pins for adaptive draft
+lengths); two confident arms disagreeing fails the gate as corruption.
+
+The wgpu twin still hosts chains only
+(`VERIFY_CHAIN_FORWARDS_THE_WHOLE_BAKED_M_ROW_CHUNK_AND_COMMITS_IN_PLACE_ONLY_AT_FULL_WIDTH`
+in `qwen3_5_moe_wgpu.rs`); the gemma4 `tree_verify_attn` kernels remain the
+full-attention-only prior art.
+
+The recoverable mass that priced this work is measured by the suite covering
+drafter-alternative recovery at rejected positions (`qwen38_pctree_headroom`),
+which runs the champion basis over the three sufspec workload classes with
+`NV_Q38_MTP_ROUND_DEBUG` collecting drafter top-3 per draft step: at rounds
+whose first draft position the verify rejects, the verify-decided token sits
+in the drafter's top-2 for ~46% and in the top-3 for ~60% of them (k=3,
+`unsloth/Qwen3.8-27B-NVFP4`, 1024-token prompts, 512 generated tokens per
+class; deeper positions recover 29-60%; per-class splits in the suite's
+`PCTREE-HEADROOM` stderr lines). At serving, branch B lands in 5.5-14.7% of
+tree rounds at 1-2 extra tokens each (the `TREE-GATE`/`CTX-TREE`
+recovery_rate lines).
+
+**The tree ships default-off because the recovery does not convert to net
+tok/s on the deployed kernels.** The recovered mass buys +0.06-0.18
+tokens/round, but every tree round pays one extra drafter step (~+1.2 ms,
+including the step-0 full-row readback that yields the top-2 sibling) and two
+extra verify rows — and the mk-verify attention scan, the lm_head rows and
+the logits readback are all row-count-proportional, so m=6 verify costs
+~+1.4 ms over m=4 at depth 256 growing to ~+4 ms at 32768. On the champion
+basis (suffix on, kvshare knee gate) the tree measures -2.4% to -14.6%
+effective decode tok/s across 256/8192/32768 and the three workload classes
+(`perf/runs.jsonl` build_name `q38 tree`, the `it2` rows). Two changes could
+move the economics. A row-shared m-row attention exists as a third
+verify arm (`NV_Q38_MK_VERIFY_ROWSHARED`, one launch scoring an smem KV tile
+against all m x group query rows, holes included) but does not move them on
+scalar cores: reading each KV byte once multiplies per-byte compute by m, so
+the kernel runs compute-bound where the kvshare arm runs bandwidth-bound, and
+the arm measures +2.8%/+0.5%/even round_ms against the shipped gate at
+8192/32768/172032 (`ROWSHARED_OUTRANKS_KVSHARE_WHEN_BOTH_ENGAGE_...` in
+`qwen3_5_moe.rs` carries the numbers). The tensor-core arm that cashes the
+one-read structure exists as the fourth arm (`NV_Q38_MK_VERIFY_TCTILE`, the
+llama.cpp fattn-mma shape: each warp scores one chain row's 6-row q group as
+an m16n8k16 A tile against 8-position chunks of a block-shared K stage, V
+register-prefetched through L2): kernel-only at 172032, m=4, it runs 0.81 ms
+at 442 effective one-read GB/s against the m-sequential kvshare's 1.71 ms --
+2.1x -- and the f64 oracle, hole-mask, and live-serving-tensor parity gates
+are green (`fp8_mk_ratio_oracle`, `qwen38_tctile_gate`). Forced on the
+champion basis it measures round_ms_median 32.7->30.7 at 8192, 36.6->32.8 at
+32768, and 63.8->45.5 at 172032 -- effective decode 46.3->61.6 tok/s, +33%
+at the depth where attention dominates the round -- and loses only at 256
+where the gate would run the mk arm anyway (`perf/runs.jsonl` build_name
+'q38 tctile'). Stream identity cannot gate it:
+mma tiles reassociate the score sums, the bf16 attention output sits 1-2 ulp
+from the mk arm's, and the MoE router amplifies that into confidently
+different greedy streams (the scalar rowshared arm fails the same forced
+m-invariance sweep at m=8 by the same mechanism, where warps_on_mi=1
+reorders its l/acc sums). The certification that ships it is
+baseline-calibrated aggregates instead (`qwen38_tctile_cert.rs`, rows
+'q38 tctile-cert'): acceptance and tokens-per-round per workload class,
+self-scored NLL of the emitted text through the shared plain path, and a
+teacher-forced verify-walk vs the accepted arm's own bands; the fleet
+profile sets `NV_Q38_MK_VERIFY_TCTILE=gate` on that basis.
+`NV_Q38_CERT_VARIANTS` adds prompt variants per class and the measured
+variance rule: within-class prompt scatter (accept sd up to 0.26 tiled,
+0.05-0.10 agentic) dominates any arm effect, matched-prompt deltas
+sign-flip across variants, and highly-tileable variants reproduce
+bitwise-identical streams on both arms -- so an arm-quality claim needs
+matched-prompt pairs with a sign-consistent delta across >=3 variants, and
+a class-aggregate comparison across different prompts certifies nothing.
+A drafter-confidence gate that drafts the sibling
+only on rounds whose step-0 top-1 is weak (recovery concentrates exactly
+there) does not exist.
 
 ## Conditioning modes
 
@@ -397,7 +546,7 @@ the prefill pass list stops before the final norm, so there is no M-row
   no guard**, so landing it kills chunked prefill by falling through `gemv_mk`'s
   `Bf16`/`Fp8`-only match rather than refusing cleanly.
 - **The verify path exists only because `subgroup_ok` is strict**
-  (`min_size == max_size == 32`). The Ultra-class Apple adapter reports a range, so the predicate
+  (`min_size == max_size == 32`). The M2 Ultra reports a range, so the predicate
   is false, the *tree* epilogue runs, and the tree epilogue is the only one with
   M-row twins. Relaxing it to the `sg32_ok` runtime probe — the standing
   recommendation elsewhere — would **silently delete chunked prefill and any
@@ -644,6 +793,23 @@ rate.
 *Accept path and windows:* `NV_SPEC_NO_GPU_ACCEPT`, `NV_DFLASH_HOST_ACCEPT`,
 `NV_DFLASH_HOST_CTX`, `NV_DFLASH_DEVICE_DRAFTS`, `NV_DFLASH_DEVICE_ROUND`,
 `NV_SPEC_CTX_DISABLE`, `NV_SPEC_PREFILL_CHUNK`, `NV_DFLASH_PREFILL_CHUNK`.
+
+*Spec prefill shadow:* `NV_SPEC_PREFILL_FLASH=0` sends every prefill-shadow
+layer to the chunked eager f32 GEMM path. Head-dim-512 full-attention shadows
+(the 31B's ten full layers) take candle flash by default, like the hd-256
+sliding layers: candle 0.11's sm_120 hdim512 forward matches eager sdpa
+(0.000244-class max-abs), and the `hd512 flashvsbf16` decision rows show flash
+ahead of the bf16 route at every depth with the five-arm quality gate green.
+Two per-layer escapes cover those ten layers: `NV_SPEC_PREFILL_HD512_BF16=1`
+selects chunked bf16 tensor-core QK/PV GEMMs with fused softmax
+(`causal_attention_chunked_bf16`, the E4B full-layer route with the f32 path's
+no-copy GQA geometry, within 1.06-1.21x of flash), and
+`NV_SPEC_PREFILL_HD512_EAGER=1` selects chunked eager f32, the reference route,
+which wins when both escapes are set. The regression canary guarding the flash
+default is `candle_flash_hdim512_forward_stays_exact_on_sm120_regression_canary`
+in `gemma4_spec_prefill_hd512_flash.rs`: it fails the day a candle bump
+regresses the hdim512 forward, which is the signal to re-contain the default
+behind these escapes.
 
 ## Connections
 

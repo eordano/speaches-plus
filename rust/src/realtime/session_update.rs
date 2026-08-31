@@ -27,6 +27,8 @@ const SESSION_APPLIED_KEYS: &[&str] = &[
     "turn_detection",
     "session_max_duration_s",
     "voice",
+    "speed",
+    "input_audio_transcription",
     "min_speech_ms",
     "min_speech_for_response_ms",
     "no_speech_prob_threshold",
@@ -36,6 +38,8 @@ const SESSION_APPLIED_KEYS: &[&str] = &[
     "output_audio_format",
 ];
 
+const INPUT_AUDIO_TRANSCRIPTION_KEYS: &[&str] = &["model", "language"];
+
 const SESSION_ACCEPTED_UNAPPLIED_KEYS: &[&str] = &[
     "id",
     "object",
@@ -44,7 +48,6 @@ const SESSION_ACCEPTED_UNAPPLIED_KEYS: &[&str] = &[
     "modalities",
     "output_modalities",
     "audio",
-    "input_audio_transcription",
     "tools",
     "tool_choice",
     "temperature",
@@ -53,7 +56,6 @@ const SESSION_ACCEPTED_UNAPPLIED_KEYS: &[&str] = &[
     "tracing",
     "include",
     "client_secret",
-    "speed",
     "prompt",
     "truncation",
     "conversation",
@@ -132,6 +134,8 @@ pub(super) struct StagedSessionUpdate {
     pub turn_detection: Option<StagedTurnDetection>,
     pub session_max_duration_s: Option<u64>,
     pub voice: Option<Option<String>>,
+    pub speed: Option<f32>,
+    pub input_audio_transcription: Option<StagedInputAudioTranscription>,
     pub min_speech_ms: Option<u64>,
     pub min_speech_for_response_ms: Option<u64>,
     pub no_speech_prob_threshold: Option<Option<f32>>,
@@ -144,6 +148,12 @@ pub(super) struct StagedSessionUpdate {
 pub(super) enum StagedInstructions {
     Set(String),
     Clear,
+}
+
+#[derive(Default, Debug, PartialEq)]
+pub(super) struct StagedInputAudioTranscription {
+    pub model: Option<String>,
+    pub language: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -236,6 +246,34 @@ pub(super) fn parse_session_update(
         });
     }
 
+    if let Some(v) = session_obj.get("speed") {
+        let f = v.as_f64().ok_or((
+            "session.speed",
+            format!(
+                "speed: must be a number in [{:.1},{:.1}] (kokoro's implemented range)",
+                crate::tts::text::SPEED_MIN,
+                crate::tts::text::SPEED_MAX
+            ),
+        ))? as f32;
+        if !f.is_finite() || !(crate::tts::text::SPEED_MIN..=crate::tts::text::SPEED_MAX).contains(&f)
+        {
+            return Err((
+                "session.speed",
+                format!(
+                    "speed: must be in [{:.1},{:.1}] (kokoro's implemented range), got {f}",
+                    crate::tts::text::SPEED_MIN,
+                    crate::tts::text::SPEED_MAX
+                ),
+            )
+                .into());
+        }
+        staged.speed = Some(f);
+    }
+
+    if let Some(v) = session_obj.get("input_audio_transcription") {
+        staged.input_audio_transcription = Some(parse_input_audio_transcription(v)?);
+    }
+
     if let Some(v) = session_obj.get("min_speech_ms") {
         staged.min_speech_ms = Some(parse_bounded_u64(
             v,
@@ -313,6 +351,58 @@ pub(super) fn parse_session_update(
     }
 
     Ok(staged)
+}
+
+fn parse_input_audio_transcription(v: &Value) -> Result<StagedInputAudioTranscription, FieldErr> {
+    let mut out = StagedInputAudioTranscription::default();
+    let obj = match v {
+        Value::Object(o) => o,
+        Value::Null => return Ok(out),
+        _ => {
+            return Err((
+                "session.input_audio_transcription",
+                "input_audio_transcription: must be an object or null".into(),
+            )
+                .into())
+        }
+    };
+    reject_unknown_keys(
+        v,
+        &[INPUT_AUDIO_TRANSCRIPTION_KEYS],
+        "session.input_audio_transcription",
+    )?;
+    if let Some(m) = obj.get("model") {
+        let s = m.as_str().ok_or((
+            "session.input_audio_transcription.model",
+            "input_audio_transcription.model: must be a string".to_string(),
+        ))?;
+        let s = s.trim();
+        if !s.is_empty() {
+            out.model = Some(s.to_string());
+        }
+    }
+    if let Some(l) = obj.get("language") {
+        let s = l.as_str().ok_or((
+            "session.input_audio_transcription.language",
+            "input_audio_transcription.language: must be a string".to_string(),
+        ))?;
+        let s = s.trim();
+        if !s.is_empty() && !s.eq_ignore_ascii_case("auto") {
+            let code = s.to_ascii_lowercase();
+            if !crate::oapi::WHISPER_LANGUAGES.contains(&code.as_str()) {
+                return Err((
+                    "session.input_audio_transcription.language",
+                    format!(
+                        "input_audio_transcription.language: {s:?} is not a whisper language \
+                         code; omit it or send \"auto\" to auto-detect"
+                    ),
+                )
+                    .into());
+            }
+            out.language = Some(code);
+        }
+    }
+    Ok(out)
 }
 
 fn parse_optional_unit_interval(
@@ -824,6 +914,46 @@ mod tests {
             "sealed_buffer_retention_count": 4,
         }))
         .expect("round-tripped session view must be accepted");
+    }
+
+    #[test]
+    fn speed_in_kokoro_range_is_staged() {
+        let s = parse(json!({"speed": 1.5})).unwrap();
+        assert_eq!(s.speed, Some(1.5));
+    }
+
+    #[test]
+    fn speed_out_of_kokoro_range_is_rejected() {
+        for bad in [0.4, 2.5, -1.0] {
+            let e = parse(json!({"speed": bad})).err().expect("expected err");
+            assert_eq!(e.param, "session.speed");
+            assert!(e.message.contains("[0.5,2.0]"), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn input_audio_transcription_model_and_language_are_staged() {
+        let s = parse(json!({"input_audio_transcription": {"model": "whisper", "language": "DE"}}))
+            .unwrap();
+        let iat = s.input_audio_transcription.expect("staged");
+        assert_eq!(iat.model.as_deref(), Some("whisper"));
+        assert_eq!(iat.language.as_deref(), Some("de"));
+    }
+
+    #[test]
+    fn input_audio_transcription_unknown_language_is_rejected() {
+        let e = parse(json!({"input_audio_transcription": {"language": "klingon"}}))
+            .err()
+            .expect("expected err");
+        assert_eq!(e.param, "session.input_audio_transcription.language");
+    }
+
+    #[test]
+    fn input_audio_transcription_unknown_key_is_rejected() {
+        let e = parse(json!({"input_audio_transcription": {"prompt": "x"}}))
+            .err()
+            .expect("expected err");
+        assert_eq!(e.param, "session.input_audio_transcription.prompt");
     }
 
     #[test]

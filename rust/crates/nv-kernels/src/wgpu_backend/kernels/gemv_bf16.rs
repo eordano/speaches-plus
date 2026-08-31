@@ -1,7 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-use std::sync::OnceLock;
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::{compose, Result, WgpuError};
@@ -71,10 +69,9 @@ pub fn sg32_from(subgroup: bool, min_size: u32, max_size: u32, probed: Option<u3
 }
 
 pub fn probed_subgroup_width(ctx: &WgpuContext) -> Option<u32> {
-    static ADVERTISED_ONLY: OnceLock<bool> = OnceLock::new();
-    if *ADVERTISED_ONLY
-        .get_or_init(|| std::env::var(ADVERTISED_SUBGROUP_ONLY_ENV).is_ok_and(|v| v != "0"))
-    {
+    if nv_config::env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins!(
+        ADVERTISED_SUBGROUP_ONLY_ENV
+    ) {
         return None;
     }
     ctx.subgroup_width()

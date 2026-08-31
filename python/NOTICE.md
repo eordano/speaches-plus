@@ -2,6 +2,8 @@
 
 This project is licensed under Apache 2.0 (see `LICENSE`). It bundles code from upstream projects that retain their original licenses.
 
+For drift audits against these upstreams see `.claude/skills/upstream-align/SKILL.md`.
+
 ## Vendored
 
 ### `tts/qwen3/` -- Qwen3-TTS

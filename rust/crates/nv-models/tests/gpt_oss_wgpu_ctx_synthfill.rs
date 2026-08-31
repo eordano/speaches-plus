@@ -4,6 +4,10 @@ mod common;
 use common::snapshot_dir_env_override_then_home_hub_first_repo_with_config_and_weights;
 
 mod ctx_timing_common;
+use ctx_timing_common::ctx_tokens_from_env_default_256_8k_120k_because_max_pos_131072_has_no_room_for_168k;
+use ctx_timing_common::median_ms_of_timed_steps;
+use ctx_timing_common::nv_ctx_tokens_env_with_k_suffix;
+use ctx_timing_common::print_wgpu_profile_share_table_then_reset;
 
 const TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN: usize = 64;
 const DECODE_SLOTS_BEYOND_DEPTH_WORST_CASE_WARMUP_PLUS_TIMED_PLUS_16_SLACK: usize =
@@ -11,61 +15,14 @@ const DECODE_SLOTS_BEYOND_DEPTH_WORST_CASE_WARMUP_PLUS_TIMED_PLUS_16_SLACK: usiz
         + TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN
         + 16;
 
-fn nv_ctx_tokens_env_with_k_suffix() -> Option<Vec<usize>> {
-    std::env::var("NV_CTX_TOKENS").ok().map(|v| {
-        v.split(',')
-            .map(|s| {
-                let s = s.trim();
-                let (num, mult) = match s.strip_suffix(['k', 'K']) {
-                    Some(n) => (n, 1024),
-                    None => (s, 1),
-                };
-                num.parse::<usize>().expect("NV_CTX_TOKENS entry") * mult
-            })
-            .collect()
-    })
-}
-
-fn ctx_tokens_from_env_default_256_8k_120k_because_max_pos_131072_has_no_room_for_168k(
-) -> Vec<usize> {
-    nv_ctx_tokens_env_with_k_suffix().unwrap_or_else(|| vec![256, 8192, 120 * 1024])
-}
-
-fn median_ms_of_timed_steps(step_ms: &mut Vec<f64>) -> f64 {
-    step_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    step_ms[step_ms.len() / 2]
-}
-
-fn print_wgpu_profile_share_table_then_reset(tag: &str) {
-    use nv_kernels::wgpu_backend::dispatch::profile;
-    if !profile::enabled() {
-        return;
-    }
-    let rows = profile::report();
-    let n: u64 = rows.iter().map(|r| r.1).sum();
-    let total: f64 = rows.iter().map(|r| r.2).sum();
-    eprintln!(
-        "[wgpu-prof] {tag}: {} labels {n} dispatches {:.1} ms GPU",
-        rows.len(),
-        total / 1e6
-    );
-    for (label, count, ns) in rows.into_iter().take(48) {
-        eprintln!(
-            "[wgpu-prof] {tag} | {label} n={count} total_ms={:.1} share={:.1}%",
-            ns / 1e6,
-            100.0 * ns / total.max(1.0)
-        );
-    }
-    profile::reset();
-}
-
 const AB_STEPS_48_CROSS_SPLIT_AND_ROUND_BOUNDARIES_AT_DEPTH: usize = 48;
 
 #[test]
 #[ignore = "loads the ~13 GB gpt-oss-20b MXFP4 on wgpu twice; set NV_GPTOSS_CTX_TEST=1 -- greedy argmax A/B of NV_GPTOSS_WGPU_FLASH_DECODE=1 against the serial arm from the same synthetic state at depth (default 8192, override via single-entry NV_CTX_TOKENS); the flash split/round merge math must be argmax-invariant"]
 fn gptoss_wgpu_flash_decode_argmax_matches_the_serial_arm_from_the_same_synthetic_state() {
-    if std::env::var("NV_GPTOSS_CTX_TEST").ok().as_deref() != Some("1") {
-        eprintln!("skip: NV_GPTOSS_CTX_TEST != 1");
+    if ctx_timing_common::skip_when_env_gate_not_1_printing_the_exact_skip_line(
+        "NV_GPTOSS_CTX_TEST",
+    ) {
         return;
     }
     let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
@@ -191,8 +148,9 @@ const KERNEL_PARITY_BAND_1E3_LAYER1_INPUTS_ARE_IDENTICAL_BOTH_ARMS_SO_ONLY_THE_T
 #[ignore = "loads the ~13 GB gpt-oss-20b MXFP4 on wgpu; set NV_GPTOSS_CTX_TEST=1 -- decode ms/token vs KV depth on the 256/8k/120k ladder (max_pos 131072), every state buffer filled with finite synthetic bytes and pos set directly (the flat kv caches index slots by pos and the sliding-window start is a pure function of pos; MoE routing is only weakly value-dependent and the byte pattern keeps it non-degenerate), so the deep rung costs seconds instead of a step-primed hour; run ONE depth per process via NV_CTX_TOKENS (the #96 residual race)"]
 fn gptoss_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_the_only_depth_state(
 ) {
-    if std::env::var("NV_GPTOSS_CTX_TEST").ok().as_deref() != Some("1") {
-        eprintln!("skip: NV_GPTOSS_CTX_TEST != 1");
+    if ctx_timing_common::skip_when_env_gate_not_1_printing_the_exact_skip_line(
+        "NV_GPTOSS_CTX_TEST",
+    ) {
         return;
     }
     let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
@@ -248,6 +206,24 @@ fn gptoss_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_
             "CTX-SCALING gptoss-wgpu-synthfill depth={depth} median_ms_tok={median:.3} tok_s={:.1} fill_s={fill_s:.1} max_seq={max_seq} steps={} warmup_steps={warmup_steps}",
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_dense_wgpu_decode_step_synthetic_state_fill",
+            },
+            &[
+                ("fill_s", format!("{fill_s:.1}")),
+                ("max_seq", format!("{max_seq}")),
+            ],
         );
         print_wgpu_profile_share_table_then_reset(&format!("gptoss-wgpu-synthfill-{depth}"));
     }

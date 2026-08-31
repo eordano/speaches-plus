@@ -53,15 +53,31 @@ impl Qwen3MmSpec {
         let vision_start = resolve(vision_start_id, "vision_start_token_id")?;
         let vision_end = resolve(vision_end_id, "vision_end_token_id")?;
 
-        let pp_path = model_dir.join("preprocessor_config.json");
-        let pp_raw = std::fs::read_to_string(&pp_path).with_context(|| {
-            format!(
-                "read {} (the qwen3.8 checkpoint ships a preprocessor_config.json)",
-                pp_path.display()
-            )
-        })?;
-        let pp: serde_json::Value =
-            serde_json::from_str(&pp_raw).with_context(|| format!("parse {}", pp_path.display()))?;
+        let pp: serde_json::Value = {
+            let flat = model_dir.join("preprocessor_config.json");
+            let nested = model_dir.join("processor_config.json");
+            if flat.is_file() {
+                let raw = std::fs::read_to_string(&flat)
+                    .with_context(|| format!("read {}", flat.display()))?;
+                serde_json::from_str(&raw).with_context(|| format!("parse {}", flat.display()))?
+            } else {
+                let raw = std::fs::read_to_string(&nested).with_context(|| {
+                    format!(
+                        "read {} (qwen3.8 ships preprocessor_config.json, qwen3.6 nests the same \
+                         keys under processor_config.json:image_processor; neither is present)",
+                        nested.display()
+                    )
+                })?;
+                let v: serde_json::Value = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse {}", nested.display()))?;
+                v.get("image_processor").cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{}: no image_processor object to read patch/merge/size from",
+                        nested.display()
+                    )
+                })?
+            }
+        };
         let get_usize = |k: &str, default: usize| -> usize {
             pp.get(k)
                 .and_then(|v| v.as_u64())

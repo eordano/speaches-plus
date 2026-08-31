@@ -121,8 +121,10 @@ impl Gemma4VisionConfig {
         let max_patches = max_soft * pk2;
         let orig = (image_height as f64 / patch) * (image_width as f64 / patch);
         let scale = (max_patches / orig).sqrt();
-        let mut th = (((image_height as f64 * scale / unit).floor() * unit) as usize).max(self.unit());
-        let mut tw = (((image_width as f64 * scale / unit).floor() * unit) as usize).max(self.unit());
+        let mut th =
+            (((image_height as f64 * scale / unit).floor() * unit) as usize).max(self.unit());
+        let mut tw =
+            (((image_width as f64 * scale / unit).floor() * unit) as usize).max(self.unit());
         let unit_px = self.unit();
         let budget_px = max_patches as usize * self.patch_size * self.patch_size;
         if tw * th > budget_px {
@@ -151,13 +153,14 @@ impl Gemma4VisionConfig {
 pub(crate) enum VisLinear {
     Dense(Linear),
     Int8Row { w: Tensor, scale: Tensor },
+    Nvfp4KPadded { lin: Linear, in_logical: usize },
 }
 
 impl VisLinear {
     pub(crate) fn dense_weight(&self) -> Option<&Tensor> {
         match self {
             VisLinear::Dense(l) => l.weight(),
-            VisLinear::Int8Row { .. } => None,
+            VisLinear::Int8Row { .. } | VisLinear::Nvfp4KPadded { .. } => None,
         }
     }
 
@@ -176,6 +179,19 @@ impl VisLinear {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             VisLinear::Dense(l) => l.forward(x),
+            VisLinear::Nvfp4KPadded { lin, in_logical } => {
+                let dims = x.dims();
+                let last = dims.len() - 1;
+                anyhow::ensure!(
+                    dims[last] == *in_logical,
+                    "nvfp4 k-padded vis linear: input last dim {} != {in_logical}",
+                    dims[last]
+                );
+                let mut zdims = dims.to_vec();
+                zdims[last] = lin.in_features() - in_logical;
+                let z = Tensor::zeros(zdims.as_slice(), x.dtype(), x.device())?;
+                lin.forward(&Tensor::cat(&[x, &z], last)?)
+            }
             VisLinear::Int8Row { w, scale } => {
                 let wt = w
                     .to_dtype(DType::F32)?
@@ -299,9 +315,7 @@ impl Rope2d {
         let t1 = t.narrow(2, 0, half)?;
         let t2 = t.narrow(2, half, half)?;
         let rot = Tensor::cat(&[&t2.neg()?, &t1], 2)?;
-        let out = t
-            .broadcast_mul(cos)?
-            .add(&rot.broadcast_mul(sin)?)?;
+        let out = t.broadcast_mul(cos)?.add(&rot.broadcast_mul(sin)?)?;
         Ok(out)
     }
 
@@ -325,8 +339,7 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, scale: f64)
 }
 
 pub fn vision_prof_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_PROF_VISION").ok().as_deref() == Some("1"))
+    nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_PROF_VISION")
 }
 
 pub struct VisionWall {
@@ -374,7 +387,11 @@ impl VisionWall {
         eprintln!(
             "[vision_prof] route={route} patches={n} total={total:.2}ms patch_embed={:.2}ms \
              rope={:.2}ms attn={:.2}ms mlp={:.2}ms pool={:.2}ms proj={:.2}ms",
-            self.patch_embed_ms, self.rope_ms, self.attn_ms, self.mlp_ms, self.pool_ms,
+            self.patch_embed_ms,
+            self.rope_ms,
+            self.attn_ms,
+            self.mlp_ms,
+            self.pool_ms,
             self.proj_ms
         );
     }
@@ -505,8 +522,7 @@ impl PatchEmbedder {
     ) -> Result<Tensor> {
         let n = positions.len();
         let device = pixel_values.device();
-        let (x_ids, y_ids) =
-            position_id_tensors(positions, self.position_embedding_size, device)?;
+        let (x_ids, y_ids) = position_id_tensors(positions, self.position_embedding_size, device)?;
         let emb = self.forward_with_ids(pixel_values, &x_ids, &y_ids)?;
         if valid.iter().all(|&b| b) {
             return Ok(emb);
@@ -521,8 +537,7 @@ impl PatchEmbedder {
         positions: &[(i64, i64)],
         device: &Device,
     ) -> Result<Tensor> {
-        let (x_ids, y_ids) =
-            position_id_tensors(positions, self.position_embedding_size, device)?;
+        let (x_ids, y_ids) = position_id_tensors(positions, self.position_embedding_size, device)?;
         let px = self.table_x.index_select(&x_ids, 0)?;
         let py = self.table_y.index_select(&y_ids, 0)?;
         Ok(px.add(&py)?)
@@ -545,6 +560,87 @@ impl PatchEmbedder {
             .to_dtype(proj.dtype())?;
         Ok(proj.add(&pos_x)?.add(&pos_y)?)
     }
+}
+
+#[cfg(feature = "cuda")]
+const NVFP4_VIS_K_ALIGN_128_BECAUSE_K4304_IS_REFUSED_AND_K4320_NANS_IN_CUBLASLT_FP4: usize = 128;
+
+#[cfg(feature = "cuda")]
+const NVFP4_VIS_SMOKE_M_ROWS_COVER_CUTLASS_128_AND_CUBLASLT_RAGGED: [usize; 2] = [128, 132];
+
+#[cfg(feature = "cuda")]
+fn nvfp4_smoke_forward_is_finite(
+    quantized: &Linear,
+    in_logical: usize,
+    device: &Device,
+) -> Result<()> {
+    for m in NVFP4_VIS_SMOKE_M_ROWS_COVER_CUTLASS_128_AND_CUBLASLT_RAGGED {
+        let live = Tensor::ones((m, in_logical), DType::BF16, device)?;
+        let pad = quantized.in_features() - in_logical;
+        let x = if pad > 0 {
+            let z = Tensor::zeros((m, pad), DType::BF16, device)?;
+            Tensor::cat(&[&live, &z], 1)?
+        } else {
+            live
+        };
+        let sum = quantized
+            .forward(&x)?
+            .to_dtype(DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        anyhow::ensure!(
+            sum.is_finite(),
+            "smoke gemm at m={m} produced a non-finite sum {sum}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn nvfp4_quantize_vis_linear(
+    lin: &mut VisLinear,
+    runner: &std::sync::Arc<std::sync::Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+    device: &Device,
+) -> Result<bool> {
+    let w = match lin.dense_weight() {
+        Some(w) => {
+            let d = w.dims();
+            if d.len() != 2 || d[0] < nv_quant::nvfp4::MIN_TILE || d[1] < nv_quant::nvfp4::MIN_TILE
+            {
+                return Ok(false);
+            }
+            w.clone()
+        }
+        None => return Ok(false),
+    };
+    let (out_logical, in_logical) = (w.dims()[0], w.dims()[1]);
+    let in_padded = in_logical.next_multiple_of(
+        NVFP4_VIS_K_ALIGN_128_BECAUSE_K4304_IS_REFUSED_AND_K4320_NANS_IN_CUBLASLT_FP4,
+    );
+    let wp = if in_padded > in_logical {
+        let z = Tensor::zeros((out_logical, in_padded - in_logical), w.dtype(), device)?;
+        Tensor::cat(&[&w, &z], 1)?
+    } else {
+        w
+    };
+    let quantized =
+        Linear::from_bf16_quantized_nvfp4_dev(&wp.contiguous()?, None, device, runner.clone())?;
+    if let Err(e) = nvfp4_smoke_forward_is_finite(&quantized, in_logical, device) {
+        eprintln!(
+            "[gemma4_vision] nvfp4 rejected for [{out_logical}, {in_logical}] (k padded to \
+             {in_padded}): {e:#}; projection stays dense"
+        );
+        return Ok(false);
+    }
+    *lin = if in_padded == in_logical {
+        VisLinear::Dense(quantized)
+    } else {
+        VisLinear::Nvfp4KPadded {
+            lin: quantized,
+            in_logical,
+        }
+    };
+    Ok(true)
 }
 
 pub struct FullGridPlan {
@@ -640,7 +736,10 @@ fn synth_linear(
 }
 
 fn ones_norm(dim: usize, eps: f64, dtype: DType, device: &Device) -> Result<RmsNorm> {
-    Ok(RmsNorm::new(Tensor::ones(dim, act_dtype(dtype), device)?, eps))
+    Ok(RmsNorm::new(
+        Tensor::ones(dim, act_dtype(dtype), device)?,
+        eps,
+    ))
 }
 
 fn load_linear(
@@ -704,14 +803,7 @@ fn load_rmsnorm(
     eps: f64,
     dtype: DType,
 ) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, act_dtype(dtype))
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(RmsNorm::new(w, eps))
+    nv_layers::weight_load::load_rmsnorm(weights, name, dim, eps, act_dtype(dtype))
 }
 
 impl Gemma4VisionTower {
@@ -976,13 +1068,65 @@ impl Gemma4VisionTower {
         })
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn quantize_linears_nvfp4(&mut self) -> Result<usize> {
+        use std::sync::{Arc, Mutex};
+        anyhow::ensure!(
+            matches!(self.dtype, DType::BF16 | DType::F16),
+            "nvfp4 vision projections need bf16/f16 activations, tower dtype is {:?}",
+            self.dtype
+        );
+        let cuda = match &self.device {
+            Device::Cuda(d) => d.clone(),
+            _ => anyhow::bail!("nvfp4 vision projections require a CUDA device"),
+        };
+        let stream = cuda.cuda_stream();
+        let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
+            stream.clone(),
+        )?));
+        let device = self.device.clone();
+        let mut quantized = 0usize;
+        for lin in [
+            &mut self.patch_embedder.input_proj,
+            &mut self.embedding_projection,
+        ] {
+            quantized += usize::from(nvfp4_quantize_vis_linear(lin, &runner, &device)?);
+        }
+        for layer in &mut self.layers {
+            for clipped in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+                &mut layer.gate_proj,
+                &mut layer.up_proj,
+                &mut layer.down_proj,
+            ] {
+                quantized += usize::from(nvfp4_quantize_vis_linear(
+                    &mut clipped.linear,
+                    &runner,
+                    &device,
+                )?);
+            }
+        }
+        anyhow::ensure!(
+            quantized > 0,
+            "nvfp4 vision quantization matched no projections (every dim below MIN_TILE {} or \
+             already non-dense)",
+            nv_quant::nvfp4::MIN_TILE
+        );
+        Ok(quantized)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    pub fn quantize_linears_nvfp4(&mut self) -> Result<usize> {
+        anyhow::bail!("nvfp4 vision projections require a cuda build")
+    }
+
     pub fn plan_full_grid(&self, grid_w: usize, grid_h: usize) -> Result<FullGridPlan> {
         let pk = self.cfg.pooling_kernel_size;
         anyhow::ensure!(
-            grid_w > 0
-                && grid_h > 0
-                && grid_w.is_multiple_of(pk)
-                && grid_h.is_multiple_of(pk),
+            grid_w > 0 && grid_h > 0 && grid_w.is_multiple_of(pk) && grid_h.is_multiple_of(pk),
             "plan_full_grid: grid {grid_w}x{grid_h} not a positive multiple of pooling kernel {pk}"
         );
         let positions = full_grid_positions(grid_w, grid_h);

@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Context, Result};
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use ort::value::Tensor;
 
+use crate::diarization::ep;
 use crate::vad::ort_err;
 
 pub const PARAKEET_DIR_ENV: &str = "STT_PARAKEET_DIR";
@@ -25,6 +26,7 @@ pub struct ParakeetTdt {
     encoder: Mutex<Session>,
     joint: Mutex<Session>,
     vocab: Vec<String>,
+    encoder_ep: &'static str,
 }
 
 pub fn parakeet_dir() -> Result<PathBuf> {
@@ -56,13 +58,8 @@ pub fn parakeet_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("empty snapshots dir {}", snaps.display()))
 }
 
-fn load_session(dir: &Path, file: &str) -> Result<Session> {
-    Session::builder()
-        .map_err(ort_err)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(ort_err)?
-        .commit_from_file(dir.join(file))
-        .map_err(ort_err)
+fn load_session(dir: &Path, file: &str) -> Result<ep::Loaded> {
+    ep::load_session(&dir.join(file), file)
         .with_context(|| format!("load parakeet {file} from {}", dir.display()))
 }
 
@@ -80,12 +77,21 @@ impl ParakeetTdt {
                 vocab.len()
             ));
         }
+        let pre = load_session(dir, "nemo128.onnx")?;
+        let encoder = load_session(dir, "encoder-model.onnx")?;
+        let joint = load_session(dir, "decoder_joint-model.onnx")?;
+        let encoder_ep = encoder.provider;
         Ok(Self {
-            pre: Mutex::new(load_session(dir, "nemo128.onnx")?),
-            encoder: Mutex::new(load_session(dir, "encoder-model.onnx")?),
-            joint: Mutex::new(load_session(dir, "decoder_joint-model.onnx")?),
+            pre: Mutex::new(pre.session),
+            encoder: Mutex::new(encoder.session),
+            joint: Mutex::new(joint.session),
             vocab,
+            encoder_ep,
         })
+    }
+
+    pub fn ep(&self) -> &'static str {
+        self.encoder_ep
     }
 
     pub fn transcribe(&self, audio_16k_mono: &[f32]) -> Result<String> {

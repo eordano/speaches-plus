@@ -1325,3 +1325,168 @@ fn quantize_kv_fp8_kv_write_bf16_is_bit_identical_to_kv_write_plus_the_quantize_
         );
     }
 }
+
+const HEAD_WIDE_ENTRY: &str = "q3w_delta_head_fused_wide";
+
+const WHY_THE_WIDE_HEAD_GETS_A_BAND_NOT_BIT_IDENTITY: &str = "q3w_delta_head_fused_wide \
+     splits each column's 128-row kv and out reductions across four 32-row chunks combined \
+     in chunk order, so bit identity to the serial fused entry is impossible by construction \
+     and the arm ships default-off behind NV_Q3D_DN_HEAD_WIDE; reassociating a 128-term f32 \
+     sum of O(1) terms into 4 ordered partials moves the result by a few ulp, so a tight \
+     relative band still catches any indexing, gating, decay or state-update defect while \
+     admitting exactly the reorder the entry declares";
+
+const WIDE_STATE_REL_BAND_1E4_COVERS_4_CHUNK_REASSOCIATION_OF_128_TERM_F32_SUMS: f32 = 1e-4;
+
+const WIDE_GATED_ABS_BAND_2_BF16_ULP_AT_UNIT_SCALE: f32 = 0.016;
+
+#[test]
+fn q3w_delta_head_fused_wide_matches_the_fused_head_within_the_reassociation_band() {
+    let ctx = ctx();
+    let src = shipped("q3d:delta");
+    for e in [HEAD_FUSED_ENTRY, HEAD_WIDE_ENTRY] {
+        assert_entry(&src, e);
+    }
+    let c = HeadCase {
+        label: "served nv48 vpk3 dk128 dv128 (qwen3.8 geometry, the only wide-gated shape)",
+        n_v: 48,
+        v_per_k: 3,
+        d_k: 128,
+        d_v: 128,
+    };
+    let key_dim = c.n_v / c.v_per_k * c.d_k;
+    let conv_dim = 2 * key_dim + c.n_v * c.d_v;
+    let mut r = Lcg::new(0x51de_ca5e ^ ((c.n_v as u64) << 8) ^ c.d_k as u64);
+
+    let dq_p = dispatch::uniform_from(
+        ctx,
+        "fw-dq-p",
+        &DqParams {
+            n_v: c.n_v as u32,
+            d_k: c.d_k as u32,
+            d_v: c.d_v as u32,
+            key_dim: key_dim as u32,
+            v_per_k: c.v_per_k as u32,
+            pad0: 0,
+            pad1: 0,
+            scale: 1.0 / (c.d_k as f32).sqrt(),
+        },
+    );
+    let dg_p = dispatch::uniform_from(
+        ctx,
+        "fw-dg-p",
+        &DgParams {
+            n_v: c.n_v as u32,
+            pad0: 0,
+            pad1: 0,
+            pad2: 0,
+        },
+    );
+    let do_p = dispatch::uniform_from(
+        ctx,
+        "fw-do-p",
+        &DoParams {
+            n_v: c.n_v as u32,
+            d_v: c.d_v as u32,
+            pad0: 0,
+            eps: 1e-6,
+        },
+    );
+    let alog = dispatch::storage_from_slice(ctx, "fw-alog", &r.f32s(c.n_v, 0.5));
+    let dt = dispatch::storage_from_slice(ctx, "fw-dt", &r.f32s(c.n_v, 1.0));
+    let norm_w = dispatch::storage_from_slice(
+        ctx,
+        "fw-normw",
+        &pack_bf16(&r.f64s(c.d_v, 0.5).iter().map(|x| 1.0 + x).collect::<Vec<_>>()),
+    );
+
+    let state_words = c.n_v * c.d_k * c.d_v;
+    let state_a = dispatch::storage_zeroed(ctx, "fw-state-a", (state_words * 4) as u64);
+    let state_b = dispatch::storage_zeroed(ctx, "fw-state-b", (state_words * 4) as u64);
+    let gated_words = c.n_v * c.d_v / 2;
+    let gated_a = dispatch::storage_zeroed(ctx, "fw-gated-a", (gated_words * 4) as u64);
+    let gated_b = dispatch::storage_zeroed(ctx, "fw-gated-b", (gated_words * 4) as u64);
+
+    let unpack_bf16 = |words: &[u32]| -> Vec<f32> {
+        words
+            .iter()
+            .flat_map(|w| {
+                [
+                    f32::from_bits((*w & 0xffff) << 16),
+                    f32::from_bits((*w >> 16) << 16),
+                ]
+            })
+            .collect()
+    };
+
+    for step in 0..HEAD_STEPS_CARRIED_STATE_SEES_DECAY_AND_HISTORY_DEFECTS {
+        let mixed = dispatch::storage_from_slice(ctx, "fw-mixed", &r.f32s(conv_dim, 1.2));
+        let ab = dispatch::storage_from_slice(ctx, "fw-ab", &pack_bf16(&r.f64s(2 * c.n_v, 1.5)));
+        let z = dispatch::storage_from_slice(ctx, "fw-z", &pack_bf16(&r.f64s(c.n_v * c.d_v, 1.0)));
+
+        for (entry, state, gated, what) in [
+            (HEAD_FUSED_ENTRY, &state_a, &gated_a, "fused"),
+            (HEAD_WIDE_ENTRY, &state_b, &gated_b, "wide"),
+        ] {
+            dispatch::run(
+                ctx,
+                "fw-head",
+                &src,
+                entry,
+                &[
+                    (10, &mixed),
+                    (14, &dq_p),
+                    (20, &ab),
+                    (21, &alog),
+                    (22, &dt),
+                    (25, &dg_p),
+                    (36, state),
+                    (41, &norm_w),
+                    (42, &z),
+                    (43, gated),
+                    (44, &do_p),
+                ],
+                (c.n_v as u32, 1, 1),
+            )
+            .unwrap_or_else(|e| panic!("{what} head step {step}: {e}"));
+        }
+
+        let sa: Vec<f32> = dispatch::read_back(ctx, &state_a, state_words).expect("state a");
+        let sb: Vec<f32> = dispatch::read_back(ctx, &state_b, state_words).expect("state b");
+        assert_nondegenerate_f32(c.label, &format!("state step {step}"), &sa);
+        let mut worst = 0.0f32;
+        for (i, (a, b)) in sa.iter().zip(sb.iter()).enumerate() {
+            let denom = a.abs().max(b.abs()).max(1.0);
+            let rel = (a - b).abs() / denom;
+            if rel > worst {
+                worst = rel;
+            }
+            assert!(
+                rel <= WIDE_STATE_REL_BAND_1E4_COVERS_4_CHUNK_REASSOCIATION_OF_128_TERM_F32_SUMS,
+                "{}: state[{i}] step {step} fused {a} vs wide {b} rel {rel:e} exceeds the \
+                 band. {WHY_THE_WIDE_HEAD_GETS_A_BAND_NOT_BIT_IDENTITY}",
+                c.label
+            );
+        }
+        let ga = unpack_bf16(&dispatch::read_back(ctx, &gated_a, gated_words).expect("gated a"));
+        let gb = unpack_bf16(&dispatch::read_back(ctx, &gated_b, gated_words).expect("gated b"));
+        assert!(
+            ga.iter().any(|x| *x != 0.0),
+            "{}: fused gated output all zero at step {step}; the band would be vacuous",
+            c.label
+        );
+        for (i, (a, b)) in ga.iter().zip(gb.iter()).enumerate() {
+            let band = WIDE_GATED_ABS_BAND_2_BF16_ULP_AT_UNIT_SCALE * a.abs().max(b.abs()).max(1.0);
+            assert!(
+                (a - b).abs() <= band,
+                "{}: gated[{i}] step {step} fused {a} vs wide {b} exceeds the bf16 band. \
+                 {WHY_THE_WIDE_HEAD_GETS_A_BAND_NOT_BIT_IDENTITY}",
+                c.label
+            );
+        }
+        eprintln!(
+            "[q3d-fused-identity] {}: wide head step {step} worst state rel {worst:e}",
+            c.label
+        );
+    }
+}

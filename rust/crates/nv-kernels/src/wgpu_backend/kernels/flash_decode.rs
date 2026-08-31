@@ -116,7 +116,7 @@ mod gqa_fold_default_tests {
 
     #[test]
     fn the_default_fold_is_two_where_the_group_allows_it() {
-        if std::env::var(GQA_FOLD_ENV).is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call(GQA_FOLD_ENV) {
             return;
         }
         assert_eq!(gqa_fold_env(2), 2);
@@ -126,7 +126,7 @@ mod gqa_fold_default_tests {
 
     #[test]
     fn the_default_never_folds_more_than_two() {
-        if std::env::var(GQA_FOLD_ENV).is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call(GQA_FOLD_ENV) {
             return;
         }
         for group in [2usize, 4, 6, 8, 16] {
@@ -141,7 +141,7 @@ mod gqa_fold_default_tests {
 
     #[test]
     fn an_indivisible_group_falls_back_to_one() {
-        if std::env::var(GQA_FOLD_ENV).is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call(GQA_FOLD_ENV) {
             return;
         }
         for group in [1usize, 3, 5, 7] {
@@ -192,6 +192,7 @@ pub fn fold_stage1_source_sd(hd_max: u32, sg: bool, fold: u32) -> String {
     let sd = base
         .replacen(&format!("fn {entry}("), &format!("fn {entry_sd}("), 1)
         .replace("fd_k_fp8(", "fd_k_fp8_sd(")
+        .replace("fd_k_byte(", "fd_k_byte_sd(")
         .replace("fd_v_fp8(", "fd_v_fp8_sd(")
         .replacen(
             "ks = fd_k_scales[sp * nkv + kvh];",
@@ -204,7 +205,10 @@ pub fn fold_stage1_source_sd(hd_max: u32, sg: bool, fold: u32) -> String {
             1,
         );
     assert!(
-        sd.contains(&entry_sd) && sd.contains("fd_k_fp8_sd(") && sd.contains("0x7B800000"),
+        sd.contains(&entry_sd)
+            && sd.contains("fd_k_fp8_sd(")
+            && sd.contains("fd_k_byte_sd(")
+            && sd.contains("0x7B800000"),
         "fold shift-decode rewrite missed an anchor; the generated kernel would silently \
          apply exact-decode magnitudes against 2pow120-folded scales"
     );
@@ -354,32 +358,56 @@ pub fn fold_stage1_source(hd_max: u32, sg: bool, fold: u32) -> String {
     writeln!(b, "            let kbase = (sp * nkv + kvh) * hd;").unwrap();
     writeln!(b, "            ks = fd_k_scales[sp * nkv + kvh];").unwrap();
     writeln!(b, "            if (use_vec4) {{").unwrap();
-    writeln!(b, "                let n4 = hd >> 2u;").unwrap();
-    writeln!(
-        b,
-        "                for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{"
-    )
-    .unwrap();
-    writeln!(b, "                    let qb = jv * 4u;").unwrap();
-    writeln!(b, "                    let kb = kbase + qb;").unwrap();
-    for i in 0..4 {
+    if hd_max == 64 {
+        writeln!(b, "                let n2 = hd >> 1u;").unwrap();
         writeln!(
             b,
-            "                    let e{i} = fd_k_fp8(kb + {i}u);"
+            "                for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{"
         )
         .unwrap();
+        writeln!(b, "                    let qb = jp * 2u;").unwrap();
+        writeln!(b, "                    let kb = kbase + qb;").unwrap();
+        writeln!(b, "                    let kw = fd_k_word(kb);").unwrap();
+        writeln!(b, "                    let e0 = fd_k_byte(kw, kb);").unwrap();
+        writeln!(b, "                    let e1 = fd_k_byte(kw, kb + 1u);").unwrap();
+        for j in 0..fold {
+            writeln!(b, "                    {{").unwrap();
+            writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
+            writeln!(b, "                        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+            writeln!(b, "                        t = fma({p}_qsh[qo], e0, t);").unwrap();
+            writeln!(b, "                        pt{j} = pt{j} + t;").unwrap();
+            writeln!(b, "                    }}").unwrap();
+        }
+        writeln!(b, "                }}").unwrap();
+    } else {
+        writeln!(b, "                let n4 = hd >> 2u;").unwrap();
+        writeln!(
+            b,
+            "                for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{"
+        )
+        .unwrap();
+        writeln!(b, "                    let qb = jv * 4u;").unwrap();
+        writeln!(b, "                    let kb = kbase + qb;").unwrap();
+        writeln!(b, "                    let kw = fd_k_word(kb);").unwrap();
+        for i in 0..4 {
+            writeln!(
+                b,
+                "                    let e{i} = fd_k_byte(kw, kb + {i}u);"
+            )
+            .unwrap();
+        }
+        for j in 0..fold {
+            writeln!(b, "                    {{").unwrap();
+            writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
+            writeln!(b, "                        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+            writeln!(b, "                        t = fma({p}_qsh[qo], e0, t);").unwrap();
+            writeln!(b, "                        t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
+            writeln!(b, "                        t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+            writeln!(b, "                        pt{j} = pt{j} + t;").unwrap();
+            writeln!(b, "                    }}").unwrap();
+        }
+        writeln!(b, "                }}").unwrap();
     }
-    for j in 0..fold {
-        writeln!(b, "                    {{").unwrap();
-        writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
-        writeln!(b, "                        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
-        writeln!(b, "                        t = fma({p}_qsh[qo], e0, t);").unwrap();
-        writeln!(b, "                        t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
-        writeln!(b, "                        t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
-        writeln!(b, "                        pt{j} = pt{j} + t;").unwrap();
-        writeln!(b, "                    }}").unwrap();
-    }
-    writeln!(b, "                }}").unwrap();
     writeln!(b, "            }} else {{").unwrap();
     writeln!(
         b,
@@ -457,6 +485,591 @@ pub fn fold_stage1_source(hd_max: u32, sg: bool, fold: u32) -> String {
     }
     writeln!(b, "}}").unwrap();
     b
+}
+
+
+pub fn fold_prefix_blksm(hd_max: u32, fold: u32) -> String {
+    format!("fdb{hd_max}sg{fold}")
+}
+
+pub fn fold_stage1_entry_blksm(hd_max: u32, fold: u32) -> String {
+    format!("{}_stage1_fp8", fold_prefix_blksm(hd_max, fold))
+}
+
+pub fn fold_stage1_entry_blksm_sd(hd_max: u32, fold: u32) -> String {
+    format!("{}_stage1_fp8_sd", fold_prefix_blksm(hd_max, fold))
+}
+
+const BLKSM_POSITIONS_PER_ROUND_4_AMORTIZES_THE_SERIAL_SOFTMAX_CHAIN_AND_QUADRUPLES_LOADS_IN_FLIGHT: u32 = 4;
+
+pub fn fold_stage1_source_blksm(hd_max: u32, fold: u32) -> String {
+    use std::fmt::Write;
+    assert!(
+        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        "blksm stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
+    );
+    assert!(
+        fold >= 1 && fold as usize <= MAX_GQA_FOLD,
+        "blksm stage1 folds {fold} query heads per workgroup; 1..={MAX_GQA_FOLD} bounds the \
+         per-thread accumulator file"
+    );
+    let bq = BLKSM_POSITIONS_PER_ROUND_4_AMORTIZES_THE_SERIAL_SOFTMAX_CHAIN_AND_QUADRUPLES_LOADS_IN_FLIGHT;
+    let accs = hd_max / 32;
+    let p = fold_prefix_blksm(hd_max, fold);
+    let entry = fold_stage1_entry_blksm(hd_max, fold);
+    let sub = |s: &str| {
+        s.replace("{P}", &p)
+            .replace("{E}", &entry)
+            .replace("{F}", &fold.to_string())
+            .replace("{HD}", &hd_max.to_string())
+    };
+    let mut b = String::with_capacity(24576);
+
+    writeln!(b, "var<workgroup> {p}_qsh: array<f32, {}>;", hd_max * fold).unwrap();
+    writeln!(b, "var<workgroup> {p}_sacc: array<f32, {}>;", hd_max * 8).unwrap();
+    writeln!(b, "var<workgroup> {p}_sm: array<f32, 8>;").unwrap();
+    writeln!(b, "var<workgroup> {p}_sl: array<f32, 8>;").unwrap();
+    b.push_str(&sub(FOLD_REDUCE_SG));
+    b.push_str(&sub(FOLD_EPILOGUE));
+    b.push_str(&sub(FOLD_HEAD));
+    for j in 0..fold {
+        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
+        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        for i in 0..accs {
+            writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
+        }
+    }
+    writeln!(b, "    let total = fd_params.total;").unwrap();
+    writeln!(b, "    let base = fd_params.start + split * FD_WARPS;").unwrap();
+    writeln!(b, "    let stride = fd_params.splits * FD_WARPS;").unwrap();
+    writeln!(b, "    var rounds = 0u;").unwrap();
+    writeln!(b, "    if (total > base) {{").unwrap();
+    writeln!(b, "        rounds = (total - base + stride - 1u) / stride;").unwrap();
+    writeln!(b, "    }}").unwrap();
+    writeln!(b, "    let rblk = (rounds + {bq}u - 1u) / {bq}u;").unwrap();
+    writeln!(b, "    for (var rb = 0u; rb < rblk; rb = rb + 1u) {{").unwrap();
+    for q in 0..bq {
+        writeln!(b, "        let p{q} = base + warp + (rb * {bq}u + {q}u) * stride;").unwrap();
+        writeln!(b, "        let live{q} = p{q} < total;").unwrap();
+        writeln!(b, "        var sp{q} = p{q};").unwrap();
+        writeln!(b, "        if (fd_params.ring > 0u) {{ sp{q} = p{q} % fd_params.ring; }}").unwrap();
+    }
+    for q in 0..bq {
+        for j in 0..fold {
+            writeln!(b, "        var pt{j}_{q} = 0.0;").unwrap();
+        }
+        writeln!(b, "        var ks{q} = 0.0;").unwrap();
+        writeln!(b, "        if (live{q}) {{").unwrap();
+        writeln!(b, "            let kbase = (sp{q} * nkv + kvh) * hd;").unwrap();
+        writeln!(b, "            ks{q} = fd_k_scales[sp{q} * nkv + kvh];").unwrap();
+        if hd_max == 64 {
+            writeln!(b, "            let n2 = hd >> 1u;").unwrap();
+            writeln!(b, "            for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{").unwrap();
+            writeln!(b, "                let qb = jp * 2u;").unwrap();
+            writeln!(b, "                let kb = kbase + qb;").unwrap();
+            writeln!(b, "                let kw = fd_k_word(kb);").unwrap();
+            writeln!(b, "                let e0 = fd_k_byte(kw, kb);").unwrap();
+            writeln!(b, "                let e1 = fd_k_byte(kw, kb + 1u);").unwrap();
+            for j in 0..fold {
+                writeln!(b, "                {{").unwrap();
+                writeln!(b, "                    let qo = {j}u * hd + qb;").unwrap();
+                writeln!(b, "                    var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+                writeln!(b, "                    t = fma({p}_qsh[qo], e0, t);").unwrap();
+                writeln!(b, "                    pt{j}_{q} = pt{j}_{q} + t;").unwrap();
+                writeln!(b, "                }}").unwrap();
+            }
+            writeln!(b, "            }}").unwrap();
+        } else {
+            writeln!(b, "            let n4 = hd >> 2u;").unwrap();
+            writeln!(b, "            for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{").unwrap();
+            writeln!(b, "                let qb = jv * 4u;").unwrap();
+            writeln!(b, "                let kb = kbase + qb;").unwrap();
+            writeln!(b, "                let kw = fd_k_word(kb);").unwrap();
+            for i in 0..4 {
+                writeln!(b, "                let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
+            }
+            for j in 0..fold {
+                writeln!(b, "                {{").unwrap();
+                writeln!(b, "                    let qo = {j}u * hd + qb;").unwrap();
+                writeln!(b, "                    var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+                writeln!(b, "                    t = fma({p}_qsh[qo], e0, t);").unwrap();
+                writeln!(b, "                    t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
+                writeln!(b, "                    t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+                writeln!(b, "                    pt{j}_{q} = pt{j}_{q} + t;").unwrap();
+                writeln!(b, "                }}").unwrap();
+            }
+            writeln!(b, "            }}").unwrap();
+        }
+        writeln!(b, "        }}").unwrap();
+    }
+    for j in 0..fold {
+        for q in 0..bq {
+            writeln!(
+                b,
+                "        var sc{j}_{q} = ({p}_reduce(lid, pt{j}_{q}) * ks{q}) * fd_params.scaling;"
+            )
+            .unwrap();
+            writeln!(b, "        if (!live{q}) {{ sc{j}_{q} = fd_neg_inf(); }}").unwrap();
+        }
+    }
+    for q in 0..bq {
+        writeln!(b, "        var vsc{q} = 0.0;").unwrap();
+        writeln!(b, "        var vbase{q} = 0u;").unwrap();
+        writeln!(b, "        if (live{q}) {{").unwrap();
+        writeln!(b, "            vbase{q} = (sp{q} * nkv + kvh) * hd;").unwrap();
+        writeln!(b, "            vsc{q} = fd_v_scales[sp{q} * nkv + kvh];").unwrap();
+        writeln!(b, "        }}").unwrap();
+    }
+    writeln!(b, "        if (live0) {{").unwrap();
+    for j in 0..fold {
+        writeln!(
+            b,
+            "            let mb{j} = max(max(m{j}, sc{j}_0), max(max(sc{j}_1, sc{j}_2), sc{j}_3));"
+        )
+        .unwrap();
+        writeln!(b, "            let cr{j} = fd_exp(m{j} - mb{j});").unwrap();
+        for q in 0..bq {
+            writeln!(b, "            let w{j}_{q} = fd_exp(sc{j}_{q} - mb{j});").unwrap();
+        }
+        writeln!(
+            b,
+            "            l{j} = fma(l{j}, cr{j}, ((w{j}_0 + w{j}_1) + (w{j}_2 + w{j}_3)));"
+        )
+        .unwrap();
+        for q in 0..bq {
+            writeln!(b, "            let wv{j}_{q} = w{j}_{q} * vsc{q};").unwrap();
+        }
+        writeln!(b, "            m{j} = mb{j};").unwrap();
+        for i in 0..accs {
+            writeln!(b, "            {{").unwrap();
+            writeln!(b, "                let d = lane + {i}u * FD_LANES;").unwrap();
+            writeln!(b, "                if (d < hd) {{").unwrap();
+            for q in 0..bq {
+                writeln!(b, "                    var vx{q} = 0.0;").unwrap();
+                writeln!(b, "                    if (live{q}) {{ vx{q} = fd_v_fp8(vbase{q} + d); }}").unwrap();
+            }
+            writeln!(b, "                    var av = a{j}_{i} * cr{j};").unwrap();
+            for q in 0..bq {
+                writeln!(b, "                    av = fma(wv{j}_{q}, vx{q}, av);").unwrap();
+            }
+            writeln!(b, "                    a{j}_{i} = av;").unwrap();
+            writeln!(b, "                }}").unwrap();
+            writeln!(b, "            }}").unwrap();
+        }
+    }
+    writeln!(b, "        }}").unwrap();
+    writeln!(b, "    }}\n").unwrap();
+    for j in 0..fold {
+        writeln!(b, "    workgroupBarrier();").unwrap();
+        for i in 0..accs {
+            writeln!(b, "    {{").unwrap();
+            writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
+            writeln!(b, "        if (d < hd) {{").unwrap();
+            writeln!(b, "            {p}_sacc[warp * {hd_max}u + d] = a{j}_{i};").unwrap();
+            writeln!(b, "        }}").unwrap();
+            writeln!(b, "    }}").unwrap();
+        }
+        writeln!(
+            b,
+            "    {p}_epilogue(lid, lane, warp, hd, ((h0 + {j}u) * fd_params.splits + split) * (hd + \
+             2u), m{j}, l{j});"
+        )
+        .unwrap();
+    }
+    writeln!(b, "}}").unwrap();
+    b
+}
+
+pub fn fold_stage1_source_blksm_sd(hd_max: u32, fold: u32) -> String {
+    let base = fold_stage1_source_blksm(hd_max, fold);
+    let entry = fold_stage1_entry_blksm(hd_max, fold);
+    let entry_sd = fold_stage1_entry_blksm_sd(hd_max, fold);
+    let sd = base
+        .replacen(&format!("fn {entry}("), &format!("fn {entry_sd}("), 1)
+        .replace("fd_k_byte(", "fd_k_byte_sd(")
+        .replace("fd_v_fp8(", "fd_v_fp8_sd(")
+        .replace(
+            "ks0 = fd_k_scales[sp0 * nkv + kvh];",
+            "ks0 = fd_k_scales[sp0 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "ks1 = fd_k_scales[sp1 * nkv + kvh];",
+            "ks1 = fd_k_scales[sp1 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "ks2 = fd_k_scales[sp2 * nkv + kvh];",
+            "ks2 = fd_k_scales[sp2 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "ks3 = fd_k_scales[sp3 * nkv + kvh];",
+            "ks3 = fd_k_scales[sp3 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "vsc0 = fd_v_scales[sp0 * nkv + kvh];",
+            "vsc0 = fd_v_scales[sp0 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "vsc1 = fd_v_scales[sp1 * nkv + kvh];",
+            "vsc1 = fd_v_scales[sp1 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "vsc2 = fd_v_scales[sp2 * nkv + kvh];",
+            "vsc2 = fd_v_scales[sp2 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        )
+        .replace(
+            "vsc3 = fd_v_scales[sp3 * nkv + kvh];",
+            "vsc3 = fd_v_scales[sp3 * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+        );
+    assert!(
+        sd.contains(&entry_sd)
+            && sd.contains("fd_k_byte_sd(")
+            && sd.contains("fd_v_fp8_sd(")
+            && sd.matches("0x7B800000").count() == 8,
+        "blksm shift-decode rewrite missed an anchor; the generated kernel would silently apply \
+         exact-decode magnitudes against 2pow120-folded scales"
+    );
+    sd
+}
+
+
+pub fn fold_prefix_lanepos(hd_max: u32, fold: u32) -> String {
+    format!("fdl{hd_max}sg{fold}")
+}
+
+pub fn fold_stage1_entry_lanepos(hd_max: u32, fold: u32) -> String {
+    format!("{}_stage1_fp8", fold_prefix_lanepos(hd_max, fold))
+}
+
+pub fn fold_stage1_entry_lanepos_sd(hd_max: u32, fold: u32) -> String {
+    format!("{}_stage1_fp8_sd", fold_prefix_lanepos(hd_max, fold))
+}
+
+pub fn fold_stage1_source_lanepos(hd_max: u32, fold: u32) -> String {
+    use std::fmt::Write;
+    assert!(
+        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        "lanepos stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
+    );
+    assert!(
+        fold >= 1 && fold as usize <= MAX_GQA_FOLD,
+        "lanepos stage1 folds {fold} query heads per warp; 1..={MAX_GQA_FOLD} bounds the \
+         per-lane score file"
+    );
+    let accs = hd_max / 32;
+    let p = fold_prefix_lanepos(hd_max, fold);
+    let entry = fold_stage1_entry_lanepos(hd_max, fold);
+    let sub = |s: &str| {
+        s.replace("{P}", &p)
+            .replace("{E}", &entry)
+            .replace("{F}", &fold.to_string())
+            .replace("{HD}", &hd_max.to_string())
+    };
+    let mut b = String::with_capacity(24576);
+    writeln!(b, "var<workgroup> {p}_qsh: array<f32, {}>;", hd_max * fold).unwrap();
+    writeln!(b, "var<workgroup> {p}_sacc: array<f32, {}>;", hd_max * 8).unwrap();
+    writeln!(b, "var<workgroup> {p}_sm: array<f32, 8>;").unwrap();
+    writeln!(b, "var<workgroup> {p}_sl: array<f32, 8>;").unwrap();
+    b.push_str(&sub(FOLD_EPILOGUE));
+    b.push_str(&sub(FOLD_HEAD));
+    for j in 0..fold {
+        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
+        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        for i in 0..accs {
+            writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
+        }
+    }
+    writeln!(b, "    let total = fd_params.total;").unwrap();
+    writeln!(b, "    let blkstride = fd_params.splits * FD_WARPS * 32u;").unwrap();
+    writeln!(
+        b,
+        "    var blockstart = fd_params.start + (split * FD_WARPS + warp) * 32u;"
+    )
+    .unwrap();
+    writeln!(b, "    loop {{").unwrap();
+    writeln!(b, "        if (blockstart >= total) {{ break; }}").unwrap();
+    writeln!(b, "        let pl = blockstart + lane;").unwrap();
+    writeln!(b, "        let livel = pl < total;").unwrap();
+    writeln!(b, "        var spl = pl;").unwrap();
+    writeln!(b, "        if (fd_params.ring > 0u) {{ spl = pl % fd_params.ring; }}").unwrap();
+    for j in 0..fold {
+        writeln!(b, "        var sc{j} = 0.0;").unwrap();
+    }
+    writeln!(b, "        var ksl = 0.0;").unwrap();
+    writeln!(b, "        var vscl = 0.0;").unwrap();
+    writeln!(b, "        if (livel) {{").unwrap();
+    writeln!(b, "            let rowb = (spl * nkv + kvh) * hd;").unwrap();
+    writeln!(b, "            ksl = fd_k_scales[spl * nkv + kvh];").unwrap();
+    writeln!(b, "            vscl = fd_v_scales[spl * nkv + kvh];").unwrap();
+    writeln!(b, "            let nw = hd >> 2u;").unwrap();
+    writeln!(b, "            for (var w = 0u; w < nw; w = w + 1u) {{").unwrap();
+    writeln!(b, "                let kb = rowb + w * 4u;").unwrap();
+    writeln!(b, "                let kw = fd_k_word(kb);").unwrap();
+    for i in 0..4 {
+        writeln!(b, "                let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
+    }
+    writeln!(b, "                let q4 = w * 4u;").unwrap();
+    for j in 0..fold {
+        writeln!(b, "                {{").unwrap();
+        writeln!(b, "                    let qo = {j}u * hd + q4;").unwrap();
+        writeln!(b, "                    var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+        writeln!(b, "                    t = fma({p}_qsh[qo], e0, t);").unwrap();
+        writeln!(b, "                    t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
+        writeln!(b, "                    t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+        writeln!(b, "                    sc{j} = sc{j} + t;").unwrap();
+        writeln!(b, "                }}").unwrap();
+    }
+    writeln!(b, "            }}").unwrap();
+    writeln!(b, "        }}").unwrap();
+    for j in 0..fold {
+        writeln!(b, "        var scm{j} = (sc{j} * ksl) * fd_params.scaling;").unwrap();
+        writeln!(b, "        if (!livel) {{ scm{j} = fd_neg_inf(); }}").unwrap();
+        writeln!(b, "        let bm{j} = subgroupMax(scm{j});").unwrap();
+        writeln!(b, "        let mn{j} = max(m{j}, bm{j});").unwrap();
+        writeln!(b, "        let cr{j} = fd_exp(m{j} - mn{j});").unwrap();
+        writeln!(b, "        let w{j} = fd_exp(scm{j} - mn{j});").unwrap();
+        writeln!(b, "        let wv{j} = w{j} * vscl;").unwrap();
+        writeln!(b, "        l{j} = fma(l{j}, cr{j}, subgroupAdd(w{j}));").unwrap();
+        writeln!(b, "        m{j} = mn{j};").unwrap();
+        for i in 0..accs {
+            writeln!(b, "        a{j}_{i} = a{j}_{i} * cr{j};").unwrap();
+        }
+    }
+    writeln!(b, "        for (var i = 0u; i < 32u; i = i + 1u) {{").unwrap();
+    writeln!(b, "            let pv = blockstart + i;").unwrap();
+    writeln!(b, "            if (pv >= total) {{ break; }}").unwrap();
+    writeln!(b, "            var spv = pv;").unwrap();
+    writeln!(b, "            if (fd_params.ring > 0u) {{ spv = pv % fd_params.ring; }}").unwrap();
+    writeln!(b, "            let vrow = (spv * nkv + kvh) * hd;").unwrap();
+    for j in 0..fold {
+        writeln!(b, "            let wvi{j} = subgroupShuffle(wv{j}, i);").unwrap();
+    }
+    for i in 0..accs {
+        writeln!(b, "            {{").unwrap();
+        writeln!(b, "                let d = lane + {i}u * FD_LANES;").unwrap();
+        writeln!(b, "                if (d < hd) {{").unwrap();
+        writeln!(b, "                    let vx = fd_v_fp8(vrow + d);").unwrap();
+        for j in 0..fold {
+            writeln!(b, "                    a{j}_{i} = fma(wvi{j}, vx, a{j}_{i});").unwrap();
+        }
+        writeln!(b, "                }}").unwrap();
+        writeln!(b, "            }}").unwrap();
+    }
+    writeln!(b, "        }}").unwrap();
+    writeln!(b, "        blockstart = blockstart + blkstride;").unwrap();
+    writeln!(b, "    }}\n").unwrap();
+    for j in 0..fold {
+        writeln!(b, "    workgroupBarrier();").unwrap();
+        for i in 0..accs {
+            writeln!(b, "    {{").unwrap();
+            writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
+            writeln!(b, "        if (d < hd) {{").unwrap();
+            writeln!(b, "            {p}_sacc[warp * {hd_max}u + d] = a{j}_{i};").unwrap();
+            writeln!(b, "        }}").unwrap();
+            writeln!(b, "    }}").unwrap();
+        }
+        writeln!(
+            b,
+            "    {p}_epilogue(lid, lane, warp, hd, ((h0 + {j}u) * fd_params.splits + split) * (hd + \
+             2u), m{j}, l{j});"
+        )
+        .unwrap();
+    }
+    writeln!(b, "}}").unwrap();
+    b
+}
+
+pub fn fold_stage1_entry_lanepos_h2(hd_max: u32, fold: u32) -> String {
+    format!("{}_stage1_fp8_h2", fold_prefix_lanepos(hd_max, fold))
+}
+
+pub fn fold_stage1_entry_lanepos_h2_sd(hd_max: u32, fold: u32) -> String {
+    format!("{}_stage1_fp8_h2_sd", fold_prefix_lanepos(hd_max, fold))
+}
+
+pub fn fold_stage1_source_lanepos_h2(hd_max: u32, fold: u32) -> String {
+    use std::fmt::Write;
+    let base = fold_stage1_source_lanepos(hd_max, fold);
+    let p = fold_prefix_lanepos(hd_max, fold);
+    let entry = fold_stage1_entry_lanepos(hd_max, fold);
+    let entry_h2 = fold_stage1_entry_lanepos_h2(hd_max, fold);
+    let mut b = base.replacen(&format!("fn {entry}("), &format!("fn {entry_h2}("), 1);
+    b = b.replacen(
+        &format!("var<workgroup> {p}_qsh: array<f32, {}>;", hd_max * fold),
+        &format!(
+            "var<workgroup> {p}_qsh: array<f32, {}>;\nvar<workgroup> {p}_qshh: array<u32, {}>;",
+            hd_max * fold,
+            hd_max * fold / 2
+        ),
+        1,
+    );
+    let head_fill = format!(
+        "    for (var d = lid; d < hd * {fold}u; d = d + FD_BLOCK) {{\n        {p}_qsh[d] = fd_q[h0 * hd + d];\n    }}\n    workgroupBarrier();"
+    );
+    assert!(
+        b.contains(&head_fill),
+        "lanepos h2: the FOLD_HEAD qsh fill anchor moved; the f16 pack pass would never be \
+         emitted and the h2 dot would read zeros"
+    );
+    let head_fill_h2 = format!(
+        "    for (var d = lid; d < hd * {fold}u; d = d + FD_BLOCK) {{\n        {p}_qsh[d] = fd_q[h0 * hd + d];\n    }}\n    workgroupBarrier();\n    for (var d2 = lid; d2 < (hd * {fold}u) / 2u; d2 = d2 + FD_BLOCK) {{\n        {p}_qshh[d2] = pack2x16float(vec2<f32>({p}_qsh[d2 * 2u], {p}_qsh[d2 * 2u + 1u]));\n    }}\n    workgroupBarrier();"
+    );
+    b = b.replacen(&head_fill, &head_fill_h2, 1);
+    let mut old_dot = String::new();
+    for i in 0..4 {
+        writeln!(old_dot, "                let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
+    }
+    writeln!(old_dot, "                let q4 = w * 4u;").unwrap();
+    for j in 0..fold {
+        writeln!(old_dot, "                {{").unwrap();
+        writeln!(old_dot, "                    let qo = {j}u * hd + q4;").unwrap();
+        writeln!(old_dot, "                    var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+        writeln!(old_dot, "                    t = fma({p}_qsh[qo], e0, t);").unwrap();
+        writeln!(old_dot, "                    t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
+        writeln!(old_dot, "                    t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+        writeln!(old_dot, "                    sc{j} = sc{j} + t;").unwrap();
+        writeln!(old_dot, "                }}").unwrap();
+    }
+    assert!(
+        b.contains(&old_dot),
+        "lanepos h2: the scalar K-dot anchor moved; the vec2<f16> dot would never replace it"
+    );
+    let mut new_dot = String::new();
+    for i in 0..4 {
+        writeln!(new_dot, "                let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
+    }
+    writeln!(
+        new_dot,
+        "                let eh01 = vec2<f16>(vec2<f32>(e0, e1));"
+    )
+    .unwrap();
+    writeln!(
+        new_dot,
+        "                let eh23 = vec2<f16>(vec2<f32>(e2, e3));"
+    )
+    .unwrap();
+    writeln!(new_dot, "                let q2 = w * 2u;").unwrap();
+    for j in 0..fold {
+        writeln!(new_dot, "                {{").unwrap();
+        writeln!(
+            new_dot,
+            "                    let qo2 = {j}u * (hd / 2u) + q2;"
+        )
+        .unwrap();
+        writeln!(
+            new_dot,
+            "                    let qh01 = vec2<f16>(unpack2x16float({p}_qshh[qo2]));"
+        )
+        .unwrap();
+        writeln!(
+            new_dot,
+            "                    let qh23 = vec2<f16>(unpack2x16float({p}_qshh[qo2 + 1u]));"
+        )
+        .unwrap();
+        writeln!(
+            new_dot,
+            "                    sh{j} = sh{j} + qh01 * eh01;"
+        )
+        .unwrap();
+        writeln!(
+            new_dot,
+            "                    sh{j} = sh{j} + qh23 * eh23;"
+        )
+        .unwrap();
+        writeln!(new_dot, "                }}").unwrap();
+    }
+    b = b.replacen(&old_dot, &new_dot, 1);
+    let mut old_init = String::new();
+    for j in 0..fold {
+        writeln!(old_init, "        var sc{j} = 0.0;").unwrap();
+    }
+    assert!(b.contains(&old_init), "lanepos h2: sc init anchor moved");
+    let mut new_init = String::new();
+    for j in 0..fold {
+        writeln!(new_init, "        var sc{j} = 0.0;").unwrap();
+        writeln!(new_init, "        var sh{j} = vec2<f16>(0.0);").unwrap();
+    }
+    b = b.replacen(&old_init, &new_init, 1);
+    let mut old_scm = String::new();
+    let mut new_scm = String::new();
+    for j in 0..fold {
+        writeln!(
+            old_scm,
+            "        var scm{j} = (sc{j} * ksl) * fd_params.scaling;"
+        )
+        .unwrap();
+        writeln!(
+            new_scm,
+            "        sc{j} = f32(sh{j}.x) + f32(sh{j}.y);\n        var scm{j} = (sc{j} * ksl) * fd_params.scaling;"
+        )
+        .unwrap();
+    }
+    let old_first = format!("        var scm0 = (sc0 * ksl) * fd_params.scaling;");
+    assert!(b.contains(&old_first), "lanepos h2: scm anchor moved");
+    for j in 0..fold {
+        let o = format!("        var scm{j} = (sc{j} * ksl) * fd_params.scaling;");
+        let n = format!(
+            "        sc{j} = f32(sh{j}.x) + f32(sh{j}.y);\n        var scm{j} = (sc{j} * ksl) * fd_params.scaling;"
+        );
+        b = b.replacen(&o, &n, 1);
+    }
+    b
+}
+
+pub fn fold_stage1_source_lanepos_h2_sd(hd_max: u32, fold: u32) -> String {
+    let base = fold_stage1_source_lanepos_h2(hd_max, fold);
+    let entry = fold_stage1_entry_lanepos_h2(hd_max, fold);
+    let entry_sd = fold_stage1_entry_lanepos_h2_sd(hd_max, fold);
+    let sd = base
+        .replacen(&format!("fn {entry}("), &format!("fn {entry_sd}("), 1)
+        .replace("fd_k_byte(", "fd_k_byte_sd(")
+        .replace("fd_v_fp8(", "fd_v_fp8_sd(")
+        .replacen(
+            "ksl = fd_k_scales[spl * nkv + kvh];",
+            "ksl = fd_k_scales[spl * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+            1,
+        )
+        .replacen(
+            "vscl = fd_v_scales[spl * nkv + kvh];",
+            "vscl = fd_v_scales[spl * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+            1,
+        );
+    assert!(
+        sd.contains(&entry_sd)
+            && sd.contains("fd_k_byte_sd(")
+            && sd.contains("fd_v_fp8_sd(")
+            && sd.matches("0x7B800000").count() == 2,
+        "lanepos h2 shift-decode rewrite missed an anchor"
+    );
+    sd
+}
+
+pub fn fold_stage1_source_lanepos_sd(hd_max: u32, fold: u32) -> String {
+    let base = fold_stage1_source_lanepos(hd_max, fold);
+    let entry = fold_stage1_entry_lanepos(hd_max, fold);
+    let entry_sd = fold_stage1_entry_lanepos_sd(hd_max, fold);
+    let sd = base
+        .replacen(&format!("fn {entry}("), &format!("fn {entry_sd}("), 1)
+        .replace("fd_k_byte(", "fd_k_byte_sd(")
+        .replace("fd_v_fp8(", "fd_v_fp8_sd(")
+        .replacen(
+            "ksl = fd_k_scales[spl * nkv + kvh];",
+            "ksl = fd_k_scales[spl * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+            1,
+        )
+        .replacen(
+            "vscl = fd_v_scales[spl * nkv + kvh];",
+            "vscl = fd_v_scales[spl * nkv + kvh] * bitcast<f32>(0x7B800000u);",
+            1,
+        );
+    assert!(
+        sd.contains(&entry_sd)
+            && sd.contains("fd_k_byte_sd(")
+            && sd.contains("fd_v_fp8_sd(")
+            && sd.matches("0x7B800000").count() == 2,
+        "lanepos shift-decode rewrite missed an anchor; the generated kernel would silently \
+         apply exact-decode magnitudes against 2pow120-folded scales"
+    );
+    sd
 }
 
 pub const KV_NVFP4_STAGE1_BINDS_TEN_STORAGE_BUFFERS: u32 = 10;
@@ -544,12 +1157,32 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
     writeln!(b, "        var ks = 0.0;").unwrap();
     writeln!(b, "        let snk = sp < {sink}u;").unwrap();
     let emit_k_fp8_vec4 = |b: &mut String, indent: &str| {
+        if hd_max == 64 {
+            writeln!(b, "{indent}let n2 = hd >> 1u;").unwrap();
+            writeln!(b, "{indent}for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{").unwrap();
+            writeln!(b, "{indent}    let qb = jp * 2u;").unwrap();
+            writeln!(b, "{indent}    let kb = kbase + qb;").unwrap();
+            writeln!(b, "{indent}    let kw = fd_k_word(kb);").unwrap();
+            writeln!(b, "{indent}    let e0 = fd_k_byte(kw, kb);").unwrap();
+            writeln!(b, "{indent}    let e1 = fd_k_byte(kw, kb + 1u);").unwrap();
+            for j in 0..fold {
+                writeln!(b, "{indent}    {{").unwrap();
+                writeln!(b, "{indent}        let qo = {j}u * hd + qb;").unwrap();
+                writeln!(b, "{indent}        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+                writeln!(b, "{indent}        t = fma({p}_qsh[qo], e0, t);").unwrap();
+                writeln!(b, "{indent}        pt{j} = pt{j} + t;").unwrap();
+                writeln!(b, "{indent}    }}").unwrap();
+            }
+            writeln!(b, "{indent}}}").unwrap();
+            return;
+        }
         writeln!(b, "{indent}let n4 = hd >> 2u;").unwrap();
         writeln!(b, "{indent}for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{").unwrap();
         writeln!(b, "{indent}    let qb = jv * 4u;").unwrap();
         writeln!(b, "{indent}    let kb = kbase + qb;").unwrap();
+        writeln!(b, "{indent}    let kw = fd_k_word(kb);").unwrap();
         for i in 0..4 {
-            writeln!(b, "{indent}    let e{i} = fd_k_fp8(kb + {i}u);").unwrap();
+            writeln!(b, "{indent}    let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
         }
         for j in 0..fold {
             writeln!(b, "{indent}    {{").unwrap();
@@ -1155,7 +1788,7 @@ mod splits_for_tests {
 
     #[test]
     fn splits_follow_the_measured_knee_between_2k_and_4k() {
-        if std::env::var(SPLITS_ENV).is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call(SPLITS_ENV) {
             return;
         }
         assert_eq!(splits_for(0), SPLITS_MEASURED_BEST_SHORT_KV);

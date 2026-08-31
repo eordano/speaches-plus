@@ -5,12 +5,11 @@ mod ctx_timing_common;
 use common::argmax;
 use common::ctx_tokens_from_env_default_256_8k_168k;
 use common::decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state;
-use common::percentile_of_sorted;
+use common::ig1_qwen35_9b_nvfp4_snapshot_dir_env_override_then_home_hub;
 use candle_core::{DType, Device, Tensor};
 use nv_models::graph_engine::GraphedQwen3Moe;
 use nv_models::qwen3_5_moe::{Qwen3Moe, Qwen3_5DenseConfig};
 use nv_weights::{QuantizationConfig, WeightLoader};
-use std::path::PathBuf;
 use std::time::Instant;
 
 fn fixed_position_hashed_token_id_same_for_every_arm_so_per_position_argmax_is_comparable(
@@ -24,35 +23,12 @@ const PREFILL_CHUNK_512_QWEN3MOE_KV_IS_FLAT_WITH_NO_RING_CAP_ONLY_MAX_SEQ_BOUNDS
 const TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN: usize = 64;
 const WARMUP_DECODE_STEPS_8_SO_THE_FIRST_ALLOCS_DONT_COUNT: usize = 8;
 
-fn ig1_qwen35_9b_nvfp4_snapshot_dir_env_override_then_home_hub() -> PathBuf {
-    if let Ok(d) = std::env::var("NV_QWEN35_DENSE_DIR") {
-        return PathBuf::from(d);
-    }
-    let home = std::env::var("HOME").expect("HOME");
-    let base = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--ig1--Qwen3.5-9B-NVFP4/snapshots");
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&base)
-        .unwrap_or_else(|e| panic!("ig1 qwen3.5-9b snapshots dir {base:?} missing: {e}"))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.join("config.json").is_file()
-                && (p.join("model.safetensors").is_file()
-                    || p.join("model.safetensors.index.json").is_file())
-        })
-        .collect();
-    candidates.sort();
-    candidates
-        .into_iter()
-        .next()
-        .expect("no ig1 Qwen3.5-9B NVFP4 snapshot with weights under HOME hub; set NV_QWEN35_DENSE_DIR")
-}
-
 #[test]
 #[ignore = "loads the 9.6 GiB ig1 Qwen3.5-9B NVFP4; set NV_QWEN35_CTX_TEST=1 -- decode ms/token vs KV depth (max_pos 262144 fits the full 256/8k/168k ladder), chunked-prefill primed, eager dense cuda arm (same build as NV_QWEN35_DENSE_CUDA_SERVE); run ONE depth per process via NV_CTX_TOKENS (the #96 residual race)"]
 fn qwen35_9b_cuda_decode_ms_per_token_vs_context_depth_eager_dense_chunked_prefill_primed() {
-    if std::env::var("NV_QWEN35_CTX_TEST").ok().as_deref() != Some("1") {
-        eprintln!("skip: NV_QWEN35_CTX_TEST != 1");
+    if ctx_timing_common::skip_when_env_gate_not_1_printing_the_exact_skip_line(
+        "NV_QWEN35_CTX_TEST",
+    ) {
         return;
     }
     let dir = ig1_qwen35_9b_nvfp4_snapshot_dir_env_override_then_home_hub();
@@ -132,13 +108,34 @@ fn qwen35_9b_cuda_decode_ms_per_token_vs_context_depth_eager_dense_chunked_prefi
             }
             pos_argmax.push((p, argmax(&row)));
         }
-        step_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = step_ms[step_ms.len() / 2];
+        let median = ctx_timing_common::median_ms_of_timed_steps(&mut step_ms);
         eprintln!(
             "CTX-SCALING qwen35-9b-cuda-eager depth={depth} decode_kernel={} median_ms_tok={median:.3} tok_s={:.1} prime_s={prime_s:.1} steps={}",
             decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state(),
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "cuda",
+                device: ctx_timing_common::cuda_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: WARMUP_DECODE_STEPS_8_SO_THE_FIRST_ALLOCS_DONT_COUNT,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_dense_cuda_decode_step_chunked_prefill_primed",
+            },
+            &[
+                ("arm", arm_label_from_the_resolved_value_of_every_numerics_changing_gate()),
+                (
+                    "decode_kernel",
+                    decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state().to_string(),
+                ),
+                ("prime_s", format!("{prime_s:.1}")),
+            ],
         );
         eprintln!(
             "DECODE-ARGMAX qwen35-9b-cuda-eager depth={depth} decode_kernel={} feed=fixed_position_hashed_ids pos_argmax={pos_argmax:?}",
@@ -150,7 +147,22 @@ fn qwen35_9b_cuda_decode_ms_per_token_vs_context_depth_eager_dense_chunked_prefi
 const TIMED_GRAPHED_DECODE_STEPS_64_MATCHES_THE_EAGER_LADDER: usize = 64;
 const KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS: usize = 16;
 
-const GREEDY_CHAIN_STEPS_64_LONG_ENOUGH_THAT_A_KERNEL_DEFECT_DERAILS_THE_SEQUENCE: usize = 64;
+const GREEDY_CHAIN_STEPS_128_IS_THE_QUALITY_PROTOCOL_MINIMUM_FOR_A_QUANTIZATION_CLASS_ARM: usize =
+    128;
+
+fn greedy_chain_steps_env_nv_qwen35_chain_steps_else_the_quality_protocol_minimum() -> usize {
+    std::env::var("NV_QWEN35_CHAIN_STEPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(GREEDY_CHAIN_STEPS_128_IS_THE_QUALITY_PROTOCOL_MINIMUM_FOR_A_QUANTIZATION_CLASS_ARM)
+}
+
+fn arm_label_from_the_resolved_value_of_every_numerics_changing_gate() -> String {
+    ctx_timing_common::arm_label_from_the_resolved_value_of_every_gate_accessor_because_a_presence_label_lies_after_a_default_flip(
+        &ctx_timing_common::Q36_Q38_DECODE_NUMERICS_GATES_EVERY_ONE_APPEARS_RESOLVED_IN_THE_ARM_LABEL,
+    )
+}
 
 fn logits_last_row_f32(logits: &Tensor) -> Vec<f32> {
     let dims = logits.dims().to_vec();
@@ -169,8 +181,9 @@ fn logits_last_row_f32(logits: &Tensor) -> Vec<f32> {
 #[test]
 #[ignore = "loads the 9.6 GiB ig1 Qwen3.5-9B NVFP4; set NV_QWEN35_CTX_TEST=1 -- greedy argmax chain on a REAL chat-template prompt (synthetic-noise contexts flip argmax on near-ties and prove nothing); NV_QWEN35_CHAIN_GRAPHED=1 selects the graphed engine, NV_Q36_GRAPHED_DECODE_FIX selects the attention decode kernel; identical chains across arms are the argmax-class parity evidence"]
 fn qwen35_9b_cuda_greedy_chain_real_chat_template_for_cross_arm_argmax_parity() {
-    if std::env::var("NV_QWEN35_CTX_TEST").ok().as_deref() != Some("1") {
-        eprintln!("skip: NV_QWEN35_CTX_TEST != 1");
+    if ctx_timing_common::skip_when_env_gate_not_1_printing_the_exact_skip_line(
+        "NV_QWEN35_CTX_TEST",
+    ) {
         return;
     }
     let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
@@ -197,7 +210,7 @@ fn qwen35_9b_cuda_greedy_chain_real_chat_template_for_cross_arm_argmax_parity() 
         .to_vec();
 
     let graphed = std::env::var("NV_QWEN35_CHAIN_GRAPHED").ok().as_deref() == Some("1");
-    let steps = GREEDY_CHAIN_STEPS_64_LONG_ENOUGH_THAT_A_KERNEL_DEFECT_DERAILS_THE_SEQUENCE;
+    let steps = greedy_chain_steps_env_nv_qwen35_chain_steps_else_the_quality_protocol_minimum();
     let mut chain: Vec<u32> = Vec::new();
     if graphed {
         let mut eng = GraphedQwen3Moe::new(model, &device, prompt.len() + steps + 16)
@@ -242,9 +255,10 @@ fn qwen35_9b_cuda_greedy_chain_real_chat_template_for_cross_arm_argmax_parity() 
     }
     let text = tok.decode(&chain, false).unwrap_or_default();
     eprintln!(
-        "GREEDY-CHAIN qwen35-9b engine={} decode_kernel={} prompt_toks={} steps={steps} ids={chain:?} text={text:?}",
+        "GREEDY-CHAIN qwen35-9b engine={} decode_kernel={} arm={} prompt_toks={} steps={steps} ids={chain:?} text={text:?}",
         if graphed { "graphed" } else { "eager" },
         decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state(),
+        arm_label_from_the_resolved_value_of_every_numerics_changing_gate(),
         prompt.len()
     );
 }
@@ -252,8 +266,9 @@ fn qwen35_9b_cuda_greedy_chain_real_chat_template_for_cross_arm_argmax_parity() 
 #[test]
 #[ignore = "loads the 9.6 GiB ig1 Qwen3.5-9B NVFP4; set NV_QWEN35_CTX_TEST=1 -- graphed serving-class decode ms/token vs KV depth for the SAME dense build, chunked-prefill primed then captured graph decode; feeds the eager ladder's fixed position-hashed ids so per-position argmax is comparable across arms; run ONE depth per process via NV_CTX_TOKENS (the #96 residual race)"]
 fn qwen35_9b_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_dense_chunk_primed() {
-    if std::env::var("NV_QWEN35_CTX_TEST").ok().as_deref() != Some("1") {
-        eprintln!("skip: NV_QWEN35_CTX_TEST != 1");
+    if ctx_timing_common::skip_when_env_gate_not_1_printing_the_exact_skip_line(
+        "NV_QWEN35_CTX_TEST",
+    ) {
         return;
     }
     let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
@@ -343,21 +358,39 @@ fn qwen35_9b_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_dens
              serving-class"
         );
 
-        let mut sorted = step_ms.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median = percentile_of_sorted(&sorted, 0.5);
-        let p10 = percentile_of_sorted(&sorted, 0.1);
-        let p90 = percentile_of_sorted(&sorted, 0.9);
-        assert!(
-            median.is_finite() && median > 0.0,
-            "median decode step time is not a positive number: {median}"
-        );
+        let (median, p10, p90) =
+            ctx_timing_common::sorted_median_p10_p90_asserting_a_positive_finite_median(&step_ms);
         eprintln!(
             "CTX-SCALING qwen35-9b-cuda-serving-graphed depth={depth} basis=graphed_dense_captured_decode_fixed_id_feed_includes_logits_host decode_kernel={} capture_active={} median_ms_tok={median:.3} p10={p10:.3} p90={p90:.3} tok_s={:.1} prime_s={prime_s:.1} prefill_chunk={chunk} steps={} warmup_steps={warmup_steps}",
             decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state(),
             eng.capture_active(),
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "cuda",
+                device: ctx_timing_common::cuda_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "graphed_dense_captured_decode_fixed_id_feed_includes_logits_host",
+            },
+            &[
+                ("arm", arm_label_from_the_resolved_value_of_every_numerics_changing_gate()),
+                (
+                    "decode_kernel",
+                    decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state().to_string(),
+                ),
+                ("p10", format!("{p10:.3}")),
+                ("p90", format!("{p90:.3}")),
+                ("prime_s", format!("{prime_s:.1}")),
+                ("prefill_chunk", chunk.to_string()),
+            ],
         );
         eprintln!(
             "DECODE-ARGMAX qwen35-9b-cuda-serving-graphed depth={depth} decode_kernel={} feed=fixed_position_hashed_ids pos_argmax={pos_argmax:?}",

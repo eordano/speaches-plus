@@ -22,7 +22,6 @@ struct FacParams {
 
 const FAC_BLOCK: u32 = 256u;
 const FAC_WARP: u32 = 32u;
-const FAC_FP8_E4M3_MAX: f32 = 448.0;
 
 var<workgroup> fac_scratch: array<f32, 256>;
 var<workgroup> fac_shared: f32;
@@ -57,123 +56,6 @@ fn fac_rms_reduce(lid: u32, local: f32) -> f32 {
     }
     workgroupBarrier();
     return fac_shared;
-}
-
-fn fac_kv_div_rn(a: f32, b: f32) -> f32 {
-    let ua = bitcast<u32>(a);
-    let ub = bitcast<u32>(b);
-    let sign = (ua ^ ub) & 0x80000000u;
-    let amag = ua & 0x7fffffffu;
-    let bmag = ub & 0x7fffffffu;
-    if (amag > 0x7f800000u || bmag > 0x7f800000u
-        || (amag == 0u && bmag == 0u)
-        || (amag == 0x7f800000u && bmag == 0x7f800000u)) {
-        return bitcast<f32>(0x7fc00000u);
-    }
-    if (amag == 0u || bmag == 0x7f800000u) {
-        return bitcast<f32>(sign);
-    }
-    if (amag == 0x7f800000u || bmag == 0u) {
-        return bitcast<f32>(sign | 0x7f800000u);
-    }
-    var ea = i32(amag >> 23u);
-    var ma = amag & 0x7fffffu;
-    if (ea == 0) {
-        let sh = countLeadingZeros(ma) - 8u;
-        ma = ma << sh;
-        ea = 1 - i32(sh);
-    } else {
-        ma = ma | 0x800000u;
-    }
-    var eb = i32(bmag >> 23u);
-    var mb = bmag & 0x7fffffu;
-    if (eb == 0) {
-        let sh = countLeadingZeros(mb) - 8u;
-        mb = mb << sh;
-        eb = 1 - i32(sh);
-    } else {
-        mb = mb | 0x800000u;
-    }
-    var q = 0u;
-    var rem = ma;
-    for (var i = 0u; i < 26u; i = i + 1u) {
-        q = q << 1u;
-        if (rem >= mb) {
-            rem = rem - mb;
-            q = q | 1u;
-        }
-        rem = rem << 1u;
-    }
-    var mant: u32;
-    var round: u32;
-    var sticky = u32(rem != 0u);
-    var be: i32;
-    if (q >= 0x2000000u) {
-        mant = q >> 2u;
-        round = (q >> 1u) & 1u;
-        sticky = sticky | (q & 1u);
-        be = ea - eb + 127;
-    } else {
-        mant = q >> 1u;
-        round = q & 1u;
-        be = ea - eb + 126;
-    }
-    if (be >= 255) {
-        return bitcast<f32>(sign | 0x7f800000u);
-    }
-    if (be <= 0) {
-        let s = u32(1 - be);
-        if (s > 24u) {
-            return bitcast<f32>(sign);
-        }
-        sticky = sticky | round | u32((mant & ((1u << (s - 1u)) - 1u)) != 0u);
-        round = (mant >> (s - 1u)) & 1u;
-        mant = mant >> s;
-        be = 0;
-    }
-    if (round == 1u && (sticky != 0u || (mant & 1u) == 1u)) {
-        mant = mant + 1u;
-    }
-    var bits: u32;
-    if (be == 0) {
-        bits = sign | mant;
-    } else {
-        bits = sign | ((u32(be) << 23u) + (mant - 0x800000u));
-    }
-    return bitcast<f32>(bits);
-}
-
-fn fac_encode_e4m3(x: f32) -> u32 {
-    let b = bitcast<u32>(x);
-    let sign = (b >> 31u) << 7u;
-    let mag = b & 0x7fffffffu;
-    if (mag > 0x7f800000u) {
-        return sign | 0x7fu;
-    }
-    let e = i32(mag >> 23u) - 127;
-    if (e >= -6) {
-        let lsb = (mag >> 20u) & 1u;
-        let r = mag + 0x7ffffu + lsb;
-        let e2 = i32(r >> 23u) - 127;
-        let m2 = (r >> 20u) & 7u;
-        if (e2 > 8 || (e2 == 8 && m2 == 7u)) {
-            return sign | 0x7eu;
-        }
-        return sign | (u32(e2 + 7) << 3u) | m2;
-    }
-    let s = u32(14 - e);
-    if (s >= 32u) {
-        return sign;
-    }
-    let full = 0x800000u | (mag & 0x7fffffu);
-    let q = full >> s;
-    let round_bit = (full >> (s - 1u)) & 1u;
-    let rest = full & ((1u << (s - 1u)) - 1u);
-    var n = q;
-    if (round_bit == 1u && (rest != 0u || (q & 1u) == 1u)) {
-        n = n + 1u;
-    }
-    return sign | n;
 }
 
 fn fac_kv_reduce_max(lid: u32, local: f32) -> f32 {
@@ -272,8 +154,8 @@ fn fac_quant_stage2(lid: u32, row: u32) {
     }
     let amax = fac_kv_reduce_max(lid, local);
     let positive = amax > 0.0;
-    let scale = select(1.0, fac_kv_div_rn(amax, FAC_FP8_E4M3_MAX), positive);
-    let inv_scale = select(1.0, fac_kv_div_rn(FAC_FP8_E4M3_MAX, amax), positive);
+    let scale = select(1.0, kv_div_rn(amax, KV_FP8_E4M3_MAX), positive);
+    let inv_scale = select(1.0, kv_div_rn(KV_FP8_E4M3_MAX, amax), positive);
 
     if (lid == 0u) {
         fac_scales[slot * n_kv + kv_head] = scale;
@@ -285,7 +167,7 @@ fn fac_quant_stage2(lid: u32, row: u32) {
         var packed = 0u;
         for (var j = 0u; j < 4u; j = j + 1u) {
             let v = fac_stage2_at(d0 + j);
-            packed = packed | (fac_encode_e4m3(v * inv_scale) << (8u * j));
+            packed = packed | (kv_encode_e4m3(v * inv_scale) << (8u * j));
         }
         fac_fp8[(base_dst >> 2u) + w] = packed;
     }

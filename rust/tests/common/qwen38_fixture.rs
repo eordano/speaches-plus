@@ -24,7 +24,7 @@ pub fn qwen38_nvfp4_snapshot_dir_env_override_then_home_hub() -> PathBuf {
         .expect("no complete Qwen3.8-27B-NVFP4 snapshot under HOME hub; set NV_QWEN38_DIR")
 }
 
-pub fn load_qwen38_dense_on_the_cuda_serving_arm(dir: &PathBuf, device: &Device) -> Qwen3Moe {
+pub fn load_qwen38_dense_on_the_cuda_serving_arm(dir: &std::path::Path, device: &Device) -> Qwen3Moe {
     let raw_cfg = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
     let cfg = Qwen3_5DenseConfig::from_hf_json_str(&raw_cfg).expect("parse qwen3.8 dense config");
     let qcfg = QuantizationConfig::from_hf_json_str(&raw_cfg).expect("parse qcfg");
@@ -50,7 +50,7 @@ pub fn host_row_f32(logits: &Tensor) -> Vec<f32> {
         .expect("host")
 }
 
-pub fn eos_ids_from_generation_config(dir: &PathBuf) -> Vec<u32> {
+pub fn eos_ids_from_generation_config(dir: &std::path::Path) -> Vec<u32> {
     let raw = std::fs::read_to_string(dir.join("generation_config.json"))
         .expect("generation_config.json");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("parse generation_config.json");

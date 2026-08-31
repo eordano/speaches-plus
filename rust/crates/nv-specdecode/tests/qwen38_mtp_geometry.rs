@@ -1,11 +1,12 @@
 mod hub_dirs;
 
 use nv_specdecode::qwen38_mtp::{
-    assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling, mtp_chain_depth, mtp_drafter_selected,
-    mtp_round_hidden_reanchor_index, mtp_verify_rows_per_round, read_safetensors_header_shapes,
-    resolve_mtp_weight_files, validate_mtp_named_shapes, verify_lm_head_f32_fast_path_rows_ceiling,
-    verify_lm_head_rows_per_call_ceiling, Qwen38MtpGeometry, MTP_CHAIN_DEPTH_DEFAULT,
-    MTP_WEIGHTS_FILE_NAME, QWEN38_27B_MTP_GEOMETRY,
+    adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run,
+    assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling, mtp_chain_depth, mtp_draft_p_min,
+    mtp_drafter_selected, mtp_round_hidden_reanchor_index, mtp_verify_rows_per_round,
+    read_safetensors_header_shapes, resolve_mtp_weight_files, validate_mtp_named_shapes,
+    verify_lm_head_f32_fast_path_rows_ceiling, verify_lm_head_rows_per_call_ceiling,
+    Qwen38MtpGeometry, MTP_CHAIN_DEPTH_DEFAULT, MTP_WEIGHTS_FILE_NAME, QWEN38_27B_MTP_GEOMETRY,
 };
 use nv_specdecode::{accept_prefix_argmax, build_chain_batch};
 
@@ -35,6 +36,30 @@ fn expected_shapes_match_the_verified_official_index_arithmetic() {
     ] {
         assert_eq!(shapes[n], vec![5120], "{n}");
     }
+}
+
+#[test]
+fn p_min_parses_only_open_interval_floats_and_defaults_off() {
+    assert_eq!(mtp_draft_p_min(None), None);
+    assert_eq!(mtp_draft_p_min(Some("")), None);
+    assert_eq!(mtp_draft_p_min(Some("0")), None);
+    assert_eq!(mtp_draft_p_min(Some("1")), None);
+    assert_eq!(mtp_draft_p_min(Some("1.5")), None);
+    assert_eq!(mtp_draft_p_min(Some("-0.3")), None);
+    assert_eq!(mtp_draft_p_min(Some("junk")), None);
+    assert_eq!(mtp_draft_p_min(Some(" 0.75 ")), Some(0.75));
+    assert_eq!(mtp_draft_p_min(Some("0.05")), Some(0.05));
+}
+
+#[test]
+fn adaptive_cut_keeps_the_leading_confident_run_and_never_fewer_than_two_of_the_available_drafts() {
+    let cut = adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run;
+    assert_eq!(cut(&[0.9, 0.8, 0.4, 0.9], 0.75), 2);
+    assert_eq!(cut(&[0.9, 0.8, 0.9, 0.9], 0.75), 4);
+    assert_eq!(cut(&[0.1, 0.9, 0.9], 0.75), 2);
+    assert_eq!(cut(&[0.75], 0.75), 1);
+    assert_eq!(cut(&[0.2], 0.75), 1);
+    assert_eq!(cut(&[], 0.75), 1);
 }
 
 #[test]

@@ -411,6 +411,8 @@ struct Builder {
     quant_lane: (usize, usize),
 
     w8_proj: (usize, u64, u64),
+    rope_cs_buffers_one_per_attn_layer_shared_by_decode_and_pf_passes: Vec<wgpu::Buffer>,
+    attn_probe_qf32_and_out_for_test: Vec<(wgpu::Buffer, wgpu::Buffer)>,
 }
 
 impl std::ops::Deref for Builder {
@@ -963,6 +965,9 @@ pub struct Qwen3MoeWgpu {
     embed_gather_end: usize,
     pfm_gather_end: usize,
     splice_validated: bool,
+    rope_cs_buffers: Vec<wgpu::Buffer>,
+    attn_probes: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    mrope_rows_installed: bool,
 
     base_passes: usize,
 }
@@ -1599,7 +1604,134 @@ impl Qwen3MoeWgpu {
             let zeros = vec![0u8; *bytes as usize];
             self.ctx.queue.write_buffer(buf, 0, &zeros);
         }
+        self.restore_text_rope_rows();
         Ok(())
+    }
+
+    pub fn rope_rot_half(&self) -> usize {
+        self.config.rotary_dim().max(2) / 2
+    }
+
+    fn rope_std_host_cos_sin(&self) -> (Vec<f32>, Vec<f32>) {
+        rope_tables(
+            self.config.rotary_dim().max(2),
+            self.config.rope_theta,
+            self.max_seq,
+        )
+    }
+
+    pub fn install_mrope_rows_for_prompt_and_shift_continuation_rows_by_delta(
+        &mut self,
+        pos: &crate::qwen3_mm_splice::Qwen3MropePositions,
+        section: [usize; 3],
+    ) -> Result<()> {
+        let rh = self.rope_rot_half();
+        anyhow::ensure!(
+            section.iter().sum::<usize>() == rh,
+            "mrope section {section:?} must tile the {rh} rotary half-frequencies of this graph"
+        );
+        let n = pos.len();
+        anyhow::ensure!(
+            n > 0 && n <= self.max_seq,
+            "mrope prompt of {n} tokens does not fit max_seq {}",
+            self.max_seq
+        );
+        let (std_cos, std_sin) = self.rope_std_host_cos_sin();
+        let sin_off = std_cos.len();
+        let mut cs = vec![0f32; 2 * sin_off];
+        for i in 0..n {
+            for j in 0..rh {
+                let axis = crate::qwen3_mm_splice::interleaved_axis_of_half_freq_matching_hf_overwrite_semantics(j, section);
+                let p = match axis {
+                    1 => pos.h[i],
+                    2 => pos.w[i],
+                    _ => pos.t[i],
+                } as usize;
+                anyhow::ensure!(
+                    p < self.max_seq,
+                    "mrope axis-{axis} position {p} at token {i} exceeds the {}-row rope table",
+                    self.max_seq
+                );
+                cs[i * rh + j] = std_cos[p * rh + j];
+                cs[sin_off + i * rh + j] = std_sin[p * rh + j];
+            }
+        }
+        let delta = pos.delta_added_to_token_index_for_every_position_after_this_prefill;
+        for i in n..self.max_seq {
+            let p = i as i64 + delta;
+            anyhow::ensure!(
+                (0..self.max_seq as i64).contains(&p),
+                "mrope continuation row {i} shifts to {p}, outside the {}-row rope table",
+                self.max_seq
+            );
+            let p = p as usize;
+            cs[i * rh..(i + 1) * rh].copy_from_slice(&std_cos[p * rh..(p + 1) * rh]);
+            cs[sin_off + i * rh..sin_off + (i + 1) * rh]
+                .copy_from_slice(&std_sin[p * rh..(p + 1) * rh]);
+        }
+        for csb in &self.rope_cs_buffers {
+            self.ctx
+                .queue
+                .write_buffer(csb, 0, bytemuck::cast_slice(&cs));
+        }
+        self.mrope_rows_installed = true;
+        Ok(())
+    }
+
+    pub fn restore_text_rope_rows(&mut self) {
+        if !self.mrope_rows_installed {
+            return;
+        }
+        let (std_cos, std_sin) = self.rope_std_host_cos_sin();
+        let mut cs = std_cos;
+        cs.extend_from_slice(&std_sin);
+        for csb in &self.rope_cs_buffers {
+            self.ctx
+                .queue
+                .write_buffer(csb, 0, bytemuck::cast_slice(&cs));
+        }
+        self.mrope_rows_installed = false;
+    }
+
+    pub fn mrope_rows_installed(&self) -> bool {
+        self.mrope_rows_installed
+    }
+
+    pub fn attn_rope_layer_count(&self) -> usize {
+        self.rope_cs_buffers.len()
+    }
+
+    pub fn read_attn_qf32_and_out_for_test(&self, attn_layer: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (qf, at) = self
+            .attn_probes
+            .get(attn_layer)
+            .ok_or_else(|| anyhow::anyhow!("no attention layer {attn_layer} probe"))?;
+        let n = self.config.num_attention_heads * self.config.head_dim;
+        Ok((
+            dispatch::read_back::<f32>(self.ctx, qf, n).map_err(|e| anyhow::anyhow!("{e}"))?,
+            dispatch::read_back::<f32>(self.ctx, at, n).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ))
+    }
+
+    pub fn write_rope_cs_rows_for_test(&self, cs: &[f32]) -> Result<()> {
+        anyhow::ensure!(
+            cs.len() == 2 * self.max_seq * self.rope_rot_half(),
+            "cs must be the full cos||sin table"
+        );
+        for csb in &self.rope_cs_buffers {
+            self.ctx
+                .queue
+                .write_buffer(csb, 0, bytemuck::cast_slice(cs));
+        }
+        Ok(())
+    }
+
+    pub fn read_rope_cs_rows_for_test(&self, attn_layer: usize) -> Result<Vec<f32>> {
+        let csb = self.rope_cs_buffers.get(attn_layer).ok_or_else(|| {
+            anyhow::anyhow!("no attention layer {attn_layer} with a rope cs buffer")
+        })?;
+        dispatch::read_back::<f32>(self.ctx, csb, 2 * self.max_seq * self.rope_rot_half())
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     pub fn fill_state_buffers_with_finite_synthetic_bytes_and_set_pos_for_depth_timing_decode_reads_kv_size_not_values(
@@ -1731,6 +1863,8 @@ impl Qwen3MoeWgpu {
             gemv_unrolled: (0, 0),
             quant_lane: (0, 0),
             w8_proj: (0, 0, 0),
+            rope_cs_buffers_one_per_attn_layer_shared_by_decode_and_pf_passes: Vec::new(),
+            attn_probe_qf32_and_out_for_test: Vec::new(),
         };
 
         let tok_buf = b.upload_u32("q3w-tok", &[0u32]);
@@ -2245,6 +2379,8 @@ impl Qwen3MoeWgpu {
             gemv_unrolled,
             quant_lane,
             w8_proj,
+            rope_cs_buffers_one_per_attn_layer_shared_by_decode_and_pf_passes: rope_cs_buffers,
+            attn_probe_qf32_and_out_for_test: attn_probes,
             ..
         } = b;
         let buffers = core.buffers;
@@ -2399,6 +2535,9 @@ impl Qwen3MoeWgpu {
             embed_gather_end,
             pfm_gather_end,
             splice_validated: false,
+            rope_cs_buffers,
+            attn_probes,
+            mrope_rows_installed: false,
             base_passes,
         })
     }
@@ -3116,18 +3255,20 @@ impl Qwen3MoeWgpu {
         Ok(())
     }
 
-    pub fn prefill_with_splices(
+    pub fn prefill_tokens_with_image_rows(
         &mut self,
         tokens: &[u32],
         splices: &[EmbedRowsSplice],
-    ) -> Result<u32> {
+    ) -> Result<usize> {
         if splices.is_empty() {
-            return self.prefill(tokens);
+            let done = self.prefill_tokens(tokens)?;
+            for t in &tokens[done..] {
+                self.prefill_step(*t)?;
+            }
+            return Ok(tokens.len());
         }
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let hidden = self.config.hidden_size;
         let hidden_words = hidden / 2;
-        let last_plain = tokens.len() - 1;
         let mut cursor = 0usize;
         for (k, sp) in splices.iter().enumerate() {
             anyhow::ensure!(
@@ -3143,21 +3284,21 @@ impl Qwen3MoeWgpu {
                 sp.position
             );
             anyhow::ensure!(
-                sp.position + n_rows <= last_plain,
-                "splice {k} covers tokens [{}, {}) but the final token at {last_plain} must be a \
-                 plain token: it is decoded via decode_step, which replays the embed gathers",
+                sp.position + n_rows <= tokens.len(),
+                "splice {k} covers tokens [{}, {}) but only {} tokens are being prefilled; the \
+                 final prompt token must stay plain because decode_step replays the embed gathers",
                 sp.position,
-                sp.position + n_rows
+                sp.position + n_rows,
+                tokens.len()
             );
             cursor = sp.position + n_rows;
         }
         let packed: Vec<Vec<u32>> = splices.iter().map(|sp| pack_pairs(&sp.rows_bf16)).collect();
-        let (last, rest) = tokens.split_last().expect("non-empty");
         let m = self.pfm.as_ref().map(|e| e.m);
         let mut i = 0usize;
-        while i < rest.len() {
+        while i < tokens.len() {
             if let Some(mm) = m {
-                if rest.len() - i >= mm && self.pos + mm <= self.max_seq {
+                if tokens.len() - i >= mm && self.pos + mm <= self.max_seq {
                     let mut chunk_rows: Vec<(usize, &[u32])> = Vec::new();
                     for (si, sp) in splices.iter().enumerate() {
                         let n_rows = sp.rows_bf16.len() / hidden;
@@ -3173,9 +3314,9 @@ impl Qwen3MoeWgpu {
                         }
                     }
                     if chunk_rows.is_empty() {
-                        self.prefill_chunk_m_row_projections(&rest[i..i + mm])?;
+                        self.prefill_chunk_m_row_projections(&tokens[i..i + mm])?;
                     } else {
-                        self.prefill_chunk_m_rows_spliced(&rest[i..i + mm], &chunk_rows)?;
+                        self.prefill_chunk_m_rows_spliced(&tokens[i..i + mm], &chunk_rows)?;
                     }
                     i += mm;
                     continue;
@@ -3196,8 +3337,8 @@ impl Qwen3MoeWgpu {
                     .map(|sp| sp.position)
                     .filter(|&p| p > i)
                     .min()
-                    .unwrap_or(rest.len());
-                let seg = &rest[i..next];
+                    .unwrap_or(tokens.len());
+                let seg = &tokens[i..next];
                 let done = self.prefill_tokens(seg)?;
                 for t in &seg[done..] {
                     self.prefill_step(*t)?;
@@ -3205,6 +3346,20 @@ impl Qwen3MoeWgpu {
                 i = next;
             }
         }
+        Ok(tokens.len())
+    }
+
+    pub fn prefill_with_splices(
+        &mut self,
+        tokens: &[u32],
+        splices: &[EmbedRowsSplice],
+    ) -> Result<u32> {
+        if splices.is_empty() {
+            return self.prefill(tokens);
+        }
+        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        let (last, rest) = tokens.split_last().expect("non-empty");
+        self.prefill_tokens_with_image_rows(rest, splices)?;
         self.decode_step(*last)
     }
 }
@@ -3324,7 +3479,7 @@ struct Q8eParams {
 }
 
 fn fuse_silu_quant_enabled() -> bool {
-    std::env::var("NV_Q3_WGPU_FUSE_SILU_QUANT").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q3_WGPU_FUSE_SILU_QUANT")
 }
 
 pub fn quant_lane_mode() -> Option<usize> {
@@ -3618,7 +3773,7 @@ pub const SLOTSHARED_IS_ONLY_CORRECT_WHEN_EVERY_SLOT_SELECTS_EXPERT_ZERO: &str =
      experts (the MoE stacks) must keep the z-replicated route.";
 
 pub fn nvfp4_slotshared_enabled() -> bool {
-    std::env::var("NV_NVFP4_SLOTSHARED").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_NVFP4_SLOTSHARED")
 }
 
 pub const SLOTSHARED_MAP_ENTRY: &str = "q3w_i8map_x_rows";
@@ -3690,7 +3845,7 @@ fn mrow2_upgrade(
 ) -> (wk::gemv_nvfp4_v2::V2Kernel, &'static str) {
     let mrow2 = wk::gemv_nvfp4_v2::V2Kernel::MRow2;
     if pk_entry != wk::gemv_nvfp4_v2::MROW_PK_ENTRY
-        || std::env::var("NV_Q3_WGPU_NVFP4_MROW2").ok().as_deref() == Some("0")
+        || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q3_WGPU_NVFP4_MROW2")
         || !mrow2.shape_ok(k)
         || !wk::gemv_nvfp4_v2::pk_capable(mrow2, cfg)
     {
@@ -3785,7 +3940,7 @@ fn w8_group() -> usize {
 }
 
 fn w8_experts_enabled(ctx: &WgpuContext) -> bool {
-    std::env::var("NV_Q3_WGPU_W8_EXPERTS").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3_WGPU_W8_EXPERTS")
         && wk::gemv_nvfp4_v2::subgroup32_ok(ctx)
 }
 
@@ -3816,7 +3971,7 @@ fn w8_delta_proj_enabled(ctx: &WgpuContext) -> (bool, bool) {
 }
 
 fn w8_lmhead_enabled(ctx: &WgpuContext) -> bool {
-    std::env::var("NV_Q3_WGPU_W8_LMHEAD").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q3_WGPU_W8_LMHEAD")
         && wk::gemv_nvfp4_v2::subgroup32_ok(ctx)
 }
 
@@ -4979,6 +5134,8 @@ fn build_attn(
     let mut cs = cos;
     cs.extend_from_slice(&sin);
     let csb = b.upload_f32("q3w-at-cs", &cs);
+    b.rope_cs_buffers_one_per_attn_layer_shared_by_decode_and_pf_passes
+        .push(csb.clone());
     let mut qkn = a.q_norm.clone();
     qkn.extend_from_slice(&a.k_norm);
     let qkn = b.upload_u32("q3w-at-qkn", &pack_pairs(&qkn));
@@ -5163,6 +5320,8 @@ fn build_attn(
         (n_h * flash_splits() as usize * (hd + 2) * 4) as u64,
     );
     let attn = b.zeros("q3w-at-out", (n_h * hd * 4) as u64);
+    b.attn_probe_qf32_and_out_for_test
+        .push((q_f32.clone(), attn.clone()));
     b.push(
         "q3w-at-flash1",
         &s.flash,

@@ -27,9 +27,7 @@ pub(crate) fn kernel_decode_enabled() -> bool {
 }
 
 pub fn graph_enabled() -> bool {
-    std::env::var("NV_DSOCR_GRAPH")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_GRAPH")
 }
 
 fn init_lock() -> &'static std::sync::Mutex<()> {
@@ -589,8 +587,7 @@ pub(crate) fn dense_decode_ffn(
 }
 
 fn gemv_env_ok() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_err())
+    !nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_LINEAR_BF16_FORCE_CUBLAS")
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -163,6 +163,20 @@ each individually load-bearing.
    `#$ compiler-bindir=/nix/store/…`, which fails that regex and kills every
    compile. Disable with `NVK_CCACHE=0`.
 
+6. **sccache for rustc — opt-in, and not what it looks like.** `NVK_SCCACHE=1`
+   sets `RUSTC_WRAPPER` (plus `CARGO_INCREMENTAL=0`, which sccache requires).
+   The obvious hope — lane #2 reuses lane #1's compiled crates — is falsified
+   by measurement: sccache's rust cache key includes the per-lane target-dir
+   path, so a fresh lane hits 0% of a cache another lane just filled and comes
+   out *slower* than bare (nv-models `--release` lane-cold: 5m52s vs 5m31s).
+   The one case that pays is rebuilding a lane under the **same name** after
+   its target dir was reaped: 100% hit rate, 4m39s vs 5m31s (~16% — the
+   remaining wall is linking, build scripts, and proc-macro crates, which
+   sccache does not cache). Hence default 0; `NVK_SCCACHE_DIR` (default
+   `$HOME/build/sccache`), `NVK_SCCACHE_SIZE`, `NVK_SCCACHE_BIN`
+   (provision via `nix build --inputs-from . nixpkgs#sccache`). The real
+   cross-lane economics live in ccache (above) and in reusing lane names.
+
 It also sets `TMPDIR` into the cache dir (`/tmp` here is a root-mounted tmpfs;
 filling it breaks the machine, not just the build) and defaults
 `NV_KERNELS_PARITY_REQUIRE=1`, which is discussed under the trap below.
@@ -196,11 +210,21 @@ lanes**. Every concurrent worker must set its own `NVK_LANE`; sharing a lane
 means two cargo processes fighting over one target dir.
 
 The cost of that isolation is disk: nothing is shared between lanes except the
-ccache, and per-lane target dirs are the dominant disk consumer in this repo —
-far ahead of model weights. Reuse lane names where you can, and prefer a
-filesystem with headroom (`NVK_CACHE` accepts any path). On a
-snapshotting filesystem, deleting stale target dirs frees nothing until the
+ccache (sccache does not cross lanes — see the build point above), and per-lane
+target dirs are the dominant disk consumer in this repo — far ahead of model
+weights. Reuse lane names where you can, and prefer a filesystem with headroom
+(`NVK_CACHE` accepts any path).
+On a snapshotting filesystem, deleting stale target dirs frees nothing until the
 snapshots referencing them expire — check the pool, not `df`.
+
+`nvk.sh lanes` is the ledger for that disk: it lists every `tgt-*` dir with
+size, idle days, and the PIDs of any live consumer (matched via `pgrep` on the
+target-dir path and the `NVK_LANE=` token, plus `/proc/*/environ`).
+`nvk.sh lanes --reap DAYS` deletes lanes idle longer than `DAYS`;
+`--dry-run` prints the doomed list and deletes nothing. Three lanes are never
+reaped: `tgt-base`, the caller's current `NVK_LANE`, and any lane a live
+process references. Reaping is a manual act — nothing in the repo runs it on a
+timer, because deleting build state is a decision, not a side effect.
 
 ## Test taxonomy
 
@@ -418,6 +442,6 @@ use as a gate. `SKIP_DIRS` excludes `.git`, `target`, `vendor`, `node_modules`,
 Where explanation is genuinely load-bearing, it goes into `docs/` — which is what
 this book is — not into the source. The handful of comments that survive in
 `flake.nix` and `nvk.sh` are of a specific type: they record a *falsified*
-hypothesis or an upstream bug (why sccache cannot be used, why NCCL is disabled
+hypothesis or an upstream bug (why sccache cannot wrap nvcc, why NCCL is disabled
 in onnxruntime, why CUTLASS is pinned out of tree, why `:-` failed to override
 `CUDA_ARCH_LIST`). That is the bar.

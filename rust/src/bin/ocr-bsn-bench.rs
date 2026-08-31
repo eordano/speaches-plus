@@ -500,7 +500,7 @@ struct Pre {
     tokens: Vec<u32>,
     cache: nv_models::deepseek_ocr::DeepseekOcrKvCache,
     logits: Vec<f32>,
-    feats: candle_core::Tensor,
+    _feats_kept_resident: candle_core::Tensor,
 }
 
 #[cfg(feature = "cuda")]
@@ -541,7 +541,7 @@ fn preload_decode(pipeline: &DeepSeekOcr2Pipeline, args: &Args) -> Result<()> {
                 tokens,
                 cache,
                 logits,
-                feats,
+                _feats_kept_resident: feats,
             });
         }
         let front_s = t_front.elapsed().as_secs_f64();

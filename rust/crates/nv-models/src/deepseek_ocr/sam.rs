@@ -206,9 +206,7 @@ extern "C" __global__ void sam_relpos_softmax_bf16(
     }
 
     fn enabled() -> bool {
-        std::env::var("NV_SAM_FUSED")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_SAM_FUSED")
     }
 
     pub fn supported(scores: &Tensor, rel_h: &Tensor, rel_w: &Tensor) -> bool {

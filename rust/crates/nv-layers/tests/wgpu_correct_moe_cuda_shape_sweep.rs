@@ -124,6 +124,7 @@ fn cuda_weights(
     #[allow(deprecated)]
     let htod_f32 = |v: &[f32]| stream.clone_htod(v).expect("htod");
     MoeGroupedWeights {
+        folded_shared: false,
         num_experts: e_total,
         hidden_size: hidden,
         intermediate_size: inter,

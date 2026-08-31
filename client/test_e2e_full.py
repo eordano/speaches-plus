@@ -1,14 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "aiortc>=1.13.0,<1.14",
-#   "httpx>=0.28",
-#   "numpy>=2.0",
-#   "soundfile>=0.13",
-#   "av>=14.0,<14.3",
-# ]
-# ///
 
 from __future__ import annotations
 
@@ -43,7 +33,6 @@ from test_e2e import (
     REFERENCE_TEXT,
     _try_parse_event,
     generate_reference_audio,
-    normalize,
     text_match,
 )
 

@@ -213,7 +213,7 @@ impl ModelClass {
                 module: "nv_models::gemma4_e4b_wgpu",
                 entry: "Gemma4E4bWgpu::new",
                 evidence: WgpuEvidence::RealWeights {
-                    checkpoint: "google/gemma-4-E4B-it",
+                    checkpoint: "google/gemma-4-E4B-it-qat-w4a16-ct (int4 group-32 weights serve by default: chat_engine_wgpu redirects a bf16 gemma-4-E4B-it dir to this pack-quantized sibling's weights unless NV_E4B_SERVE_BF16=1; ppl reference row for this checkpoint lives in perf/runs.jsonl)",
                     test: "real_e4b_checkpoint_wgpu_decode (NV_E4B_WGPU_TEST=1)",
                 },
             }),
@@ -236,7 +236,7 @@ impl ModelClass {
                 module: "nv_models::qwen3_5_dense_wgpu",
                 entry: "Qwen3_5DenseWgpu::from_loader",
                 evidence: WgpuEvidence::RealWeights {
-                    checkpoint: "ig1/Qwen3.5-9B-NVFP4",
+                    checkpoint: "ig1/Qwen3.5-9B-NVFP4 (nvfp4 weight_packed weights serve by default: chat_engine_wgpu redirects a bf16 Qwen3.5-9B dir to this pack-quantized sibling's weights unless NV_QWEN35_SERVE_BF16=1; ppl A/B rows for both arms live in perf/runs.jsonl)",
                     test: "qwen35_dense_wgpu_real_weights_decode (NV_QWEN35_DENSE_WGPU_TEST=1)",
                 },
             }),
@@ -266,8 +266,9 @@ impl ModelClass {
             Self::Gemma4Moe => Some(WgpuDecoder {
                 module: "nv_models::gemma4_moe_wgpu",
                 entry: "Gemma4MoeWgpu::from_loader",
-                evidence: WgpuEvidence::ArchitectureFamily {
-                    verified_sibling: "chat_engine_wgpu::classify_wgpu_model routes it as WgpuModelKind::Gemma4Moe and builds it at chat_engine_wgpu.rs:1541; chunked prefill landed for this decoder in 10db591d5. No real-weights wgpu decode is recorded for google/gemma-4-26B-A4B-it",
+                evidence: WgpuEvidence::RealWeights {
+                    checkpoint: "google/gemma-4-26B-A4B-it",
+                    test: "real_26b_a4b_wgpu_decode (NV_GEMMA4_MOE_WGPU_TEST=1); serving-decode ppl rows in perf/runs.jsonl (g4moe_chat_wrapped_continuation_teacher_forced_ppl_via_wgpu_serving_decode)",
                 },
             }),
             Self::Qwen38Max | Self::DiffusionGemma | Self::Unknown => None,
@@ -319,6 +320,10 @@ fn wgpu_decoder_class_list() -> String {
 pub const KNOWN_MODELS: &[(&str, ModelClass)] = &[
     ("nvidia/Gemma-4-31B-IT-NVFP4", ModelClass::Gemma4Dense),
     ("google/gemma-4-E4B-it", ModelClass::Gemma4E4b),
+    (
+        "google/gemma-4-E4B-it-qat-w4a16-ct",
+        ModelClass::Gemma4E4b,
+    ),
     ("google/gemma-4-26B-A4B-it", ModelClass::Gemma4Moe),
     ("RedHatAI/Qwen3.6-35B-A3B-NVFP4", ModelClass::Qwen36Moe),
     ("Qwen/Qwen3.5-MoE", ModelClass::Qwen35Moe),
@@ -539,13 +544,12 @@ pub fn wgpu_unservable_reason_for_build(
     class: ModelClass,
     decoders_compiled_in: bool,
 ) -> Option<String> {
-    if !decoders_compiled_in {
-        return Some(WGPU_FEATURE_OFF_REASON.to_string());
+    match wgpu_model_support(class) {
+        Err(permanent_model_gap) if class.wgpu_decoder().is_none() => Some(permanent_model_gap),
+        _ if !decoders_compiled_in => Some(WGPU_FEATURE_OFF_REASON.to_string()),
+        Err(reason) => Some(reason),
+        Ok(_) => None,
     }
-    if let Err(reason) = wgpu_model_support(class) {
-        return Some(reason);
-    }
-    None
 }
 
 pub fn wgpu_unservable_reason(class: ModelClass) -> Option<String> {

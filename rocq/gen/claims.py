@@ -52,7 +52,6 @@ CONTEXT_KEYS = {"model", "phase", "drafter", "k"}
 OUTCOMES = ("CONTRADICTED", "BOUNDED_BELOW_CLAIM", "CONSISTENT",
             "NOT_COMPARABLE", "REFUSED")
 
-
 class Refusal(Exception):
     """Raised by a check that cannot decide. Carries the construct and the file."""
 
@@ -61,18 +60,15 @@ class Refusal(Exception):
         self.what = what
         self.where = where
 
-
 def fatal(msg, where):
     print(f"[claims] LEDGER MALFORMED: {msg}\n         at {where}", file=sys.stderr)
     sys.exit(2)
-
 
 def frac(v, where):
     if not (isinstance(v, list) and len(v) == 2
             and all(isinstance(x, int) for x in v) and v[1] != 0):
         fatal(f"expected a [num, den] integer pair, got {v!r}", where)
     return Fraction(v[0], v[1])
-
 
 def resolve_model(name, models):
     if name not in models:
@@ -86,7 +82,6 @@ def resolve_model(name, models):
         f"no snapshot for model {name!r}; tried " + ", ".join(m["dir_candidates"]),
         LEDGER,
     )
-
 
 def read_config(m):
     with open(os.path.join(m["dir"], "config.json")) as f:
@@ -104,7 +99,6 @@ def read_config(m):
                 os.path.join(m["dir"], "config.json"),
             )
     return cfg
-
 
 def safetensors_header(path):
     """Header dict, or a Refusal naming exactly why the file is not weights."""
@@ -136,11 +130,9 @@ def safetensors_header(path):
     hdr.pop("__metadata__", None)
     return hdr
 
-
 def tensor_bytes(t):
     lo, hi = t["data_offsets"]
     return hi - lo
-
 
 def group_bytes(m, hdr):
     """Total bytes per m1_groups bucket. First matching pattern wins; the last
@@ -165,7 +157,6 @@ def group_bytes(m, hdr):
         fatal(f"bucket accounting lost tensors: {seen} of {len(hdr)}", LEDGER)
     return tot, {g["name"]: g["per_step"] for g in groups}
 
-
 def m1_compulsory(m, cfg, hdr):
     tot, per_step = group_bytes(m, hdr)
     active = {}
@@ -187,9 +178,6 @@ def m1_compulsory(m, cfg, hdr):
         else:
             fatal(f"unknown per_step {ps!r}", LEDGER)
     return sum(active.values()), active, tot
-
-
-# ---------------------------------------------------------------- checks
 
 def check_block_format_bytes(c, ctx):
     a = c["check_args"]
@@ -221,7 +209,6 @@ def check_block_format_bytes(c, ctx):
         },
     }
 
-
 def check_declared_context_ceiling(c, ctx):
     a = c["check_args"]
     m = resolve_model(a["model"], ctx["models"])
@@ -235,7 +222,6 @@ def check_declared_context_ceiling(c, ctx):
                    f"the claimed point lies outside the declared context"),
         "rocq": {"kind": "context", "mpe": mpe, "claimed": want},
     }
-
 
 def check_checkpoint_tensor_file_real(c, ctx):
     a = c["check_args"]
@@ -254,7 +240,6 @@ def check_checkpoint_tensor_file_real(c, ctx):
         "detail": f"{a['file']} holds {len(hdr)} real tensors",
         "rocq": None,
     }
-
 
 def check_tensor_prefix_census(c, ctx):
     a = c["check_args"]
@@ -282,7 +267,6 @@ def check_tensor_prefix_census(c, ctx):
                  "expect_zero": a["expect_zero"]},
     }
 
-
 def check_m1_weight_amdahl(c, ctx):
     a = c["check_args"]
     m = resolve_model(a["model"], ctx["models"])
@@ -309,7 +293,6 @@ def check_m1_weight_amdahl(c, ctx):
                  "group": grp, "active": active[grp]},
     }
 
-
 def _measured_refusal(ctx, why):
     missing = [p for p in ctx["measured"]["artifacts"]
                if not os.path.exists(os.path.join(HERE, p))]
@@ -328,20 +311,16 @@ def _measured_refusal(ctx, why):
         LEDGER,
     )
 
-
 def check_verify_weight_floor_ratio(c, ctx):
     _measured_refusal(ctx, "verify-phase ratio needs measured_verify_hi_s")
-
 
 def check_phase_share_amdahl(c, ctx):
     _measured_refusal(
         ctx, f"phase-share Amdahl on {c['check_args']['phase']} needs the "
              f"measured round split")
 
-
 def check_accept_rate_ceiling(c, ctx):
     _measured_refusal(ctx, "acceptance-rate ceiling needs measured tokens/round")
-
 
 CHECKS = {
     "block_format_bytes": check_block_format_bytes,
@@ -353,9 +332,6 @@ CHECKS = {
     "phase_share_amdahl": check_phase_share_amdahl,
     "accept_rate_ceiling": check_accept_rate_ceiling,
 }
-
-
-# ---------------------------------------------------------------- Rocq
 
 def emit_rocq(rows, ledger):
     L = []
@@ -419,9 +395,6 @@ def emit_rocq(rows, ledger):
             fatal(f"emit_rocq has no case for {k['kind']!r}", LEDGER)
         w("")
     return "\n".join(L) + "\n"
-
-
-# ---------------------------------------------------------------- main
 
 def main(argv):
     check_only = "--check" in argv[1:]
@@ -524,7 +497,6 @@ def main(argv):
               f"decided; see the REFUSED lines above", file=sys.stderr)
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))

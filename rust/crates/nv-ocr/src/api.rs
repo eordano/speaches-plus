@@ -164,6 +164,13 @@ pub trait DotsOcrModel: Send + Sync {
         let _ = max_new_override;
         self.recognize_layout(image_bytes, mode)
     }
+
+    fn reload_adapter(&self, adapter_dir: Option<&std::path::Path>) -> Result<bool, Error> {
+        let _ = adapter_dir;
+        Err(Error::Backend(
+            "this dots backend cannot hot-load a lora adapter".to_string(),
+        ))
+    }
 }
 
 pub struct ClassicalAnalyzer;
@@ -269,6 +276,18 @@ impl OcrEngine {
         match mode {
             DeepSeekMode::FreeOcr => DotsOcrMode::LayoutAll,
             DeepSeekMode::Markdown => DotsOcrMode::LayoutAll,
+        }
+    }
+
+    pub fn dots_reload_adapter(
+        &self,
+        adapter_dir: Option<&std::path::Path>,
+    ) -> Result<bool, Error> {
+        match &self.inner {
+            EngineInner::DotsOcr(m) => m.reload_adapter(adapter_dir),
+            _ => Err(Error::Backend(
+                "adapter hot-load is a dots backend surface".to_string(),
+            )),
         }
     }
 

@@ -67,7 +67,7 @@ mod tests {
     }
 
     fn require() -> bool {
-        std::env::var("NV_KERNELS_PARITY_REQUIRE").as_deref() == Ok("1")
+        nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_KERNELS_PARITY_REQUIRE")
     }
 
     fn wgpu_ctx(test: &str) -> Option<&'static WgpuContext> {

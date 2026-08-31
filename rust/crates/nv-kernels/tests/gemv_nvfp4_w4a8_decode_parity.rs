@@ -1002,8 +1002,13 @@ fn gemv_nvfp4_w4a8_refuses_ragged_k_and_oversized_smem_without_launching() {
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- times the silu-quant producer alternatives (single-block m1 vs multi-block mk split), the post-norm+rowquant fold vs the two-kernel chain, and the small-m dual/down dp4a arms m=1..8 on the q38 dense shapes"]
 fn gemv_nvfp4_w4a8_producer_and_fold_alternatives_shape_bench() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the w4a8 producer/fold alternatives bench executed \
+             nothing. It is already #[ignore]d, which makes --ignored the opt-in; a second env \
+             gate behind that can only make an --ignored run print `1 passed` for a bench that \
+             measured nothing. A suite whose precondition is absent must fail or be ignored, \
+             never return green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();
@@ -1298,8 +1303,13 @@ fn gemv_nvfp4_w4a8_producer_and_fold_alternatives_shape_bench() {
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- times the four-kernel w4a8 decode MLP (rowquant_i8 x, dual gate+up dp4a, silu-mul rowquant producer, down dp4a with residual epilogue) on the q38 dense shapes (dual N=17408 K=5120, down N=5120 K=17408) so the per-layer cost is comparable against the 154 us/layer padded-A4 tensor-core route and the 157 us/layer w4a16 gemv pair"]
 fn gemv_nvfp4_w4a8_decode_mlp_shape_bench() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the w4a8 decode mlp shape bench executed nothing. It \
+             is already #[ignore]d, which makes --ignored the opt-in; a second env gate behind \
+             that can only make an --ignored run print `1 passed` for a bench that measured \
+             nothing. A suite whose precondition is absent must fail or be ignored, never return \
+             green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();

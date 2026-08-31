@@ -166,6 +166,56 @@ pub fn prepare(img: &RgbImage, budget: PixelBudget) -> Result<PreparedImage> {
     })
 }
 
+pub const INK_LUMA_BELOW_128_COUNTS_GLYPH_CORES_SO_LIGHT_GREY_LINEWORK_IS_NOT_TEXT: u16 = 128;
+pub const INK_SAMPLE_STRIDE_4_KEEPS_A_50MP_SHEET_UNDER_4M_SAMPLES: usize = 4;
+
+pub struct InkPoints {
+    pub xs: Vec<f32>,
+    pub ys: Vec<f32>,
+    pub sampled: usize,
+}
+
+pub const BRIGHT_INK_LUMA_AT_OR_ABOVE_192_READS_DARK_THEME_TEXT_OVER_MID_GREY_CHROME: u16 = 192;
+
+fn sample_ink_by(img: &RgbImage, is_ink: impl Fn(u16) -> bool) -> InkPoints {
+    let stride = INK_SAMPLE_STRIDE_4_KEEPS_A_50MP_SHEET_UNDER_4M_SAMPLES;
+    let mut pts = InkPoints {
+        xs: Vec::new(),
+        ys: Vec::new(),
+        sampled: 0,
+    };
+    let mut y = 0;
+    while y < img.h {
+        let row = &img.data[y * img.w * 3..(y + 1) * img.w * 3];
+        let mut x = 0;
+        while x < img.w {
+            let o = x * 3;
+            let luma =
+                (row[o] as u16 * 77 + row[o + 1] as u16 * 150 + row[o + 2] as u16 * 29) >> 8;
+            if is_ink(luma) {
+                pts.xs.push(x as f32);
+                pts.ys.push(y as f32);
+            }
+            pts.sampled += 1;
+            x += stride;
+        }
+        y += stride;
+    }
+    pts
+}
+
+pub fn sample_ink(img: &RgbImage) -> InkPoints {
+    sample_ink_by(img, |luma| {
+        luma < INK_LUMA_BELOW_128_COUNTS_GLYPH_CORES_SO_LIGHT_GREY_LINEWORK_IS_NOT_TEXT
+    })
+}
+
+pub fn sample_bright_ink(img: &RgbImage) -> InkPoints {
+    sample_ink_by(img, |luma| {
+        luma >= BRIGHT_INK_LUMA_AT_OR_ABOVE_192_READS_DARK_THEME_TEXT_OVER_MID_GREY_CHROME
+    })
+}
+
 pub fn position_ids(grid_h: usize, grid_w: usize) -> Vec<(u32, u32)> {
     let blocks_h = grid_h / MERGE_SIZE;
     let blocks_w = grid_w / MERGE_SIZE;

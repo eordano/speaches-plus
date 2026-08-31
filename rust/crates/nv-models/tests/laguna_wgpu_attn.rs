@@ -230,7 +230,7 @@ fn gpu_steps(
         half: inv.len(),
     };
 
-    build_attn_layer(&mut b, &src, s, l, w, &xbuf, &out, &step, &rope).unwrap();
+    build_attn_layer(&mut b, &src, s, l, w, &xbuf, &out, &step, &rope, None).unwrap();
     b.flush_staging();
 
     let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -577,9 +577,9 @@ fn distinct_head_counts_share_one_pipeline_set() {
         sin: b.upload_f32("lgw-test2-ssin", &ssin),
         half: s.rope_inv_freq_sliding.len(),
     };
-    build_attn_layer(&mut b, &src, &s, &l0, &w0, &xbuf, &out0, &step, &rope0).unwrap();
+    build_attn_layer(&mut b, &src, &s, &l0, &w0, &xbuf, &out0, &step, &rope0, None).unwrap();
     let split = b.passes.len();
-    build_attn_layer(&mut b, &src, &s, &l1, &w1, &xbuf, &out1, &step, &rope1).unwrap();
+    build_attn_layer(&mut b, &src, &s, &l1, &w1, &xbuf, &out1, &step, &rope1, None).unwrap();
     b.flush_staging();
 
     let e0: Vec<&str> = b.passes[..split].iter().map(|p| p.entry.as_str()).collect();

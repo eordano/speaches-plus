@@ -77,6 +77,9 @@ impl Default for BsnOptions {
     }
 }
 
+const BSN_DECODE_DEATH_EXIT_CODE_BECAUSE_A_DEAD_DECODE_THREAD_500S_FOREVER_BEHIND_A_HEALTHY_BOOT:
+    i32 = 86;
+
 type Reply = mpsc::SyncSender<Result<OcrOutput, String>>;
 
 struct Envelope {
@@ -191,7 +194,14 @@ impl DsocrBsnEngine {
                     .name("dsocr-bsn-decode".to_string())
                     .spawn(move || {
                         if let Err(e) = decode_loop(pipe, adm_rx, o, inflight_dec) {
-                            eprintln!("[dsocr-bsn] decode loop died: {e:#}");
+                            eprintln!(
+                                "[dsocr-bsn] FATAL: decode loop died: {e:#}; deepseek would stay \
+                                 registered behind a healthy-looking server and 500 every request \
+                                 forever, so the process exits instead of serving that"
+                            );
+                            std::process::exit(
+                                BSN_DECODE_DEATH_EXIT_CODE_BECAUSE_A_DEAD_DECODE_THREAD_500S_FOREVER_BEHIND_A_HEALTHY_BOOT,
+                            );
                         }
                     })
                     .expect("spawn bsn decode thread"),

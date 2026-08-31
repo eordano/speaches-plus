@@ -1,6 +1,9 @@
 [workspace]
 members = [".", "crates/*"]
-exclude = ["third-party/wgpu-hal-30.0.0"]
+exclude = [
+    "third-party/wgpu-hal-30.0.0",
+    "third-party/candle-core-0.11.0",
+]
 resolver = "2"
 
 [workspace.package]
@@ -47,6 +50,7 @@ thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ts-rs = { version = "12", features = ["serde-json-impl"] }
+typeshare = "1"
 tracing = "0.1"
 half = "2"
 bytemuck = { version = "1", features = ["derive"] }
@@ -54,12 +58,12 @@ rand_pcg = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 minijinja = { version = "2", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
-safetensors = "0.7"
+safetensors = "0.8"
 memmap2 = "0.9"
-tokenizers = "0.22"
-candle-core = { version = "0.10", default-features = false }
-candle-nn = { version = "0.10", default-features = false }
-candle-flash-attn = "0.10"
+tokenizers = "0.23"
+candle-core = { version = "0.11", default-features = false }
+candle-nn = { version = "0.11", default-features = false }
+candle-flash-attn = "0.11"
 cudarc = { version = "0.19", default-features = false, features = ["std", "cublas", "cublaslt", "cudnn", "curand", "nccl", "driver", "runtime", "nvrtc", "f16", "dynamic-linking", "cuda-12090"] }
 tokio = { version = "1", default-features = false }
 futures-util = "0.3"
@@ -101,6 +105,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+typeshare = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "net", "test-util", "process"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
@@ -132,6 +137,7 @@ nv-kernels = { workspace = true }
 nv-engine = { workspace = true }
 nv-layers = { workspace = true }
 nv-models = { workspace = true }
+nv-train = { workspace = true }
 nv-ocr = { workspace = true }
 nv-specdecode = { workspace = true }
 nv-omni = { workspace = true }
@@ -157,6 +163,7 @@ metal = [
     "nv-omni/metal",
     "nv-tts/metal",
     "nv-aligner/metal",
+    "nv-train/metal",
     "candle-core/metal",
     "candle-nn/metal",
 ]
@@ -170,6 +177,7 @@ cuda = [
     "nv-omni/cuda",
     "nv-tts/cuda",
     "nv-aligner/cuda",
+    "nv-train/cuda",
     "candle-core/cuda",
     "candle-nn/cuda",
 ]
@@ -200,3 +208,5 @@ workspace = true
 
 [patch.crates-io]
 wgpu-hal = { path = "third-party/wgpu-hal-30.0.0" }
+candle-core = { path = "third-party/candle-core-0.11.0" }
+candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "4761e00bfb687cc2666e30be7726077f9e2c4456" }

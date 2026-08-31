@@ -4,7 +4,6 @@ import json
 import threading
 from typing import Any
 
-import torch
 import xgrammar
 from xgrammar.contrib.hf import LogitsProcessor as XGrammarLogitsProcessor
 

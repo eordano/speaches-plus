@@ -4,6 +4,7 @@ use super::config::{LagunaShapes, LayerShape};
 use super::gpu::{
     alloc_lin_scratch, push_lin_gemv, push_silu_mul, upload_lin, Builder, Sources, W8Scope,
 };
+use super::lora::LoraSiteCtx;
 use super::weights::HostDenseMlp;
 use super::{rbf, ref_gemv_lin, silu};
 
@@ -50,6 +51,7 @@ pub fn build_dense_mlp(
     w: &HostDenseMlp,
     x_normed_packed: &wgpu::Buffer,
     out_packed: &wgpu::Buffer,
+    lora: Option<&LoraSiteCtx>,
 ) -> Result<()> {
     let inter = check_shapes(shapes, layer, w)?;
     let label = format!("lgw-dense{}", layer.idx);
@@ -84,6 +86,11 @@ pub fn build_dense_mlp(
         x_normed_packed,
         &y_up,
     )?;
+    if let Some(lc) = lora {
+        if let Some(site) = &lc.layer.gate_up {
+            lc.push_site(b, site, x_normed_packed, &[&y_gate, &y_up]);
+        }
+    }
     push_silu_mul(b, s, &format!("{label}-silu"), &y_gate, &y_up, &act, inter)?;
     push_lin_gemv(
         b,
@@ -93,7 +100,13 @@ pub fn build_dense_mlp(
         &down_sc,
         &act,
         out_packed,
-    )
+    )?;
+    if let Some(lc) = lora {
+        if let Some(site) = &lc.layer.down {
+            lc.push_site(b, site, &act, &[out_packed]);
+        }
+    }
+    Ok(())
 }
 
 pub fn ref_dense_mlp(

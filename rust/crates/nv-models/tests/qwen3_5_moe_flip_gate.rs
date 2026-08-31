@@ -183,7 +183,7 @@ THREE NULLS, BECAUSE ONE ARM-VS-ARM NUMBER DECIDES NOTHING HERE.
      per repetition, which is the only null here with the power to catch a rare event.";
 
     pub const WHAT_THIS_MEASURED: &str = "\
-MEASURED 2026-08-10, Apple silicon (Ultra-class) / wgpu-Metal, RedHatAI/Qwen3.6-35B-A3B-NVFP4 @965bfb0e,
+MEASURED 2026-08-10, Apple M2 Ultra / wgpu-Metal, RedHatAI/Qwen3.6-35B-A3B-NVFP4 @965bfb0e,
 thinking-off pack, 11 control + 3 open-ended prompts, 5 processes, the last at
 NV_QWEN36_FLIP_REPS=20 (31.6 min, 110/110 nvfp4 GEMVs on the v2 route in both candidate legs).
 

@@ -8,7 +8,6 @@ from math import log1p
 from typing import Tuple
 
 from .heuristic import (
-    CONTINUATIONS,
     ends_strong_terminator,
     ends_soft_terminator,
     last_word_is_continuation,

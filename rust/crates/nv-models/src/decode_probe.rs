@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NV_PROF_DECODE_PHASES").is_some())
+    nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_PROF_DECODE_PHASES")
 }
 
 fn report_every() -> u64 {

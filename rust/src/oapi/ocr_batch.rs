@@ -125,17 +125,26 @@ impl DsocrScheduler {
     pub fn new(pipeline: Arc<DeepSeekOcr2Pipeline>, opts: BatchOptions) -> Self {
         #[cfg(feature = "cuda")]
         if bsn_enabled() {
-            let bopts = super::ocr_batch_n::BsnOptions::from_env();
-            eprintln!(
-                "[dsocr-batch] routing to the bs=N engine (buckets {:?}, front {}); NV_OCR_BSN=0 to opt out",
-                bopts.buckets, bopts.front_threads
-            );
-            return Self {
-                job_tx: None,
-                threads: Vec::new(),
-                opts,
-                bsn: Some(super::ocr_batch_n::DsocrBsnEngine::new(pipeline, bopts)),
-            };
+            match nv_models::deepseek_ocr::graph_supported(pipeline.decoder()) {
+                Ok(()) => {
+                    let bopts = super::ocr_batch_n::BsnOptions::from_env();
+                    eprintln!(
+                        "[dsocr-batch] routing to the bs=N engine (buckets {:?}, front {}); NV_OCR_BSN=0 to opt out",
+                        bopts.buckets, bopts.front_threads
+                    );
+                    return Self {
+                        job_tx: None,
+                        threads: Vec::new(),
+                        opts,
+                        bsn: Some(super::ocr_batch_n::DsocrBsnEngine::new(pipeline, bopts)),
+                    };
+                }
+                Err(reason) => eprintln!(
+                    "[dsocr-batch] bs=N engine needs the bf16 batch decode graph ({reason}); \
+                     routing to the single-sequence scheduler, which decodes NVFP4 eagerly \
+                     instead of dropping every job on a dead decode thread"
+                ),
+            }
         }
         let (job_tx, job_rx) = mpsc::sync_channel::<Envelope>(opts.queue_depth);
         let (prep_tx, prep_rx) = mpsc::sync_channel::<Prepared>(opts.queue_depth);

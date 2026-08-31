@@ -662,22 +662,47 @@ fn strftime_now(fmt: String) -> Result<JinjaValue, minijinja::Error> {
     Ok(JinjaValue::from(format_utc_date(&fmt, secs)))
 }
 
+const HARMONY_MARKERS: [&str; 7] = [
+    "<|channel|>",
+    "<|message|>",
+    "<|start|>",
+    "<|end|>",
+    "<|return|>",
+    "<|call|>",
+    "<|constrain|>",
+];
+
 fn next_harmony_marker(s: &str) -> Option<usize> {
     let mut best: Option<usize> = None;
-    for m in [
-        "<|channel|>",
-        "<|message|>",
-        "<|start|>",
-        "<|end|>",
-        "<|return|>",
-        "<|call|>",
-        "<|constrain|>",
-    ] {
+    for m in HARMONY_MARKERS {
         if let Some(at) = s.find(m) {
             best = Some(best.map_or(at, |b: usize| b.min(at)));
         }
     }
     best
+}
+
+pub fn harmony_stream_safe_len(text: &str) -> usize {
+    let mut end = text.len();
+    while let Some(c) = text[..end].chars().next_back() {
+        if c == '\u{FFFD}' {
+            end -= c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let longest_marker = HARMONY_MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
+    let tail_start = end.saturating_sub(longest_marker.saturating_sub(1));
+    for at in tail_start..end {
+        if !text.is_char_boundary(at) {
+            continue;
+        }
+        let tail = &text[at..end];
+        if HARMONY_MARKERS.iter().any(|m| m.starts_with(tail)) {
+            return at;
+        }
+    }
+    end
 }
 
 pub fn harmony_reasoning_text(raw: &str) -> String {
@@ -1037,6 +1062,54 @@ mod tests {
             "unchannelled output is content, never reasoning"
         );
         assert_eq!(harmony_reasoning_text(""), "");
+    }
+
+    #[test]
+    fn stream_safe_len_holds_back_partial_markers_and_trailing_replacement_chars() {
+        assert_eq!(harmony_stream_safe_len(""), 0);
+        assert_eq!(harmony_stream_safe_len("abc"), 3);
+        assert_eq!(harmony_stream_safe_len("abc<"), 3);
+        assert_eq!(harmony_stream_safe_len("abc<|"), 3);
+        assert_eq!(harmony_stream_safe_len("abc<|chan"), 3);
+        assert_eq!(harmony_stream_safe_len("abc<|constrain|"), 3);
+        assert_eq!(
+            harmony_stream_safe_len("abc<x"),
+            5,
+            "a lone < released once the next char rules every marker out"
+        );
+        assert_eq!(harmony_stream_safe_len("abc\u{FFFD}"), 3);
+        assert_eq!(harmony_stream_safe_len("abc\u{FFFD}\u{FFFD}"), 3);
+        assert_eq!(harmony_stream_safe_len("caf\u{E9}<|e"), "caf\u{E9}".len());
+        assert_eq!(harmony_stream_safe_len("a < b"), 5);
+    }
+
+    #[test]
+    fn stream_safe_prefixes_of_reasoning_grow_monotonically_and_never_leak_markup() {
+        let raw = "<|channel|>analysis<|message|>Count: 1, 2, caf\u{E9}.<|end|>\
+                   <|start|>assistant<|channel|>analysis<|message|>More.<|end|>\
+                   <|start|>assistant<|channel|>final<|message|>Four.";
+        let want = harmony_reasoning_text(raw);
+        let mut prev_safe = String::new();
+        for cut in 0..=raw.len() {
+            if !raw.is_char_boundary(cut) {
+                continue;
+            }
+            let now = harmony_reasoning_text(&raw[..cut]);
+            let safe = &now[..harmony_stream_safe_len(&now)];
+            assert!(
+                safe.starts_with(prev_safe.as_str()),
+                "safe prefix regressed at cut {cut}: {prev_safe:?} -> {safe:?}"
+            );
+            assert!(
+                want.starts_with(safe),
+                "safe prefix {safe:?} at cut {cut} is not a prefix of the final reasoning {want:?}"
+            );
+            for m in HARMONY_MARKERS {
+                assert!(!safe.contains(m), "marker {m} leaked at cut {cut}: {safe:?}");
+            }
+            prev_safe = safe.to_string();
+        }
+        assert_eq!(prev_safe, want);
     }
 
     fn laguna_snapshot() -> Option<std::path::PathBuf> {

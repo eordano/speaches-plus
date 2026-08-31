@@ -1,22 +1,21 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::oapi::chat::{
     engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed, now_unix_secs, parse_model_tool_calls, rand_seed, render_chat_checked_kwargs,
     resolve_guided_think_close, resolve_tool_policy, split_thinking, template_required_for,
     ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn, ClientDeadline,
-    EngineBusy, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess, Tool,
+    FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess, Tool,
     ToolCall, ToolChoice, THINK_OPEN,
 };
 
@@ -103,6 +102,7 @@ fn engine_event_error(msg: String) -> Response {
     engine_event_error_by_surface(
         msg,
         RESPONSES_SHED_NOTE,
+        |m| error_response(StatusCode::BAD_REQUEST, "invalid_request_error", m),
         |m| error_response(StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", m),
         |m| error_response(StatusCode::INTERNAL_SERVER_ERROR, "api_error", m),
     )
@@ -112,23 +112,30 @@ async fn first_event(
     rx: &mut mpsc::Receiver<ChatEvent>,
     client: Option<ClientDeadline>,
 ) -> Result<Option<ChatEvent>, Response> {
-    let Some(client) = client else {
-        return Ok(None);
-    };
-    match tokio::time::timeout(client.budget, rx.recv()).await {
-        Ok(ev) => match ev {
-            Some(ChatEvent::Error(msg)) if is_busy_shed(&msg) => Err(engine_event_error(msg)),
-            other => Ok(other),
+    let ev = match client {
+        Some(client) => match tokio::time::timeout(client.budget, rx.recv()).await {
+            Ok(ev) => ev,
+            Err(_) => {
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "overloaded_error",
+                    format!(
+                        "generation did not start within the {} ms client budget ({})",
+                        client.budget_ms(),
+                        client.source
+                    ),
+                ))
+            }
         },
-        Err(_) => Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "overloaded_error",
-            format!(
-                "generation did not start within the {} ms client budget ({})",
-                client.budget_ms(),
-                client.source
-            ),
-        )),
+        None => rx.recv().await,
+    };
+    match ev {
+        Some(ChatEvent::Error(msg))
+            if is_busy_shed(&msg) || crate::oapi::chat::is_prompt_overflow(&msg) =>
+        {
+            Err(engine_event_error(msg))
+        }
+        other => Ok(other),
     }
 }
 
@@ -832,6 +839,7 @@ async fn run_non_streaming(
         tool_calls: Vec::new(),
         finish: String::from("stop"),
     };
+    #[allow(clippy::while_let_loop)]
     loop {
         let Some(ev) = (match pre.take() {
             Some(ev) => Some(ev),
@@ -877,10 +885,7 @@ async fn send_event(
 ) -> Result<(), ()> {
     data["sequence_number"] = json!(*seq);
     *seq += 1;
-    let frame = format!("event: {event}\ndata: {data}\n\n");
-    tx.send(Ok(Bytes::from(frame.into_bytes())))
-        .await
-        .map_err(|_| ())
+    crate::oapi::send_sse_event(tx, event, &data).await
 }
 
 async fn emit_message_events(
@@ -1104,6 +1109,7 @@ async fn run_streaming(
         };
         let mut raw = String::new();
         let mut emitted = 0usize;
+        #[allow(clippy::while_let_loop)]
         loop {
             let Some(ev) = (match pre.take() {
                 Some(ev) => Some(ev),
@@ -1244,13 +1250,7 @@ async fn run_streaming(
         .await;
     });
 
-    let stream = ReceiverStream::new(rx_bytes);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::oapi::sse_response(rx_bytes)
 }
 
 pub async fn handle_get_response(Path(id): Path<String>) -> Response {

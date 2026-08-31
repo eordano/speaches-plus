@@ -225,7 +225,7 @@ fn out_dir() -> PathBuf {
         .or_else(|_| std::env::var("NV_CHAT_EVAL_OUT").map(PathBuf::from))
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".cache/nvk-tmp/flip-eval")
+                .join(".cache/claude-tmp/flip-eval")
         });
     std::fs::create_dir_all(&d).ok();
     d

@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use half::bf16;
 use nv_models::gemma4::{Gemma4Config, LayerType};
+use nv_models::wgpu_lora::lora_site_probe_pk;
 use nv_models::gemma4_e4b_wgpu::{
-    lora_site_probe, E4bHostLayer, E4bHostWeights, E4bLora, Gemma4E4bWgpu, HostLin,
+    E4bHostLayer, E4bHostWeights, E4bLora, Gemma4E4bWgpu, HostLin,
 };
 
 const PREFIX: &str = "model.language_model";
@@ -402,17 +403,7 @@ fn max_abs_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 }
 
 fn expected_lora_passes(config: &Gemma4Config) -> usize {
-    let mut n = 0usize;
-    for li in 0..config.num_hidden_layers {
-        let qkv_segs = if config.kv_source_layer(li).is_some() {
-            1
-        } else {
-            3
-        };
-        n += 1 + 2 * qkv_segs;
-        n += 3 * (1 + 2);
-    }
-    n
+    config.num_hidden_layers * 2 * 4
 }
 
 #[test]
@@ -523,16 +514,11 @@ fn lora_pass_geometry_matches_the_layer_structure() {
     assert_eq!(
         lora.total_pass_count(),
         expected_lora_passes(&config),
-        "one fused dispatch plus a widen/repack pair per packed destination"
+        "one pk shrink/expand pair per site, qkv/o/gate_up/down"
     );
-    assert_eq!(lora.total_pass_count(), 88);
+    assert_eq!(lora.total_pass_count(), 48);
     for li in 0..config.num_hidden_layers {
-        let want = if config.kv_source_layer(li).is_some() {
-            12
-        } else {
-            16
-        };
-        assert_eq!(lora.layer_pass_count(li), want, "layer {li}");
+        assert_eq!(lora.layer_pass_count(li), 8, "layer {li}");
     }
 }
 
@@ -861,7 +847,7 @@ fn probe_case(m: usize, rank: usize, k: usize, widths: &[usize], segs: &[usize],
         off += w;
     }
 
-    lora_site_probe(&x, &a, &b, &mut segments, widths, segs, m, rank, k).unwrap();
+    lora_site_probe_pk(&x, &a, &b, &mut segments, widths, segs, m, rank, k).unwrap();
 
     let mut flat = vec![0u16; m * total_w];
     let mut off = 0usize;
@@ -935,6 +921,89 @@ fn the_resident_site_path_matches_the_kernel_and_a_cpu_oracle_bitwise() {
 
 #[test]
 #[ignore]
+fn real_e4b_adapter_decode_ab_perfb() {
+    if std::env::var("NV_E4B_WGPU_TEST").ok().as_deref() != Some("1") {
+        eprintln!("skipping: set NV_E4B_WGPU_TEST=1 to run");
+        return;
+    }
+    if ctx_or_skip().is_none() {
+        return;
+    }
+    let dir = common::e4b_snapshot_dir();
+    let config = Gemma4Config::from_hf_json_file(&dir.join("config.json")).unwrap();
+    let loader = nv_weights::WeightLoader::open_dir(&dir, &candle_core::Device::Cpu).unwrap();
+    let max_seq: usize = std::env::var("NV_E4B_WGPU_MAXSEQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let n_new: usize = std::env::var("NV_E4B_WGPU_NEW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    let prompt: Vec<u32> = (0..16u32).map(|i| 2 + (i * 97) % 1000).collect();
+
+    let (adapter_dir, _scratch);
+    match std::env::var("NV_LORA_REAL_ADAPTER_DIR") {
+        Ok(d) => {
+            adapter_dir = PathBuf::from(d);
+            _scratch = None;
+        }
+        Err(_) => {
+            let synth = synth_adapter(&config, 0xd317a1, Fill::Dense);
+            let s = write_adapter("perfab", &synth);
+            adapter_dir = s.0.clone();
+            _scratch = Some(s);
+        }
+    }
+    let lora = E4bLora::from_peft_dir(&adapter_dir, &config).unwrap();
+    eprintln!(
+        "adapter: rank {} matched {} modules, +{} passes/token",
+        lora.rank(),
+        lora.matched_modules(),
+        lora.total_pass_count()
+    );
+
+    let measure = |label: &str, m: &mut Gemma4E4bWgpu| -> f64 {
+        for t in &prompt {
+            m.decode_step(*t).unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        let mut next = 7u32;
+        for _ in 0..n_new {
+            next = m.decode_step(next % config.vocab_size as u32).unwrap();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / n_new as f64;
+        eprintln!(
+            "LORA-E4B-AB arm={label} passes={} ms_per_tok={ms:.3}",
+            m.pass_count()
+        );
+        ms
+    };
+
+    let mut base = Gemma4E4bWgpu::from_loader(config.clone(), &loader, max_seq).unwrap();
+    let base_passes = base.pass_count();
+    let base_ms = measure("base", &mut base);
+    drop(base);
+
+    let mut adapted =
+        Gemma4E4bWgpu::from_loader_with_lora(config.clone(), &loader, max_seq, Some(&lora))
+            .unwrap();
+    assert_eq!(
+        adapted.pass_count() - base_passes,
+        lora.total_pass_count(),
+        "adapter decode pass delta must be the pk ledger's 2 passes/site"
+    );
+    let lora_ms = measure("adapter", &mut adapted);
+    eprintln!(
+        "LORA-E4B-AB summary base_ms={base_ms:.3} adapter_ms={lora_ms:.3} \
+         delta_ms={:.3} lora_passes={}",
+        lora_ms - base_ms,
+        lora.total_pass_count()
+    );
+}
+
+#[test]
+#[ignore]
 fn real_peft_adapter_builds_e4b_lora_sites() {
     let dir = match std::env::var("NV_LORA_REAL_ADAPTER_DIR") {
         Ok(d) => d,
@@ -992,8 +1061,5 @@ fn real_peft_adapter_builds_e4b_lora_sites() {
             "{name} was dropped but layer {li} does compute its own k/v"
         );
     }
-    assert_eq!(
-        lora.total_pass_count(),
-        (n_layers - shared) * 16 + shared * 12
-    );
+    assert_eq!(lora.total_pass_count(), n_layers * 8);
 }

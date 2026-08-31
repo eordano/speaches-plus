@@ -250,7 +250,7 @@ __global__ void argmax_bf16_stage1_kernel(
     int bidx = 0x7fffffff;
     for (int i = blockIdx.x * kBlock + tid; i < n; i += gridDim.x * kBlock) {
         float v = __bfloat162float(logits[i]);
-        if (v > best || (v == best && i < bidx)) {
+        if (isfinite(v) && (v > best || (v == best && i < bidx))) {
             best = v;
             bidx = i;
         }
@@ -307,7 +307,7 @@ __global__ void argmax_bf16_stage2_kernel(
         __syncthreads();
     }
     if (tid == 0) {
-        uint32_t t = (uint32_t)sidx[0];
+        uint32_t t = (sidx[0] == 0x7fffffff) ? 0u : (uint32_t)sidx[0];
         token_out[0] = t;
         if (ring != nullptr) ring[(pos[0] - 1) & ring_mask] = t;
     }

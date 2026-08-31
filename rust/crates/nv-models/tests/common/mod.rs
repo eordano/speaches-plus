@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, CudaStream};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use nv_models::deepseek_ocr::{
     DecoderPrecision, DeepSeekOcr2Pipeline, GenerateOptions, ResolutionMode, RgbImage,
     PROMPT_FREE_OCR,
@@ -62,6 +62,72 @@ pub fn argmax(row: &[f32]) -> u32 {
         }
     }
     best
+}
+
+#[cfg(feature = "cuda")]
+pub const HARNESS_HOST_ARGMAX_THE_PRE_2026_08_20_LADDER_BASIS_ENV: &str =
+    "HARNESS_HOST_ARGMAX_THE_PRE_2026_08_20_LADDER_BASIS";
+
+#[cfg(feature = "cuda")]
+pub fn argmax_lanewise_max_then_scan_nonfinite_skip_ties_lowest_matching_sampler_argmax_checked(
+    row: &[f32],
+) -> u32 {
+    const LANES_16_VECTORIZES_THE_MAX_PASS_WHERE_THE_SCALAR_BRANCHY_LOOP_COULD_NOT: usize = 16;
+    const LANES: usize = LANES_16_VECTORIZES_THE_MAX_PASS_WHERE_THE_SCALAR_BRANCHY_LOOP_COULD_NOT;
+    let mut lane_v = [f32::NEG_INFINITY; LANES];
+    let mut chunks = row.chunks_exact(LANES);
+    for c in &mut chunks {
+        for l in 0..LANES {
+            let x = c[l];
+            let v = if x.is_finite() { x } else { f32::NEG_INFINITY };
+            lane_v[l] = if v > lane_v[l] { v } else { lane_v[l] };
+        }
+    }
+    let mut m = f32::NEG_INFINITY;
+    for &v in &lane_v {
+        if v > m {
+            m = v;
+        }
+    }
+    for &x in chunks.remainder() {
+        if x.is_finite() && x > m {
+            m = x;
+        }
+    }
+    if m == f32::NEG_INFINITY {
+        return 0;
+    }
+    let mut base = 0usize;
+    for c in row.chunks(4096) {
+        if c.iter().any(|&x| x == m) {
+            return (base + c.iter().position(|&x| x == m).unwrap()) as u32;
+        }
+        base += c.len();
+    }
+    0
+}
+
+#[cfg(feature = "cuda")]
+pub const NV_Q38_SERVING_DEVICE_ARGMAX_ENV: &str = "NV_Q38_SERVING_DEVICE_ARGMAX";
+
+#[cfg(feature = "cuda")]
+pub fn serving_feed_device_argmax_env_default_off_because_every_published_ladder_number_is_a_host_feed(
+) -> bool {
+    std::env::var(NV_Q38_SERVING_DEVICE_ARGMAX_ENV).as_deref() == Ok("1")
+}
+
+#[cfg(feature = "cuda")]
+pub fn serving_feed_argmax_and_basis_label_env_selects_the_pre_2026_08_20_scalar(
+) -> (fn(&[f32]) -> u32, &'static str) {
+    if std::env::var(HARNESS_HOST_ARGMAX_THE_PRE_2026_08_20_LADDER_BASIS_ENV).as_deref() == Ok("1")
+    {
+        (argmax, "host_scalar_pre_2026_08_20_ladder_basis")
+    } else {
+        (
+            argmax_lanewise_max_then_scan_nonfinite_skip_ties_lowest_matching_sampler_argmax_checked,
+            "host_lanewise_max_then_scan",
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -145,7 +211,7 @@ pub fn build(dir: &PathBuf, device: &Device, arm: &Arm) -> GraphedQwen3Moe {
     eng
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn cer(got: &str, want: &str) -> f64 {
     let a: Vec<char> = norm(got).chars().collect();
     let b: Vec<char> = norm(want).chars().collect();
@@ -210,7 +276,6 @@ pub const CFG: &str = r#"{
     "num_attention_heads_per_layer": [4, 8, 8, 4]
 }"#;
 
-#[cfg(feature = "wgpu")]
 pub const CHAT_WRAPPED_PROMPT_CONTEXT_TOKENS_256_THEN_SCORE_512_SO_EVERY_CHAT_PPL_FAMILY_SHARES_ONE_SLICE:
     usize = 256;
 
@@ -423,7 +488,7 @@ pub struct FdP {
     pub pad4: u32,
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn fixture_expected_text(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../conformance/fixtures")
@@ -437,7 +502,7 @@ pub fn fixture_expected_text(name: &str) -> String {
         .to_string()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn fixture_rgb(name: &str) -> RgbImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../../conformance/fixtures")
@@ -447,7 +512,7 @@ pub fn fixture_rgb(name: &str) -> RgbImage {
     RgbImage::decode(&bytes).expect("decode fixture")
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub const FIXTURES: &[&str] = &[
     "070-ocr-clean-line",
     "070-ocr-lowcontrast-gradient",
@@ -705,7 +770,7 @@ pub const N_Q_2: usize = 2;
 #[cfg(feature = "wgpu")]
 pub const N_Q_4: usize = 4;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn norm(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
@@ -995,6 +1060,7 @@ pub fn tiny_config_gpt_oss() -> GptOssConfig {
         yarn_beta_fast: 32.0,
         yarn_beta_slow: 1.0,
         yarn_original_max: 16,
+        yarn_truncate_correction_dims: true,
         tie_word_embeddings: false,
     }
 }
@@ -1222,7 +1288,7 @@ pub const VOCAB_160: usize = 160;
 #[cfg(feature = "cuda")]
 pub const VOCAB_512: usize = 512;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn wer(got: &str, want: &str) -> f64 {
     let na = norm(got);
     let nb = norm(want);
@@ -2067,6 +2133,7 @@ pub fn tiny_weights_q3d(cfg: &Qwen3_5DenseConfig, seed: u64) -> q3d::HostDenseWe
                     o: bf16_lin(&mut r, hidden, cfg.num_attention_heads * hd, 0.12).into(),
                     q_norm: norm_vec(&mut r, hd),
                     k_norm: norm_vec(&mut r, hd),
+                    qkv_bias_bf16: vec![],
                 }))
             }
         };
@@ -2088,6 +2155,38 @@ pub fn tiny_weights_q3d(cfg: &Qwen3_5DenseConfig, seed: u64) -> q3d::HostDenseWe
         final_norm: norm_vec(&mut r, hidden),
         lm_head: r.bf16_vec(cfg.vocab_size * hidden, 0.2),
         layers,
+    }
+}
+
+#[cfg(feature = "wgpu")]
+pub fn mtp_tiny_weights_q3d(cfg: &Qwen3_5DenseConfig, seed: u64) -> q3d::MtpHostWeights {
+    let mut r = LcgOddSeedShift33SignedUnit::new(seed);
+    let hidden = cfg.hidden_size;
+    let hd = cfg.head_dim;
+    let inter = cfg.intermediate_size;
+    let q_out = cfg.num_attention_heads * hd * 2;
+    let kv_out = cfg.num_key_value_heads * hd;
+    q3d::MtpHostWeights {
+        pre_fc_norm_embedding: norm_vec(&mut r, hidden),
+        pre_fc_norm_hidden: norm_vec(&mut r, hidden),
+        fc: bf16_lin(&mut r, hidden, 2 * hidden, 0.1),
+        input_ln: norm_vec(&mut r, hidden),
+        attn: q3d::HostDenseAttention {
+            q: bf16_lin(&mut r, q_out, hidden, 0.12).into(),
+            k: bf16_lin(&mut r, kv_out, hidden, 0.12).into(),
+            v: bf16_lin(&mut r, kv_out, hidden, 0.12).into(),
+            o: bf16_lin(&mut r, hidden, cfg.num_attention_heads * hd, 0.12).into(),
+            q_norm: norm_vec(&mut r, hd),
+            k_norm: norm_vec(&mut r, hd),
+            qkv_bias_bf16: vec![],
+        },
+        post_attn_ln: norm_vec(&mut r, hidden),
+        mlp: q3d::HostDenseMlp {
+            gate: bf16_lin(&mut r, inter, hidden, 0.15).into(),
+            up: bf16_lin(&mut r, inter, hidden, 0.15).into(),
+            down: bf16_lin(&mut r, hidden, inter, 0.15).into(),
+        },
+        final_norm: norm_vec(&mut r, hidden),
     }
 }
 
@@ -2685,5 +2784,223 @@ pub fn e4b_qat_w4a16_ct_snapshot_dir() -> std::path::PathBuf {
                 .find(|p| p.join("config.json").exists())
                 .expect("no snapshot with config.json")
         }
+    }
+}
+
+#[cfg(feature = "wgpu")]
+pub mod q3d_lora_synth {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    use nv_models::qwen3_5_moe::{LayerType, Qwen3_5DenseConfig};
+
+    pub const PREFIX: &str = "model.language_model.layers";
+    pub const SYNTH_RANK: usize = 4;
+    pub const SYNTH_ALPHA: f64 = 8.0;
+    pub const SYNTH_SCALING: f32 = (SYNTH_ALPHA / SYNTH_RANK as f64) as f32;
+
+    pub struct Rng(pub u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn pick(&mut self, table: &[f32]) -> f32 {
+            table[(self.next() >> 33) as usize % table.len()]
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Fill {
+        ZeroA,
+        ZeroB,
+        Coarse,
+    }
+
+    pub struct Synth {
+        pub rank: usize,
+        pub alpha: f64,
+        pub mods: BTreeMap<String, (Vec<f32>, Vec<f32>)>,
+    }
+
+    impl Synth {
+        pub fn retain_modules(mut self, keep: impl Fn(&str) -> bool) -> Synth {
+            self.mods.retain(|name, _| keep(name));
+            assert!(
+                !self.mods.is_empty(),
+                "retain_modules filtered every synthetic lora module away"
+            );
+            self
+        }
+    }
+
+    pub fn synth_adapter(
+        config: &Qwen3_5DenseConfig,
+        seed: u64,
+        fill: Fill,
+        q_rows_override: Option<usize>,
+    ) -> Synth {
+        const A_VALS: [f32; 5] = [0.0, 0.125, -0.125, 0.125, -0.125];
+        const B_VALS: [f32; 5] = [0.0, 0.25, -0.25, 0.25, -0.25];
+        let mut rng = Rng(seed);
+        let hidden = config.hidden_size;
+        let inter = config.intermediate_size;
+        let hd = config.head_dim;
+        let n_h = config.num_attention_heads;
+        let kv = config.num_key_value_heads * hd;
+        let q_out = n_h * hd * if config.attn_output_gate { 2 } else { 1 };
+        let rank = SYNTH_RANK;
+        let mut mods = BTreeMap::new();
+        let mut emit = |rng: &mut Rng, name: String, k: usize, n: usize| {
+            let a: Vec<f32> = (0..rank * k)
+                .map(|_| {
+                    if fill == Fill::ZeroA {
+                        0.0
+                    } else {
+                        rng.pick(&A_VALS)
+                    }
+                })
+                .collect();
+            let b: Vec<f32> = (0..n * rank)
+                .map(|_| {
+                    if fill == Fill::ZeroB {
+                        0.0
+                    } else {
+                        rng.pick(&B_VALS)
+                    }
+                })
+                .collect();
+            mods.insert(name, (a, b));
+        };
+        for li in 0..config.num_hidden_layers {
+            let p = format!("{PREFIX}.{li}");
+            if matches!(config.layer_types[li], LayerType::FullAttention) {
+                let q_rows = q_rows_override.unwrap_or(q_out);
+                emit(&mut rng, format!("{p}.self_attn.q_proj"), hidden, q_rows);
+                emit(&mut rng, format!("{p}.self_attn.k_proj"), hidden, kv);
+                emit(&mut rng, format!("{p}.self_attn.v_proj"), hidden, kv);
+                emit(&mut rng, format!("{p}.self_attn.o_proj"), n_h * hd, hidden);
+            } else {
+                let n_vh = config.linear_num_value_heads;
+                let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+                let value_dim = n_vh * config.linear_value_head_dim;
+                let conv_dim = 2 * key_dim + value_dim;
+                emit(
+                    &mut rng,
+                    format!("{p}.linear_attn.in_proj_qkv"),
+                    hidden,
+                    conv_dim,
+                );
+                emit(
+                    &mut rng,
+                    format!("{p}.linear_attn.in_proj_z"),
+                    hidden,
+                    value_dim,
+                );
+                emit(&mut rng, format!("{p}.linear_attn.in_proj_a"), hidden, n_vh);
+                emit(&mut rng, format!("{p}.linear_attn.in_proj_b"), hidden, n_vh);
+                emit(
+                    &mut rng,
+                    format!("{p}.linear_attn.out_proj"),
+                    value_dim,
+                    hidden,
+                );
+            }
+            emit(&mut rng, format!("{p}.mlp.gate_proj"), hidden, inter);
+            emit(&mut rng, format!("{p}.mlp.up_proj"), hidden, inter);
+            emit(&mut rng, format!("{p}.mlp.down_proj"), inter, hidden);
+        }
+        Synth {
+            rank,
+            alpha: SYNTH_ALPHA,
+            mods,
+        }
+    }
+
+    fn write_safetensors(path: &Path, tensors: &mut [(String, Vec<usize>, Vec<f32>)]) {
+        tensors.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut header = serde_json::Map::new();
+        let mut data: Vec<u8> = Vec::new();
+        for (name, shape, vals) in tensors.iter() {
+            let start = data.len();
+            for v in vals {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            header.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, data.len()],
+                }),
+            );
+        }
+        let mut hdr = serde_json::to_string(&serde_json::Value::Object(header))
+            .unwrap()
+            .into_bytes();
+        while !hdr.len().is_multiple_of(8) {
+            hdr.push(b' ');
+        }
+        let mut out = Vec::with_capacity(8 + hdr.len() + data.len());
+        out.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).expect("write adapter_model.safetensors");
+    }
+
+    pub struct Scratch(pub PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    pub fn write_adapter(tag: &str, synth: &Synth) -> Scratch {
+        let dir = std::env::temp_dir().join(format!(
+            "nv-lora-q3d-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create adapter dir");
+        let cfg = serde_json::json!({
+            "peft_type": "LORA",
+            "r": synth.rank,
+            "lora_alpha": synth.alpha,
+            "lora_dropout": 0.0,
+            "bias": "none",
+            "use_rslora": false,
+            "use_dora": false,
+            "modules_to_save": serde_json::Value::Null,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj"],
+        });
+        std::fs::write(
+            dir.join("adapter_config.json"),
+            serde_json::to_string_pretty(&cfg).unwrap(),
+        )
+        .expect("write adapter_config.json");
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        for (module, (a, b)) in &synth.mods {
+            let k = a.len() / synth.rank;
+            let n = b.len() / synth.rank;
+            tensors.push((
+                format!("base_model.model.{module}.lora_A.weight"),
+                vec![synth.rank, k],
+                a.clone(),
+            ));
+            tensors.push((
+                format!("base_model.model.{module}.lora_B.weight"),
+                vec![n, synth.rank],
+                b.clone(),
+            ));
+        }
+        write_safetensors(&dir.join("adapter_model.safetensors"), &mut tensors);
+        Scratch(dir)
     }
 }

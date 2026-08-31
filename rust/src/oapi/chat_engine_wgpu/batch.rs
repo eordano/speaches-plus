@@ -931,10 +931,11 @@ mod probe {
 
     const SLC_DEFEAT_BYTES: u64 = 1_800_000_000;
 
-    const COOP_LADDER_SPEEDUPS_ON_RECORD_ARE_FROM_AN_APPLE_SILICON_ADAPTER: &str =
-        "the only coop-vs-m-row speedups on record for this ladder were measured on an Apple \
-         silicon Metal adapter and say nothing about this box (the coop route outruns the m-row \
-         arm at batch); the ladder above prints this adapter's own numbers when the coop arm runs";
+    const COOP_LADDER_SPEEDUPS_ON_RECORD_ARE_M2_ULTRA: &str =
+        "the only coop-vs-m-row speedups on record for this ladder were measured on an Apple M2 \
+         Ultra and say nothing about this box (the coop route outruns the m-row arm at batch, and \
+         current numbers live in perf/runs.jsonl); the ladder above prints this adapter's own \
+         numbers when the coop arm runs";
 
     fn mrow_source(m: u32) -> String {
         use std::fmt::Write as _;
@@ -1470,7 +1471,7 @@ mod probe {
                  advertising 16x16x16 f16xf16->f32 at subgroup width 32 is measured here with no \
                  further porting. The adapter reports {} cooperative-matrix config(s), \
                  coop_gemm_tile()={:?}, coop_gemm_reason()={:?}. \
-                 {COOP_LADDER_SPEEDUPS_ON_RECORD_ARE_FROM_AN_APPLE_SILICON_ADAPTER}. Adapter: {}",
+                 {COOP_LADDER_SPEEDUPS_ON_RECORD_ARE_M2_ULTRA}. Adapter: {}",
                 coop::TILES,
                 ctx.caps.coop_configs.len(),
                 ctx.caps.coop_gemm_tile(),

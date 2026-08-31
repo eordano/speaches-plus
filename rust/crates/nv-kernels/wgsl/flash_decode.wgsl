@@ -89,6 +89,14 @@ fn fd_k_fp8(idx: u32) -> f32 {
     return e4m3_decode(byte_at(fd_k_words[idx >> 2u], idx));
 }
 
+fn fd_k_word(idx: u32) -> u32 {
+    return fd_k_words[idx >> 2u];
+}
+
+fn fd_k_byte(w: u32, idx: u32) -> f32 {
+    return e4m3_decode(byte_at(w, idx));
+}
+
 fn fd_v_fp8(idx: u32) -> f32 {
     return e4m3_decode(byte_at(fd_v_words[idx >> 2u], idx));
 }
@@ -1126,6 +1134,10 @@ fn flash_splitk_stage1_fp8kv(
 
 fn fd_k_fp8_sd(idx: u32) -> f32 {
     return e4m3_shift_decode_scale_must_carry_2pow120(byte_at(fd_k_words[idx >> 2u], idx));
+}
+
+fn fd_k_byte_sd(w: u32, idx: u32) -> f32 {
+    return e4m3_shift_decode_scale_must_carry_2pow120(byte_at(w, idx));
 }
 
 fn fd_v_fp8_sd(idx: u32) -> f32 {

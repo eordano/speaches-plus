@@ -209,21 +209,34 @@ pub const MROW_VERIFY_CONV_KERNEL_MAX_8_THE_GDN_CONV_CHUNK_KERNEL_K_CAP: usize =
 pub fn chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths() -> bool {
     const CHUNK_IS_THE_DEFAULT_SCAN_THE_PUBLISHED_PP512_5500_AND_WIKITEXT_PPL_7_0851_WERE_MEASURED_ON_IT_AND_ZERO_RESTORES_THE_TOKEN_SEQUENTIAL_CANDLE_SCAN_AT_ITS_6X_FORMATION_COST: &str =
         "NV_Q38_GDN_CHUNK_PREFILL";
-    std::env::var(
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
         CHUNK_IS_THE_DEFAULT_SCAN_THE_PUBLISHED_PP512_5500_AND_WIKITEXT_PPL_7_0851_WERE_MEASURED_ON_IT_AND_ZERO_RESTORES_THE_TOKEN_SEQUENTIAL_CANDLE_SCAN_AT_ITS_6X_FORMATION_COST,
     )
-    .ok()
-    .as_deref()
-        != Some("0")
+}
+
+pub fn gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations() -> bool {
+    const CHUNK_GEMM_OPT_IN_AFTER_THE_FREEFORM_V1_8192_NONFINITE_REPRO_THE_WY_UT_SCAN_NANS_ONE_SUBCHUNK_CARRY_WHERE_THE_TOKEN_SEQUENTIAL_KERNEL_STAYS_FINITE_COSTING_ITS_FLIP_MARGIN_7447_VS_7391_TOK_S_AT_8K_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP_UNTIL_THE_CARRY_IS_STABILIZED:
+        &str = "NV_Q38_GDN_CHUNK_GEMM";
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        CHUNK_GEMM_OPT_IN_AFTER_THE_FREEFORM_V1_8192_NONFINITE_REPRO_THE_WY_UT_SCAN_NANS_ONE_SUBCHUNK_CARRY_WHERE_THE_TOKEN_SEQUENTIAL_KERNEL_STAYS_FINITE_COSTING_ITS_FLIP_MARGIN_7447_VS_7391_TOK_S_AT_8K_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP_UNTIL_THE_CARRY_IS_STABILIZED,
+    )
+}
+
+pub fn gdn_scan_v2_env_read_per_call_so_one_process_can_ab_both_scan_kernels() -> bool {
+    const V2_IS_THE_WARP_SYNCHRONOUS_SCAN_SAME_MATH_SAME_ORDER_BITWISE_VS_V1_AND_OFF_KEEPS_THE_SHIPPED_128_THREAD_BLOCK_KERNEL:
+        &str = "NV_Q38_GDN_SCAN_V2";
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        V2_IS_THE_WARP_SYNCHRONOUS_SCAN_SAME_MATH_SAME_ORDER_BITWISE_VS_V1_AND_OFF_KEEPS_THE_SHIPPED_128_THREAD_BLOCK_KERNEL,
+    )
 }
 
 pub fn mrow_verify_env_read_per_call_so_one_process_can_ab_both_verify_paths() -> bool {
-    std::env::var("NV_Q38_MROW_VERIFY").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_MROW_VERIFY")
 }
 
 pub fn verify_tc_env_read_per_call_nv_q38_verify_tc_1_selects_projections_once_plus_lt_gemm_verify_arms(
 ) -> bool {
-    std::env::var("NV_Q38_VERIFY_TC").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_VERIFY_TC")
 }
 
 #[cfg(feature = "cuda")]
@@ -237,7 +250,7 @@ pub mod gdn_step_prof {
 
     pub fn arm_only_while_an_eager_decode_profiler_is_active_because_every_lap_syncs(on: bool) {
         ARMED.store(
-            on && std::env::var("NV_PROF_GDN").ok().as_deref() == Some("1"),
+            on && nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_PROF_GDN"),
             Ordering::Relaxed,
         );
     }
@@ -320,18 +333,14 @@ struct GdnScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers(
 impl std::ops::Deref for GdnScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers {
     type Target = GdnDecodeScratch;
     fn deref(&self) -> &GdnDecodeScratch {
-        self.0
-            .as_ref()
-            .expect("lease holds its scratch until drop")
+        self.0.as_ref().expect("lease holds its scratch until drop")
     }
 }
 
 #[cfg(feature = "cuda")]
 impl std::ops::DerefMut for GdnScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers {
     fn deref_mut(&mut self) -> &mut GdnDecodeScratch {
-        self.0
-            .as_mut()
-            .expect("lease holds its scratch until drop")
+        self.0.as_mut().expect("lease holds its scratch until drop")
     }
 }
 
@@ -413,21 +422,23 @@ fn gdn_decode_scratch_take_or_build(
             .alloc::<half::bf16>(value_dim)
             .map_err(|e| anyhow::anyhow!("scratch core: {e:?}"))?
     };
-    Ok(GdnScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers(Some(
-        GdnDecodeScratch {
-            conv_dim,
-            value_dim,
-            nk_dk,
-            n_v,
-            mixed,
-            gated_tensor_reused_across_layers_because_the_stream_serializes: gated_tensor,
-            qn,
-            kn,
-            g_exp,
-            beta,
-            core,
-        },
-    )))
+    Ok(
+        GdnScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers(Some(
+            GdnDecodeScratch {
+                conv_dim,
+                value_dim,
+                nk_dk,
+                n_v,
+                mixed,
+                gated_tensor_reused_across_layers_because_the_stream_serializes: gated_tensor,
+                qn,
+                kn,
+                g_exp,
+                beta,
+                core,
+            },
+        )),
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -553,24 +564,471 @@ pub struct QkvzConcatFp8DecodeArm {
 }
 
 pub fn gdn_fuse_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
-    std::env::var("NV_Q38_GDN_FUSE").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_FUSE")
 }
 
 pub fn gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
-    std::env::var("NV_Q38_GDN_SPLIT").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_SPLIT")
 }
 
+pub const GDN_SPLIT_STEP_TRADES_ONE_LANE_PRIVATE_KERNEL_FOR_THREE_THAT_SHARE_ONE_LANE_WIDE_PREP_SCRATCH_SO_A_LANE_GROUP_RUNNING_IT_CANNOT_FORK_ITS_PER_LANE_STREAMS: &str =
+    "gdn_decode_step_split_bf16 writes qn/kn/g_exp/beta/core scratch sized for ONE lane, so \
+     every lane in a group must serialize on the main stream to use it, while \
+     gdn_decode_step_bf16 touches only lane-private buffers and rides the per-lane streams the \
+     batch GEMM arm forks. Below the crossover the split's own per-lane win pays for the lost \
+     overlap; above it, it does not";
+
+pub const GDN_SPLIT_STEP_WINS_TO_THIS_MANY_LANES_AND_LOSES_WIDER_SO_THE_ARM_IS_A_WIDTH_TRADEOFF_NOT_A_WIN: usize = 6;
+
+pub const GDN_SPLIT_STEP_WIDTH_LADDER_MEASURED_ON_QWEN38_27B_NVFP4_SO_THE_LANE_CAP_IS_NEVER_READ_AS_ARBITRARY: &str =
+    "step-rate ladder, unsloth/Qwen3.8-27B-NVFP4@7d6f8d4d, synthetic prime depth 96, 24 timed \
+     steps x 2 reps, one process per cell, ascending and descending passes, quiet card: split \
+     versus no-split reads +9.74 / +6.71 / +4.80 / +4.52 / +2.75 / +1.68 / +0.48 / -1.23 / \
+     -6.72 / -11.31 percent at m = 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 / 12 / 16. The curve is \
+     monotone, m=7 is a tie inside the run spread and m=8 is the first measured loss, so 6 is \
+     the last width the split is a win at";
+
+pub fn gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm() -> usize {
+    std::env::var("NV_Q38_GDN_SPLIT_MAX_LANES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(
+            GDN_SPLIT_STEP_WINS_TO_THIS_MANY_LANES_AND_LOSES_WIDER_SO_THE_ARM_IS_A_WIDTH_TRADEOFF_NOT_A_WIN,
+        )
+}
+
+pub fn gdn_split_selected_for_lane_count(m: usize) -> bool {
+    let _ = GDN_SPLIT_STEP_TRADES_ONE_LANE_PRIVATE_KERNEL_FOR_THREE_THAT_SHARE_ONE_LANE_WIDE_PREP_SCRATCH_SO_A_LANE_GROUP_RUNNING_IT_CANNOT_FORK_ITS_PER_LANE_STREAMS;
+    let _ = GDN_SPLIT_STEP_WIDTH_LADDER_MEASURED_ON_QWEN38_27B_NVFP4_SO_THE_LANE_CAP_IS_NEVER_READ_AS_ARBITRARY;
+    gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process()
+        && m <= gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
+}
+
+pub const THE_PER_LANE_GDN_STEP_LOOP_PAYS_ONE_CONV_LAUNCH_AND_ONE_STEP_LAUNCH_PER_LANE_PER_LAYER_WHILE_BOTH_KERNELS_GIVE_EVERY_BLOCK_A_LANE_PRIVATE_CHANNEL_OR_HEAD_SO_THE_LANES_ARE_ONE_MORE_GRID_DIMENSION: &str =
+    "gdn_conv_decode_silu_bf16 gives block-thread (c) one conv channel and gdn_decode_step_bf16 \
+     gives block (h) one value head with d_v threads; neither reads another lane's channel, head \
+     or reduction, so m lanes are grid.y and not m launches. At 48 GDN layers and 16 lanes the \
+     loop is 1536 launches per step for a grid that is 32 blocks wide on a 188-SM card";
+
+pub const GDN_GROUP_LANES_IS_BIT_IDENTICAL_TO_THE_PER_LANE_LOOP_BECAUSE_BOTH_RUN_THE_SAME_DEVICE_FUNCTION_ON_THE_SAME_BLOCK_SHAPE_AND_ONLY_THE_LANE_BASE_POINTER_MOVES_FROM_THE_HOST_INTO_GRID_Y: &str =
+    "gdn_decode_step_group_bf16_kernel calls gdn_decode_token, the identical __forceinline__ \
+     device function gdn_decode_step_bf16_kernel calls, with the identical d_v-thread block, the \
+     identical dynamic shared-memory layout and the identical head index; the conv group kernel \
+     is gdn_conv_decode_silu_bf16_kernel's body with a lane offset added to two index \
+     expressions. The suite that proves it rather than argues it is \
+     nv-layers/tests/gdn_lanes_group_identity.rs";
+
+pub const GDN_GROUP_STEP_LANE_CAP_IS_THE_KERNELS_BY_VALUE_POINTER_PACK_WIDTH_SO_A_WIDER_GROUP_FALLS_BACK_TO_THE_PER_LANE_LOOP_INSTEAD_OF_READING_PAST_IT: usize = 16;
+
+pub const GDN_GROUP_LANE_STATE_POINTERS_RIDE_KERNEL_PARAMS_NOT_A_DEVICE_ARRAY_BECAUSE_A_CAPTURED_DECODE_GRAPH_ALREADY_BAKES_THE_SAME_POINTERS_AS_PARAMS_OF_THE_M_LAUNCHES_THIS_REPLACES: &str =
+    "each lane's conv_state and recurrent_state is its own allocation, so a group-spanning kernel \
+     needs m pointers. A device pointer array would owe an HtoD copy per layer per step that \
+     stream capture forbids from pageable memory; m pointers as a by-value param pack is 128 \
+     bytes of the 4 KB parameter space and is baked into the graph node exactly as the per-lane \
+     launches' single state pointer already is";
+
+pub fn gdn_lanes_group_env_opt_in_nv_q38_gdn_lanes_group_1_one_conv_and_one_step_launch_span_the_group(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_LANES_GROUP")
+}
+
+pub const THE_GROUP_FORM_REMOVES_THE_VERY_MECHANISM_THE_SPLIT_STEPS_SIX_LANE_CAP_EXISTS_FOR_SO_A_GROUP_SPANNING_SPLIT_IS_NOT_CAPPED_AT_SIX: &str =
+    "the cap exists because gdn_decode_step_split_bf16's qn/kn/g_exp/beta/core scratch is sized \
+     for ONE lane, so m lanes must serialize on the main stream to use it. The group split sizes \
+     that scratch m-wide and makes the lane grid.y, so nothing serializes and nothing is shared; \
+     the cap on the per-lane split step is unchanged and still decides the non-group path";
+
+pub fn gdn_lanes_group_selected_for_lane_count(m: usize) -> bool {
+    let _ = THE_PER_LANE_GDN_STEP_LOOP_PAYS_ONE_CONV_LAUNCH_AND_ONE_STEP_LAUNCH_PER_LANE_PER_LAYER_WHILE_BOTH_KERNELS_GIVE_EVERY_BLOCK_A_LANE_PRIVATE_CHANNEL_OR_HEAD_SO_THE_LANES_ARE_ONE_MORE_GRID_DIMENSION;
+    let _ = GDN_GROUP_LANES_IS_BIT_IDENTICAL_TO_THE_PER_LANE_LOOP_BECAUSE_BOTH_RUN_THE_SAME_DEVICE_FUNCTION_ON_THE_SAME_BLOCK_SHAPE_AND_ONLY_THE_LANE_BASE_POINTER_MOVES_FROM_THE_HOST_INTO_GRID_Y;
+    let _ = GDN_GROUP_LANE_STATE_POINTERS_RIDE_KERNEL_PARAMS_NOT_A_DEVICE_ARRAY_BECAUSE_A_CAPTURED_DECODE_GRAPH_ALREADY_BAKES_THE_SAME_POINTERS_AS_PARAMS_OF_THE_M_LAUNCHES_THIS_REPLACES;
+    gdn_lanes_group_env_opt_in_nv_q38_gdn_lanes_group_1_one_conv_and_one_step_launch_span_the_group()
+        && m >= 2
+        && m <= GDN_GROUP_STEP_LANE_CAP_IS_THE_KERNELS_BY_VALUE_POINTER_PACK_WIDTH_SO_A_WIDER_GROUP_FALLS_BACK_TO_THE_PER_LANE_LOOP_INSTEAD_OF_READING_PAST_IT
+}
+
+pub fn gdn_lanes_group_takes_the_split_step_form_when_the_split_arm_is_set(m: usize) -> bool {
+    let _ = THE_GROUP_FORM_REMOVES_THE_VERY_MECHANISM_THE_SPLIT_STEPS_SIX_LANE_CAP_EXISTS_FOR_SO_A_GROUP_SPANNING_SPLIT_IS_NOT_CAPPED_AT_SIX;
+    gdn_lanes_group_selected_for_lane_count(m)
+        && gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process()
+}
+
+pub const A_NULLED_GDN_SUBSTAGE_SERVES_MEANINGLESS_TOKENS_BY_CONSTRUCTION_BECAUSE_IT_WRITES_ZEROS_INSTEAD_OF_ITS_FUNCTION_AND_ONLY_THE_GRAPHED_STEP_DELTA_AGAINST_THE_SAME_SESSIONS_UNNULLED_CELL_IS_A_MEASUREMENT: &str =
+    "NV_GDN_NULL_SUBSTAGE exists because the whole-block gdn null cannot say which half of the \
+     B=1 to B=16 growth is the recurrent state and which half is the m-row projections, and \
+     splitting a block by arithmetic assumes exactly the thing under test -- that the projections \
+     are flat in m. It replaces one named substage's launches with one zeroing node at that \
+     substage's own point in the same captured stream, so stream order and every downstream shape \
+     survive while the substage's kernels leave";
+
+pub const THE_LANES_TOKEN_NULLS_THE_ONLY_SUBSTAGE_THAT_READS_AND_WRITES_THE_RECURRENT_STATE_SO_ITS_DELTA_IS_THE_STATE_TRAFFICS_IN_SITU_PRICE: &str =
+    "conv+step is where the 0.302 GB per lane of recurrent state read and write happens; \
+     qkvz_proj, ab_proj and o_proj never touch it. A step whose lanes substage is nulled leaves \
+     the state unwritten and therefore serves meaningless tokens, which is why no numeric claim is \
+     made from a nulled run and only the graphed step delta is read";
+
+pub fn gdn_null_substage_env_nv_gdn_null_substage_replaces_a_named_gdn_substage_with_one_zeroing_node_at_its_own_point_in_the_captured_stream(
+    token: &str,
+) -> bool {
+    let _ = A_NULLED_GDN_SUBSTAGE_SERVES_MEANINGLESS_TOKENS_BY_CONSTRUCTION_BECAUSE_IT_WRITES_ZEROS_INSTEAD_OF_ITS_FUNCTION_AND_ONLY_THE_GRAPHED_STEP_DELTA_AGAINST_THE_SAME_SESSIONS_UNNULLED_CELL_IS_A_MEASUREMENT;
+    let _ = THE_LANES_TOKEN_NULLS_THE_ONLY_SUBSTAGE_THAT_READS_AND_WRITES_THE_RECURRENT_STATE_SO_ITS_DELTA_IS_THE_STATE_TRAFFICS_IN_SITU_PRICE;
+    match std::env::var("NV_GDN_NULL_SUBSTAGE") {
+        Ok(v) => v.split(',').any(|t| t.trim() == token),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn one_zeroing_node_where_a_gdn_substages_launches_were(
+    dev: &candle_core::CudaDevice,
+    dims: (usize, usize, usize),
+) -> Result<Tensor> {
+    let s = crate::cuda_stream::current_stream(dev);
+    let n = dims.0 * dims.1 * dims.2;
+    let sl = s
+        .alloc_zeros::<half::bf16>(n)
+        .map_err(|e| anyhow::anyhow!("NV_GDN_NULL_SUBSTAGE alloc_zeros {n}: {e:?}"))?;
+    let st = candle_core::CudaStorage::wrap_cuda_slice(sl, dev.clone());
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(st),
+        dims,
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+pub fn gdn_qkvz_one_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_QKVZ_ONE")
+}
+
+pub fn gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_AB_ONE")
+}
+
+#[cfg(feature = "cuda")]
+
+pub fn gdn_nvfp4_verify_env_read_per_call_arms_the_qkv_z_twin_route() -> bool {
+    matches!(
+        std::env::var("NV_Q38_GDN_NVFP4_VERIFY").as_deref(),
+        Ok("1") | Ok("qkv")
+    )
+}
+
+pub fn gdn_nvfp4_verify_qkv_only_mode_keeps_z_on_the_lt_route_because_the_full_pair_failed_freeform_cert(
+) -> bool {
+    std::env::var("NV_Q38_GDN_NVFP4_VERIFY").as_deref() == Ok("qkv")
+}
+
+#[cfg(feature = "cuda")]
+fn gdn_qkv_z_nvfp4_w4a8_pair(
+    twins: &(Linear, Linear),
+    x_c: &Tensor,
+    m: usize,
+    dev: &candle_core::CudaDevice,
+) -> Result<Option<(Tensor, Tensor)>> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use half::bf16;
+    use std::ffi::c_void;
+
+    let (qkv_t, z_t) = twins;
+    let (Some((qw, qs, qa, qig)), Some((zw, zs, za, zig))) =
+        (qkv_t.nvfp4_parts(), z_t.nvfp4_parts())
+    else {
+        return Ok(None);
+    };
+    let k = qkv_t.in_features();
+    let n_a = qkv_t.out_features();
+    let n_b = z_t.out_features();
+    let stream = crate::cuda_stream::current_stream(dev);
+    let mut x_q8: cudarc::driver::CudaSlice<i8> = unsafe {
+        stream.alloc::<i8>(m * k).map_err(|e| anyhow::anyhow!(e))?
+    };
+    let mut x_scales: cudarc::driver::CudaSlice<f32> =
+        unsafe { stream.alloc::<f32>(m).map_err(|e| anyhow::anyhow!(e))? };
+    let mut y_a: cudarc::driver::CudaSlice<bf16> = unsafe {
+        stream.alloc::<bf16>(m * n_a).map_err(|e| anyhow::anyhow!(e))?
+    };
+    let mut y_b: cudarc::driver::CudaSlice<bf16> = unsafe {
+        stream.alloc::<bf16>(m * n_b).map_err(|e| anyhow::anyhow!(e))?
+    };
+    {
+        let (xs_store, xl) = x_c.storage_and_layout();
+        let x_cuda = match &*xs_store {
+            candle_core::Storage::Cuda(st) => st,
+            _ => return Ok(None),
+        };
+        let x_view = x_cuda.as_cuda_slice::<bf16>()?.slice(xl.start_offset()..);
+        let (xp, _g0) = x_view.device_ptr(&stream);
+        let (xqp, _g1) = x_q8.device_ptr_mut(&stream);
+        let (xsp, _g2) = x_scales.device_ptr_mut(&stream);
+        let rc = unsafe {
+            nv_kernels::cuda::rowquant_i8(
+                stream.cu_stream() as *mut c_void,
+                xp as *const u16,
+                xqp as *mut i8,
+                xsp as *mut f32,
+                m as i32,
+                k as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "gdn nvfp4 verify rowquant_i8 rc={rc}");
+        let (qwp, _g3) = qw.device_ptr(&stream);
+        let (qsp, _g4) = qs.device_ptr(&stream);
+        let (zwp, _g5) = zw.device_ptr(&stream);
+        let (zsp, _g6) = zs.device_ptr(&stream);
+        let (yap, _g7) = y_a.device_ptr_mut(&stream);
+        let (ybp, _g8) = y_b.device_ptr_mut(&stream);
+        let rc = unsafe {
+            nv_kernels::cuda::gemv_nvfp4_w4a8_dual_mk(
+                stream.cu_stream() as *mut c_void,
+                qwp as *const u8,
+                qsp as *const u8,
+                zwp as *const u8,
+                zsp as *const u8,
+                xqp as *const i8,
+                xsp as *const f32,
+                yap as *mut u16,
+                ybp as *mut u16,
+                qa * qig,
+                za * zig,
+                m as i32,
+                n_a as i32,
+                n_b as i32,
+                k as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "gdn nvfp4 verify dual_mk rc={rc}");
+    }
+    let wrap = |buf: cudarc::driver::CudaSlice<bf16>, n: usize| -> Result<Tensor> {
+        let storage = candle_core::CudaStorage::wrap_cuda_slice(buf, dev.clone());
+        Ok(Tensor::from_storage(
+            candle_core::Storage::Cuda(storage),
+            (1usize, m, n),
+            candle_core::op::BackpropOp::none(),
+            false,
+        ))
+    };
+    Ok(Some((wrap(y_a, n_a)?, wrap(y_b, n_b)?)))
+}
+
+#[cfg(feature = "cuda")]
+fn qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
+    in_proj_qkv: &Linear,
+    in_proj_z: &Linear,
+    x: &Tensor,
+    m: usize,
+    dev: &candle_core::CudaDevice,
+) -> Result<Option<(Tensor, Tensor)>> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+
+    if !gdn_qkvz_one_env_read_per_call_so_the_kill_switch_works_mid_process() {
+        return Ok(None);
+    }
+    if m == 0 || m > 16 || x.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    if m >= 2 && crate::linear::verify_tc_fp8_lt_gemm_scope_active() {
+        return Ok(None);
+    }
+    if in_proj_qkv.has_lora() || in_proj_z.has_lora() {
+        return Ok(None);
+    }
+    let k = in_proj_qkv.in_features();
+    if in_proj_z.in_features() != k || x.elem_count() != m * k {
+        return Ok(None);
+    }
+    let x_c = x.contiguous()?;
+    let x_c = &x_c;
+    let Some((qkv_wq, qkv_scales)) = in_proj_qkv
+        .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
+    else {
+        return Ok(None);
+    };
+    let Some((z_wq, z_scales)) =
+        in_proj_z.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
+    else {
+        return Ok(None);
+    };
+    let n_a = in_proj_qkv.out_features();
+    let n_b = in_proj_z.out_features();
+    let stream = crate::cuda_stream::current_stream(dev);
+    let (_dx, x_ptr, _lx) = cuda_tensor_raw(x_c)?;
+    let mut y_a: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+        stream
+            .alloc::<half::bf16>(m * n_a)
+            .map_err(|e| anyhow::anyhow!("alloc qkvz-one qkv: {e:?}"))?
+    };
+    let mut y_b: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+        stream
+            .alloc::<half::bf16>(m * n_b)
+            .map_err(|e| anyhow::anyhow!("alloc qkvz-one z: {e:?}"))?
+    };
+    let rc = {
+        let (wa, _ga) = qkv_wq.device_ptr(&stream);
+        let (sa, _gsa) = qkv_scales.device_ptr(&stream);
+        let (wb, _gb) = z_wq.device_ptr(&stream);
+        let (sb, _gsb) = z_scales.device_ptr(&stream);
+        let (pa, _gpa) = y_a.device_ptr_mut(&stream);
+        let (pb, _gpb) = y_b.device_ptr_mut(&stream);
+        unsafe {
+            nv_kernels::cuda::gemv_e4m3_mk_dual(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                wa as *const u8,
+                sa as *const f32,
+                wb as *const u8,
+                sb as *const f32,
+                x_ptr as *const u16,
+                pa as *mut u16,
+                pb as *mut u16,
+                n_a as i32,
+                n_b as i32,
+                k as i32,
+                m as i32,
+            )
+        }
+    };
+    if rc == -1 {
+        return Ok(None);
+    }
+    anyhow::ensure!(rc == 0, "gemv_e4m3_mk_dual rc={rc}");
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "[linear_attn] NV_Q38_GDN_QKVZ_ONE dual gemv arm active \
+                 (qkv+z one launch, n_a={n_a} n_b={n_b} k={k})"
+            );
+        });
+    }
+    let wrap = |slice: cudarc::driver::CudaSlice<half::bf16>, cols: usize| -> Tensor {
+        let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+        Tensor::from_storage(
+            candle_core::Storage::Cuda(storage),
+            (1usize, m, cols),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+    };
+    Ok(Some((wrap(y_a, n_a), wrap(y_b, n_b))))
+}
+
+pub const THE_PER_LANE_AB_LOOP_PAYS_ONE_NARROW_CONTIGUOUS_COPY_ONE_GEMV_LAUNCH_AND_ONE_CAT_INPUT_PER_LANE_PER_LAYER_WHILE_THE_WEIGHT_IT_READS_IS_THE_SAME_96_BY_HIDDEN_BLOCK_EVERY_TIME: &str =
+    "the a/b projection is 2*linear_num_value_heads rows by hidden columns -- under a megabyte -- \
+     so its wall is launch count, not bandwidth. Stage profile of the qwen3.8-27B NVFP4 batch \
+     step at synthetic depth 96, NV_GRAPH_OFF=1, NV_Q38_BATCH_PROF=1: b.gdn.ab_proj costs 0.630 \
+     ms at m=1 and 6.744 ms at m=16 -- x10.7 for 16x the rows, the worst-scaling stage in the \
+     whole step and a third of its m=1 to m=16 growth, while the NVFP4 MLP beside it grows x1.14 \
+     because it already runs one padded cutlass tile whose CTA spans the group";
+
+pub const GDN_AB_WIDE_IS_BIT_IDENTICAL_TO_THE_PER_LANE_GEMV_LOOP_BECAUSE_BOTH_GIVE_ONE_WARP_ONE_OUTPUT_ROW_AND_STRIDE_ITS_LANES_OVER_THE_SAME_K: &str =
+    "gemv_bf16 and gemm_bf16_mk assign one warp per output row n, walk K in uint4 chunks strided \
+     by lane, accumulate in f32 as wf.x*xf.x + wf.y*xf.y in the same j order, and finish with the \
+     same 5-step __shfl_xor butterfly. Widening m adds an accumulator register per row and \
+     changes nothing a row's own reduction touches, so row j of the wide call is the same bits \
+     as call j of the loop -- certified per row by the suite covering it \
+     (gdn_ab_wide_row_identity::gemm_bf16_mk_rows_are_bit_identical_to_the_looped_gemv_bf16_at_the_gdn_ab_shape), \
+     not inferred from the source";
+
+pub fn gdn_ab_wide_env_opt_in_nv_q38_gdn_ab_wide_1_one_launch_per_layer_instead_of_one_per_lane(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_AB_WIDE")
+}
+
+#[cfg(feature = "cuda")]
+fn ab_rows_one_gemm_bf16_mk_launch_bit_identical_to_the_per_lane_gemv_loop(
+    ab: Option<&Linear>,
+    x_c: &Tensor,
+    m: usize,
+    dev: &candle_core::CudaDevice,
+) -> Result<Option<Tensor>> {
+    use cudarc::driver::DevicePtrMut;
+
+    let _ = THE_PER_LANE_AB_LOOP_PAYS_ONE_NARROW_CONTIGUOUS_COPY_ONE_GEMV_LAUNCH_AND_ONE_CAT_INPUT_PER_LANE_PER_LAYER_WHILE_THE_WEIGHT_IT_READS_IS_THE_SAME_96_BY_HIDDEN_BLOCK_EVERY_TIME;
+    let _ = GDN_AB_WIDE_IS_BIT_IDENTICAL_TO_THE_PER_LANE_GEMV_LOOP_BECAUSE_BOTH_GIVE_ONE_WARP_ONE_OUTPUT_ROW_AND_STRIDE_ITS_LANES_OVER_THE_SAME_K;
+    if !gdn_ab_wide_env_opt_in_nv_q38_gdn_ab_wide_1_one_launch_per_layer_instead_of_one_per_lane() {
+        return Ok(None);
+    }
+    let Some(ab) = ab else { return Ok(None) };
+    if ab.has_lora() || ab.bias().is_some() || x_c.dtype() != DType::BF16 {
+        return Ok(None);
+    }
+    let n = ab.out_features();
+    let k = ab.in_features();
+    if m == 0 || m > GDN_AB_WIDE_ROWS_STOP_AT_THE_KMAXGEMMM_TEMPLATE_CAP_THE_KERNEL_REFUSES_ABOVE
+        || k % 8 != 0
+        || x_c.elem_count() != m * k
+    {
+        return Ok(None);
+    }
+    if std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_ok() {
+        return Ok(None);
+    }
+    let Some(w) = ab.weight() else {
+        return Ok(None);
+    };
+    let w_c = w.contiguous()?;
+    if w_c.dtype() != DType::BF16 || w_c.elem_count() != n * k {
+        return Ok(None);
+    }
+    let stream = crate::cuda_stream::current_stream(dev);
+    let (_dw, w_ptr, _lw) = cuda_tensor_raw(&w_c)?;
+    let (_dx, x_ptr, _lx) = cuda_tensor_raw(x_c)?;
+    let mut y: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+        stream
+            .alloc::<half::bf16>(m * n)
+            .map_err(|e| anyhow::anyhow!("alloc gdn ab wide: {e:?}"))?
+    };
+    let rc = {
+        let (yp, _gy) = y.device_ptr_mut(&stream);
+        unsafe {
+            nv_kernels::cuda::gemm_bf16_mk(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                w_ptr as *const u16,
+                x_ptr as *const u16,
+                yp as *mut u16,
+                n as i32,
+                k as i32,
+                m as i32,
+            )
+        }
+    };
+    if rc == -1 {
+        return Ok(None);
+    }
+    anyhow::ensure!(rc == 0, "gemm_bf16_mk rc={rc}");
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "[linear_attn] NV_Q38_GDN_AB_WIDE active: one gemm_bf16_mk per layer over m \
+                 lanes replaces m narrow+gemv+cat rows (n={n} k={k} m={m})"
+            );
+        });
+    }
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone());
+    Ok(Some(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        (1usize, m, n),
+        candle_core::op::BackpropOp::none(),
+        false,
+    )))
+}
+
+pub const GDN_AB_WIDE_ROWS_STOP_AT_THE_KMAXGEMMM_TEMPLATE_CAP_THE_KERNEL_REFUSES_ABOVE: usize = 16;
+
 pub fn gdn_prenorm_fold_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
-    std::env::var("NV_Q38_GDN_PRENORM_FOLD").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_PRENORM_FOLD")
 }
 
 pub fn gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0() -> bool {
-    std::env::var("NV_Q38_GDN_CHUNK_SPLIT").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_Q38_GDN_CHUNK_SPLIT",
+    )
 }
 
 pub fn verify_gdn_chunk_env_opt_in_nv_q38_verify_gdn_chunk_1_writes_ckpts_in_place_off_pooled_scratch(
 ) -> bool {
-    std::env::var("NV_Q38_VERIFY_GDN_CHUNK").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_VERIFY_GDN_CHUNK")
 }
 
 #[cfg(feature = "cuda")]
@@ -633,19 +1091,21 @@ fn mrow_verify_scratch_take_or_build(
     value_dim: usize,
     n_v: usize,
 ) -> Result<MrowScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers> {
-    let pooled = MROW_VERIFY_SCRATCH_POOL_SHARED_BY_EVERY_GDN_LAYER_BECAUSE_ONE_STREAM_SERIALIZES_THEM
-        .with(|c| {
-            let mut v = c.borrow_mut();
-            v.iter()
-                .position(|s| {
-                    s.m == m
-                        && s.conv_dim == conv_dim
-                        && s.key_dim == key_dim
-                        && s.value_dim == value_dim
-                        && s.n_v == n_v
-                })
-                .map(|i| v.swap_remove(i))
-        });
+    let pooled =
+        MROW_VERIFY_SCRATCH_POOL_SHARED_BY_EVERY_GDN_LAYER_BECAUSE_ONE_STREAM_SERIALIZES_THEM.with(
+            |c| {
+                let mut v = c.borrow_mut();
+                v.iter()
+                    .position(|s| {
+                        s.m == m
+                            && s.conv_dim == conv_dim
+                            && s.key_dim == key_dim
+                            && s.value_dim == value_dim
+                            && s.n_v == n_v
+                    })
+                    .map(|i| v.swap_remove(i))
+            },
+        );
     if let Some(s) = pooled {
         return Ok(MrowScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers(Some(s)));
     }
@@ -714,8 +1174,7 @@ fn ckpt_rows_contiguous_base(
     for (j, ck) in ckpts.iter().enumerate() {
         let (_d1, cp, _l1) = cuda_tensor_raw(&ck.conv_state)?;
         let (_d2, rp, _l2) = cuda_tensor_raw(&ck.recurrent_state)?;
-        if cp != conv_base + j as u64 * conv_row_bytes
-            || rp != rec_base + j as u64 * rec_row_bytes
+        if cp != conv_base + j as u64 * conv_row_bytes || rp != rec_base + j as u64 * rec_row_bytes
         {
             return Ok(None);
         }
@@ -727,6 +1186,8 @@ pub struct LinearAttention {
     cfg: LinearAttentionConfig,
     in_proj_qkv: Linear,
     in_proj_z: Linear,
+    nvfp4_verify_qkv_z_twins_lazily_quantized_from_the_fp8_residents_because_the_arm_is_opt_in:
+        std::sync::OnceLock<Option<(Linear, Linear)>>,
     in_proj_a: Linear,
     in_proj_b: Linear,
     conv1d_weight: Tensor,
@@ -843,6 +1304,8 @@ impl LinearAttention {
             cfg,
             in_proj_qkv,
             in_proj_z,
+            nvfp4_verify_qkv_z_twins_lazily_quantized_from_the_fp8_residents_because_the_arm_is_opt_in:
+                std::sync::OnceLock::new(),
             in_proj_a,
             in_proj_b,
             conv1d_weight,
@@ -920,12 +1383,17 @@ impl LinearAttention {
         device: &Device,
         fp8_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::fp8::Fp8GemmRunner>>,
     ) -> Result<Self> {
-        let mut la =
-            Self::from_loader_with_projection_loader(cfg, prefix, weights, dtype, &|w, m, o, i| {
+        let mut la = Self::from_loader_with_projection_loader(
+            cfg,
+            prefix,
+            weights,
+            dtype,
+            &|w, m, o, i| {
                 load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_byte_per_param(
                     w, m, o, i, dtype, device, fp8_runner,
                 )
-            })?;
+            },
+        )?;
         if gdn_fuse_env_read_per_call_so_the_kill_switch_works_mid_process() {
             let conv_dim = la.cfg.conv_dim();
             let value_dim = la.cfg.value_dim();
@@ -979,33 +1447,49 @@ impl LinearAttention {
             value_dim,
             cfg.hidden_size,
         )?;
-        let in_proj_a = load_linear(
+        let in_proj_a = crate::weight_load::load_linear_resolving(
             weights,
             &format!("{prefix}.in_proj_a.weight"),
             n_v,
             cfg.hidden_size,
             dtype,
+            crate::weight_load::resolve_stripping_model_prefix,
         )?;
-        let in_proj_b = load_linear(
+        let in_proj_b = crate::weight_load::load_linear_resolving(
             weights,
             &format!("{prefix}.in_proj_b.weight"),
             n_v,
             cfg.hidden_size,
             dtype,
+            crate::weight_load::resolve_stripping_model_prefix,
         )?;
-        let conv1d_weight = load_tensor(
+        let conv1d_weight = crate::weight_load::load_tensor_resolving(
             weights,
             &format!("{prefix}.conv1d.weight"),
             &[conv_dim, 1, cfg.linear_conv_kernel_dim],
             dtype,
+            crate::weight_load::resolve_stripping_model_prefix,
         )?;
-        let a_log = load_tensor(weights, &format!("{prefix}.A_log"), &[n_v], dtype)?;
-        let dt_bias = load_tensor(weights, &format!("{prefix}.dt_bias"), &[n_v], dtype)?;
-        let norm_weight = load_tensor(
+        let a_log = crate::weight_load::load_tensor_resolving(
+            weights,
+            &format!("{prefix}.A_log"),
+            &[n_v],
+            dtype,
+            crate::weight_load::resolve_stripping_model_prefix,
+        )?;
+        let dt_bias = crate::weight_load::load_tensor_resolving(
+            weights,
+            &format!("{prefix}.dt_bias"),
+            &[n_v],
+            dtype,
+            crate::weight_load::resolve_stripping_model_prefix,
+        )?;
+        let norm_weight = crate::weight_load::load_tensor_resolving(
             weights,
             &format!("{prefix}.norm.weight"),
             &[cfg.linear_value_head_dim],
             dtype,
+            crate::weight_load::resolve_stripping_model_prefix,
         )?;
         let out_proj = load_proj(
             weights,
@@ -1075,7 +1559,7 @@ impl LinearAttention {
         let acc_dtype = self.cfg.mamba_ssm_dtype;
         let pad_left = kernel - 1;
 
-        let prof_enabled = std::env::var("NV_PROF_LINATTN").is_ok();
+        let prof_enabled = nv_config::env_arm_present_at_all_reread_every_call("NV_PROF_LINATTN");
         #[cfg(feature = "cuda")]
         let prof_dev: Option<candle_core::CudaDevice> = if prof_enabled {
             match x.device() {
@@ -1137,11 +1621,9 @@ impl LinearAttention {
                 let qkv_btc = qkv_bt.transpose(1, 2)?.contiguous()?;
                 let left = match &prev_conv {
                     Some(prev) => prev.to_dtype(qkv_btc.dtype())?,
-                    None => Tensor::zeros(
-                        (b, conv_dim, pad_left),
-                        qkv_btc.dtype(),
-                        qkv_btc.device(),
-                    )?,
+                    None => {
+                        Tensor::zeros((b, conv_dim, pad_left), qkv_btc.dtype(), qkv_btc.device())?
+                    }
                 };
                 let conv_in = if pad_left > 0 {
                     Tensor::cat(&[&left, &qkv_btc], 2)?.contiguous()?
@@ -1264,10 +1746,7 @@ impl LinearAttention {
         toc!("out_proj", t0);
         if prof_enabled {
             let total: f64 = prof.iter().map(|(_, v)| v).sum();
-            let parts: Vec<String> = prof
-                .iter()
-                .map(|(l, v)| format!("{l}={v:.3}"))
-                .collect();
+            let parts: Vec<String> = prof.iter().map(|(l, v)| format!("{l}={v:.3}")).collect();
             eprintln!(
                 "[la_prof_prefill] b={b} t={t} total_ms={total:.3} {}",
                 parts.join(" ")
@@ -1368,7 +1847,10 @@ impl LinearAttention {
                 candle_core::op::BackpropOp::none(),
                 false,
             );
-            return Ok(y_bct.narrow(2, pad_left, t)?.transpose(1, 2)?.contiguous()?);
+            return Ok(y_bct
+                .narrow(2, pad_left, t)?
+                .transpose(1, 2)?
+                .contiguous()?);
         }
         let conv_out = conv_in.conv1d(&self.conv1d_weight, 0, 1, 1, conv_dim)?;
         let conv_out = candle_nn::ops::silu(&conv_out)?;
@@ -1403,9 +1885,7 @@ impl LinearAttention {
             return Ok(None);
         }
         if let Some(prev) = prev_conv {
-            if prev.dtype() != DType::BF16
-                || prev.dims() != [b, conv_dim, pad_left]
-            {
+            if prev.dtype() != DType::BF16 || prev.dims() != [b, conv_dim, pad_left] {
                 return Ok(None);
             }
         }
@@ -1494,7 +1974,9 @@ impl LinearAttention {
         if c.linear_key_head_dim != 128
             || c.linear_value_head_dim != 128
             || c.mamba_ssm_dtype != DType::F32
-            || !c.linear_num_value_heads.is_multiple_of(c.linear_num_key_heads)
+            || !c
+                .linear_num_value_heads
+                .is_multiple_of(c.linear_num_key_heads)
         {
             return Ok(None);
         }
@@ -1586,13 +2068,75 @@ impl LinearAttention {
             };
             anyhow::ensure!(rc == 0, "gdn_prefill_qk_l2norm_from_mixed rc={rc}");
         }
-        {
+        let chunk_gemm_armed =
+            b == 1 && gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations();
+        if chunk_gemm_armed {
+            static WS_CACHED_PER_STREAM_BECAUSE_A_PER_CALL_GIGABYTE_ALLOC_COSTS_MORE_WALL_THAN_THE_SCAN_SAVES:
+                std::sync::OnceLock<
+                    std::sync::Mutex<
+                        std::collections::HashMap<usize, cudarc::driver::CudaSlice<f32>>,
+                    >,
+                > = std::sync::OnceLock::new();
+            let ws_elems =
+                nvk::gdn_chunk_gemm_scan_workspace_elems(t as i32, n_v as i32, n_k as i32);
+            anyhow::ensure!(ws_elems > 0, "gdn_chunk_gemm workspace_elems returned 0 for t={t}");
+            let cache =
+                WS_CACHED_PER_STREAM_BECAUSE_A_PER_CALL_GIGABYTE_ALLOC_COSTS_MORE_WALL_THAN_THE_SCAN_SAVES
+                    .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut guard = cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("gdn_chunk_gemm ws cache poisoned: {e}"))?;
+            let key = nv_quant::stream_cache_key(&stream);
+            let needs_grow = guard.get(&key).is_none_or(|s| s.len() < ws_elems);
+            if needs_grow {
+                let fresh: cudarc::driver::CudaSlice<f32> = unsafe {
+                    stream
+                        .alloc::<f32>(ws_elems)
+                        .map_err(|e| anyhow::anyhow!("alloc gdn_chunk_gemm workspace: {e:?}"))?
+                };
+                guard.insert(key, fresh);
+            }
+            let ws_dev = guard.get_mut(&key).expect("inserted above");
             let (qp, _gq) = qn_dev.device_ptr_mut(&stream);
             let (kp, _gk) = kn_dev.device_ptr_mut(&stream);
             let (sp, _gs) = state_dev.device_ptr_mut(&stream);
             let (cp, _gc) = core_dev.device_ptr_mut(&stream);
+            let (wp, _gw) = ws_dev.device_ptr_mut(&stream);
             let rc = unsafe {
-                nvk::gdn_recurrent_stateful_gqa_bf16out(
+                nvk::gdn_chunk_gemm_scan_f32(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    qp as *const f32,
+                    kp as *const f32,
+                    mixed_ptr as *const u16,
+                    g_ptr as *const f32,
+                    beta_ptr as *const f32,
+                    sp as *mut f32,
+                    cp as *mut u16,
+                    wp as *mut f32,
+                    ws_elems as i64,
+                    b as i32,
+                    t as i32,
+                    n_v as i32,
+                    n_k as i32,
+                    d_k as i32,
+                    d_v as i32,
+                    conv_dim as i32,
+                    (2 * key_dim) as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "gdn_chunk_gemm_scan_f32 rc={rc}");
+        } else {
+            let (qp, _gq) = qn_dev.device_ptr_mut(&stream);
+            let (kp, _gk) = kn_dev.device_ptr_mut(&stream);
+            let (sp, _gs) = state_dev.device_ptr_mut(&stream);
+            let (cp, _gc) = core_dev.device_ptr_mut(&stream);
+            let scan = if gdn_scan_v2_env_read_per_call_so_one_process_can_ab_both_scan_kernels() {
+                nvk::gdn_recurrent_stateful_gqa_bf16out_shfl
+            } else {
+                nvk::gdn_recurrent_stateful_gqa_bf16out
+            };
+            let rc = unsafe {
+                scan(
                     stream.cu_stream() as *mut std::ffi::c_void,
                     qp as *const f32,
                     kp as *const f32,
@@ -1611,7 +2155,7 @@ impl LinearAttention {
                     (2 * key_dim) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "gdn_recurrent_stateful_gqa_bf16out rc={rc}");
+            anyhow::ensure!(rc == 0, "gdn_recurrent_stateful_gqa_bf16out scan rc={rc}");
         }
         {
             let (cp, _gc) = core_dev.device_ptr_mut(&stream);
@@ -1799,14 +2343,32 @@ impl LinearAttention {
 
         let n_v = self.cfg.linear_num_value_heads;
         let mut prof = gdn_step_prof::SyncLaps::begin_if_armed(&dev);
-        let qkv = self.in_proj_qkv.forward(x)?.contiguous()?;
-        if let Some(p) = prof.as_mut() {
-            p.lap("in_qkv");
-        }
-        let z = self.in_proj_z.forward(x)?.contiguous()?;
-        if let Some(p) = prof.as_mut() {
-            p.lap("in_z");
-        }
+        let qkvz_pair = qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            x,
+            1,
+            &dev,
+        )?;
+        let (qkv, z) = match qkvz_pair {
+            Some(pair) => {
+                if let Some(p) = prof.as_mut() {
+                    p.lap("in_qkvz_one");
+                }
+                pair
+            }
+            None => {
+                let qkv = self.in_proj_qkv.forward(x)?.contiguous()?;
+                if let Some(p) = prof.as_mut() {
+                    p.lap("in_qkv");
+                }
+                let z = self.in_proj_z.forward(x)?.contiguous()?;
+                if let Some(p) = prof.as_mut() {
+                    p.lap("in_z");
+                }
+                (qkv, z)
+            }
+        };
         let (a, b_proj) = match &self
             .ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
         {
@@ -1908,9 +2470,10 @@ impl LinearAttention {
             p.lap("conv");
         }
         let mut split_step_taken = false;
-        let (_gdev, gated_ptr, _glen) =
-            cuda_tensor_raw(&scratch.gated_tensor_reused_across_layers_because_the_stream_serializes)?;
-        if gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process() {
+        let (_gdev, gated_ptr, _glen) = cuda_tensor_raw(
+            &scratch.gated_tensor_reused_across_layers_because_the_stream_serializes,
+        )?;
+        if gdn_split_selected_for_lane_count(1) {
             if let Some(p) = prof.as_mut() {
                 p.lap("step_allocs");
             }
@@ -2047,8 +2610,27 @@ impl LinearAttention {
         let key_dim = n_k * d_k;
 
         let x_c = x.contiguous()?;
-        let qkv = self.in_proj_qkv.forward(&x_c)?.contiguous()?;
-        let z = self.in_proj_z.forward(&x_c)?.contiguous()?;
+        let null_qkvz = gdn_null_substage_env_nv_gdn_null_substage_replaces_a_named_gdn_substage_with_one_zeroing_node_at_its_own_point_in_the_captured_stream("qkvz_proj");
+        let (qkv, z) = if null_qkvz {
+            (
+                one_zeroing_node_where_a_gdn_substages_launches_were(&dev, (1, m, conv_dim))?,
+                one_zeroing_node_where_a_gdn_substages_launches_were(&dev, (1, m, value_dim))?,
+            )
+        } else {
+            match qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &x_c,
+                m,
+                &dev,
+            )? {
+                Some(pair) => pair,
+                None => (
+                    self.in_proj_qkv.forward(&x_c)?.contiguous()?,
+                    self.in_proj_z.forward(&x_c)?.contiguous()?,
+                ),
+            }
+        };
         if let Some(p) = prof.as_deref_mut() {
             p.lap("b.gdn.qkvz_proj");
         }
@@ -2059,8 +2641,11 @@ impl LinearAttention {
             lane_streams_index_0_is_the_main_stream_conc_arm_also_selects_the_mrow_ab_gemm
                 .filter(|ls| m > 1 && ls.len() >= m);
         let mrow_ab_subarm_opt_in_nv_q38_batch_gemm_ab_1_because_its_gemm_deltas_cascade_through_the_gdn_state_and_flipped_argmax_at_m2_where_the_route_was_clean =
-            std::env::var("NV_Q38_BATCH_GEMM_AB").ok().as_deref() == Some("1");
-        let ab_holder = if conc_arm.is_some()
+            nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_BATCH_GEMM_AB");
+        let ab_holder = if gdn_null_substage_env_nv_gdn_null_substage_replaces_a_named_gdn_substage_with_one_zeroing_node_at_its_own_point_in_the_captured_stream("ab_proj")
+        {
+            one_zeroing_node_where_a_gdn_substages_launches_were(&dev, (1, m, ab_stride))?
+        } else if conc_arm.is_some()
             && mrow_ab_subarm_opt_in_nv_q38_batch_gemm_ab_1_because_its_gemm_deltas_cascade_through_the_gdn_state_and_flipped_argmax_at_m2_where_the_route_was_clean
         {
             let one_mrow_gemm_not_a_gemv_row_twin_acceptable_under_the_argmax_class_serving_bar =
@@ -2076,6 +2661,14 @@ impl LinearAttention {
                 };
             one_mrow_gemm_not_a_gemv_row_twin_acceptable_under_the_argmax_class_serving_bar
                 .contiguous()?
+        } else if let Some(wide) = ab_rows_one_gemm_bf16_mk_launch_bit_identical_to_the_per_lane_gemv_loop(
+            self.ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
+                .as_ref(),
+            &x_c,
+            m,
+            &dev,
+        )? {
+            wide
         } else {
             let mut rows: Vec<Tensor> = Vec::with_capacity(m);
             for lane in 0..m {
@@ -2139,29 +2732,34 @@ impl LinearAttention {
                 .alloc::<half::bf16>(m * value_dim)
                 .map_err(|e| anyhow::anyhow!("alloc batch gated: {e:?}"))?
         };
+        let group_split = gdn_lanes_group_takes_the_split_step_form_when_the_split_arm_is_set(m);
+        let split_scratch_rows_are_one_per_lane_only_for_the_group_split_so_the_arm_off_allocation_is_byte_for_byte_what_it_was =
+            if group_split { m } else { 1 };
+        let scratch_rows =
+            split_scratch_rows_are_one_per_lane_only_for_the_group_split_so_the_arm_off_allocation_is_byte_for_byte_what_it_was;
         let mut qn_s: cudarc::driver::CudaSlice<f32> = unsafe {
             stream
-                .alloc::<f32>(key_dim)
+                .alloc::<f32>(scratch_rows * key_dim)
                 .map_err(|e| anyhow::anyhow!("alloc batch qn: {e:?}"))?
         };
         let mut kn_s: cudarc::driver::CudaSlice<f32> = unsafe {
             stream
-                .alloc::<f32>(key_dim)
+                .alloc::<f32>(scratch_rows * key_dim)
                 .map_err(|e| anyhow::anyhow!("alloc batch kn: {e:?}"))?
         };
         let mut ge_s: cudarc::driver::CudaSlice<f32> = unsafe {
             stream
-                .alloc::<f32>(n_v)
+                .alloc::<f32>(scratch_rows * n_v)
                 .map_err(|e| anyhow::anyhow!("alloc batch g_exp: {e:?}"))?
         };
         let mut be_s: cudarc::driver::CudaSlice<f32> = unsafe {
             stream
-                .alloc::<f32>(n_v)
+                .alloc::<f32>(scratch_rows * n_v)
                 .map_err(|e| anyhow::anyhow!("alloc batch beta: {e:?}"))?
         };
         let mut core_s: cudarc::driver::CudaSlice<half::bf16> = unsafe {
             stream
-                .alloc::<half::bf16>(value_dim)
+                .alloc::<half::bf16>(scratch_rows * value_dim)
                 .map_err(|e| anyhow::anyhow!("alloc batch core: {e:?}"))?
         };
         let (mixed_base, _gm) = mixed.device_ptr_mut(&stream);
@@ -2171,9 +2769,148 @@ impl LinearAttention {
         let (ge_ptr, _gge) = ge_s.device_ptr_mut(&stream);
         let (be_ptr, _gbe) = be_s.device_ptr_mut(&stream);
         let (core_ptr, _gco) = core_s.device_ptr_mut(&stream);
-        let split_env = gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process();
+        let split_env = gdn_split_selected_for_lane_count(m);
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[linear_attn] gdn split lane gate: env={} m={m} cap={} -> split={split_env}",
+                    gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process(),
+                    gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
+                );
+            });
+        }
+        let null_lanes = gdn_null_substage_env_nv_gdn_null_substage_replaces_a_named_gdn_substage_with_one_zeroing_node_at_its_own_point_in_the_captured_stream("lanes");
+        let null_step = null_lanes
+            || gdn_null_substage_env_nv_gdn_null_substage_replaces_a_named_gdn_substage_with_one_zeroing_node_at_its_own_point_in_the_captured_stream("step");
+        if let Ok(nulled) = std::env::var("NV_GDN_NULL_SUBSTAGE") {
+            let _ = &nulled;
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[linear_attn] NV_GDN_NULL_SUBSTAGE active: {} -- the named GDN substages are \
+                     replaced by one zeroing node each at their own point in the captured stream, \
+                     so this process serves meaningless tokens and only its graphed step delta \
+                     against the same session's unnulled cell is a measurement (m={m})",
+                    std::env::var("NV_GDN_NULL_SUBSTAGE").unwrap_or_default()
+                );
+            });
+        }
+        if null_step {
+            unsafe {
+                cudarc::driver::result::memset_d8_async(
+                    gated_base,
+                    0u8,
+                    m * value_dim * 2,
+                    stream.cu_stream(),
+                )
+                .map_err(|e| anyhow::anyhow!("NV_GDN_NULL_SUBSTAGE gated memset: {e:?}"))?;
+            }
+        }
+        let group_lanes = gdn_lanes_group_selected_for_lane_count(m) && !null_lanes;
+        if group_lanes {
+            let mut conv_state_ptrs: Vec<*mut u16> = Vec::with_capacity(m);
+            let mut rec_state_ptrs: Vec<*mut f32> = Vec::with_capacity(m);
+            for st in states.iter() {
+                let (_dc, conv_state_ptr, _lc) = cuda_tensor_raw(&st.conv_state)?;
+                let (_dr, rec_state_ptr, _lr) = cuda_tensor_raw(&st.recurrent_state)?;
+                conv_state_ptrs.push(conv_state_ptr as *mut u16);
+                rec_state_ptrs.push(rec_state_ptr as *mut f32);
+            }
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "[linear_attn] NV_Q38_GDN_LANES_GROUP active: one conv launch plus the \
+                         {} step form span the lane group, replacing 2m per-lane launches per \
+                         layer (m={m} conv_dim={conv_dim} n_v={n_v} d_v={d_v})",
+                        if group_split { "split" } else { "plain" }
+                    );
+                });
+            }
+            let rc = unsafe {
+                nv_kernels::cuda::gdn_conv_decode_silu_group_bf16(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    qkv_ptr as *const u16,
+                    conv_state_ptrs.as_ptr(),
+                    w_ptr as *const u16,
+                    mixed_base as *mut u16,
+                    conv_dim as i32,
+                    kernel as i32,
+                    m as i32,
+                    conv_dim as i32,
+                    conv_dim as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "gdn_conv_decode_silu_group_bf16 rc={rc} m={m}");
+            let mut group_split_step_taken = null_step;
+            if group_split && !null_step {
+                let rc = unsafe {
+                    nv_kernels::cuda::gdn_decode_step_split_group_bf16(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        mixed_base as *const u16,
+                        z_ptr as *const u16,
+                        (ab_ptr + (a_off * 2) as u64) as *const u16,
+                        (ab_ptr + (b_off * 2) as u64) as *const u16,
+                        a_log_ptr as *const u16,
+                        dt_ptr as *const u16,
+                        nw_ptr as *const u16,
+                        rec_state_ptrs.as_ptr(),
+                        gated_base as *mut u16,
+                        qn_ptr as *mut f32,
+                        kn_ptr as *mut f32,
+                        ge_ptr as *mut f32,
+                        be_ptr as *mut f32,
+                        core_ptr as *mut u16,
+                        n_k as i32,
+                        n_v as i32,
+                        d_k as i32,
+                        d_v as i32,
+                        self.cfg.rms_eps as f32,
+                        m as i32,
+                        ab_stride as i32,
+                    )
+                };
+                if rc == 0 {
+                    group_split_step_taken = true;
+                } else {
+                    anyhow::ensure!(
+                        rc == -1,
+                        "gdn_decode_step_split_group_bf16 rc={rc} m={m}"
+                    );
+                }
+            }
+            if !group_split_step_taken {
+                let rc = unsafe {
+                    nv_kernels::cuda::gdn_decode_step_group_bf16(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        mixed_base as *const u16,
+                        z_ptr as *const u16,
+                        (ab_ptr + (a_off * 2) as u64) as *const u16,
+                        (ab_ptr + (b_off * 2) as u64) as *const u16,
+                        a_log_ptr as *const u16,
+                        dt_ptr as *const u16,
+                        nw_ptr as *const u16,
+                        rec_state_ptrs.as_ptr(),
+                        gated_base as *mut u16,
+                        n_k as i32,
+                        n_v as i32,
+                        d_k as i32,
+                        d_v as i32,
+                        self.cfg.rms_eps as f32,
+                        m as i32,
+                        conv_dim as i32,
+                        value_dim as i32,
+                        ab_stride as i32,
+                        value_dim as i32,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "gdn_decode_step_group_bf16 rc={rc} m={m}");
+            }
+        }
         let conc_steps = conc_arm.filter(|_| {
-            let scratch_free_non_split_step_writes_only_lane_private_buffers = !split_env;
+            let scratch_free_non_split_step_writes_only_lane_private_buffers =
+                !split_env && !group_lanes;
             scratch_free_non_split_step_writes_only_lane_private_buffers
         });
         if let Some(ls) = conc_steps {
@@ -2185,7 +2922,13 @@ impl LinearAttention {
                     .map_err(|e| anyhow::anyhow!("gdn lane fork wait: {e:?}"))?;
             }
         }
-        for (lane, st) in states.iter().enumerate() {
+        let lanes_left_to_the_per_lane_loop_after_the_group_launch_took_them_all =
+            if group_lanes || null_lanes { 0 } else { m };
+        for (lane, st) in states
+            .iter()
+            .enumerate()
+            .take(lanes_left_to_the_per_lane_loop_after_the_group_launch_took_them_all)
+        {
             let lane_cu = match conc_steps {
                 Some(ls) if lane > 0 => ls[lane].cu_stream(),
                 _ => stream.cu_stream(),
@@ -2209,9 +2952,12 @@ impl LinearAttention {
                     kernel as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "batch-lane {lane} gdn_conv_decode_silu_bf16 rc={rc}");
-            let mut split_step_taken = false;
-            if split_env {
+            anyhow::ensure!(
+                rc == 0,
+                "batch-lane {lane} gdn_conv_decode_silu_bf16 rc={rc}"
+            );
+            let mut split_step_taken = null_step;
+            if split_env && !null_step {
                 let rc = unsafe {
                     nv_kernels::cuda::gdn_decode_step_split_bf16(
                         lane_cu as *mut std::ffi::c_void,
@@ -2239,7 +2985,10 @@ impl LinearAttention {
                 if rc == 0 {
                     split_step_taken = true;
                 } else {
-                    anyhow::ensure!(rc == -1, "batch-lane {lane} gdn_decode_step_split_bf16 rc={rc}");
+                    anyhow::ensure!(
+                        rc == -1,
+                        "batch-lane {lane} gdn_decode_step_split_bf16 rc={rc}"
+                    );
                 }
             }
             if !split_step_taken {
@@ -2294,7 +3043,12 @@ impl LinearAttention {
                 false,
             )
         };
-        let out = self.out_proj.forward(&flat)?;
+        let out = if gdn_null_substage_env_nv_gdn_null_substage_replaces_a_named_gdn_substage_with_one_zeroing_node_at_its_own_point_in_the_captured_stream("o_proj")
+        {
+            one_zeroing_node_where_a_gdn_substages_launches_were(&dev, (1, m, self.cfg.hidden_size))?
+        } else {
+            self.out_proj.forward(&flat)?
+        };
         if let Some(p) = prof.as_deref_mut() {
             p.lap("b.gdn.o_proj");
         }
@@ -2344,8 +3098,8 @@ impl LinearAttention {
         else {
             return Ok(None);
         };
-        let Some(ab) = &self
-            .ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
+        let Some(ab) =
+            &self.ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
         else {
             return Ok(None);
         };
@@ -2633,13 +3387,62 @@ impl LinearAttention {
     }
 
     #[cfg(feature = "cuda")]
+    pub fn prebuild_nvfp4_verify_twins_from_the_fp8_residents_the_disk_itself_stores_qkv_z_as_f8e4m3(
+        &self,
+        dev: &candle_core::CudaDevice,
+    ) {
+        if !gdn_nvfp4_verify_env_read_per_call_arms_the_qkv_z_twin_route() {
+            return;
+        }
+        let _ = self
+            .nvfp4_verify_qkv_z_twins_lazily_quantized_from_the_fp8_residents_because_the_arm_is_opt_in
+            .get_or_init(|| {
+                let build = || -> Result<(Linear, Linear)> {
+                    let runner = std::sync::Arc::new(std::sync::Mutex::new(
+                        nv_quant::nvfp4::Nvfp4GemmRunner::new(
+                            crate::cuda_stream::current_stream(dev),
+                        )?,
+                    ));
+                    let qkv = self
+                        .in_proj_qkv
+                        .nvfp4_draft_twin_rows_quantized_from_this_resident_copy_which_stays_untouched(
+                            runner.clone(),
+                            0,
+                            self.in_proj_qkv.out_features(),
+                        )?;
+                    let z = self
+                        .in_proj_z
+                        .nvfp4_draft_twin_rows_quantized_from_this_resident_copy_which_stays_untouched(
+                            runner,
+                            0,
+                            self.in_proj_z.out_features(),
+                        )?;
+                    Ok((qkv, z))
+                };
+                match build() {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        eprintln!(
+                            "[linear_attn] NV_Q38_GDN_NVFP4_VERIFY twin build failed, arm \
+                             stays off for this layer: {e:#}"
+                        );
+                        None
+                    }
+                }
+            });
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn forward_verify_mrow_projections_once_because_per_row_fused_steps_reread_every_gdn_weight(
         &self,
         x: &Tensor,
         state: &LinAttnState,
         ckpts: &[LinAttnState],
+        tree_parents_forking_each_row_from_its_parents_ckpt_slot_none_means_linear_chain: Option<
+            &cudarc::driver::CudaSlice<i32>,
+        >,
     ) -> Result<Option<Tensor>> {
-        use cudarc::driver::DevicePtrMut;
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
 
         if !state.fused || !self.fused_decode_supported() {
             return Ok(None);
@@ -2677,21 +3480,100 @@ impl LinearAttention {
 
         let mut prof = gdn_step_prof::SyncLaps::begin_if_armed(&dev);
         let x_c = x.contiguous()?;
-        let qkv = self.in_proj_qkv.forward(&x_c)?.contiguous()?;
-        if let Some(p) = prof.as_mut() {
-            p.lap("mrow_in_qkv");
+        let nvfp4_pair = if gdn_nvfp4_verify_env_read_per_call_arms_the_qkv_z_twin_route()
+            && (2..=8).contains(&m)
+        {
+            match self
+                .nvfp4_verify_qkv_z_twins_lazily_quantized_from_the_fp8_residents_because_the_arm_is_opt_in
+                .get()
+                .and_then(|o| o.as_ref())
+            {
+                Some(t) => {
+                    if gdn_nvfp4_verify_qkv_only_mode_keeps_z_on_the_lt_route_because_the_full_pair_failed_freeform_cert() {
+                        match gdn_qkv_z_nvfp4_w4a8_pair(t, &x_c, m, &dev)? {
+                            Some((qkv_nv, _z_nv)) => {
+                                let z_lt = self.in_proj_z.forward(&x_c)?.contiguous()?;
+                                Some((qkv_nv, z_lt))
+                            }
+                            None => None,
+                        }
+                    } else {
+                        gdn_qkv_z_nvfp4_w4a8_pair(t, &x_c, m, &dev)?
+                    }
+                }
+                None => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        eprintln!(
+                            "[linear_attn] NV_Q38_GDN_NVFP4_VERIFY armed but twins are not \
+                             prebuilt (session start runs the disk-bf16 prebuild); the lt \
+                             route serves this verify"
+                        );
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (qkv, z) = if let Some(pair) = nvfp4_pair {
+            if let Some(p) = prof.as_mut() {
+                p.lap("mrow_in_qkvz_nvfp4");
+            }
+            pair
+        } else {
+        match qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            &x_c,
+            m,
+            &dev,
+        )? {
+            Some(pair) => {
+                if let Some(p) = prof.as_mut() {
+                    p.lap("mrow_in_qkvz_one");
+                }
+                pair
+            }
+            None => {
+                let qkv = self.in_proj_qkv.forward(&x_c)?.contiguous()?;
+                if let Some(p) = prof.as_mut() {
+                    p.lap("mrow_in_qkv");
+                }
+                let z = self.in_proj_z.forward(&x_c)?.contiguous()?;
+                (qkv, z)
+            }
         }
-        let z = self.in_proj_z.forward(&x_c)?.contiguous()?;
-        let a = self.in_proj_a.forward(&x_c)?.contiguous()?;
-        let b_proj = self.in_proj_b.forward(&x_c)?.contiguous()?;
+        };
+        let ab_one_holder = if gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process()
+        {
+            match &self
+                .ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
+            {
+                Some(ab) => Some(ab.forward(&x_c)?.contiguous()?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let ab_separate_holder = match &ab_one_holder {
+            Some(_) => None,
+            None => Some((
+                self.in_proj_a.forward(&x_c)?.contiguous()?,
+                self.in_proj_b.forward(&x_c)?.contiguous()?,
+            )),
+        };
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_in_z_a_b");
         }
-        if qkv.dtype() != DType::BF16
-            || z.dtype() != DType::BF16
-            || a.dtype() != DType::BF16
-            || b_proj.dtype() != DType::BF16
-        {
+        let ab_dtype_bf16 = match (&ab_one_holder, &ab_separate_holder) {
+            (Some(ab), _) => ab.dtype() == DType::BF16,
+            (None, Some((a, b_proj))) => {
+                a.dtype() == DType::BF16 && b_proj.dtype() == DType::BF16
+            }
+            (None, None) => unreachable!("one of the two ab holders is always built"),
+        };
+        if qkv.dtype() != DType::BF16 || z.dtype() != DType::BF16 || !ab_dtype_bf16 {
             return Ok(None);
         }
 
@@ -2719,8 +3601,26 @@ impl LinearAttention {
 
         let (_d1, qkv_ptr, _l1) = cuda_tensor_raw(&qkv)?;
         let (_d2, z_ptr, _l2) = cuda_tensor_raw(&z)?;
-        let (_d3, a_ptr, _l3) = cuda_tensor_raw(&a)?;
-        let (_d4, b_ptr, _l4) = cuda_tensor_raw(&b_proj)?;
+        let (a_ptr, b_ptr, ab_row_stride) = match (&ab_one_holder, &ab_separate_holder) {
+            (Some(ab), _) => {
+                let (_da, base, _la) = cuda_tensor_raw(ab)?;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "[linear_attn] NV_Q38_GDN_AB_ONE mrow arm active (ab concat one GEMM, \
+                         chunk kernels read stride {})",
+                        2 * n_v
+                    );
+                });
+                (base, base + (n_v * 2) as u64, 2 * n_v)
+            }
+            (None, Some((a, b_proj))) => {
+                let (_d3, a_ptr, _l3) = cuda_tensor_raw(a)?;
+                let (_d4, b_ptr, _l4) = cuda_tensor_raw(b_proj)?;
+                (a_ptr, b_ptr, n_v)
+            }
+            (None, None) => unreachable!("one of the two ab holders is always built"),
+        };
         let w_c = self.conv1d_weight.contiguous()?;
         let (_d5, w_ptr, _l5) = cuda_tensor_raw(&w_c)?;
         let a_log_c = self.a_log.contiguous()?;
@@ -2771,15 +3671,14 @@ impl LinearAttention {
             }
             None => None,
         };
-        let mut owned_mixed: Option<cudarc::driver::CudaSlice<half::bf16>> =
-            match pooled_ptrs {
-                Some(_) => None,
-                None => Some(unsafe {
-                    stream
-                        .alloc::<half::bf16>(m * conv_dim)
-                        .map_err(|e| anyhow::anyhow!("alloc mrow mixed: {e:?}"))?
-                }),
-            };
+        let mut owned_mixed: Option<cudarc::driver::CudaSlice<half::bf16>> = match pooled_ptrs {
+            Some(_) => None,
+            None => Some(unsafe {
+                stream
+                    .alloc::<half::bf16>(m * conv_dim)
+                    .map_err(|e| anyhow::anyhow!("alloc mrow mixed: {e:?}"))?
+            }),
+        };
         let mut owned_ckpt_conv: Option<cudarc::driver::CudaSlice<half::bf16>> =
             match ckpt_in_place_bases {
                 Some(_) => None,
@@ -2824,27 +3723,63 @@ impl LinearAttention {
             }
         };
 
+        let tree_parents_ptr = match
+            tree_parents_forking_each_row_from_its_parents_ckpt_slot_none_means_linear_chain
+        {
+            Some(parents) => {
+                anyhow::ensure!(
+                    parents.len() >= m,
+                    "m-row verify tree: parents buffer holds {} rows, verify has {m}",
+                    parents.len()
+                );
+                let (p, _g) = parents.device_ptr(&stream);
+                Some(p)
+            }
+            None => None,
+        };
         {
             let mp = mixed_ptr;
             let cp = ckpt_conv_base;
-            let rc = unsafe {
-                nv_kernels::cuda::gdn_conv_decode_chunk_silu_bf16(
-                    stream.cu_stream() as *mut std::ffi::c_void,
-                    qkv_ptr as *const u16,
-                    conv_state_ptr as *const u16,
-                    w_ptr as *const u16,
-                    mp as *mut u16,
-                    cp as *mut u16,
-                    conv_dim as i32,
-                    kernel as i32,
-                    m as i32,
-                )
+            let rc = match tree_parents_ptr {
+                Some(pp) => unsafe {
+                    nv_kernels::cuda::gdn_conv_decode_chunk_silu_tree_bf16(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        qkv_ptr as *const u16,
+                        conv_state_ptr as *const u16,
+                        w_ptr as *const u16,
+                        mp as *mut u16,
+                        cp as *mut u16,
+                        pp as *const i32,
+                        conv_dim as i32,
+                        kernel as i32,
+                        m as i32,
+                    )
+                },
+                None => unsafe {
+                    nv_kernels::cuda::gdn_conv_decode_chunk_silu_bf16(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        qkv_ptr as *const u16,
+                        conv_state_ptr as *const u16,
+                        w_ptr as *const u16,
+                        mp as *mut u16,
+                        cp as *mut u16,
+                        conv_dim as i32,
+                        kernel as i32,
+                        m as i32,
+                    )
+                },
             };
             anyhow::ensure!(rc == 0, "gdn_conv_decode_chunk_silu_bf16 rc={rc}");
         }
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_conv_chunk");
         }
+        anyhow::ensure!(
+            tree_parents_ptr.is_none()
+                || gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0(),
+            "m-row verify tree: only the chunk-split state kernel has a parent-forking twin; \
+             unset NV_Q38_GDN_CHUNK_SPLIT=0 for tree rounds"
+        );
         let mut chunk_split_wrote_live_state = false;
         if gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0() {
             let mut owned_split: Option<(
@@ -2890,33 +3825,70 @@ impl LinearAttention {
             let mp = mixed_ptr;
             let rp = ckpt_rec_base;
             let (gp, _gg) = gated.device_ptr_mut(&stream);
-            let rc = unsafe {
-                nv_kernels::cuda::gdn_decode_chunk_split_bf16(
-                    stream.cu_stream() as *mut std::ffi::c_void,
-                    mp as *const u16,
-                    z_ptr as *const u16,
-                    a_ptr as *const u16,
-                    b_ptr as *const u16,
-                    a_log_ptr as *const u16,
-                    dt_ptr as *const u16,
-                    nw_ptr as *const u16,
-                    rec_state_ptr as *const f32,
-                    rp as *mut f32,
-                    rec_state_ptr as *mut f32,
-                    gp as *mut u16,
-                    qp as *mut f32,
-                    kp as *mut f32,
-                    gep as *mut f32,
-                    bep as *mut f32,
-                    cp as *mut u16,
-                    n_k as i32,
-                    n_v as i32,
-                    d_k as i32,
-                    d_v as i32,
-                    self.cfg.rms_eps as f32,
-                    m as i32,
-                )
+            let rc = match tree_parents_ptr {
+                Some(pp) => unsafe {
+                    nv_kernels::cuda::gdn_decode_chunk_split_tree_bf16(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        mp as *const u16,
+                        z_ptr as *const u16,
+                        a_ptr as *const u16,
+                        b_ptr as *const u16,
+                        a_log_ptr as *const u16,
+                        dt_ptr as *const u16,
+                        nw_ptr as *const u16,
+                        rec_state_ptr as *const f32,
+                        rp as *mut f32,
+                        rec_state_ptr as *mut f32,
+                        gp as *mut u16,
+                        qp as *mut f32,
+                        kp as *mut f32,
+                        gep as *mut f32,
+                        bep as *mut f32,
+                        cp as *mut u16,
+                        pp as *const i32,
+                        n_k as i32,
+                        n_v as i32,
+                        d_k as i32,
+                        d_v as i32,
+                        self.cfg.rms_eps as f32,
+                        m as i32,
+                        ab_row_stride as i32,
+                    )
+                },
+                None => unsafe {
+                    nv_kernels::cuda::gdn_decode_chunk_split_bf16(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        mp as *const u16,
+                        z_ptr as *const u16,
+                        a_ptr as *const u16,
+                        b_ptr as *const u16,
+                        a_log_ptr as *const u16,
+                        dt_ptr as *const u16,
+                        nw_ptr as *const u16,
+                        rec_state_ptr as *const f32,
+                        rp as *mut f32,
+                        rec_state_ptr as *mut f32,
+                        gp as *mut u16,
+                        qp as *mut f32,
+                        kp as *mut f32,
+                        gep as *mut f32,
+                        bep as *mut f32,
+                        cp as *mut u16,
+                        n_k as i32,
+                        n_v as i32,
+                        d_k as i32,
+                        d_v as i32,
+                        self.cfg.rms_eps as f32,
+                        m as i32,
+                        ab_row_stride as i32,
+                    )
+                },
             };
+            anyhow::ensure!(
+                tree_parents_ptr.is_none() || rc == 0,
+                "gdn_decode_chunk_split_tree_bf16 rc={rc}: the tree state kernel refused a \
+                 geometry the chain kernel accepts and no lossless fallback exists"
+            );
             if rc == 0 {
                 chunk_split_wrote_live_state = true;
                 static ONCE: std::sync::Once = std::sync::Once::new();
@@ -2953,6 +3925,7 @@ impl LinearAttention {
                     d_v as i32,
                     self.cfg.rms_eps as f32,
                     m as i32,
+                    ab_row_stride as i32,
                 )
             };
             anyhow::ensure!(rc == 0, "gdn_decode_chunk_bf16 rc={rc}");
@@ -3055,7 +4028,7 @@ impl LinearAttention {
         let kernel = self.cfg.linear_conv_kernel_dim;
         let acc_dtype = self.cfg.mamba_ssm_dtype;
 
-        let prof_enabled = std::env::var("NV_PROF_LINATTN").is_ok();
+        let prof_enabled = nv_config::env_arm_present_at_all_reread_every_call("NV_PROF_LINATTN");
         #[cfg(feature = "cuda")]
         let prof_dev: Option<candle_core::CudaDevice> = if prof_enabled {
             match x.device() {
@@ -3659,7 +4632,7 @@ fn load_linear_else_fp8_rowscale_dequant_because_q38_mixed_checkpoints_store_gdn
     dtype: DType,
 ) -> Result<Linear> {
     let weight_name = format!("{module}.weight");
-    let resolved = resolve_name(weights, &weight_name)?;
+    let resolved = crate::weight_load::resolve_stripping_model_prefix(weights, &weight_name)?;
     let resolved_module = resolved
         .strip_suffix(".weight")
         .unwrap_or(&resolved)
@@ -3673,7 +4646,14 @@ fn load_linear_else_fp8_rowscale_dequant_because_q38_mixed_checkpoints_store_gdn
             dtype,
         );
     }
-    load_linear(weights, &weight_name, out_features, in_features, dtype)
+    crate::weight_load::load_linear_resolving(
+        weights,
+        &weight_name,
+        out_features,
+        in_features,
+        dtype,
+        crate::weight_load::resolve_stripping_model_prefix,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -3690,7 +4670,10 @@ fn qkvz_concat_raw_fp8_if_both_modules_are_fp8(
         (format!("{prefix}.in_proj_qkv"), conv_dim),
         (format!("{prefix}.in_proj_z"), value_dim),
     ] {
-        let resolved_w = resolve_name(weights, &format!("{module}.weight"))?;
+        let resolved_w = crate::weight_load::resolve_stripping_model_prefix(
+            weights,
+            &format!("{module}.weight"),
+        )?;
         let resolved_module = resolved_w
             .strip_suffix(".weight")
             .unwrap_or(&resolved_w)
@@ -3735,7 +4718,7 @@ fn load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_b
     fp8_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::fp8::Fp8GemmRunner>>,
 ) -> Result<Linear> {
     let weight_name = format!("{module}.weight");
-    let resolved = resolve_name(weights, &weight_name)?;
+    let resolved = crate::weight_load::resolve_stripping_model_prefix(weights, &weight_name)?;
     let resolved_module = resolved
         .strip_suffix(".weight")
         .unwrap_or(&resolved)
@@ -3750,7 +4733,14 @@ fn load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_b
             fp8_runner.clone(),
         );
     }
-    load_linear(weights, &weight_name, out_features, in_features, dtype)
+    crate::weight_load::load_linear_resolving(
+        weights,
+        &weight_name,
+        out_features,
+        in_features,
+        dtype,
+        crate::weight_load::resolve_stripping_model_prefix,
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -3763,7 +4753,7 @@ fn load_linear_fp8_resident_quantizing_bf16_checkpoint_modules_because_qwen36_sh
     fp8_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::fp8::Fp8GemmRunner>>,
 ) -> Result<Linear> {
     let weight_name = format!("{module}.weight");
-    let resolved = resolve_name(weights, &weight_name)?;
+    let resolved = crate::weight_load::resolve_stripping_model_prefix(weights, &weight_name)?;
     let resolved_module = resolved
         .strip_suffix(".weight")
         .unwrap_or(&resolved)
@@ -3815,68 +4805,17 @@ fn load_linear_fp8_resident_quantizing_bf16_checkpoint_modules_because_qwen36_sh
     )
 }
 
-fn load_linear(
-    weights: &WeightLoader,
-    name: &str,
-    out_features: usize,
-    in_features: usize,
-    dtype: DType,
-) -> Result<Linear> {
-    let resolved = resolve_name(weights, name)?;
-    let w = weights
-        .get(&resolved, dtype)
-        .with_context(|| format!("load {resolved}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
-            "linear {resolved}: expected [{}, {}], got {:?}",
-            out_features,
-            in_features,
-            d
-        );
-    }
-    Linear::new(w, None)
-}
-
-fn load_tensor(
-    weights: &WeightLoader,
-    name: &str,
-    expected: &[usize],
-    dtype: DType,
-) -> Result<Tensor> {
-    let resolved = resolve_name(weights, name)?;
-    let t = weights
-        .get(&resolved, dtype)
-        .with_context(|| format!("load {resolved}"))?;
-    if t.dims() != expected {
-        anyhow::bail!(
-            "tensor {resolved}: expected {:?}, got {:?}",
-            expected,
-            t.dims()
-        );
-    }
-    Ok(t)
-}
-
-fn resolve_name(weights: &WeightLoader, name: &str) -> Result<String> {
-    if weights.has(name) {
-        return Ok(name.to_string());
-    }
-    if let Some(stripped) = name.strip_prefix("model.") {
-        if weights.has(stripped) {
-            return Ok(stripped.to_string());
-        }
-    }
-    anyhow::bail!("tensor not found (tried {name})")
-}
-
 #[cfg(all(test, feature = "cuda"))]
 mod gdn_decode_scratch_lifetime_tests {
     use super::*;
     use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-    const DIMS_A_CONV64_VAL32_NKDK4096_NV4_QN_IS_16KIB_SO_POOL_REUSE_IS_BLOCK_GRANULAR:
-        (usize, usize, usize, usize) = (64, 32, 4096, 4);
+    const DIMS_A_CONV64_VAL32_NKDK4096_NV4_QN_IS_16KIB_SO_POOL_REUSE_IS_BLOCK_GRANULAR: (
+        usize,
+        usize,
+        usize,
+        usize,
+    ) = (64, 32, 4096, 4);
     const DIMS_B_CONV128_VAL64_NKDK8192_NV8: (usize, usize, usize, usize) = (128, 64, 8192, 8);
     const PATTERN_COPIED_THROUGH_THE_BAKED_QN_POINTER: f32 = 7.5;
     const CANARY_FILL_THAT_MUST_SURVIVE_THE_REPLAY: f32 = -3.25;
@@ -3898,7 +4837,8 @@ mod gdn_decode_scratch_lifetime_tests {
             ),
         };
         let stream = crate::cuda_stream::current_stream(&dev);
-        let (ca, va, ka, na) = DIMS_A_CONV64_VAL32_NKDK4096_NV4_QN_IS_16KIB_SO_POOL_REUSE_IS_BLOCK_GRANULAR;
+        let (ca, va, ka, na) =
+            DIMS_A_CONV64_VAL32_NKDK4096_NV4_QN_IS_16KIB_SO_POOL_REUSE_IS_BLOCK_GRANULAR;
         let mut a = gdn_decode_scratch_take_or_build(&dev, ca, va, ka, na).unwrap();
         let a_qn_ptr_at_capture = {
             let (p, _g) = a.qn.device_ptr_mut(&stream);

@@ -134,7 +134,7 @@ pub fn pack_search_dirs() -> Vec<PathBuf> {
         push(PathBuf::from(v));
     }
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    push(home.join(".cache/nvk-tmp/chat-eval"));
+    push(home.join(".cache/claude-tmp/chat-eval"));
     out
 }
 

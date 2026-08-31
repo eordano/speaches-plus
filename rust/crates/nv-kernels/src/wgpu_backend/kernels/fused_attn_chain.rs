@@ -8,6 +8,14 @@ use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/fused_attn_chain.wgsl");
 
+pub fn wgsl_with_kv_fp8_e4m3_encode_helpers_because_the_k_v_quant_stages_call_them() -> String {
+    format!(
+        "{}\n{}",
+        super::kv_fp8::e4m3_encode_helpers_sliced_verbatim_from_wgsl_so_the_rn_division_and_rounding_text_exists_once(),
+        WGSL
+    )
+}
+
 pub const ENTRY_Q: &str = "e4b_attn_q_rms_rope_f32";
 pub const ENTRY_K: &str = "e4b_attn_k_rms_rope_fp8";
 pub const ENTRY_V: &str = "e4b_attn_v_rms_fp8";
@@ -119,7 +127,7 @@ pub fn q_rms_rope_f32(
     dispatch::run(
         ctx,
         "nv_kernels_fac_q",
-        &compose(WGSL),
+        &compose(&wgsl_with_kv_fp8_e4m3_encode_helpers_because_the_k_v_quant_stages_call_them()),
         ENTRY_Q,
         &[
             (0, &xb),
@@ -249,7 +257,7 @@ fn run_kv_entry(
     let scb = dispatch::storage_from_slice(ctx, "fac-kv-scales", scales);
     let up = params_uniform(ctx, n_kv, head_dim, eps, tokens, ring);
     let groups = dispatch::workgroup_count_1d(ctx, rows as u64, 1);
-    let src = compose(WGSL);
+    let src = compose(&wgsl_with_kv_fp8_e4m3_encode_helpers_because_the_k_v_quant_stages_call_them());
     match tables {
         Some((cos_tbl, sin_tbl, positions)) => {
             let cb = dispatch::storage_from_slice(ctx, "fac-kv-cos", cos_tbl);

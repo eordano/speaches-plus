@@ -10,6 +10,72 @@ use crate::CausalLm;
 
 const PREFIX: &str = "model.language_model";
 
+pub const NV_E4B_BOOT_WARM_PREFILL_ENV_OPT_IN_1_RUNS_ONE_THROWAWAY_CHUNK_AT_MODEL_BUILD_BECAUSE_THE_FIRST_REAL_CHUNK_OF_A_FRESH_PROCESS_PAYS_ONE_TIME_MODULE_AND_WORKSPACE_INIT_LANDING_IN_TTFT:
+    &str = "NV_E4B_BOOT_WARM_PREFILL";
+
+const E4B_BOOT_WARM_CHUNK_512_MATCHES_THE_SERVING_PREFILL_CHUNK_SO_THE_THROWAWAY_PASS_COMPILES_EXACTLY_THE_MODULES_THE_FIRST_REAL_CHUNK_NEEDS:
+    usize = 512;
+
+fn boot_warm_prefill_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        NV_E4B_BOOT_WARM_PREFILL_ENV_OPT_IN_1_RUNS_ONE_THROWAWAY_CHUNK_AT_MODEL_BUILD_BECAUSE_THE_FIRST_REAL_CHUNK_OF_A_FRESH_PROCESS_PAYS_ONE_TIME_MODULE_AND_WORKSPACE_INIT_LANDING_IN_TTFT,
+    )
+}
+
+pub const NV_E4B_PREFILL_FIXED_CACHE_ENV_OPT_IN_1_WRITES_PREFILL_KV_IN_PLACE_INTO_A_PREALLOCATED_CAPACITY_BUFFER_MEASURED_A_WASH_VS_CAT_BECAUSE_THE_DEPTH_TERM_IS_THE_EAGER_FULL_WIDTH_SDPA_KEPT_AS_THE_SUBSTRATE_FOR_SLIDING_WINDOW_KV_NARROWING:
+    &str = "NV_E4B_PREFILL_FIXED_CACHE";
+
+pub fn prefill_fixed_cache_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        NV_E4B_PREFILL_FIXED_CACHE_ENV_OPT_IN_1_WRITES_PREFILL_KV_IN_PLACE_INTO_A_PREALLOCATED_CAPACITY_BUFFER_MEASURED_A_WASH_VS_CAT_BECAUSE_THE_DEPTH_TERM_IS_THE_EAGER_FULL_WIDTH_SDPA_KEPT_AS_THE_SUBSTRATE_FOR_SLIDING_WINDOW_KV_NARROWING,
+    )
+}
+
+pub const NV_E4B_PREFILL_SLIDING_NARROW_ENV_OPT_IN_1_SCORES_THE_35_SLIDING_LAYERS_AGAINST_ONLY_THE_LAST_WINDOW_512_PLUS_CHUNK_KV_ROWS_WITH_A_SHIFTED_MASK_BECAUSE_THE_SLIDING_MASK_ALREADY_DISCARDS_EVERY_OLDER_COLUMN_SO_FULL_HISTORY_SCORING_IS_PURE_WASTE_KV_SHARING_NEVER_CROSSES_LAYER_TYPES_AND_THE_CACHE_ITSELF_STAYS_FULL_HISTORY_FOR_DECODE:
+    &str = "NV_E4B_PREFILL_SLIDING_NARROW";
+
+pub fn prefill_sliding_narrow_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        NV_E4B_PREFILL_SLIDING_NARROW_ENV_OPT_IN_1_SCORES_THE_35_SLIDING_LAYERS_AGAINST_ONLY_THE_LAST_WINDOW_512_PLUS_CHUNK_KV_ROWS_WITH_A_SHIFTED_MASK_BECAUSE_THE_SLIDING_MASK_ALREADY_DISCARDS_EVERY_OLDER_COLUMN_SO_FULL_HISTORY_SCORING_IS_PURE_WASTE_KV_SHARING_NEVER_CROSSES_LAYER_TYPES_AND_THE_CACHE_ITSELF_STAYS_FULL_HISTORY_FOR_DECODE,
+    )
+}
+
+pub const NV_E4B_MLP_W4A8FP8_ENV_OPT_IN_1_RUNS_MLP_MARLIN_GEMMS_WITH_PER_ROW_FP8_ACTIVATIONS_AND_X512_COMPENSATED_SCALES_BECAUSE_CHUNK_512_PREFILL_IS_THE_LARGE_M_REGIME_WHERE_FP8_TENSOR_CORES_PAY_WHILE_DECODE_M1_KEEPS_THE_GEMV_PATH_UNTOUCHED_AND_ATTN_PROJECTIONS_STAY_A16_PER_THE_QWEN_W4A8_MLP_ONLY_PRECEDENT:
+    &str = "NV_E4B_MLP_W4A8FP8";
+
+pub fn mlp_w4a8fp8_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        NV_E4B_MLP_W4A8FP8_ENV_OPT_IN_1_RUNS_MLP_MARLIN_GEMMS_WITH_PER_ROW_FP8_ACTIVATIONS_AND_X512_COMPENSATED_SCALES_BECAUSE_CHUNK_512_PREFILL_IS_THE_LARGE_M_REGIME_WHERE_FP8_TENSOR_CORES_PAY_WHILE_DECODE_M1_KEEPS_THE_GEMV_PATH_UNTOUCHED_AND_ATTN_PROJECTIONS_STAY_A16_PER_THE_QWEN_W4A8_MLP_ONLY_PRECEDENT,
+    )
+}
+
+pub const NV_E4B_PREFILL_FLASH_ATTN_ENV_OPT_IN_1_SLIDING_LAYERS_HD256_TAKE_CANDLE_FLASH_ATTN_F16_NATIVE_GQA_WINDOW_LEFT_511_AND_FULL_LAYERS_HD512_TAKE_BF16_TENSOR_CORE_GEMMS_WITH_FUSED_SOFTMAX_BECAUSE_THE_HDIM512_FLASH_FWD_KERNEL_RETURNS_WRONG_MASS_ON_SM120_FOR_EVERY_DTYPE_AND_WINDOW_MODE_WHILE_DECODE_N1_KEEPS_ATTN_DECODE_F32_UNTOUCHED:
+    &str = "NV_E4B_PREFILL_FLASH_ATTN";
+
+pub fn prefill_flash_attn_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        NV_E4B_PREFILL_FLASH_ATTN_ENV_OPT_IN_1_SLIDING_LAYERS_HD256_TAKE_CANDLE_FLASH_ATTN_F16_NATIVE_GQA_WINDOW_LEFT_511_AND_FULL_LAYERS_HD512_TAKE_BF16_TENSOR_CORE_GEMMS_WITH_FUSED_SOFTMAX_BECAUSE_THE_HDIM512_FLASH_FWD_KERNEL_RETURNS_WRONG_MASS_ON_SM120_FOR_EVERY_DTYPE_AND_WINDOW_MODE_WHILE_DECODE_N1_KEEPS_ATTN_DECODE_F32_UNTOUCHED,
+    )
+}
+
+pub const NV_E4B_PREFILL_FULL_FLASH_HD512_ENV_OPT_OUT_0_UNDER_NV_E4B_PREFILL_FLASH_ATTN_FULL_ATTENTION_HD512_LAYERS_DEFAULT_TO_CANDLE_FLASH_ATTN_F16_NATIVE_GQA_CAUSAL_BECAUSE_CANDLE_011_FIXED_THE_SM120_HDIM512_FORWARD_AND_FLASH_WINS_1_09X_AT_8K_TO_1_39X_AT_120K_ON_THE_HD512_FLASHVSBF16_ROWS_WHILE_0_SELECTS_THE_BF16_TENSOR_CORE_GEMM_ROUTE:
+    &str = "NV_E4B_PREFILL_FULL_FLASH_HD512";
+
+pub fn prefill_full_flash_hd512_enabled() -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        NV_E4B_PREFILL_FULL_FLASH_HD512_ENV_OPT_OUT_0_UNDER_NV_E4B_PREFILL_FLASH_ATTN_FULL_ATTENTION_HD512_LAYERS_DEFAULT_TO_CANDLE_FLASH_ATTN_F16_NATIVE_GQA_CAUSAL_BECAUSE_CANDLE_011_FIXED_THE_SM120_HDIM512_FORWARD_AND_FLASH_WINS_1_09X_AT_8K_TO_1_39X_AT_120K_ON_THE_HD512_FLASHVSBF16_ROWS_WHILE_0_SELECTS_THE_BF16_TENSOR_CORE_GEMM_ROUTE,
+    )
+}
+
+pub const NV_E4B_STEP_LOGITS_UNCAPPED_ENV_OPT_IN_1_RESTORES_THE_RAW_LM_HEAD_STEP_ROWS_THAT_SKIPPED_THE_CONFIGS_FINAL_LOGIT_SOFTCAPPING_WHICH_TRACE_WGPU_AND_GEMMA4_31B_ALL_APPLY_TANH_IS_MONOTONE_SO_GREEDY_OUTPUT_NEVER_MOVED_BUT_SAMPLING_LOGPROBS_AND_PPL_READ_THE_UNCAPPED_DISTRIBUTION_705_VS_16_ON_THE_CHAT_SLICE:
+    &str = "NV_E4B_STEP_LOGITS_UNCAPPED";
+
+pub fn step_logits_uncapped_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        NV_E4B_STEP_LOGITS_UNCAPPED_ENV_OPT_IN_1_RESTORES_THE_RAW_LM_HEAD_STEP_ROWS_THAT_SKIPPED_THE_CONFIGS_FINAL_LOGIT_SOFTCAPPING_WHICH_TRACE_WGPU_AND_GEMMA4_31B_ALL_APPLY_TANH_IS_MONOTONE_SO_GREEDY_OUTPUT_NEVER_MOVED_BUT_SAMPLING_LOGPROBS_AND_PPL_READ_THE_UNCAPPED_DISTRIBUTION_705_VS_16_ON_THE_CHAT_SLICE,
+    )
+}
+
 fn name(suffix: &str) -> String {
     format!("{PREFIX}.{suffix}")
 }
@@ -40,7 +106,7 @@ fn load_linear(
     #[cfg(feature = "cuda")]
     if matches!(device, Device::Cuda(_)) {
         let (pbytes, scale, out, inp) = read_packed_parts(weights, suffix)?;
-        return pick_quant_backend(&pbytes, scale, out, inp, device);
+        return pick_quant_backend(&pbytes, scale, out, inp, device, suffix);
     }
     Ok(QLinear::Dense(Linear::new(
         dequant_pack_quantized(weights, suffix, dtype, device)?,
@@ -82,7 +148,7 @@ fn load_linear_merged(
         }
         let refs: Vec<&Tensor> = scales.iter().collect();
         let scale = Tensor::cat(&refs, 0)?;
-        return pick_quant_backend(&p, scale, out, inp, device);
+        return pick_quant_backend(&p, scale, out, inp, device, suffixes[0]);
     }
     let parts = suffixes
         .iter()
@@ -117,6 +183,7 @@ fn pick_quant_backend(
     out: usize,
     inp: usize,
     device: &Device,
+    suffix: &str,
 ) -> Result<QLinear> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -124,20 +191,22 @@ fn pick_quant_backend(
 
     let gs = inp / scale.dim(1)?;
     let marlin_supported = inp % 16 == 0 && out % 64 == 0 && inp % 32 == 0;
-    if std::env::var("NV_E4B_FORCE_GEMV").is_ok() || !marlin_supported {
+    let a8_mlp = mlp_w4a8fp8_env_opted_in() && suffix.contains(".mlp.") && marlin_supported;
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_FORCE_GEMV") || !marlin_supported
+    {
         return Ok(QLinear::Quant(W4a16Linear::from_raw(
             pbytes, scale, out, inp, device,
         )?));
     }
-    if std::env::var("NV_E4B_FORCE_MARLIN").is_ok() {
-        return Ok(QLinear::Marlin(MarlinLinear::from_raw(
-            pbytes, scale, out, inp, device,
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_FORCE_MARLIN") {
+        return Ok(QLinear::Marlin(MarlinLinear::from_raw_backend(
+            pbytes, scale, out, inp, device, a8_mlp,
         )?));
     }
 
-    let large_gemv = std::env::var("NV_E4B_GEMV_LARGE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let large_gemv = nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_GEMV_LARGE",
+    );
     if large_gemv && gs == 32 {
         let variant = if inp == 2560 && out == 20480 {
             Some(0)
@@ -149,28 +218,33 @@ fn pick_quant_backend(
         if let Some(variant) = variant {
             return Ok(QLinear::GemvM1(GemvM1Hybrid {
                 gemv: W4a16Linear::from_raw(pbytes, scale.clone(), out, inp, device)?,
-                marlin: MarlinLinear::from_raw(pbytes, scale, out, inp, device)?,
+                marlin: MarlinLinear::from_raw_backend(pbytes, scale, out, inp, device, a8_mlp)?,
                 variant,
                 y_persist: std::sync::OnceLock::new(),
             }));
         }
     }
 
-    if std::env::var("NV_E4B_GEMV_SMALL").is_ok() && inp <= 3072 && out <= 4096 {
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_GEMV_SMALL")
+        && inp <= 3072
+        && out <= 4096
+    {
         return Ok(QLinear::Quant(W4a16Linear::from_raw(
             pbytes, scale, out, inp, device,
         )?));
     }
 
-    if std::env::var("NV_E4B_TINY_GEMV").is_ok() && (inp <= 512 || out <= 512) {
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_TINY_GEMV")
+        && (inp <= 512 || out <= 512)
+    {
         return Ok(QLinear::Quant(W4a16Linear::from_raw(
             pbytes, scale, out, inp, device,
         )?));
     }
 
     if std::env::var("NV_E4B_AUTOTUNE").is_err() {
-        return Ok(QLinear::Marlin(MarlinLinear::from_raw(
-            pbytes, scale, out, inp, device,
+        return Ok(QLinear::Marlin(MarlinLinear::from_raw_backend(
+            pbytes, scale, out, inp, device, a8_mlp,
         )?));
     }
 
@@ -619,13 +693,14 @@ impl W4a16Linear {
 }
 
 #[cfg(feature = "cuda")]
-struct MarlinLinear {
+pub(crate) struct MarlinLinear {
     b_q_marlin: cudarc::driver::CudaSlice<i32>,
     b_scales: Tensor,
     workspace: cudarc::driver::CudaSlice<i32>,
 
     c_tmp: Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
     c_persist: std::sync::OnceLock<(Tensor, u64)>,
+    a8_fp8: bool,
     out_features: usize,
     in_features: usize,
     group_size: usize,
@@ -674,7 +749,9 @@ fn marlin_zero_register(ptr: u64, elems: u64) -> bool {
 }
 
 #[cfg(feature = "cuda")]
-fn marlin_zero_upload(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+pub(crate) fn marlin_zero_upload(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<()> {
     use cudarc::driver::DevicePtrMut;
     let mut reg = marlin_zero_registry().lock().unwrap();
     if reg.version == reg.uploaded_version {
@@ -705,7 +782,9 @@ fn marlin_zero_upload(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Re
 }
 
 #[cfg(feature = "cuda")]
-fn marlin_zero_launch(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+pub(crate) fn marlin_zero_launch(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<()> {
     let (ptr, count) = {
         let reg = marlin_zero_registry().lock().unwrap();
         (reg.dev_ptr, reg.uploaded_count)
@@ -722,6 +801,56 @@ fn marlin_zero_launch(stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Re
     };
     anyhow::ensure!(rc == 0, "multi_zero_bf16 returned {rc}");
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn marlin_zero_deregister_then_reupload_before_the_buffer_frees_so_no_zero_launch_scribbles_the_reused_address(
+    ptr: u64,
+    device: &candle_core::CudaDevice,
+) {
+    let reupload = {
+        let mut reg = marlin_zero_registry().lock().unwrap();
+        let before = reg.entries.len();
+        let mut i = 0;
+        while i < reg.entries.len() {
+            if reg.entries[i] == ptr {
+                reg.entries.drain(i..i + 2);
+            } else {
+                i += 2;
+            }
+        }
+        if reg.entries.len() == before {
+            false
+        } else {
+            reg.version += 1;
+            reg.dev.is_some()
+        }
+    };
+    if reupload {
+        let stream = nv_layers::cuda_stream::current_stream(device);
+        let _ = marlin_zero_upload(&stream);
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for MarlinLinear {
+    fn drop(&mut self) {
+        if let Some((_t, ptr)) = self.c_persist.get() {
+            marlin_zero_deregister_then_reupload_before_the_buffer_frees_so_no_zero_launch_scribbles_the_reused_address(*ptr, &self.device);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn marlin_zero_snapshot_host_entries_uploaded_device_list_and_count(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<(Vec<u64>, Vec<u64>, i32)> {
+    let reg = marlin_zero_registry().lock().unwrap();
+    let dev_list = match &reg.dev {
+        Some(d) => stream.clone_dtoh(d).map_err(|e| anyhow::anyhow!(e))?,
+        None => Vec::new(),
+    };
+    Ok((reg.entries.clone(), dev_list, reg.uploaded_count))
 }
 
 #[cfg(feature = "cuda")]
@@ -750,13 +879,60 @@ fn marlin_c_tmp_scratch(
 }
 
 #[cfg(feature = "cuda")]
+fn marlin_a8_input_scratch(
+    q_elems: usize,
+    s_elems: usize,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> Result<(
+    std::sync::Arc<cudarc::driver::CudaSlice<u8>>,
+    std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+)> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Bufs = (
+        usize,
+        Arc<cudarc::driver::CudaSlice<u8>>,
+        usize,
+        Arc<cudarc::driver::CudaSlice<f32>>,
+    );
+    static SCRATCH: OnceLock<Mutex<Option<Bufs>>> = OnceLock::new();
+    let cell = SCRATCH.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().unwrap();
+    if let Some((qcap, q, scap, s)) = guard.as_ref() {
+        if *qcap >= q_elems && *scap >= s_elems {
+            return Ok((q.clone(), s.clone()));
+        }
+    }
+    let qcap = q_elems.max(guard.as_ref().map(|g| g.0).unwrap_or(0));
+    let scap = s_elems.max(guard.as_ref().map(|g| g.2).unwrap_or(0));
+    let q: Arc<cudarc::driver::CudaSlice<u8>> = Arc::new(unsafe {
+        stream.alloc::<u8>(qcap).map_err(|e| anyhow::anyhow!(e))?
+    });
+    let s: Arc<cudarc::driver::CudaSlice<f32>> = Arc::new(unsafe {
+        stream.alloc::<f32>(scap).map_err(|e| anyhow::anyhow!(e))?
+    });
+    *guard = Some((qcap, q.clone(), scap, s.clone()));
+    Ok((q, s))
+}
+
+#[cfg(feature = "cuda")]
 impl MarlinLinear {
-    fn from_raw(
+    pub(crate) fn from_raw(
         pbytes: &[u8],
         scale: Tensor,
         out: usize,
         inp: usize,
         device: &Device,
+    ) -> Result<Self> {
+        Self::from_raw_backend(pbytes, scale, out, inp, device, false)
+    }
+
+    fn from_raw_backend(
+        pbytes: &[u8],
+        scale: Tensor,
+        out: usize,
+        inp: usize,
+        device: &Device,
+        a8_fp8: bool,
     ) -> Result<Self> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let dev = match device {
@@ -764,23 +940,41 @@ impl MarlinLinear {
             _ => anyhow::bail!("marlin requires cuda"),
         };
         let group_size = inp / scale.dim(1)?;
+        anyhow::ensure!(
+            !a8_fp8 || group_size >= 32,
+            "marlin w4a8-fp8 needs group_size >= 32, got {group_size}"
+        );
 
         let s = scale.t()?.contiguous()?;
         let ng = s.dim(0)?;
         let n = s.dim(1)?;
         anyhow::ensure!((ng * n) % 64 == 0, "marlin scale reshape: {ng}x{n} not %64");
-        let mut perm = Vec::with_capacity(64);
-        for i in 0..8u32 {
-            for j in 0..8u32 {
-                perm.push(i + 8 * j);
+        let b_scales = if a8_fp8 {
+            let mut perm = Vec::with_capacity(32);
+            for i in 0..4u32 {
+                for j in [0u32, 1, 8, 9, 16, 17, 24, 25] {
+                    perm.push(2 * i + j);
+                }
             }
-        }
-        let perm_t = Tensor::from_vec(perm, 64, device)?;
-        let b_scales = s
-            .reshape((ng * n / 64, 64))?
-            .index_select(&perm_t, 1)?
-            .reshape((ng, n))?
-            .contiguous()?;
+            let perm_t = Tensor::from_vec(perm, 32, device)?;
+            let s512 = (s.to_dtype(DType::F32)? * 512.0)?.to_dtype(DType::BF16)?;
+            s512.reshape((ng * n / 32, 32))?
+                .index_select(&perm_t, 1)?
+                .reshape((ng, n))?
+                .contiguous()?
+        } else {
+            let mut perm = Vec::with_capacity(64);
+            for i in 0..8u32 {
+                for j in 0..8u32 {
+                    perm.push(i + 8 * j);
+                }
+            }
+            let perm_t = Tensor::from_vec(perm, 64, device)?;
+            s.reshape((ng * n / 64, 64))?
+                .index_select(&perm_t, 1)?
+                .reshape((ng, n))?
+                .contiguous()?
+        };
 
         let cols = inp / 8;
         anyhow::ensure!(pbytes.len() == out * cols * 4, "packed size mismatch");
@@ -804,15 +998,37 @@ impl MarlinLinear {
         let rc = {
             let (pp, _gp) = b_q_packed.device_ptr(&stream);
             let (mp, _gm) = b_q_marlin.device_ptr_mut(&stream);
-            unsafe {
-                nv_kernels::cuda::marlin_repack_w4a16(
-                    stream.cu_stream() as *mut _,
-                    pp as *const std::ffi::c_void,
-                    mp as *mut std::ffi::c_void,
-                    inp as i32,
-                    out as i32,
-                    4,
-                )
+            if a8_fp8 {
+                let pre = unsafe {
+                    nv_kernels::cuda::marlin_int4_fp8_preprocess(
+                        stream.cu_stream() as *mut _,
+                        pp as *const std::ffi::c_void,
+                        pp as *mut std::ffi::c_void,
+                        (inp * out / 8) as i64,
+                    )
+                };
+                anyhow::ensure!(pre == 0, "marlin_int4_fp8_preprocess returned {pre}");
+                unsafe {
+                    nv_kernels::cuda::marlin_repack_w4a8(
+                        stream.cu_stream() as *mut _,
+                        pp as *const std::ffi::c_void,
+                        mp as *mut std::ffi::c_void,
+                        inp as i32,
+                        out as i32,
+                        4,
+                    )
+                }
+            } else {
+                unsafe {
+                    nv_kernels::cuda::marlin_repack_w4a16(
+                        stream.cu_stream() as *mut _,
+                        pp as *const std::ffi::c_void,
+                        mp as *mut std::ffi::c_void,
+                        inp as i32,
+                        out as i32,
+                        4,
+                    )
+                }
             }
         };
         anyhow::ensure!(rc == 0, "marlin_repack returned {rc}");
@@ -827,7 +1043,8 @@ impl MarlinLinear {
             .clone_htod(&vec![0i32; elems as usize])
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let c_tmp = if std::env::var("NV_E4B_MARLIN_FP32RED").is_ok() {
+        let c_tmp = if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_MARLIN_FP32RED")
+        {
             Some(marlin_c_tmp_scratch(out, &stream)?)
         } else {
             None
@@ -839,6 +1056,7 @@ impl MarlinLinear {
             workspace,
             c_tmp,
             c_persist: std::sync::OnceLock::new(),
+            a8_fp8,
             out_features: out,
             in_features: inp,
             group_size,
@@ -878,7 +1096,7 @@ impl MarlinLinear {
         Ok(Some((t.clone(), *p)))
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use half::bf16;
         let dims = x.dims().to_vec();
@@ -887,6 +1105,9 @@ impl MarlinLinear {
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, kin))?.to_dtype(DType::BF16)?.contiguous()?;
         let stream = nv_layers::cuda_stream::current_stream(&self.device);
+        if self.a8_fp8 {
+            return self.forward_a8(&x2, m, &dims, &stream);
+        }
         if m == 1 && self.c_tmp.is_none() {
             if let Some((t, cptr)) = self.persist_out(&stream)? {
                 let rc = {
@@ -991,6 +1212,83 @@ impl MarlinLinear {
             }
         };
         anyhow::ensure!(rc == 0, "marlin_gemm returned {rc}");
+        let storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, self.device.clone());
+        let storage = candle_core::Storage::Cuda(storage);
+        let out = candle_core::Tensor::from_storage(
+            storage,
+            (m, self.out_features),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        let mut out_dims = dims[..dims.len() - 1].to_vec();
+        out_dims.push(self.out_features);
+        out.reshape(out_dims).map_err(Into::into)
+    }
+
+    fn forward_a8(
+        &self,
+        x2: &Tensor,
+        m: usize,
+        dims: &[usize],
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<Tensor> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use half::bf16;
+        let (a_q, a_s) = marlin_a8_input_scratch(m * self.in_features, m, stream)?;
+        let mut c_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * self.out_features)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let rc = {
+            let (xs, _xl) = x2.storage_and_layout();
+            let (ss, _sl) = self.b_scales.storage_and_layout();
+            let xc = match &*xs {
+                candle_core::Storage::Cuda(s) => s,
+                _ => anyhow::bail!("marlin a8: x not cuda"),
+            };
+            let sc = match &*ss {
+                candle_core::Storage::Cuda(s) => s,
+                _ => anyhow::bail!("marlin a8: scales not cuda"),
+            };
+            let xsl = xc.as_cuda_slice::<bf16>()?;
+            let ssl = sc.as_cuda_slice::<bf16>()?;
+            let (xp, _gx) = xsl.device_ptr(stream);
+            let (sp, _gs) = ssl.device_ptr(stream);
+            let (bp, _gb) = self.b_q_marlin.device_ptr(stream);
+            let (wp, _gw) = self.workspace.device_ptr(stream);
+            let (qp, _gq) = a_q.device_ptr(stream);
+            let (ap, _ga) = a_s.device_ptr(stream);
+            let (cp, _gc) = c_dev.device_ptr_mut(stream);
+            let rq = unsafe {
+                nv_kernels::cuda::rowquant_e4m3(
+                    stream.cu_stream() as *mut _,
+                    xp as *const u16,
+                    qp as *mut u8,
+                    ap as *mut f32,
+                    m as i32,
+                    self.in_features as i32,
+                )
+            };
+            anyhow::ensure!(rq == 0, "rowquant_e4m3 returned {rq}");
+            unsafe {
+                nv_kernels::cuda::marlin_gemm_w4a8_fp8(
+                    stream.cu_stream() as *mut _,
+                    qp as *const std::ffi::c_void,
+                    ap as *const std::ffi::c_void,
+                    bp as *const std::ffi::c_void,
+                    sp as *const std::ffi::c_void,
+                    cp as *mut std::ffi::c_void,
+                    wp as *mut std::ffi::c_void,
+                    m as i32,
+                    self.out_features as i32,
+                    self.in_features as i32,
+                    self.group_size as i32,
+                    0,
+                )
+            }
+        };
+        anyhow::ensure!(rc == 0, "marlin_gemm_w4a8_fp8 returned {rc}");
         let storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, self.device.clone());
         let storage = candle_core::Storage::Cuda(storage);
         let out = candle_core::Tensor::from_storage(
@@ -1126,7 +1424,9 @@ impl Gemma4E4b {
         #[cfg(feature = "cuda")]
         let lm_head_i8 =
             if std::env::var("NV_E4B_LMHEAD_INT8").is_ok() && matches!(device, Device::Cuda(_)) {
-                Some(quantize_lm_head_i8(&embed_tokens)?)
+                Some(nv_layers::lm_head_resident_quant::rowquant_i8_dev(
+                    &embed_tokens,
+                )?)
             } else {
                 None
             };
@@ -1228,7 +1528,7 @@ impl Gemma4E4b {
         )?;
 
         let hidden = config.hidden_size as f64;
-        Ok(Self {
+        let model = Self {
             config,
             dtype,
             device: device.clone(),
@@ -1247,7 +1547,17 @@ impl Gemma4E4b {
             embed_scale_per_layer: (hpl as f64).sqrt(),
             per_layer_proj_scale: hidden.powf(-0.5),
             per_layer_input_scale: 2f64.powf(-0.5),
-        })
+        };
+        if matches!(device, Device::Cuda(_)) && boot_warm_prefill_env_opted_in() {
+            let warm =
+                vec![0u32; E4B_BOOT_WARM_CHUNK_512_MATCHES_THE_SERVING_PREFILL_CHUNK_SO_THE_THROWAWAY_PASS_COMPILES_EXACTLY_THE_MODULES_THE_FIRST_REAL_CHUNK_NEEDS];
+            let mut scratch: Vec<Option<(Tensor, Tensor)>> =
+                vec![None; model.config.num_hidden_layers];
+            let _ = model.forward_step(&warm, 0, &mut scratch)?;
+            drop(scratch);
+            model.device.synchronize()?;
+        }
+        Ok(model)
     }
 
     fn per_layer_inputs(&self, ids: &Tensor, inputs_embeds: &Tensor) -> Result<Tensor> {
@@ -1466,7 +1776,8 @@ impl Gemma4E4b {
     ) -> Result<Tensor> {
         let n = new_ids.len();
         let mut kv = E4bKvMut::Cat(cache);
-        let (logits, _hidden) = self.forward_step_inner(new_ids, Some(embeds), past_len, &mut kv)?;
+        let (logits, _hidden) =
+            self.forward_step_inner(new_ids, Some(embeds), past_len, &mut kv)?;
         logits
             .narrow(0, n - 1, 1)?
             .reshape(self.config.vocab_size)
@@ -1481,6 +1792,50 @@ impl Gemma4E4b {
     ) -> Result<(Tensor, Tensor)> {
         let mut kv = E4bKvMut::Cat(cache);
         self.forward_step_inner(new_ids, None, past_len, &mut kv)
+    }
+
+    pub fn prefill_fixed_cache(&self, capacity: usize) -> Result<E4bPrefillFixedCache> {
+        anyhow::ensure!(capacity > 0, "prefill_fixed_cache: zero capacity");
+        let mut k = Vec::with_capacity(self.layers.len());
+        let mut v = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            if layer.k_norm.is_some() {
+                let shape = (1usize, capacity, layer.n_kv_heads, layer.head_dim);
+                k.push(Some(Tensor::zeros(shape, DType::F32, &self.device)?));
+                v.push(Some(Tensor::zeros(shape, DType::F32, &self.device)?));
+            } else {
+                k.push(None);
+                v.push(None);
+            }
+        }
+        Ok(E4bPrefillFixedCache {
+            k,
+            v,
+            capacity,
+            len: 0,
+        })
+    }
+
+    pub fn forward_step_fixed(
+        &self,
+        new_ids: &[u32],
+        embeds_override: Option<&Tensor>,
+        past_len: usize,
+        cache: &mut E4bPrefillFixedCache,
+    ) -> Result<Tensor> {
+        let n = new_ids.len();
+        cache.begin_step(past_len, n)?;
+        let logits = {
+            let mut kv = E4bKvMut::FixedPrefill(cache);
+            let (logits, _hidden) =
+                self.forward_step_inner(new_ids, embeds_override, past_len, &mut kv)?;
+            logits
+        };
+        cache.len = past_len + n;
+        logits
+            .narrow(0, n - 1, 1)?
+            .reshape(self.config.vocab_size)
+            .map_err(Into::into)
     }
 
     #[cfg(feature = "cuda")]
@@ -1555,12 +1910,18 @@ impl Gemma4E4b {
         let pos: Vec<u32> = (past_len..past_len + n).map(|x| x as u32).collect();
 
         let total = past_len + n;
-        let full_mask = cache_mask(n, total, past_len, None, &self.device)?;
+        let full_mask = cache_mask(n, total, past_len, None, total, &self.device)?;
+        let sliding_kept = if prefill_sliding_narrow_env_opted_in() {
+            total.min(self.config.sliding_window + n)
+        } else {
+            total
+        };
         let sliding_mask = cache_mask(
             n,
             total,
             past_len,
             Some(self.config.sliding_window),
+            sliding_kept,
             &self.device,
         )?;
         let mut x = embeds;
@@ -1576,8 +1937,23 @@ impl Gemma4E4b {
         }
         let hidden_pre = x.reshape((n, hidden))?;
         let xn = self.norm.forward(&x)?;
-        let logits = self.lm_head.forward(&xn)?;
-        Ok((logits.reshape((n, self.config.vocab_size))?, hidden_pre))
+        let logits = self
+            .lm_head
+            .forward(&xn)?
+            .reshape((n, self.config.vocab_size))?;
+        Ok((self.step_logits_softcap_f32_capped_serving_default(logits)?, hidden_pre))
+    }
+
+    fn step_logits_softcap_f32_capped_serving_default(&self, logits: Tensor) -> Result<Tensor> {
+        let cap = self.config.final_logit_softcapping;
+        if !(cap > 0.0 && cap.is_finite()) || step_logits_uncapped_env_opted_in() {
+            return Ok(logits);
+        }
+        #[cfg(feature = "cuda")]
+        if matches!(self.device, Device::Cuda(_)) && logits.dtype() == DType::BF16 {
+            return crate::gemma4::tanh_softcap_bf16_to_f32_op(&logits, cap, &self.device);
+        }
+        softcap(&logits.to_dtype(DType::F32)?, cap)
     }
 
     pub fn embed_table(&self) -> &Tensor {
@@ -1708,6 +2084,10 @@ impl Gemma4E4b {
                         cache[idx] = Some((nk.clone(), nv.clone()));
                         (nk, nv, q_rot)
                     }
+                    E4bKvMut::FixedPrefill(cache) => {
+                        let (kk, vv) = cache.append(idx, &k_rot, &v)?;
+                        (kk, vv, q_rot)
+                    }
                     #[cfg(feature = "cuda")]
                     E4bKvMut::Fp8(cache) => {
                         let total =
@@ -1723,6 +2103,11 @@ impl Gemma4E4b {
                 let (q_rot, _) = rope.apply(&q, &q, &pos_t)?;
                 let (k, v) = match kv {
                     E4bKvMut::Cat(cache) => cache[src].clone().context("kv source not in cache")?,
+                    E4bKvMut::FixedPrefill(cache) => {
+                        let total =
+                            *pos.last().context("attn_cached: empty positions")? as usize + 1;
+                        cache.view(src, total)?
+                    }
                     #[cfg(feature = "cuda")]
                     E4bKvMut::Fp8(cache) => {
                         let total =
@@ -1750,6 +2135,81 @@ impl Gemma4E4b {
         }
 
         let group = nh / layer.n_kv_heads;
+        let kept_matches_the_mask_width_so_slice_and_shift_agree_by_construction = mask.dim(1)?;
+        let k_len = k_all.dim(1)?;
+        let (k_all, v_all) =
+            if kept_matches_the_mask_width_so_slice_and_shift_agree_by_construction < k_len {
+                let kept = kept_matches_the_mask_width_so_slice_and_shift_agree_by_construction;
+                (
+                    k_all.narrow(1, k_len - kept, kept)?,
+                    v_all.narrow(1, k_len - kept, kept)?,
+                )
+            } else {
+                (k_all, v_all)
+            };
+        #[cfg(feature = "cuda")]
+        if n > 1 && matches!(self.device, Device::Cuda(_)) && prefill_flash_attn_env_opted_in() {
+            let out = match layer.kind {
+                LayerType::SlidingAttention => {
+                    let cfg = nv_layers::attn::AttnConfig {
+                        num_heads: nh,
+                        num_kv_heads: layer.n_kv_heads,
+                        head_dim: hd,
+                        softmax_scale: 1.0,
+                        causal: true,
+                    };
+                    let qh = q_rot.to_dtype(DType::F16)?.contiguous()?;
+                    let kh = k_all.to_dtype(DType::F16)?.contiguous()?;
+                    let vh = v_all.to_dtype(DType::F16)?.contiguous()?;
+                    nv_layers::attn::flash_attn_windowed(
+                        &qh,
+                        &kh,
+                        &vh,
+                        &cfg,
+                        Some(self.config.sliding_window.saturating_sub(1)),
+                        Some(0),
+                    )?
+                    .reshape((1, n, nh * hd))?
+                }
+                LayerType::FullAttention if prefill_full_flash_hd512_enabled() => {
+                    let cfg = nv_layers::attn::AttnConfig {
+                        num_heads: nh,
+                        num_kv_heads: layer.n_kv_heads,
+                        head_dim: hd,
+                        softmax_scale: 1.0,
+                        causal: true,
+                    };
+                    let qh = q_rot.to_dtype(DType::F16)?.contiguous()?;
+                    let kh = k_all.to_dtype(DType::F16)?.contiguous()?;
+                    let vh = v_all.to_dtype(DType::F16)?.contiguous()?;
+                    nv_layers::attn::flash_attn_windowed(&qh, &kh, &vh, &cfg, None, Some(0))?
+                        .reshape((1, n, nh * hd))?
+                }
+                LayerType::FullAttention => {
+                    let group = nh / layer.n_kv_heads;
+                    let qb = q_rot
+                        .squeeze(0)?
+                        .transpose(0, 1)?
+                        .to_dtype(DType::BF16)?
+                        .contiguous()?;
+                    let kb = repeat_kv(
+                        &k_all.squeeze(0)?.transpose(0, 1)?.to_dtype(DType::BF16)?,
+                        group,
+                    )?;
+                    let vb = repeat_kv(
+                        &v_all.squeeze(0)?.transpose(0, 1)?.to_dtype(DType::BF16)?,
+                        group,
+                    )?;
+                    let scores = qb.matmul(&kb.transpose(1, 2)?.contiguous()?)?;
+                    let scores = scores.broadcast_add(&mask.to_dtype(DType::BF16)?)?;
+                    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+                    let out = probs.matmul(&vb.contiguous()?)?;
+                    out.transpose(0, 1)?.reshape((1, n, nh * hd))?
+                }
+            };
+            let out = out.to_dtype(self.dtype)?;
+            return layer.o_proj.forward(&out).map_err(Into::into);
+        }
         let q = q_rot.squeeze(0)?.transpose(0, 1)?.contiguous()?;
         let k = repeat_kv(&k_all.squeeze(0)?.transpose(0, 1)?, group)?;
         let v = repeat_kv(&v_all.squeeze(0)?.transpose(0, 1)?, group)?;
@@ -1934,9 +2394,14 @@ impl Gemma4E4b {
         }
 
         match &self.lm_head_i8 {
-            Some((wq, rs)) => {
-                lm_head_i8_normed_op(wq, rs, &x, self.norm.weight_bf16(), &rstd, &dev)
-            }
+            Some((wq, rs)) => nv_layers::lm_head_resident_quant::lm_head_i8_normed_op(
+                wq,
+                rs,
+                &x,
+                self.norm.weight_bf16(),
+                &rstd,
+                &dev,
+            ),
             None => lm_head_normed_op(&self.embed_tokens, &x, self.norm.weight_bf16(), &rstd),
         }
     }
@@ -2050,7 +2515,7 @@ impl Gemma4E4b {
 
         let hidden_pre = x.reshape((m, hidden))?;
         let logits = match &self.lm_head_i8 {
-            Some((wq, rs)) => lm_head_i8_normed_mk_op(
+            Some((wq, rs)) => nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
                 wq,
                 rs,
                 &hidden_pre,
@@ -2371,13 +2836,78 @@ impl Gemma4E4b {
 
 #[cfg(feature = "cuda")]
 pub fn e4b_kv_fp8_enabled() -> bool {
-    std::env::var("NV_E4B_KV_FP8").is_ok_and(|v| v != "0")
+    nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_E4B_KV_FP8")
 }
 
 enum E4bKvMut<'a> {
     Cat(&'a mut [Option<(Tensor, Tensor)>]),
+    FixedPrefill(&'a mut E4bPrefillFixedCache),
     #[cfg(feature = "cuda")]
     Fp8(&'a mut E4bFp8Cache),
+}
+
+pub struct E4bPrefillFixedCache {
+    k: Vec<Option<Tensor>>,
+    v: Vec<Option<Tensor>>,
+    capacity: usize,
+    len: usize,
+}
+
+impl E4bPrefillFixedCache {
+    pub fn seq_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn begin_step(&self, past_len: usize, n: usize) -> Result<()> {
+        anyhow::ensure!(
+            past_len == self.len,
+            "E4bPrefillFixedCache: step at past_len {past_len} but cache holds {} tokens",
+            self.len
+        );
+        anyhow::ensure!(
+            past_len + n <= self.capacity,
+            "E4bPrefillFixedCache: step to {} exceeds capacity {}",
+            past_len + n,
+            self.capacity
+        );
+        Ok(())
+    }
+
+    fn append(&mut self, idx: usize, k_rot: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let n = k_rot.dim(1)?;
+        let kb = self.k[idx]
+            .as_ref()
+            .context("append into a kv-shared layer slot")?;
+        let vb = self.v[idx]
+            .as_ref()
+            .context("append into a kv-shared layer slot")?;
+        kb.slice_set(&k_rot.contiguous()?, 1, self.len)?;
+        vb.slice_set(&v.contiguous()?, 1, self.len)?;
+        Ok((kb.narrow(1, 0, self.len + n)?, vb.narrow(1, 0, self.len + n)?))
+    }
+
+    fn view(&self, idx: usize, total: usize) -> Result<(Tensor, Tensor)> {
+        let kb = self.k[idx].as_ref().context("kv source not in cache")?;
+        let vb = self.v[idx].as_ref().context("kv source not in cache")?;
+        Ok((kb.narrow(1, 0, total)?, vb.narrow(1, 0, total)?))
+    }
+
+    pub fn cat_views(&self) -> Result<Vec<Option<(Tensor, Tensor)>>> {
+        let mut out = Vec::with_capacity(self.k.len());
+        for (kb, vb) in self.k.iter().zip(self.v.iter()) {
+            out.push(match (kb, vb) {
+                (Some(kb), Some(vb)) => {
+                    Some((kb.narrow(1, 0, self.len)?, vb.narrow(1, 0, self.len)?))
+                }
+                _ => None,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -2462,12 +2992,15 @@ fn cache_mask(
     total: usize,
     past: usize,
     window: Option<usize>,
+    kept: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    let mut data = vec![0f32; n * total];
+    let dropped_columns_are_all_masked_because_kept_ge_window_plus_chunk = total - kept;
+    let mut data = vec![0f32; n * kept];
     for r in 0..n {
         let absr = past + r;
-        for c in 0..total {
+        for j in 0..kept {
+            let c = dropped_columns_are_all_masked_because_kept_ge_window_plus_chunk + j;
             let mut masked = c > absr;
             if let Some(w) = window {
                 if absr + 1 > w && c + w <= absr {
@@ -2475,11 +3008,11 @@ fn cache_mask(
                 }
             }
             if masked {
-                data[r * total + c] = f32::NEG_INFINITY;
+                data[r * kept + j] = f32::NEG_INFINITY;
             }
         }
     }
-    Tensor::from_vec(data, (n, total), device).map_err(Into::into)
+    Tensor::from_vec(data, (n, kept), device).map_err(Into::into)
 }
 
 fn rms_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
@@ -3334,54 +3867,6 @@ fn rms_apply_op(x: &Tensor, w_bf16: &Tensor, rstd: &Tensor) -> Result<Tensor> {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn quantize_lm_head_i8(
-    embed: &Tensor,
-) -> Result<(
-    cudarc::driver::CudaSlice<i8>,
-    cudarc::driver::CudaSlice<f32>,
-)> {
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-    use half::bf16;
-    let dev = match embed.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("quantize_lm_head_i8 requires cuda"),
-    };
-    let (vocab, hidden) = embed.dims2()?;
-    let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut wq: cudarc::driver::CudaSlice<i8> = unsafe {
-        stream
-            .alloc::<i8>(vocab * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut rs: cudarc::driver::CudaSlice<f32> =
-        unsafe { stream.alloc::<f32>(vocab).map_err(|e| anyhow::anyhow!(e))? };
-    let rc = {
-        let (es, _el) = embed.storage_and_layout();
-        let ec = match &*es {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("embed not cuda"),
-        };
-        let esl = ec.as_cuda_slice::<bf16>()?;
-        let (ep, _ge) = esl.device_ptr(&stream);
-        let (qp, _gq) = wq.device_ptr_mut(&stream);
-        let (sp, _gs) = rs.device_ptr_mut(&stream);
-        unsafe {
-            nv_kernels::cuda::rowquant_i8(
-                stream.cu_stream() as *mut _,
-                ep as *const u16,
-                qp as *mut i8,
-                sp as *mut f32,
-                vocab as i32,
-                hidden as i32,
-            )
-        }
-    };
-    anyhow::ensure!(rc == 0, "rowquant_i8 returned {rc}");
-    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
-    Ok((wq, rs))
-}
-
-#[cfg(feature = "cuda")]
 pub struct E4bSpecVerifier<'a> {
     model: &'a Gemma4E4b,
     fixed: E4bFixedCache,
@@ -3498,238 +3983,6 @@ impl<'a> E4bSpecVerifier<'a> {
             view(fl, lfl.head_dim, lfl.n_kv_heads)?,
         ))
     }
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lm_head_i8_normed_mk_op(
-    wq: &cudarc::driver::CudaSlice<i8>,
-    row_scale: &cudarc::driver::CudaSlice<f32>,
-    x: &Tensor,
-    w_norm: &Tensor,
-    rstd: &Tensor,
-    m: usize,
-    dev: &candle_core::CudaDevice,
-) -> Result<Tensor> {
-    i8_normed_mk_op_impl(wq, row_scale, x, w_norm, rstd, m, dev, false)
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn i8_mk_h_op(
-    wq: &cudarc::driver::CudaSlice<i8>,
-    row_scale: &cudarc::driver::CudaSlice<f32>,
-    x: &Tensor,
-    w_norm: &Tensor,
-    rstd: &Tensor,
-    m: usize,
-    dev: &candle_core::CudaDevice,
-) -> Result<Tensor> {
-    i8_normed_mk_op_impl(wq, row_scale, x, w_norm, rstd, m, dev, true)
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn i8_normed_mk_op_impl(
-    wq: &cudarc::driver::CudaSlice<i8>,
-    row_scale: &cudarc::driver::CudaSlice<f32>,
-    x: &Tensor,
-    w_norm: &Tensor,
-    rstd: &Tensor,
-    m: usize,
-    dev: &candle_core::CudaDevice,
-    force_h: bool,
-) -> Result<Tensor> {
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-    use half::bf16;
-    let hidden = x.elem_count() / m;
-    let vocab = wq.len() / hidden;
-    anyhow::ensure!(rstd.elem_count() == m, "lm_head_mk: rstd rows mismatch");
-    let x_c = x.reshape((m, hidden))?.contiguous()?;
-    let stream = nv_layers::cuda_stream::current_stream(dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * vocab)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let rc = {
-        let (xs, xl) = x_c.storage_and_layout();
-        let (x0, x1) = xl
-            .contiguous_offsets()
-            .ok_or_else(|| anyhow::anyhow!("lm_head_mk: x not dense"))?;
-        let (ws, _wl) = w_norm.storage_and_layout();
-        let (rs2, _rl) = rstd.storage_and_layout();
-        let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
-        };
-        let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w_norm not cuda"),
-        };
-        let rcu = match &*rs2 {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rstd not cuda"),
-        };
-        let xsl = xc.as_cuda_slice::<bf16>()?;
-        let xview = xsl.slice(x0..x1);
-        let wsl = wc.as_cuda_slice::<bf16>()?;
-        let rsl = rcu.as_cuda_slice::<f32>()?;
-        let (qp, _gq) = wq.device_ptr(&stream);
-        let (scp, _gsc) = row_scale.device_ptr(&stream);
-        let (xp, _gx) = xview.device_ptr(&stream);
-        let (wp, _gw) = wsl.device_ptr(&stream);
-        let (rp, _gr) = rsl.device_ptr(&stream);
-        let (yp, _gy) = y_dev.device_ptr_mut(&stream);
-
-        let prenorm = !force_h
-            && m <= 8
-            && hidden >= 4096
-            && std::env::var("NV_LMI8_PRENORM").ok().as_deref() != Some("0");
-        unsafe {
-            if prenorm {
-                let mut xn_dev: cudarc::driver::CudaSlice<bf16> = stream
-                    .alloc::<bf16>(m * hidden)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                let (xnp, _gxn) = xn_dev.device_ptr_mut(&stream);
-                let rc1 = nv_kernels::cuda::normx_mk(
-                    stream.cu_stream() as *mut _,
-                    xp as *const u16,
-                    wp as *const u16,
-                    rp as *const f32,
-                    xnp as *mut u16,
-                    hidden as i32,
-                    m as i32,
-                );
-                if rc1 != 0 {
-                    rc1
-                } else {
-                    nv_kernels::cuda::gemv_i8_prenormed_mk(
-                        stream.cu_stream() as *mut _,
-                        qp as *const i8,
-                        scp as *const f32,
-                        xnp as *const u16,
-                        yp as *mut u16,
-                        vocab as i32,
-                        hidden as i32,
-                        m as i32,
-                    )
-                }
-            } else if force_h {
-                nv_kernels::cuda::gemv_i8_mk_h(
-                    stream.cu_stream() as *mut _,
-                    qp as *const i8,
-                    scp as *const f32,
-                    xp as *const u16,
-                    wp as *const u16,
-                    rp as *const f32,
-                    yp as *mut u16,
-                    vocab as i32,
-                    hidden as i32,
-                    m as i32,
-                )
-            } else {
-                nv_kernels::cuda::gemv_i8_normed_mk(
-                    stream.cu_stream() as *mut _,
-                    qp as *const i8,
-                    scp as *const f32,
-                    xp as *const u16,
-                    wp as *const u16,
-                    rp as *const f32,
-                    yp as *mut u16,
-                    vocab as i32,
-                    hidden as i32,
-                    m as i32,
-                )
-            }
-        }
-    };
-    anyhow::ensure!(
-        rc == 0,
-        "gemv_i8_normed_mk(force_h={force_h}) returned {rc}"
-    );
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev.clone());
-    let storage = candle_core::Storage::Cuda(storage);
-    Ok(candle_core::Tensor::from_storage(
-        storage,
-        (m, vocab),
-        candle_core::op::BackpropOp::none(),
-        false,
-    ))
-}
-
-#[cfg(feature = "cuda")]
-fn lm_head_i8_normed_op(
-    wq: &cudarc::driver::CudaSlice<i8>,
-    row_scale: &cudarc::driver::CudaSlice<f32>,
-    x: &Tensor,
-    w_norm: &Tensor,
-    rstd: &Tensor,
-    dev: &candle_core::CudaDevice,
-) -> Result<Tensor> {
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-    use half::bf16;
-    let hidden = x.elem_count();
-    let vocab = wq.len() / hidden;
-    let x_c = x.contiguous()?;
-    let stream = nv_layers::cuda_stream::current_stream(dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(vocab)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let rc = {
-        let (xs, xl) = x_c.storage_and_layout();
-        let (x0, x1) = xl
-            .contiguous_offsets()
-            .ok_or_else(|| anyhow::anyhow!("lm_head_i8: x not dense"))?;
-        let (ws, _wl) = w_norm.storage_and_layout();
-        let (rs2, _rl) = rstd.storage_and_layout();
-        let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
-        };
-        let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w_norm not cuda"),
-        };
-        let rcu = match &*rs2 {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rstd not cuda"),
-        };
-        let xsl = xc.as_cuda_slice::<bf16>()?;
-        let xview = xsl.slice(x0..x1);
-        let wsl = wc.as_cuda_slice::<bf16>()?;
-        let rsl = rcu.as_cuda_slice::<f32>()?;
-        let (qp, _gq) = wq.device_ptr(&stream);
-        let (scp, _gsc) = row_scale.device_ptr(&stream);
-        let (xp, _gx) = xview.device_ptr(&stream);
-        let (wp, _gw) = wsl.device_ptr(&stream);
-        let (rp, _gr) = rsl.device_ptr(&stream);
-        let (yp, _gy) = y_dev.device_ptr_mut(&stream);
-        unsafe {
-            nv_kernels::cuda::gemv_i8_normed(
-                stream.cu_stream() as *mut _,
-                qp as *const i8,
-                scp as *const f32,
-                xp as *const u16,
-                wp as *const u16,
-                rp as *const f32,
-                yp as *mut u16,
-                vocab as i32,
-                hidden as i32,
-            )
-        }
-    };
-    anyhow::ensure!(rc == 0, "gemv_i8_normed returned {rc}");
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev.clone());
-    let storage = candle_core::Storage::Cuda(storage);
-    Ok(candle_core::Tensor::from_storage(
-        storage,
-        (1usize, 1usize, vocab),
-        candle_core::op::BackpropOp::none(),
-        false,
-    ))
 }
 
 #[cfg(feature = "cuda")]
@@ -4614,7 +4867,7 @@ mod fast_graph_debug {
         let graphed = model.generate_graphed(&prompt, n, &eos).unwrap();
         eprintln!("eager:   {:?}", &base);
         eprintln!("graphed: {:?}", &graphed);
-        if std::env::var("NV_E4B_FORCE_GEMV").is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_FORCE_GEMV") {
             assert_eq!(base, graphed, "graphed diverged from eager");
         }
     }

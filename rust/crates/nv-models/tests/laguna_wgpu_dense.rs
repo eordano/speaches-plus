@@ -128,7 +128,7 @@ fn gpu_dense(w: &HostDenseMlp, x: &[f32]) -> Option<Vec<f32>> {
     let xbits: Vec<u16> = x.iter().map(|v| bf16_bits(*v)).collect();
     let xbuf = b.upload_u32("lgw-test-x", &pack_pairs(&xbits));
     let out = b.zeros("lgw-test-out", (hidden * 2) as u64);
-    build_dense_mlp(&mut b, &src, &s, &layer, w, &xbuf, &out).unwrap();
+    build_dense_mlp(&mut b, &src, &s, &layer, w, &xbuf, &out, None).unwrap();
     b.flush_staging();
     run(ctx, &b.passes);
     let words: Vec<u32> =

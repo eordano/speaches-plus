@@ -45,7 +45,7 @@ func (p *sessionPipeline) startEagerRunner(respID, itemID string, epoch uint64, 
 		llmTimeout = time.Duration(defaultLLMTimeoutSec) * time.Second
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout)
-	deltas, err := llm.StreamWithInstructions(ctx, p.session.Model, p.getInstructions(), partial)
+	deltas, err := llm.StreamWithInstructions(ctx, p.session.Model, p.getInstructions(), partial, respID)
 	if err != nil {
 		cancel()
 		p.logger.Warn("eager LLM stream failed to open", "err", err)

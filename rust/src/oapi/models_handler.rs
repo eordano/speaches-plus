@@ -32,6 +32,7 @@ pub async fn handle_list_models(
             let owner = id.split('/').next().unwrap_or("speaches-plus").to_string();
             let mut extras = Map::new();
             extras.insert("sample_rate".into(), json!(talker.sample_rate()));
+            extras.insert("voices".into(), json!(talker.voices()));
             data.push(Model {
                 id,
                 created: 1,
@@ -70,7 +71,7 @@ pub async fn handle_list_models(
             let owner = id.split('/').next().unwrap_or("speaches-plus").to_string();
             let mut extras = Map::new();
             let spec = reg
-                .resolve(Some(id))
+                .resolve(Some(&id))
                 .map(|e| super::chat::spec_decode_header_value(e.spec_decode_status()))
                 .unwrap_or("unknown");
             extras.insert("spec_decode".into(), json!(spec));

@@ -293,10 +293,10 @@ Theorem min_total_for_full_window_is_tight :
       kv_max_default.
 Proof. unfold gate_accepts_on. vm_compute. intro H; exact (H eq_refl). Qed.
 
-Definition workstation_total_bytes : Z := 97887 * 1024 * 1024.
+Definition peta_total_bytes : Z := 97887 * 1024 * 1024.
 
-Theorem workstation_accepts_full_window :
-  gate_accepts_on workstation_total_bytes weights_measured_bytes kv_max_default.
+Theorem peta_accepts_full_window :
+  gate_accepts_on peta_total_bytes weights_measured_bytes kv_max_default.
 Proof. unfold gate_accepts_on. vm_compute. intro H; discriminate H. Qed.
 
 (* A card just under the threshold refuses -- and refusing is the correct

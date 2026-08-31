@@ -67,6 +67,9 @@ const NOZI_AUDITED_ENTRIES: &[&str] = &[
     "argmax_f32_rows_stage1",
     "argmax_f32_rows_stage2",
     "argmax_softcap_bf16_stage1",
+    "dv_rmsnorm_f16",
+    "dv_rmsnorm_f32_inplace",
+    "dv_softmax_rows",
     "flash_splitk_stage1_bf16kv",
     "flash_splitk_stage1_bf16kv_mk",
     "flash_splitk_stage1_bf16kv_mk_u",
@@ -290,11 +293,11 @@ pub fn nozi_audited_entries() -> &'static [&'static str] {
 }
 
 pub fn nozi_env_enabled() -> bool {
-    std::env::var("NV_WGPU_NOZI").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_WGPU_NOZI")
 }
 
 pub fn nozi_pending_enabled() -> bool {
-    std::env::var("NV_WGPU_NOZI_NVFP4_V2").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_WGPU_NOZI_NVFP4_V2")
 }
 
 pub fn nozi_entry_listed(entry: &str, pending: bool) -> bool {
@@ -306,11 +309,18 @@ fn nozi_for_entry(entry: &str) -> bool {
     nozi_env_enabled() && nozi_entry_listed(entry, nozi_pending_enabled())
 }
 
-fn pipeline_log(label: &str, entry: &str) {
-    match std::env::var("NV_WGPU_PIPELINE_LOG") {
+pub fn diag_sink_is_off(env: &str) -> bool {
+    match std::env::var(env) {
+        Err(_) => true,
+        Ok(v) => v.is_empty() || v == "0",
+    }
+}
+
+pub fn diag_write(env: &str, line: &str) {
+    match std::env::var(env) {
         Err(_) => {}
         Ok(v) if v == "0" || v.is_empty() => {}
-        Ok(v) if v == "1" => eprintln!("[pipeline] {label}:{entry}"),
+        Ok(v) if v == "1" => eprintln!("{line}"),
         Ok(path) => {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -318,10 +328,80 @@ fn pipeline_log(label: &str, entry: &str) {
                 .append(true)
                 .open(&path)
             {
-                let _ = writeln!(f, "[pipeline] {label}:{entry}");
+                let _ = writeln!(f, "{line}");
             }
         }
     }
+}
+
+fn pipeline_log(label: &str, entry: &str) {
+    diag_write("NV_WGPU_PIPELINE_LOG", &format!("[pipeline] {label}:{entry}"));
+}
+
+pub const RECLAIM_POLL_ENV: &str = "NV_WGPU_RECLAIM_POLL";
+
+pub fn reclaim_poll_is_opt_in_because_a_poll_per_submit_on_every_wgpu_model_is_an_unpriced_fleet_wide_change_and_the_dots_defect_is_already_fixed_by_the_towers_own_blocking_reclaim(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(RECLAIM_POLL_ENV)
+}
+
+pub fn reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(
+    ctx: &WgpuContext,
+) {
+    if reclaim_poll_is_opt_in_because_a_poll_per_submit_on_every_wgpu_model_is_an_unpriced_fleet_wide_change_and_the_dots_defect_is_already_fixed_by_the_towers_own_blocking_reclaim()
+    {
+        let _ = ctx.device.poll(wgpu::PollType::Poll);
+    }
+}
+
+pub const SUBMIT_TRACE_ENV: &str = "NV_WGPU_SUBMIT_TRACE";
+
+pub const BUFFER_CENSUS_ENV: &str = "NV_WGPU_BUFFER_CENSUS";
+
+pub fn submit_trace_requested() -> bool {
+    !diag_sink_is_off(SUBMIT_TRACE_ENV)
+}
+
+pub fn buffer_census(ctx: &WgpuContext) -> String {
+    use std::fmt::Write;
+    let Some(r) = ctx.device.generate_allocator_report() else {
+        return "allocator report unavailable on this backend".to_string();
+    };
+    let mut by: std::collections::BTreeMap<String, (usize, u64)> =
+        std::collections::BTreeMap::new();
+    for a in &r.allocations {
+        let e = by.entry(a.name.clone()).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += a.size;
+    }
+    let mut rows: Vec<(String, usize, u64)> =
+        by.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
+    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "[census] {} live allocations in {} blocks, {:.1} MiB allocated of {:.1} MiB reserved",
+        r.allocations.len(),
+        r.blocks.len(),
+        r.total_allocated_bytes as f64 / 1048576.0,
+        r.total_reserved_bytes as f64 / 1048576.0
+    );
+    for (name, n, bytes) in rows.iter().take(40) {
+        let _ = writeln!(
+            s,
+            "[census]   {name:<32} n={n:<5} {:>10.1} MiB",
+            *bytes as f64 / 1048576.0
+        );
+    }
+    s
+}
+
+pub fn log_buffer_census(ctx: &WgpuContext, tag: &str) {
+    if diag_sink_is_off(BUFFER_CENSUS_ENV) {
+        return;
+    }
+    diag_write(BUFFER_CENSUS_ENV, &format!("[census] --- {tag} ---"));
+    diag_write(BUFFER_CENSUS_ENV, buffer_census(ctx).trim_end());
 }
 
 pub fn cached_compute_pipeline(
@@ -354,10 +434,25 @@ pub fn compute_pipeline(
 pub const UNCHECKED_SHADERS_ENV: &str = "NV_WGPU_UNCHECKED_SHADERS";
 
 pub fn unchecked_shaders_opted_in() -> bool {
-    std::env::var(UNCHECKED_SHADERS_ENV).ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(UNCHECKED_SHADERS_ENV)
 }
 
-fn create_module_honoring_unchecked_optin(
+static UNCHECKED_SHADERS_ARM_ANNOUNCED_ONCE_SO_A_LOG_PROVES_THE_ARM_ENGAGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn announce_unchecked_shaders_once() {
+    if !UNCHECKED_SHADERS_ARM_ANNOUNCED_ONCE_SO_A_LOG_PROVES_THE_ARM_ENGAGED
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        eprintln!(
+            "[wgpu-arm] {UNCHECKED_SHADERS_ENV}=1: shader modules built with \
+             ShaderRuntimeChecks::unchecked() -- naga index Restrict clamps and the \
+             force_loop_bounding 64-bit per-iteration counter are both off"
+        );
+    }
+}
+
+pub fn create_module_honoring_unchecked_optin(
     ctx: &WgpuContext,
     label: &str,
     source: &str,
@@ -367,6 +462,7 @@ fn create_module_honoring_unchecked_optin(
         source: wgpu::ShaderSource::Wgsl(source.into()),
     };
     if unchecked_shaders_opted_in() {
+        announce_unchecked_shaders_once();
         unsafe {
             ctx.device
                 .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
@@ -497,6 +593,7 @@ pub fn dispatch(
     bindings: &[(u32, &wgpu::Buffer)],
     workgroups: (u32, u32, u32),
 ) -> Result<()> {
+    reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(ctx);
     let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let group = bind_group(ctx, pipeline, bindings);
     let mut enc = ctx.device.create_command_encoder(&Default::default());
@@ -552,7 +649,6 @@ pub mod profile {
     use std::sync::{Mutex, OnceLock};
 
     static ACC: OnceLock<Mutex<BTreeMap<String, (u64, f64)>>> = OnceLock::new();
-    static ON: OnceLock<bool> = OnceLock::new();
     static NAMES: OnceLock<Mutex<HashMap<wgpu::ComputePipeline, String>>> = OnceLock::new();
     static PEND: OnceLock<Mutex<Vec<Parked>>> = OnceLock::new();
     static LOST: AtomicU64 = AtomicU64::new(0);
@@ -575,7 +671,7 @@ pub mod profile {
     }
 
     pub fn name_pipeline(pipeline: &wgpu::ComputePipeline, name: &str) {
-        if !enabled() {
+        if !enabled() && !super::submit_trace_requested() {
             return;
         }
         if let Ok(mut m) = names().lock() {
@@ -715,7 +811,7 @@ pub mod profile {
     }
 
     pub fn enabled() -> bool {
-        *ON.get_or_init(|| std::env::var("NV_WGPU_PROFILE").as_deref() == Ok("1"))
+        nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_WGPU_PROFILE")
     }
 
     pub fn record(label: &str, ns: f64) {
@@ -849,6 +945,7 @@ pub fn submit_passes(ctx: &WgpuContext, passes: &[PassRef<'_>], labels: &[&str])
     if passes.is_empty() {
         return Ok(());
     }
+    reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(ctx);
     if profile::enabled() && ctx.caps.timestamp_query {
         return submit_profiled(ctx, passes, labels);
     }
@@ -928,25 +1025,41 @@ where
 
     let mut names = Vec::with_capacity(n);
     let mut enc = ctx.device.create_command_encoder(&Default::default());
-    for (i, (pipeline, group, wg)) in passes.enumerate() {
-        let local = (i % per_chunk) as u32;
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                    query_set: &sets[i / per_chunk],
-                    beginning_of_pass_write_index: Some(local * 2),
-                    end_of_pass_write_index: Some(local * 2 + 1),
-                }),
-            });
+    if profile_inpass_low_distortion_requested() && ctx.ts_inside_passes {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        for (i, (pipeline, group, wg)) in passes.enumerate() {
+            let local = (i % per_chunk) as u32;
+            pass.write_timestamp(&sets[i / per_chunk], local * 2);
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, group, &[]);
             pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+            pass.write_timestamp(&sets[i / per_chunk], local * 2 + 1);
+            names.push(match labels.get(i) {
+                Some(l) => (*l).to_string(),
+                None => profile::pipeline_name(pipeline).unwrap_or_else(|| format!("#{i:04}")),
+            });
         }
-        names.push(match labels.get(i) {
-            Some(l) => (*l).to_string(),
-            None => profile::pipeline_name(pipeline).unwrap_or_else(|| format!("#{i:04}")),
-        });
+    } else {
+        for (i, (pipeline, group, wg)) in passes.enumerate() {
+            let local = (i % per_chunk) as u32;
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &sets[i / per_chunk],
+                        beginning_of_pass_write_index: Some(local * 2),
+                        end_of_pass_write_index: Some(local * 2 + 1),
+                    }),
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+            }
+            names.push(match labels.get(i) {
+                Some(l) => (*l).to_string(),
+                None => profile::pipeline_name(pipeline).unwrap_or_else(|| format!("#{i:04}")),
+            });
+        }
     }
     for (c, qs) in sets.iter().enumerate() {
         let count = ((n - c * per_chunk).min(per_chunk) * 2) as u32;
@@ -967,12 +1080,84 @@ where
     cb
 }
 
+pub const PROFILE_INPASS_ENV: &str = "NV_WGPU_PROFILE_INPASS";
+
+pub fn profile_inpass_low_distortion_requested() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(PROFILE_INPASS_ENV)
+}
+
+pub const SUBMIT_CHUNK_ENV: &str = "NV_WGPU_SUBMIT_CHUNK";
+
+pub fn submit_chunk_overlapping_encode_with_execution() -> Option<usize> {
+    std::env::var(SUBMIT_CHUNK_ENV)
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .filter(|k| *k > 0)
+}
+
 pub fn submit_pass_list<'a, I>(ctx: &WgpuContext, passes: I)
 where
     I: IntoIterator<Item = PassRef<'a>>,
     I::IntoIter: ExactSizeIterator,
 {
+    let passes = passes.into_iter();
+    reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(ctx);
+    if submit_trace_requested() {
+        submit_one_dispatch_per_submit_and_drain_so_a_runaway_kernel_names_itself(ctx, passes);
+        return;
+    }
+    if let Some(k) = submit_chunk_overlapping_encode_with_execution() {
+        if !(profile::enabled() && ctx.caps.timestamp_query) {
+            let all: Vec<PassRef<'a>> = passes.collect();
+            for chunk in all.chunks(k) {
+                let mut enc = ctx.device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = enc.begin_compute_pass(&Default::default());
+                    for (pipeline, group, wg) in chunk {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, *group, &[]);
+                        pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+                    }
+                }
+                ctx.queue.submit([enc.finish()]);
+            }
+            return;
+        }
+    }
     ctx.queue.submit([encode_pass_list(ctx, passes)]);
+}
+
+fn submit_one_dispatch_per_submit_and_drain_so_a_runaway_kernel_names_itself<'a, I>(
+    ctx: &WgpuContext,
+    passes: I,
+) where
+    I: Iterator<Item = PassRef<'a>>,
+{
+    for (i, (pipeline, group, wg)) in passes.enumerate() {
+        let name = profile::pipeline_name(pipeline).unwrap_or_else(|| format!("#{i:05}"));
+        diag_write(
+            SUBMIT_TRACE_ENV,
+            &format!("[submit] {i:06} enter {name} wg={wg:?}"),
+        );
+        let t = std::time::Instant::now();
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+        }
+        ctx.queue.submit([enc.finish()]);
+        let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
+        diag_write(
+            SUBMIT_TRACE_ENV,
+            &format!(
+                "[submit] {i:06} leave {name} {:.3} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            ),
+        );
+    }
 }
 
 fn as_refs<'a>(passes: &'a [Pass]) -> Vec<PassRef<'a>> {
@@ -1036,18 +1221,29 @@ fn submit_profiled_chunk(
     });
 
     let mut enc = ctx.device.create_command_encoder(&Default::default());
-    for (i, (pipeline, group, wg)) in passes.iter().enumerate() {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: None,
-            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                query_set: &qs,
-                beginning_of_pass_write_index: Some((i * 2) as u32),
-                end_of_pass_write_index: Some((i * 2 + 1) as u32),
-            }),
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, *group, &[]);
-        pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+    if profile_inpass_low_distortion_requested() && ctx.ts_inside_passes {
+        let mut pass = enc.begin_compute_pass(&Default::default());
+        for (i, (pipeline, group, wg)) in passes.iter().enumerate() {
+            pass.write_timestamp(&qs, (i * 2) as u32);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, *group, &[]);
+            pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+            pass.write_timestamp(&qs, (i * 2 + 1) as u32);
+        }
+    } else {
+        for (i, (pipeline, group, wg)) in passes.iter().enumerate() {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &qs,
+                    beginning_of_pass_write_index: Some((i * 2) as u32),
+                    end_of_pass_write_index: Some((i * 2 + 1) as u32),
+                }),
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, *group, &[]);
+            pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+        }
     }
     enc.resolve_query_set(&qs, 0..queries, &resolve, 0);
     enc.copy_buffer_to_buffer(&resolve, 0, &staging, 0, bytes);
@@ -1127,6 +1323,7 @@ impl<'a> Chain<'a> {
         if self.passes.is_empty() {
             return Ok(());
         }
+        reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(self.ctx);
         let scope = self
             .ctx
             .device
@@ -1220,6 +1417,7 @@ impl Recorded {
         if self.passes.is_empty() {
             return Ok(());
         }
+        reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(ctx);
         let scope = if self.validated {
             None
         } else {
@@ -1253,6 +1451,7 @@ impl Recorded {
         if self.passes.is_empty() || n == 0 {
             return Ok(());
         }
+        reclaim_dropped_buffers_because_wgpu_frees_a_dropped_buffer_only_at_a_device_poll_and_the_next_graph_otherwise_runs_against_the_last_graphs_residency(ctx);
         if profile::enabled() && ctx.caps.timestamp_query {
             for _ in 0..n {
                 self.replay(ctx)?;
@@ -1334,12 +1533,21 @@ pub fn read_back_at<T: bytemuck::Pod>(
             buffer.size()
         )));
     }
+    log_buffer_census(ctx, &format!("before readback staging of {bytes} bytes"));
+    let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("nv-kernels-readback"),
         size: bytes,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    if let Some(err) = pollster::block_on(scope.pop()) {
+        return Err(WgpuError::Readback(format!(
+            "the {bytes}-byte readback staging buffer could not be allocated, so every later use \
+             of it reports an invalid buffer: {err}\n{}",
+            buffer_census(ctx)
+        )));
+    }
     let mut enc = ctx.device.create_command_encoder(&Default::default());
     enc.copy_buffer_to_buffer(buffer, start, &staging, 0, bytes);
     ctx.queue.submit([enc.finish()]);

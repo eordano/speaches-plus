@@ -2,8 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
+use nv_layers::weight_load::{load_linear, load_rmsnorm, load_tensor};
 use nv_weights::WeightLoader;
-use crate::util::{load_linear, load_rmsnorm, load_tensor};
 use serde_json::Value;
 use std::path::Path;
 
@@ -301,15 +301,10 @@ impl Gemma4AssistantDrafter {
             &[cfg.vocab_size, h],
             dtype,
         )?;
-        let centroids = load_linear(
-            &weights,
-            "masked_embedding.centroids.weight",
-            cfg.num_centroids,
-            h,
-            dtype,
-        )?;
-        let token_ordering =
-            load_token_ordering(&weights, "masked_embedding.token_ordering", cfg.vocab_size)?;
+        let (centroids, token_ordering) =
+            centroid_head_or_identity_because_full_vocab_head_checkpoints_ship_no_centroid_tensors(
+                cfg, &weights, h, dtype, device,
+            )?;
         let norm = load_rmsnorm(&weights, "model.norm.weight", h, cfg.rms_norm_eps, dtype)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -635,6 +630,336 @@ impl Gemma4AssistantDrafter {
     }
 }
 
+pub const MOE_TRUNK_EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
+
+const MOE_MIRROR_FETCH_CHUNK_ROWS_8192_BOUNDS_HOST_STAGING_TO_TENS_OF_MB: usize = 8192;
+
+const MOE_SLIDING_MIRROR_SLACK_256_ROWS_BETWEEN_COMPACTIONS: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+pub struct MoeSharedKvGeometry {
+    pub n_kv: usize,
+    pub head_dim: usize,
+}
+
+pub trait MoeSharedKvEngineTap {
+    fn committed_kv_rows(&self) -> usize;
+    fn shared_kv_geometry(&self, lt: AssistantLayerType) -> Result<MoeSharedKvGeometry>;
+    fn shared_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
+        &self,
+        lt: AssistantLayerType,
+        start: usize,
+        len: usize,
+    ) -> Result<(Tensor, Tensor)>;
+}
+
+struct DeviceKvMirror {
+    k: Tensor,
+    v: Tensor,
+    n_kv: usize,
+    hd: usize,
+    cap: usize,
+    base_pos: usize,
+    len: usize,
+}
+
+impl DeviceKvMirror {
+    fn new(device: &Device, n_kv: usize, hd: usize, cap: usize) -> Result<Self> {
+        Ok(Self {
+            k: Tensor::zeros((n_kv, cap, hd), DType::F32, device)?,
+            v: Tensor::zeros((n_kv, cap, hd), DType::F32, device)?,
+            n_kv,
+            hd,
+            cap,
+            base_pos: 0,
+            len: 0,
+        })
+    }
+
+    fn abs_end(&self) -> usize {
+        self.base_pos + self.len
+    }
+
+    fn reset_to(&mut self, base_pos: usize) {
+        self.base_pos = base_pos;
+        self.len = 0;
+    }
+
+    fn append_rows(&mut self, rows_k: &Tensor, rows_v: &Tensor, r: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.len + r <= self.cap,
+            "kv mirror append {r} overflows {} of {}",
+            self.len,
+            self.cap
+        );
+        for (dst, src) in [(&self.k, rows_k), (&self.v, rows_v)] {
+            anyhow::ensure!(
+                src.dims() == [r, self.n_kv, self.hd],
+                "kv mirror rows shaped {:?}, want [{r}, {}, {}]",
+                src.dims(),
+                self.n_kv,
+                self.hd
+            );
+            let src = src.transpose(0, 1)?.contiguous()?.to_device(dst.device())?;
+            dst.slice_set(&src, 1, self.len)?;
+        }
+        self.len += r;
+        Ok(())
+    }
+
+    fn compact_keep_last(&mut self, keep: usize) -> Result<()> {
+        let keep = keep.min(self.len);
+        let start = self.len - keep;
+        if start == 0 {
+            return Ok(());
+        }
+        for t in [&self.k, &self.v] {
+            let tail = t.narrow(1, start, keep)?.contiguous()?;
+            t.slice_set(&tail, 1, 0)?;
+        }
+        self.base_pos += start;
+        self.len = keep;
+        Ok(())
+    }
+
+    fn last_rows_view(&self, n: usize) -> Result<(Tensor, Tensor)> {
+        anyhow::ensure!(
+            n > 0 && n <= self.len,
+            "kv mirror view of {n} rows from {} mirrored",
+            self.len
+        );
+        Ok((
+            self.k.narrow(1, self.len - n, n)?,
+            self.v.narrow(1, self.len - n, n)?,
+        ))
+    }
+}
+
+pub struct MoeAssistantHost {
+    drafter: Gemma4AssistantDrafter,
+    device: Device,
+    trunk_weights: WeightLoader,
+    backbone_hidden: usize,
+    embed_normalizer: f64,
+    max_seq: usize,
+    sliding: Option<DeviceKvMirror>,
+    full: Option<DeviceKvMirror>,
+}
+
+impl MoeAssistantHost {
+    pub fn load(
+        assistant_dir: &Path,
+        trunk_dir: &Path,
+        trunk_hidden_size: usize,
+        max_seq: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let drafter = Gemma4AssistantDrafter::try_load(assistant_dir, device)
+            .with_context(|| format!("load assistant drafter from {}", assistant_dir.display()))?;
+        let acfg = drafter.config();
+        anyhow::ensure!(
+            acfg.backbone_hidden_size == trunk_hidden_size,
+            "assistant backbone_hidden_size {} != trunk hidden_size {trunk_hidden_size}",
+            acfg.backbone_hidden_size
+        );
+        let trunk_weights = WeightLoader::open_dir(trunk_dir, &Device::Cpu)
+            .with_context(|| format!("open trunk weights in {}", trunk_dir.display()))?;
+        anyhow::ensure!(
+            trunk_weights.st_dtype_of(MOE_TRUNK_EMBED_NAME) == Some(nv_weights::StDtype::BF16),
+            "assistant drafting needs a bf16 {MOE_TRUNK_EMBED_NAME} in the trunk checkpoint dir"
+        );
+        anyhow::ensure!(
+            trunk_weights.shape_of(MOE_TRUNK_EMBED_NAME).as_deref()
+                == Some(&[acfg.vocab_size, trunk_hidden_size][..]),
+            "unexpected trunk embed shape {:?}",
+            trunk_weights.shape_of(MOE_TRUNK_EMBED_NAME)
+        );
+        Ok(Self {
+            drafter,
+            device: device.clone(),
+            trunk_weights,
+            backbone_hidden: trunk_hidden_size,
+            embed_normalizer: (trunk_hidden_size as f64).sqrt(),
+            max_seq,
+            sliding: None,
+            full: None,
+        })
+    }
+
+    pub fn config(&self) -> &Gemma4AssistantConfig {
+        self.drafter.config()
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn clear_mirrors(&mut self) {
+        if let Some(m) = self.sliding.as_mut() {
+            m.reset_to(0);
+        }
+        if let Some(m) = self.full.as_mut() {
+            m.reset_to(0);
+        }
+    }
+
+    pub fn embed_scaled_trunk_row(&self, token: u32) -> Result<Tensor> {
+        let bytes = self.trunk_weights.raw_bytes(MOE_TRUNK_EMBED_NAME)?;
+        let h = self.backbone_hidden;
+        let off = token as usize * h * 2;
+        anyhow::ensure!(
+            off + h * 2 <= bytes.len(),
+            "token {token} outside the trunk embed table"
+        );
+        let mut row = Vec::with_capacity(h);
+        for i in 0..h {
+            let bits = u16::from_le_bytes([bytes[off + 2 * i], bytes[off + 2 * i + 1]]);
+            row.push(f32::from_bits((bits as u32) << 16) * self.embed_normalizer as f32);
+        }
+        Ok(Tensor::from_vec(row, h, &Device::Cpu)?.to_device(&self.device)?)
+    }
+
+    fn sync_full_mirror<E: MoeSharedKvEngineTap>(
+        &mut self,
+        engine: &E,
+        committed: usize,
+    ) -> Result<()> {
+        if self.full.is_none() {
+            let g = engine.shared_kv_geometry(AssistantLayerType::Full)?;
+            self.full = Some(DeviceKvMirror::new(
+                &self.device,
+                g.n_kv,
+                g.head_dim,
+                self.max_seq,
+            )?);
+        }
+        let m = self.full.as_mut().expect("full mirror just ensured");
+        if committed < m.abs_end() {
+            m.reset_to(0);
+        }
+        while m.abs_end() < committed {
+            let start = m.abs_end();
+            let r =
+                (committed - start).min(MOE_MIRROR_FETCH_CHUNK_ROWS_8192_BOUNDS_HOST_STAGING_TO_TENS_OF_MB);
+            let (k, v) = engine.shared_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
+                AssistantLayerType::Full,
+                start,
+                r,
+            )?;
+            m.append_rows(&k, &v, r)?;
+        }
+        Ok(())
+    }
+
+    fn sync_sliding_mirror<E: MoeSharedKvEngineTap>(
+        &mut self,
+        engine: &E,
+        committed: usize,
+    ) -> Result<()> {
+        let window = self.drafter.config().sliding_window.max(1);
+        if self.sliding.is_none() {
+            let g = engine.shared_kv_geometry(AssistantLayerType::Sliding)?;
+            self.sliding = Some(DeviceKvMirror::new(
+                &self.device,
+                g.n_kv,
+                g.head_dim,
+                window + MOE_SLIDING_MIRROR_SLACK_256_ROWS_BETWEEN_COMPACTIONS,
+            )?);
+        }
+        let m = self.sliding.as_mut().expect("sliding mirror just ensured");
+        let want_start = committed.saturating_sub(window);
+        if committed < m.abs_end() || m.abs_end() < want_start {
+            m.reset_to(want_start);
+        }
+        while m.abs_end() < committed {
+            if m.len == m.cap {
+                m.compact_keep_last(window)?;
+            }
+            let start = m.abs_end();
+            let r = (committed - start).min(m.cap - m.len);
+            let (k, v) = engine.shared_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
+                AssistantLayerType::Sliding,
+                start,
+                r,
+            )?;
+            m.append_rows(&k, &v, r)?;
+        }
+        Ok(())
+    }
+
+    pub fn propose_from_engine<E: MoeSharedKvEngineTap>(
+        &mut self,
+        engine: &E,
+        last_token: u32,
+        last_hidden: &[f32],
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        let committed = engine.committed_kv_rows();
+        if k == 0 || committed == 0 {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            last_hidden.len() == self.backbone_hidden,
+            "last_hidden holds {} values, want {}",
+            last_hidden.len(),
+            self.backbone_hidden
+        );
+        self.sync_full_mirror(engine, committed)?;
+        self.sync_sliding_mirror(engine, committed)?;
+        let window = self.drafter.config().sliding_window.max(1);
+        let sm = self.sliding.as_ref().expect("sliding mirror synced");
+        let fm = self.full.as_ref().expect("full mirror synced");
+        let (sk, sv) = sm.last_rows_view(window.min(committed))?;
+        anyhow::ensure!(
+            fm.base_pos == 0 && fm.len == committed,
+            "full mirror covers {}..{} but the engine committed {committed}",
+            fm.base_pos,
+            fm.abs_end()
+        );
+        let (fk, fv) = fm.last_rows_view(committed)?;
+        let kv = FixedSharedKv {
+            sliding: (sk, sv),
+            full: (fk, fv),
+        };
+        let hidden = Tensor::from_vec(last_hidden.to_vec(), self.backbone_hidden, &Device::Cpu)?
+            .to_device(&self.device)?;
+        let embedder = |token: u32| self.embed_scaled_trunk_row(token);
+        self.drafter
+            .propose(last_token, &hidden, committed, k, &embedder, &kv)
+    }
+}
+
+fn centroid_head_or_identity_because_full_vocab_head_checkpoints_ship_no_centroid_tensors(
+    cfg: &Gemma4AssistantConfig,
+    weights: &WeightLoader,
+    h: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<(Linear, Vec<u32>)> {
+    if cfg.use_ordered_embeddings {
+        return Ok((
+            load_linear(
+                weights,
+                "masked_embedding.centroids.weight",
+                cfg.num_centroids,
+                h,
+                dtype,
+            )?,
+            load_token_ordering(weights, "masked_embedding.token_ordering", cfg.vocab_size)?,
+        ));
+    }
+    if weights.has("masked_embedding.centroids.weight") {
+        bail!(
+            "config says use_ordered_embeddings=false but the checkpoint ships \
+             masked_embedding.centroids.weight; refusing to silently ignore a trained head"
+        );
+    }
+    Ok((
+        Linear::new(Tensor::zeros((cfg.num_centroids, h), dtype, device)?, None)?,
+        (0..cfg.vocab_size as u32).collect(),
+    ))
+}
+
 fn model_dtype(device: &Device) -> DType {
     if device.is_cuda() {
         DType::BF16
@@ -944,7 +1269,7 @@ mod tests {
 
     fn require<T>(test: &str, what: &str, found: Option<T>) -> Option<T> {
         if found.is_none() {
-            if std::env::var(ALLOW_SKIP).as_deref() != Ok("1") {
+            if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call(ALLOW_SKIP) {
                 panic!(
                     "{test}: no {what}. This test is #[ignore]d, so it runs only when asked for \
                      by name; reporting a pass without the artifact answers a question that was \

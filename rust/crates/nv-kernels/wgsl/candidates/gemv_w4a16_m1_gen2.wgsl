@@ -17,8 +17,6 @@ struct ForgeParams {
 
 const GEN2_LANES: u32 = 32u;
 
-var<workgroup> gen2_red: array<f32, 256>;
-
 fn gen2_nibble(word: u32, elem: u32) -> f32 {
     return f32(u4_unpack(word, elem)) - 8.0;
 }
@@ -46,16 +44,29 @@ fn gen2_dot32(wquad: u32, xquad: u32) -> f32 {
     return a;
 }
 
+fn gen2_group_term(row_sbase: u32, row_wquad_base: u32, v: u32) -> f32 {
+    let sc = bf16_decode(gen2_scale[row_sbase + v]);
+    return sc * gen2_dot32(row_wquad_base + v, v * 4u);
+}
+
+fn gen2_subgroup_sum(acc: f32) -> f32 {
+    var a = acc;
+    a = a + subgroupShuffleXor(a, 16u);
+    a = a + subgroupShuffleXor(a, 8u);
+    a = a + subgroupShuffleXor(a, 4u);
+    a = a + subgroupShuffleXor(a, 2u);
+    a = a + subgroupShuffleXor(a, 1u);
+    return a;
+}
+
 @compute @workgroup_size(256)
 fn gemv_w4a16_m1_gen2_w8(
     @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_invocation_id) lane: u32
 ) {
-    let t = tid.x;
-    let lane = t & (GEN2_LANES - 1u);
-    let warp = t >> 5u;
     let gid = wg.x + wg.y * gen2_params.groups_x;
-    let row = gid * gen2_params.rows_per_group + warp;
+    let row = gid * gen2_params.rows_per_group + sgid;
     let live = row < gen2_params.n_rows;
 
     var acc = 0.0;
@@ -63,25 +74,18 @@ fn gemv_w4a16_m1_gen2_w8(
         let kv = gen2_params.kv;
         let wquad_base = row * (gen2_params.w_row_words >> 2u);
         let sbase = row * kv;
-        for (var j = 0u; j < gen2_params.max_v; j = j + 1u) {
-            let v = lane + j * GEN2_LANES;
-            if (v < kv) {
-                let sc = bf16_decode(gen2_scale[sbase + v]);
-                acc = fma(sc, gen2_dot32(wquad_base + v, v * 4u), acc);
-            }
+        let full = kv / GEN2_LANES;
+        for (var j = 0u; j < full; j = j + 1u) {
+            acc = acc + gen2_group_term(sbase, wquad_base, lane + j * GEN2_LANES);
+        }
+        let tail_v = lane + full * GEN2_LANES;
+        if (tail_v < kv) {
+            acc = acc + gen2_group_term(sbase, wquad_base, tail_v);
         }
     }
 
-    gen2_red[t] = acc;
-    workgroupBarrier();
-    for (var off = GEN2_LANES >> 1u; off > 0u; off = off >> 1u) {
-        if (lane < off) {
-            gen2_red[t] = gen2_red[t] + gen2_red[t + off];
-        }
-        workgroupBarrier();
-    }
-
+    let total = gen2_subgroup_sum(acc);
     if (lane == 0u && live) {
-        gen2_y[row] = bf16_encode(gen2_red[t]);
+        gen2_y[row] = bf16_encode(total);
     }
 }

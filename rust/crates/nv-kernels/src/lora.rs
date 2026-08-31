@@ -2,6 +2,56 @@ use std::ffi::c_void;
 
 pub use crate::lora_meta::{LoraKernelMeta, NO_LORA};
 
+pub const M1_MAX_RANK: usize = 64;
+pub const M1_SHRINK_TILE_K_512_KEEPS_THE_PER_LANE_DRAM_LATENCY_CHAIN_UNDER_10_LOADS: usize = 512;
+pub const M1_SHRINK_MAX_TILES: usize = 64;
+
+pub fn m1_shrink_tiling(k: usize) -> (usize, usize) {
+    let tiles = k
+        .div_ceil(M1_SHRINK_TILE_K_512_KEEPS_THE_PER_LANE_DRAM_LATENCY_CHAIN_UNDER_10_LOADS)
+        .clamp(1, M1_SHRINK_MAX_TILES);
+    let k_tile = k.div_ceil(tiles).next_multiple_of(2);
+    (tiles, k_tile)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn lora_m1_shrink_tiles(
+    stream: *mut c_void,
+    x_bf16: *const u16,
+    a_ptrs: *const u64,
+    partials: *mut f32,
+    n_slices: i32,
+    rank: i32,
+    k: i32,
+    k_tile: i32,
+    n_tiles: i32,
+) -> i32 {
+    crate::nv_kernels_lora_m1_shrink_tiles(
+        stream, x_bf16, a_ptrs, partials, n_slices, rank, k, k_tile, n_tiles,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn lora_m1_expand_tiles(
+    stream: *mut c_void,
+    partials: *const f32,
+    b_ptrs: *const u64,
+    y_bf16: *mut u16,
+    slice_n: *const i32,
+    slice_start: *const i32,
+    n_slices: i32,
+    rank: i32,
+    n_tiles: i32,
+    max_n: i32,
+    win_off: i32,
+    win_len: i32,
+) -> i32 {
+    crate::nv_kernels_lora_m1_expand_tiles(
+        stream, partials, b_ptrs, y_bf16, slice_n, slice_start, n_slices, rank, n_tiles, max_n,
+        win_off, win_len,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn lora_shrink(
     stream: *mut c_void,

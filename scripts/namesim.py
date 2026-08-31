@@ -200,6 +200,19 @@ class UnionFind:
             self.parent[rb] = ra
 
 
+def crate_of(rel_path):
+    parts = rel_path.replace(os.sep, "/").split("/")
+    if len(parts) >= 3 and parts[0] == "rust" and parts[1] == "crates":
+        return parts[2]
+    if len(parts) >= 2 and parts[0] == "rust" and parts[1] == "src":
+        return "rust-src"
+    return parts[0]
+
+
+def cluster_spans_multiple_crates(cluster):
+    return len({crate_of(m["path"]) for m in cluster["members"]}) > 1
+
+
 def build_clusters(defs, include_same_name):
     by_name = {}
     for d in defs:
@@ -343,6 +356,7 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--include-tests", action="store_true")
+    ap.add_argument("--cross-crate-only", action="store_true")
     ap.add_argument("--root", default=REPO_ROOT)
     args = ap.parse_args()
 
@@ -351,6 +365,8 @@ def main():
 
     defs = collect_defs(args.root, args.include_tests)
     clusters = build_clusters(defs, include_same_name=True)
+    if args.cross_crate_only:
+        clusters = [c for c in clusters if cluster_spans_multiple_crates(c)]
 
     if args.json:
         out = {

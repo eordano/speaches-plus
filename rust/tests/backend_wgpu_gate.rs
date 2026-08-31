@@ -472,9 +472,10 @@ fn the_report_names_the_decoder_module_for_every_wgpu_servable_class() {
         assert_eq!(moe["reason"], WGPU_FEATURE_OFF_REASON);
     }
     assert_eq!(
-        moe["decoder"]["evidence"], "architecture-family-only",
-        "upgrade this assert to real-weights evidence only after an actual wgpu decode of this \
-         exact checkpoint is recorded"
+        moe["decoder"]["evidence"], "real-weights-decode",
+        "real_26b_a4b_wgpu_decode (NV_GEMMA4_MOE_WGPU_TEST=1) decodes this exact checkpoint \
+         coherently at 11.13 ms/tok and the serving-decode ppl rows live in perf/runs.jsonl; \
+         downgrading this row to architecture-family-only would un-record that evidence"
     );
 
     for (_, entry) in models {

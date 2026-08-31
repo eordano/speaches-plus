@@ -1,7 +1,9 @@
 #![cfg(feature = "wgpu")]
 
 mod common;
+mod ppl_common;
 use common::bf16_lin;
+use ppl_common::checkpoint_label_from_snapshot_dir;
 use common::have_gpu;
 use common::LcgOddSeedShift33SignedUnit as Lcg;
 use common::norm_vec;
@@ -209,8 +211,46 @@ fn real_snapshot_config_is_supported_by_the_dense_wgpu_module() {
     assert!(!cfg.tie_word_embeddings);
 }
 
+fn hydrated_snapshot_under(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let rd = std::fs::read_dir(root).ok()?;
+    let mut cands: Vec<std::path::PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.join("config.json").is_file()
+                && (p.join("model.safetensors").is_file()
+                    || p.join("model.safetensors.index.json").is_file())
+        })
+        .collect();
+    cands.sort();
+    cands.into_iter().next()
+}
+
+const QWEN35_DENSE_DEFAULT_IS_THE_IG1_NVFP4_SNAPSHOT_BF16_BASE_IS_THE_ESCAPE_ARM: [&str; 2] = [
+    "models--ig1--Qwen3.5-9B-NVFP4",
+    "models--Qwen--Qwen3.5-9B",
+];
+
+fn qwen35_dense_dir_env_override_then_nvfp4_default_then_bf16_base() -> std::path::PathBuf {
+    if let Ok(d) = std::env::var("NV_QWEN35_DENSE_DIR") {
+        return std::path::PathBuf::from(d);
+    }
+    let hub = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".cache/huggingface/hub");
+    QWEN35_DENSE_DEFAULT_IS_THE_IG1_NVFP4_SNAPSHOT_BF16_BASE_IS_THE_ESCAPE_ARM
+        .iter()
+        .find_map(|repo| hydrated_snapshot_under(&hub.join(repo).join("snapshots")))
+        .unwrap_or_else(|| {
+            panic!(
+                "no hydrated snapshot under {hub:?} for any of \
+                 {QWEN35_DENSE_DEFAULT_IS_THE_IG1_NVFP4_SNAPSHOT_BF16_BASE_IS_THE_ESCAPE_ARM:?}; \
+                 set NV_QWEN35_DENSE_DIR"
+            )
+        })
+}
+
 #[test]
-#[ignore = "loads ~17 GB of bf16 weights; set NV_QWEN35_DENSE_WGPU_TEST=1"]
+#[ignore = "loads the 10.4 GiB ig1 Qwen3.5-9B NVFP4 by default (bf16 base via NV_QWEN35_DENSE_DIR); set NV_QWEN35_DENSE_WGPU_TEST=1"]
 fn qwen35_dense_wgpu_real_weights_decode() {
     if std::env::var("NV_QWEN35_DENSE_WGPU_TEST").is_err() {
         eprintln!("[skip] NV_QWEN35_DENSE_WGPU_TEST not set");
@@ -219,19 +259,7 @@ fn qwen35_dense_wgpu_real_weights_decode() {
     if !have_gpu() {
         panic!("real-weights test needs a wgpu adapter");
     }
-    let dir = match std::env::var("NV_QWEN35_DENSE_DIR") {
-        Ok(d) => std::path::PathBuf::from(d),
-        Err(_) => {
-            let root = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-                .join(".cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots");
-            std::fs::read_dir(&root)
-                .expect("snapshots dir")
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| p.join("config.json").exists())
-                .expect("hydrated snapshot")
-        }
-    };
+    let dir = qwen35_dense_dir_env_override_then_nvfp4_default_then_bf16_base();
     let cfg = Qwen3_5DenseConfig::from_hf_json_file(&dir.join("config.json")).expect("config");
     let loader =
         nv_weights::WeightLoader::open_dir(&dir, &candle_core::Device::Cpu).expect("loader");
@@ -253,27 +281,48 @@ fn qwen35_dense_wgpu_real_weights_decode() {
         .expect("encode")
         .get_ids()
         .to_vec();
+    let t_pf = std::time::Instant::now();
     let mut last = 0u32;
     for t in &ids {
         last = model.decode_step(*t).expect("prefill step");
     }
+    let ttft_s = t_pf.elapsed().as_secs_f64();
     let n_new: usize = std::env::var("NV_QWEN35_DENSE_NEW")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(24);
     let mut out_ids: Vec<u32> = Vec::new();
+    let mut step_ms: Vec<f64> = Vec::new();
     let t1 = std::time::Instant::now();
     for _ in 0..n_new {
         out_ids.push(last);
         if last == cfg.eos_token_id {
             break;
         }
+        let ts = std::time::Instant::now();
         last = model.decode_step(last).expect("decode step");
+        step_ms.push(ts.elapsed().as_secs_f64() * 1e3);
     }
-    let per_tok = t1.elapsed().as_secs_f64() * 1000.0 / out_ids.len().max(1) as f64;
+    let wall_s = t1.elapsed().as_secs_f64();
+    let per_tok = wall_s * 1000.0 / out_ids.len().max(1) as f64;
     let text = tokenizer.decode(&out_ids, true).unwrap_or_default();
     eprintln!("[real] token_ids={out_ids:?}");
     eprintln!("[real] {per_tok:.1} ms/token; continuation: {text:?}");
+    let mut sorted = step_ms.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median_ms = sorted.get(sorted.len() / 2).copied().unwrap_or(per_tok);
+    let label = checkpoint_label_from_snapshot_dir(&dir);
+    println!(
+        "GEN-ARM qwen35-dense-wgpu checkpoint={label} backend=wgpu batch=1 prefill_tokens={} \
+         gen={} ttft_s={ttft_s:.3} prefill_tok_s={:.1} decode_steps={} \
+         decode_median_ms={median_ms:.3} decode_tok_s={:.1} \
+         basis=greedy_m1_prefill_then_decode_no_warmup",
+        ids.len(),
+        out_ids.len(),
+        ids.len() as f64 / ttft_s,
+        step_ms.len(),
+        step_ms.len() as f64 / wall_s.max(1e-9)
+    );
     nozi_prof_dump();
     assert!(
         text.to_lowercase().contains("paris"),
@@ -363,4 +412,59 @@ fn tiny_wgpu_chunked_prefill_matches_m1_loop_and_reference() {
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
     eprintln!("[chunk] short-prompt logits bit diff lanes: {sdiff}");
+}
+
+#[test]
+fn requant_fp8_rowscale_chunks_concatenate_bit_identical_to_the_unchunked_quantizer() {
+    let n = q3d::REQUANT_ROW_CHUNK_IS_A_MULTIPLE_OF_THE_128_ROW_SCALE_SWIZZLE_TILE_SO_CHUNK_SCALE_BUFFERS_CONCATENATE
+        * 2
+        + 128;
+    let k = 128usize;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut bytes = Vec::with_capacity(n * k);
+    for _ in 0..n * k {
+        let mut b = (next() & 0xff) as u8;
+        if b & 0x7f == 0x7f {
+            b &= 0x7e;
+        }
+        bytes.push(b);
+    }
+    let scales: Vec<f32> = (0..n).map(|r| 0.5 + (r % 97) as f32 * 0.01).collect();
+    let packed: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let got = q3d::requant_fp8_rowscale_to_nvfp4(&packed, &scales, n, k)
+        .expect("requant on aligned shapes");
+
+    let dq = nv_quant::fp8::dequantize_e4m3_per_row(&bytes, n, k, &scales).expect("dequant");
+    let rows: Vec<Vec<f32>> = dq.chunks_exact(k).map(<[f32]>::to_vec).collect();
+    let amax = dq.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let stored_global = (448.0f32 * 6.0) / amax;
+    let whole = nv_quant::nvfp4::Nvfp4Tensor::quantize_rows_with_global(&rows, stored_global);
+
+    assert_eq!(got.n, n);
+    assert_eq!(got.k, k);
+    assert!(
+        (got.alpha - 1.0 / stored_global).abs() <= f32::EPSILON * got.alpha.abs(),
+        "alpha {} != 1/global {}",
+        got.alpha,
+        1.0 / stored_global
+    );
+    assert_eq!(
+        got.packed, whole.data,
+        "chunked nvfp4 codes differ from the unchunked quantizer"
+    );
+    assert_eq!(
+        got.scales_swizzled,
+        whole.scales_swizzled(),
+        "chunk-concatenated swizzled scales differ from the unchunked swizzle"
+    );
 }

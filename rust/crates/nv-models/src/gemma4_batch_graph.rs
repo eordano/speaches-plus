@@ -108,6 +108,8 @@ mod graphed {
     use super::capture_stream::CaptureStream;
     use super::*;
     use crate::gemma4::{Gemma4, LayerType};
+    use crate::host_serving_util::CachedPinnedHostStagingViaCuMemHostAllocFlags0BecauseCudarcAllocPinnedIsWriteCombinedAndHostReadsOfWcAreUncachedAndPageableDtohReallocatesEveryStep as CachedPinnedHostStaging;
+    use crate::host_serving_util::{DeviceArgmaxTokenExit, InGraphPhaseEventLadder};
     use crate::paged_fp8::PagedKvFp8Pool;
     use anyhow::anyhow;
     use candle_core::{DType, Device, Tensor};
@@ -138,6 +140,48 @@ mod graphed {
         host_n_total: Box<[i32; 1]>,
     }
 
+    fn phase_event_ladder_enabled_env_nv_g4_phase_events() -> bool {
+        nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_G4_PHASE_EVENTS")
+    }
+
+    fn lmhead_i8_step_arm_enabled_env_nv_g4_lmhead_i8_default_off_because_i8_logits_are_not_bit_identical_to_bf16(
+    ) -> bool {
+        crate::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_G4_LMHEAD_I8")
+    }
+
+    fn step_norm_fused_arm_enabled_env_nv_g4_step_norm_fused_default_off_because_the_fused_reduction_order_differs_from_the_eager_norm_pair(
+    ) -> bool {
+        crate::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_G4_STEP_NORM_FUSED")
+    }
+
+    fn qknorm_rope_fused_arm_enabled_env_nv_g4_qknorm_rope_fused_default_off_until_bitwise_parity_with_the_eager_norm_rope_chain_is_proven(
+    ) -> bool {
+        crate::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_G4_QKNORM_ROPE_FUSED")
+    }
+
+    extern "C" {
+        fn nv_kernels_g4_qknorm_rope_vnorm_bf16(
+            stream: *mut std::ffi::c_void,
+            q_raw: *const u16,
+            k_raw: *const u16,
+            v_raw: *const u16,
+            q_norm_w: *const u16,
+            k_norm_w: *const u16,
+            v_norm_w: *const u16,
+            cos_tab: *const f32,
+            sin_tab: *const f32,
+            positions: *const i32,
+            q_out: *mut u16,
+            k_out: *mut u16,
+            v_out: *mut u16,
+            batch: i32,
+            n_q: i32,
+            n_kv: i32,
+            hd: i32,
+            eps: f32,
+        ) -> i32;
+    }
+
     pub struct Gemma4BatchGraphFamily {
         model: Arc<Gemma4>,
         pool: Arc<Mutex<PagedKvFp8Pool>>,
@@ -161,6 +205,9 @@ mod graphed {
         captures: u64,
         replays: u64,
         lora: Option<LoraArm>,
+        phase: Option<InGraphPhaseEventLadder>,
+        rows_host: CachedPinnedHostStaging<bf16>,
+        argmax_exit: Option<DeviceArgmaxTokenExit>,
     }
 
     struct BodyArgs<'a> {
@@ -176,6 +223,14 @@ mod graphed {
         logits_buf: &'a mut CudaSlice<bf16>,
         scratch: &'a mut CudaSlice<f32>,
         fan_in: &'a mut CudaSlice<u32>,
+        phase: &'a mut Option<InGraphPhaseEventLadder>,
+    }
+
+    fn pm(a: &mut BodyArgs, s: &Arc<CudaStream>, label: &'static str) -> Result<()> {
+        if let Some(l) = a.phase.as_mut() {
+            l.mark(s, label)?;
+        }
+        Ok(())
     }
 
     impl Gemma4BatchGraphFamily {
@@ -235,7 +290,9 @@ mod graphed {
             let capture_stream = capture.stream().clone();
 
             let alloc = |n: usize| -> Result<CudaSlice<bf16>> {
-                capture_stream.alloc_zeros::<bf16>(n).map_err(|e| anyhow!(e))
+                capture_stream
+                    .alloc_zeros::<bf16>(n)
+                    .map_err(|e| anyhow!(e))
             };
             let mut slots = Vec::with_capacity(b_max);
             for _ in 0..b_max {
@@ -243,21 +300,36 @@ mod graphed {
                     table_dev: capture_stream
                         .alloc_zeros::<i32>(max_rows)
                         .map_err(|e| anyhow!(e))?,
-                    start_dev: capture_stream.alloc_zeros::<i32>(1).map_err(|e| anyhow!(e))?,
-                    n_total_dev: capture_stream.alloc_zeros::<i32>(1).map_err(|e| anyhow!(e))?,
+                    start_dev: capture_stream
+                        .alloc_zeros::<i32>(1)
+                        .map_err(|e| anyhow!(e))?,
+                    n_total_dev: capture_stream
+                        .alloc_zeros::<i32>(1)
+                        .map_err(|e| anyhow!(e))?,
                     host_table: vec![0i32; max_rows].into_boxed_slice(),
                     host_start: Box::new([0i32; 1]),
                     host_n_total: Box::new([1i32; 1]),
                 });
             }
-            let token_buf = capture_stream.alloc_zeros::<u32>(b_max).map_err(|e| anyhow!(e))?;
-            let pos_buf = capture_stream.alloc_zeros::<i32>(b_max).map_err(|e| anyhow!(e))?;
+            let token_buf = capture_stream
+                .alloc_zeros::<u32>(b_max)
+                .map_err(|e| anyhow!(e))?;
+            let pos_buf = capture_stream
+                .alloc_zeros::<i32>(b_max)
+                .map_err(|e| anyhow!(e))?;
             let logits_buf = alloc(b_max * vocab)?;
             let scratch_elems = crate::paged_fp8::flash_scratch_elems_for(n_q, hd_max);
             let scratch = capture_stream
                 .alloc_zeros::<f32>(scratch_elems)
                 .map_err(|e| anyhow!(e))?;
-            let fan_in = capture_stream.alloc_zeros::<u32>(n_q).map_err(|e| anyhow!(e))?;
+            let fan_in = capture_stream
+                .alloc_zeros::<u32>(n_q)
+                .map_err(|e| anyhow!(e))?;
+            let rows_host =
+                CachedPinnedHostStaging::alloc_cu_mem_host_alloc_flags0_cached_page_locked(
+                    &capture_stream.context(),
+                    b_max * vocab,
+                )?;
             capture_stream.synchronize().map_err(|e| anyhow!(e))?;
 
             Ok(Self {
@@ -283,6 +355,10 @@ mod graphed {
                 captures: 0,
                 replays: 0,
                 lora: None,
+                phase: phase_event_ladder_enabled_env_nv_g4_phase_events()
+                    .then(|| InGraphPhaseEventLadder::new("g4-phase")),
+                rows_host,
+                argmax_exit: None,
             })
         }
 
@@ -354,6 +430,77 @@ mod graphed {
         }
 
         pub fn step(&mut self, active: &[SlotUpdate]) -> Result<Vec<Vec<f32>>> {
+            let was_cached = self.step_replay_leaving_logits_rows_on_device(active)?;
+            let n_active = active.len() * self.vocab;
+            {
+                let stream = self.capture.stream().clone();
+                let src = self.logits_buf.slice(0..n_active);
+                stream
+                    .memcpy_dtoh(&src, &mut self.rows_host.as_mut_slice()[..n_active])
+                    .map_err(|e| anyhow!("dtoh logits rows: {e:?}"))?;
+                stream
+                    .synchronize()
+                    .map_err(|e| anyhow!("dtoh logits rows landed sync: {e:?}"))?;
+            }
+            self.accumulate_phase_ladder_after_the_step_results_landed_on_host(was_cached);
+            let host = &self.rows_host.as_slice()[..n_active];
+            let mut out = Vec::with_capacity(active.len());
+            for i in 0..active.len() {
+                let row = &host[i * self.vocab..(i + 1) * self.vocab];
+                out.push(row.iter().map(|x| x.to_f32()).collect());
+            }
+            Ok(out)
+        }
+
+        pub fn step_argmax_tokens_on_device_skipping_the_rows_dtoh_and_bf16_to_f32_host_convert(
+            &mut self,
+            active: &[SlotUpdate],
+        ) -> Result<Vec<u32>> {
+            let was_cached = self.step_replay_leaving_logits_rows_on_device(active)?;
+            let toks = self.device_argmax_rows_of_the_last_step_logits(active.len())?;
+            self.accumulate_phase_ladder_after_the_step_results_landed_on_host(was_cached);
+            Ok(toks)
+        }
+
+        pub fn device_argmax_rows_of_the_last_step_logits(
+            &mut self,
+            rows_active: usize,
+        ) -> Result<Vec<u32>> {
+            anyhow::ensure!(
+                rows_active >= 1 && rows_active <= self.plan.max_bucket(),
+                "device argmax rows {rows_active} out of 1..={}",
+                self.plan.max_bucket()
+            );
+            let stream = self.capture.stream().clone();
+            if self.argmax_exit.is_none() {
+                self.argmax_exit = Some(DeviceArgmaxTokenExit::alloc_scratch_and_sync_rows(
+                    &stream.context(),
+                    &stream,
+                    self.plan.max_bucket(),
+                    self.vocab,
+                )?);
+            }
+            self.argmax_exit
+                .as_mut()
+                .unwrap()
+                .next_tokens_argmax_rows_on_device(&stream, &self.logits_buf, rows_active)
+        }
+
+        fn accumulate_phase_ladder_after_the_step_results_landed_on_host(
+            &mut self,
+            was_cached: bool,
+        ) {
+            if was_cached {
+                if let Some(l) = self.phase.as_mut() {
+                    l.accumulate_replayed_step_and_dump_when_due();
+                }
+            }
+        }
+
+        fn step_replay_leaving_logits_rows_on_device(
+            &mut self,
+            active: &[SlotUpdate],
+        ) -> Result<bool> {
             if active.is_empty() {
                 bail!("Gemma4BatchGraphFamily.step: empty batch");
             }
@@ -430,8 +577,12 @@ mod graphed {
                 scratch,
                 fan_in,
                 runners,
+                phase,
                 ..
             } = self;
+            if let Some(l) = phase.as_mut() {
+                l.begin_step_rewinds_cursor_over_the_captured_events();
+            }
             let mut args = BodyArgs {
                 model: model.as_ref(),
                 pool: pool.as_ref(),
@@ -445,6 +596,7 @@ mod graphed {
                 logits_buf,
                 scratch,
                 fan_in,
+                phase,
             };
 
             if need_warm {
@@ -467,19 +619,7 @@ mod graphed {
             } else {
                 self.captures += 1;
             }
-            self.capture.stream().synchronize().map_err(|e| anyhow!(e))?;
-
-            let host: Vec<bf16> = self
-                .capture
-                .stream()
-                .clone_dtoh(&self.logits_buf)
-                .map_err(|e| anyhow!(e))?;
-            let mut out = Vec::with_capacity(active.len());
-            for i in 0..active.len() {
-                let row = &host[i * self.vocab..(i + 1) * self.vocab];
-                out.push(row.iter().map(|x| x.to_f32()).collect());
-            }
-            Ok(out)
+            Ok(was_cached)
         }
     }
 
@@ -501,6 +641,7 @@ mod graphed {
             Device::Cuda(d) => d.clone(),
             _ => bail!("cuda device required"),
         };
+        pm(a, s, "t0")?;
 
         {
             let mut dst = a.token_buf.slice_mut(0..b);
@@ -549,17 +690,42 @@ mod graphed {
         let model = a.model;
         let cfg = model.config();
         let hidden_size = cfg.hidden_size;
+        pm(a, s, "htod_params")?;
         let x_flat =
             crate::gemma4::embed_lookup_bf16_op(model.embed_weight(), &tokens_t, a.device)?;
         let x = x_flat.reshape((1usize, b, hidden_size))?;
         let mut hidden = crate::gemma4::scale_bf16_op(&x, model.embed_scale(), a.device)?;
+        pm(a, s, "embed")?;
 
         for li in 0..model.layers().len() {
             hidden = layer_body(s, a, &dev, li, &hidden, &positions_t)?;
         }
 
-        let normed = model.final_norm().forward(&hidden)?;
-        let logits = model.lm_head().forward(&normed)?;
+        let logits = if lmhead_i8_step_arm_enabled_env_nv_g4_lmhead_i8_default_off_because_i8_logits_are_not_bit_identical_to_bf16()
+        {
+            let Some((wq, rs)) =
+                model.lm_head_i8_quantized_copy_absent_when_nv_verify_lmhead_int8_is_0()
+            else {
+                bail!(
+                    "NV_G4_LMHEAD_I8=1 needs the i8 lm_head copy; it is absent because \
+                     NV_VERIFY_LMHEAD_INT8=0 disabled building it"
+                );
+            };
+            anyhow::ensure!(
+                b <= 8,
+                "lm_head i8 mk kernel serves at most 8 rows per call, bucket is {b}"
+            );
+            let hflat = hidden.reshape((b, hidden_size))?;
+            let rstd = crate::gemma4_e4b::rstd_op(&hflat, cfg.rms_norm_eps as f32)?;
+            let wn = model.final_norm().weight_bf16();
+            nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
+                wq, rs, &hflat, wn, &rstd, b, &dev,
+            )?
+        } else {
+            let normed = model.final_norm().forward(&hidden)?;
+            model.lm_head().forward(&normed)?
+        };
+        pm(a, s, "final_norm_lm_head")?;
         let lc = logits.contiguous()?;
         let (ls, ll) = lc.storage_and_layout();
         let lcuda = match &*ls {
@@ -572,7 +738,151 @@ mod graphed {
         let src = lsl.slice(off..off + n);
         let mut dst = a.logits_buf.slice_mut(0..n);
         s.memcpy_dtod(&src, &mut dst).map_err(|e| anyhow!(e))?;
+        pm(a, s, "logits_dtod")?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qknorm_rope_vnorm_fused_op(
+        s: &Arc<CudaStream>,
+        dev: &candle_core::CudaDevice,
+        attn: &crate::gemma4::Gemma4Attention,
+        rope: &nv_layers::rope::Rope,
+        q_raw: &Tensor,
+        k_raw: &Tensor,
+        v_raw: &Tensor,
+        positions_t: &Tensor,
+        b: usize,
+        n_q: usize,
+        n_kv: usize,
+        hd: usize,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        if crate::hadamard_kv::hadamard_kv_enabled() {
+            return Ok(None);
+        }
+        if hd % 2 != 0 || hd > 4096 || rope.config().head_dim != hd {
+            return Ok(None);
+        }
+        let eps = attn.q_norm.eps();
+        if attn.k_norm.eps() != eps || attn.v_norm.eps() != eps {
+            return Ok(None);
+        }
+        if q_raw.dtype() != DType::BF16
+            || k_raw.dtype() != DType::BF16
+            || v_raw.dtype() != DType::BF16
+        {
+            return Ok(None);
+        }
+        if q_raw.elem_count() != b * n_q * hd
+            || k_raw.elem_count() != b * n_kv * hd
+            || v_raw.elem_count() != b * n_kv * hd
+        {
+            return Ok(None);
+        }
+        let qw = attn.q_norm.weight_bf16();
+        let kw = attn.k_norm.weight_bf16();
+        let vw = attn.v_norm.weight_bf16();
+        if qw.elem_count() != hd || kw.elem_count() != hd || vw.elem_count() != hd {
+            return Ok(None);
+        }
+        let q_c = q_raw.contiguous()?;
+        let k_c = k_raw.contiguous()?;
+        let v_c = v_raw.contiguous()?;
+        let cos_c = rope.cos().contiguous()?;
+        let sin_c = rope.sin().contiguous()?;
+        if cos_c.dtype() != DType::F32 || sin_c.dtype() != DType::F32 {
+            return Ok(None);
+        }
+        let mut q_out = unsafe { s.alloc::<bf16>(b * n_q * hd).map_err(|e| anyhow!(e))? };
+        let mut k_out = unsafe { s.alloc::<bf16>(b * n_kv * hd).map_err(|e| anyhow!(e))? };
+        let mut v_out = unsafe { s.alloc::<bf16>(b * n_kv * hd).map_err(|e| anyhow!(e))? };
+        let rc = {
+            let cuda_slice_bf16 = |t: &Tensor| -> Result<(u64, usize)> {
+                let (st, l) = t.storage_and_layout();
+                let c = match &*st {
+                    candle_core::Storage::Cuda(c) => {
+                        c.as_cuda_slice::<bf16>()?.slice(l.start_offset()..)
+                    }
+                    _ => bail!("fused qknorm_rope: tensor not on cuda"),
+                };
+                let (p, _g) = c.device_ptr(s);
+                Ok((p, l.start_offset()))
+            };
+            let (pq, _) = cuda_slice_bf16(&q_c)?;
+            let (pk, _) = cuda_slice_bf16(&k_c)?;
+            let (pv, _) = cuda_slice_bf16(&v_c)?;
+            let (pqw, _) = cuda_slice_bf16(qw)?;
+            let (pkw, _) = cuda_slice_bf16(kw)?;
+            let (pvw, _) = cuda_slice_bf16(vw)?;
+            let cuda_slice_f32 = |t: &Tensor| -> Result<u64> {
+                let (st, l) = t.storage_and_layout();
+                let c = match &*st {
+                    candle_core::Storage::Cuda(c) => {
+                        c.as_cuda_slice::<f32>()?.slice(l.start_offset()..)
+                    }
+                    _ => bail!("fused qknorm_rope: table not on cuda"),
+                };
+                let (p, _g) = c.device_ptr(s);
+                Ok(p)
+            };
+            let pc = cuda_slice_f32(&cos_c)?;
+            let ps = cuda_slice_f32(&sin_c)?;
+            let ppos = {
+                let (st, l) = positions_t.storage_and_layout();
+                let c = match &*st {
+                    candle_core::Storage::Cuda(c) => {
+                        c.as_cuda_slice::<i32>()?.slice(l.start_offset()..)
+                    }
+                    _ => bail!("fused qknorm_rope: positions not on cuda"),
+                };
+                let (p, _g) = c.device_ptr(s);
+                p
+            };
+            let (pqo, _g1) = q_out.device_ptr_mut(s);
+            let (pko, _g2) = k_out.device_ptr_mut(s);
+            let (pvo, _g3) = v_out.device_ptr_mut(s);
+            unsafe {
+                nv_kernels_g4_qknorm_rope_vnorm_bf16(
+                    s.cu_stream() as *mut _,
+                    pq as *const u16,
+                    pk as *const u16,
+                    pv as *const u16,
+                    pqw as *const u16,
+                    pkw as *const u16,
+                    pvw as *const u16,
+                    pc as *const f32,
+                    ps as *const f32,
+                    ppos as *const i32,
+                    pqo as *mut u16,
+                    pko as *mut u16,
+                    pvo as *mut u16,
+                    b as i32,
+                    n_q as i32,
+                    n_kv as i32,
+                    hd as i32,
+                    eps as f32,
+                )
+            }
+        };
+        anyhow::ensure!(
+            rc == 0,
+            "nv_kernels_g4_qknorm_rope_vnorm_bf16 returned {rc}"
+        );
+        let wrap = |slice: CudaSlice<bf16>, heads: usize| -> Tensor {
+            let st = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+            Tensor::from_storage(
+                candle_core::Storage::Cuda(st),
+                (1usize, b, heads, hd),
+                candle_core::op::BackpropOp::none(),
+                false,
+            )
+        };
+        Ok(Some((
+            wrap(q_out, n_q),
+            wrap(k_out, n_kv),
+            wrap(v_out, n_kv),
+        )))
     }
 
     fn layer_body(
@@ -604,18 +914,35 @@ mod graphed {
         let residual_attn = x.clone();
         let normed_pre_attn = layer.input_layernorm.forward(x)?;
         let (q_raw, k_raw, v_raw) = attn.qkv_forward(&normed_pre_attn)?;
-        let q = q_raw.reshape((1usize, b, n_q, head_dim))?;
-        let q_normed = attn.q_norm.forward(&q)?;
-        let k = k_raw.reshape((1usize, b, n_kv, head_dim))?;
-        let k_normed = attn.k_norm.forward(&k)?;
-        let v = v_raw.reshape((1usize, b, n_kv, head_dim))?;
-        let v_normed = attn.v_norm.forward(&v)?;
+        pm(a, s, "qkv_proj")?;
+        let fused_qkr = if qknorm_rope_fused_arm_enabled_env_nv_g4_qknorm_rope_fused_default_off_until_bitwise_parity_with_the_eager_norm_rope_chain_is_proven()
+        {
+            qknorm_rope_vnorm_fused_op(
+                s, dev, attn, rope, &q_raw, &k_raw, &v_raw, positions_t, b, n_q, n_kv, head_dim,
+            )?
+        } else {
+            None
+        };
+        let (q_rot, k_rot, v_for_cache) = match fused_qkr {
+            Some(t) => t,
+            None => {
+                let q = q_raw.reshape((1usize, b, n_q, head_dim))?;
+                let q_normed = attn.q_norm.forward(&q)?;
+                let k = k_raw.reshape((1usize, b, n_kv, head_dim))?;
+                let k_normed = attn.k_norm.forward(&k)?;
+                let v = v_raw.reshape((1usize, b, n_kv, head_dim))?;
+                let v_normed = attn.v_norm.forward(&v)?;
 
-        let (q_rot, k_rot) = rope.apply(&q_normed, &k_normed, positions_t)?;
-        let (q_rot, k_rot) = crate::hadamard_kv::maybe_rotate_qk(q_rot, k_rot, head_dim)?;
-        let q_rot = q_rot.contiguous()?;
-        let k_rot = k_rot.contiguous()?;
-        let v_for_cache = v_normed.contiguous()?;
+                let (q_rot, k_rot) = rope.apply(&q_normed, &k_normed, positions_t)?;
+                let (q_rot, k_rot) = crate::hadamard_kv::maybe_rotate_qk(q_rot, k_rot, head_dim)?;
+                (
+                    q_rot.contiguous()?,
+                    k_rot.contiguous()?,
+                    v_normed.contiguous()?,
+                )
+            }
+        };
+        pm(a, s, "qknorm_rope")?;
 
         let row_elems = n_q * head_dim;
         let mut out_slice = unsafe { s.alloc::<bf16>(b * row_elems).map_err(|e| anyhow!(e))? };
@@ -638,6 +965,9 @@ mod graphed {
                 .map_err(|_| anyhow!("Gemma4BatchGraphFamily: kv pool mutex poisoned"))?;
             let block_size = p.config().block_size;
             p.append_layer(li, &k_i, &v_i, 1, &slot.start_dev, &slot.table_dev)?;
+            if let Some(l) = a.phase.as_mut() {
+                l.mark(s, "kv_append")?;
+            }
             p.decode_attention_paged_into(
                 li,
                 q_slice,
@@ -653,6 +983,9 @@ mod graphed {
                 window,
                 1.0,
             )?;
+            if let Some(l) = a.phase.as_mut() {
+                l.mark(s, "attn_kernel")?;
+            }
         }
 
         let attn_flat = {
@@ -665,19 +998,46 @@ mod graphed {
             )
         };
         let attn_out = attn.o_proj.forward(&attn_flat)?;
-        let attn_post = layer.post_attention_layernorm.forward(&attn_out)?;
-        let (normed_pre_mlp, after_attn) = layer
-            .pre_feedforward_layernorm
-            .forward_residual(&attn_post, &residual_attn)?;
+        pm(a, s, "o_proj")?;
+        let step_norm_fused =
+            step_norm_fused_arm_enabled_env_nv_g4_step_norm_fused_default_off_because_the_fused_reduction_order_differs_from_the_eager_norm_pair();
+        let (normed_pre_mlp, after_attn) = if step_norm_fused {
+            crate::gemma4::verify_post_attn_pre_ff(
+                &layer.post_attention_layernorm,
+                &layer.pre_feedforward_layernorm,
+                &attn_out,
+                &residual_attn,
+                a.device,
+            )?
+        } else {
+            let attn_post = layer.post_attention_layernorm.forward(&attn_out)?;
+            layer
+                .pre_feedforward_layernorm
+                .forward_residual(&attn_post, &residual_attn)?
+        };
+        pm(a, s, "mid_norms")?;
         let residual_mlp = after_attn.clone();
         let mlp_out = crate::gemma4::mlp_forward(&layer.mlp, &normed_pre_mlp)?;
-        let mlp_post = layer.post_feedforward_layernorm.forward(&mlp_out)?;
-        crate::gemma4::residual_add_scale_bf16_op(
-            &residual_mlp,
-            &mlp_post,
-            layer.layer_scalar_host,
-            a.device,
-        )
+        pm(a, s, "mlp")?;
+        let out = if step_norm_fused {
+            Ok(crate::gemma4::verify_post_ff_residual(
+                &layer.post_feedforward_layernorm,
+                &mlp_out,
+                &residual_mlp,
+                layer.layer_scalar_host,
+                a.device,
+            )?)
+        } else {
+            let mlp_post = layer.post_feedforward_layernorm.forward(&mlp_out)?;
+            crate::gemma4::residual_add_scale_bf16_op(
+                &residual_mlp,
+                &mlp_post,
+                layer.layer_scalar_host,
+                a.device,
+            )
+        };
+        pm(a, s, "tail_norm_res")?;
+        out
     }
 }
 
@@ -729,7 +1089,10 @@ mod tests {
     fn shape_token_is_one_graph_per_batch_size() {
         let mut seen = std::collections::HashSet::new();
         for &b in &[1usize, 2, 4, 8] {
-            assert!(seen.insert(shape_token(b)), "batch {b} collided with an earlier graph");
+            assert!(
+                seen.insert(shape_token(b)),
+                "batch {b} collided with an earlier graph"
+            );
         }
         assert_eq!(seen.len(), 4);
     }

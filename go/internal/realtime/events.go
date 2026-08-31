@@ -2,6 +2,8 @@ package realtime
 
 import (
 	"encoding/json"
+
+	"github.com/eordano/speaches-plus-go/internal/wire"
 )
 
 type ClientEventType string
@@ -490,12 +492,10 @@ type responseFunctionCallArgumentsDoneEvent struct {
 }
 
 type responseToolProgressEvent struct {
-	EventID     string          `json:"event_id"`
-	Type        ServerEventType `json:"type"`
-	ResponseID  string          `json:"response_id"`
-	ItemID      string          `json:"item_id"`
-	OutputIndex int             `json:"output_index"`
-	Progress    json.RawMessage `json:"progress"`
+	EventID    string                   `json:"event_id"`
+	Type       ServerEventType          `json:"type"`
+	ResponseID string                   `json:"response_id"`
+	Tools      []wire.ToolProgressEntry `json:"tools"`
 }
 
 type responseCancelledEvent struct {

@@ -1,8 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """run_fixture -- RFC v3 §15.6 conformance fixture runner.
 
 Drives a fixture under <repo>/conformance/fixtures/<name>/ against the

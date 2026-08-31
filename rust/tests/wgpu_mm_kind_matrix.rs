@@ -71,14 +71,14 @@ mod gated {
             "every kind must land in exactly one column"
         );
         assert_eq!(
-            serves, 3,
-            "gemma4-dense, gemma4-moe and qwen3.5-dense pair an embed-row prefill entry with a \
-             tower this tree can load"
+            serves, 4,
+            "gemma4-dense, gemma4-moe, qwen3.5-dense and qwen3.5-moe pair an embed-row prefill \
+             entry with a tower this tree can load"
         );
         assert_eq!(
-            refuses, 4,
-            "gemma4-e4b and qwen3.5-moe are missing one half each, laguna and gpt-oss have no \
-             media checkpoint at all"
+            refuses, 3,
+            "gemma4-e4b is missing its embed-row prefill entry, laguna and gpt-oss have no media \
+             checkpoint at all"
         );
     }
 
@@ -94,6 +94,10 @@ mod gated {
         );
         assert_eq!(
             embed_row_route(WgpuModelKind::Qwen3_5Dense),
+            Ok(MmRoute::Qwen3Vision)
+        );
+        assert_eq!(
+            embed_row_route(WgpuModelKind::Qwen3_5Moe),
             Ok(MmRoute::Qwen3Vision)
         );
     }

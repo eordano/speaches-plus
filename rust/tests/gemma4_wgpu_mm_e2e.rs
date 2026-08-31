@@ -282,7 +282,7 @@ mod gated {
             Arc::new(WgpuChatEngine::load(&dir).expect("wgpu engine load"));
         let model = engine.model_id().to_string();
         std::env::set_var(
-            speaches_plus::oapi::chat_engine_wgpu::PREFIX_REUSE_ENV,
+            speaches_plus::oapi::chat_engine_wgpu::PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM,
             "1",
         );
 
@@ -294,7 +294,7 @@ mod gated {
             warm.cached_tokens > 0,
             "text-then-same-text must reuse KV with {}=1, otherwise this suite proves nothing \
              about what a media request leaves behind: {}",
-            speaches_plus::oapi::chat_engine_wgpu::PREFIX_REUSE_ENV,
+            speaches_plus::oapi::chat_engine_wgpu::PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM,
             warm.body
         );
 
@@ -334,7 +334,7 @@ mod gated {
             "the text answer after a media request must equal the cold answer; a different \
              answer means the image's KV rows were reused"
         );
-        std::env::remove_var(speaches_plus::oapi::chat_engine_wgpu::PREFIX_REUSE_ENV);
+        std::env::remove_var(speaches_plus::oapi::chat_engine_wgpu::PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM);
     }
 
     #[test]

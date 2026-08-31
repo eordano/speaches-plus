@@ -6,7 +6,7 @@ use common::ctx;
 use nv_kernels::wgpu_backend::device::WgpuContext;
 use nv_kernels::wgpu_backend::kernels::flash_decode as fd;
 use nv_kernels::wgpu_backend::compose;
-use nv_models::gemma4_e4b_wgpu::{flash1_e4b_entry, flash1_e4b_source, flash1_sg_supported};
+use nv_models::gemma4_e4b_wgpu::flash1_sg_supported;
 
 fn parity_at(c: &WgpuContext, s: Shape, sg: bool, fold: u32, seed: u64) {
     let group = s.n_q / s.n_kv;
@@ -23,9 +23,9 @@ fn parity_at(c: &WgpuContext, s: Shape, sg: bool, fold: u32, seed: u64) {
         &format!(
             "{}\n{}",
             compose(fd::WGSL),
-            flash1_e4b_source(s.hd, sg)
+            fd::fold_stage1_source(s.hd, sg, 1)
         ),
-        &flash1_e4b_entry(s.hd, sg),
+        &fd::fold_stage1_entry(s.hd, sg, 1),
         s.n_q,
     );
     let folded = stage1_scratch(

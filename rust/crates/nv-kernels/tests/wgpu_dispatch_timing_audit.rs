@@ -122,13 +122,15 @@ fn least_squares_fit(points: &[(f64, f64)]) -> (f64, f64) {
 }
 
 #[test]
+#[ignore = "GPU-exclusive wall-clock audit, idle-gate first; set NV_DISPATCH_AUDIT=1 -- checks the host-observed sequential-dispatch marginal cost against the published floor"]
 fn wgpu_sequential_dispatch_marginal_cost_matches_published_floor() {
     if !audit_enabled() {
-        eprintln!(
-            "wgpu_sequential_dispatch_marginal_cost_matches_published_floor: SKIP \
-             (set NV_DISPATCH_AUDIT=1 to run; GPU-exclusive, idle-gate first)"
+        panic!(
+            "NV_DISPATCH_AUDIT is not 1, so this audit executed nothing. It is now #[ignore]d, \
+             which makes --ignored the opt-in; before that it printed `1 passed` on every default \
+             run having audited nothing against the published floor. A suite whose precondition \
+             is absent must fail or be ignored, never return green."
         );
-        return;
     }
     let ctx = match WgpuContext::shared() {
         Ok(ctx) => ctx,

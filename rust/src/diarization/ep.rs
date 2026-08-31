@@ -147,7 +147,7 @@ pub fn load_session(model_path: &Path, label: &str) -> Result<Loaded> {
         let builder = match builder.with_execution_providers([dispatch.error_on_failure()]) {
             Ok(b) => b,
             Err(e) => {
-                warn!(model = label, ep = name, error = %e, "diarization: execution provider unavailable, trying next");
+                warn!(model = label, ep = name, error = %e, "ort execution provider unavailable, trying next");
                 last_err = Some(crate::vad::ort_err(e));
                 continue;
             }
@@ -167,7 +167,7 @@ pub fn load_session(model_path: &Path, label: &str) -> Result<Loaded> {
                     ep = name,
                     intra_threads = threads,
                     path = %model_path.display(),
-                    "diarization session ready"
+                    "ort session ready"
                 );
                 return Ok(Loaded {
                     session,
@@ -176,7 +176,7 @@ pub fn load_session(model_path: &Path, label: &str) -> Result<Loaded> {
                 });
             }
             Err(e) => {
-                warn!(model = label, ep = name, error = %e, "diarization: session commit failed, trying next execution provider");
+                warn!(model = label, ep = name, error = %e, "ort session commit failed, trying next execution provider");
                 last_err = Some(e);
             }
         }

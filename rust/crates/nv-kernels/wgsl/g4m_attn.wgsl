@@ -443,3 +443,109 @@ fn g4m_kv_write_stacked(@builtin(global_invocation_id) gid: vec3<u32>) {
     gk_kc[base + i] = gk_k[gk_p.k_off_words + i];
     gk_vc[base + i] = gk_k[gk_p.k_off_words + gk_p.words + i];
 }
+
+@group(0) @binding(7) var<storage, read_write> ga_kc: array<u32>;
+@group(0) @binding(8) var<storage, read_write> ga_vc: array<u32>;
+@group(0) @binding(9) var<uniform> ga_kv: G4kvParams;
+
+@compute @workgroup_size(256)
+fn g4m_attn_norm_rope_qkv_kvwrite(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let r = wid.x;
+    let lane = lid.x;
+    let hd = ga_p.head_dim;
+    let n_q = ga_p.n_q;
+    let n_kv = ga_p.n_kv;
+    let has_v = ga_p.has_rope;
+    var src_row = r;
+    var w_off = 0u;
+    var rope = true;
+    if (r >= n_q + n_kv) {
+        let vr = r - n_q - n_kv;
+        if (has_v == 1u) {
+            src_row = n_q + n_kv + vr;
+        } else {
+            src_row = n_q + vr;
+        }
+        w_off = 2u * hd;
+        rope = false;
+    } else if (r >= n_q) {
+        w_off = hd;
+    }
+    let e0 = 2u * lane;
+    var v0 = 0.0;
+    var v1 = 0.0;
+    if (e0 < hd) {
+        let base = src_row * ga_p.src_stride + e0;
+        v0 = bf16_decode(u16_at(ga_src[base >> 1u], base));
+        v1 = bf16_decode(u16_at(ga_src[(base + 1u) >> 1u], base + 1u));
+    }
+    ga_red[lane] = v0 * v0 + v1 * v1;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lane < s) {
+            ga_red[lane] = ga_red[lane] + ga_red[lane + s];
+        }
+        workgroupBarrier();
+    }
+    let rms = inverseSqrt(ga_red[0] / f32(hd) + ga_p.eps);
+    if (e0 < hd) {
+        let we0 = w_off + e0;
+        let w0 = bf16_decode(u16_at(ga_w[we0 >> 1u], we0));
+        let w1 = bf16_decode(u16_at(ga_w[(we0 + 1u) >> 1u], we0 + 1u));
+        ga_buf[e0] = bf16_decode(bf16_encode(v0 * rms * w0));
+        ga_buf[e0 + 1u] = bf16_decode(bf16_encode(v1 * rms * w1));
+    }
+    workgroupBarrier();
+    if (e0 >= hd) {
+        return;
+    }
+    var p = 0u;
+    if (ga_pos[0] > 0) {
+        p = u32(ga_pos[0]);
+    }
+    var o0 = ga_buf[e0];
+    var o1 = ga_buf[e0 + 1u];
+    if (rope) {
+        let rh = ga_p.rot_half;
+        if (e0 < rh) {
+            let c = ga_cos[p * rh + e0];
+            let s = ga_sin[p * rh + e0];
+            o0 = ga_buf[e0] * c - ga_buf[e0 + rh] * s;
+        } else {
+            let i0 = e0 - rh;
+            let c = ga_cos[p * rh + i0];
+            let s = ga_sin[p * rh + i0];
+            o0 = ga_buf[i0] * s + ga_buf[e0] * c;
+        }
+        let e1 = e0 + 1u;
+        if (e1 < rh) {
+            let c = ga_cos[p * rh + e1];
+            let s = ga_sin[p * rh + e1];
+            o1 = ga_buf[e1] * c - ga_buf[e1 + rh] * s;
+        } else {
+            let i1 = e1 - rh;
+            let c = ga_cos[p * rh + i1];
+            let s = ga_sin[p * rh + i1];
+            o1 = ga_buf[i1] * s + ga_buf[e1] * c;
+        }
+    }
+    let outw = bf16_pack(o0, o1);
+    ga_out[(r * hd + e0) >> 1u] = outw;
+    if (r >= n_q) {
+        var slot = p;
+        if (ga_kv.ring > 0u) {
+            slot = p % ga_kv.ring;
+        }
+        let base = slot * ga_kv.words;
+        if (r < n_q + n_kv) {
+            let kr = r - n_q;
+            ga_kc[base + ((kr * hd + e0) >> 1u)] = outw;
+        } else {
+            let vr = r - n_q - n_kv;
+            ga_vc[base + ((vr * hd + e0) >> 1u)] = outw;
+        }
+    }
+}

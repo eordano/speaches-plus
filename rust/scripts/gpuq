@@ -13,12 +13,14 @@
 # Exit code: the command's own exit code. 124 = command timeout, 125 = lock/idle
 # timeout. Every admission logs WAIT/START/DONE with durations to $GPUQ_LOG.
 #
-# Env: GPUQ_LOCK (default /tmp/gpuq.lock), GPUQ_LOG (default
-# /tmp/gpuq.log), GPUQ_SKIP_SMI=1 to skip the VRAM check (dry runs,
-# hostless tests).
+# Env: GPUQ_LOCK (default $HOME/tmp/wf/GPUQ_LOCK — the same file the
+# workflow lanes flock directly, so gpuq admissions and bare-flock consumers
+# interlock; the old .gpuq.lock default did not, and a co-tenant polluted a
+# measurement), GPUQ_LOG (default $HOME/tmp/wf/.gpuq.log), GPUQ_SKIP_SMI=1
+# to skip the VRAM check (dry runs, hostless tests).
 set -u
-LOCK="${GPUQ_LOCK:-/tmp/gpuq.lock}"
-LOG="${GPUQ_LOG:-/tmp/gpuq.log}"
+LOCK="${GPUQ_LOCK:-$HOME/tmp/wf/GPUQ_LOCK}"
+LOG="${GPUQ_LOG:-$HOME/tmp/wf/.gpuq.log}"
 STATE="$LOCK.holder"
 
 now() { date -Is; }

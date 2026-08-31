@@ -1,0 +1,63 @@
+{
+ "ladder": "q38-flash-splits-deep",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "q38 flash splits deep",
+  "model": "qwen3.8-27b-nvfp4",
+  "backend": "cuda",
+  "pkg": "nv-models",
+  "features": "cuda",
+  "suite": "qwen38_serving_ctx",
+  "exact": "qwen38_cuda_dense_serving_decode_ms_per_token_vs_context_depth_synthetic_cache_fill_graphed",
+  "parse": "ctx-scaling",
+  "timeout": "2400"
+ },
+ "base_env": {
+  "NV_QWEN38_SERVING_TEST": "1",
+  "NV_Q36_GRAPHED_DECODE_FIX": "1",
+  "NV_FLASH_SM_RUNGS": "1"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  8192,
+  172032
+ ],
+ "depths_per_run": false,
+ "notes": "the CUPTI trace pinned the deep plain gap on flash_splitk_fused_fp8<16>: fixed 24x16x1 grid at every depth, 48.9% of deep GPU time, 279 GB/s = 17% of ceiling; the rung ladder is instantiated and env-pinned, so this sweep prices depth-scaled splits",
+ "rationale": "Traces /home/user/tmp/wf/q38deep/trace-{256,172032}.tsv: every kernel is depth-flat except splitk::flash_splitk_fused_fp8_kernel<16> which grows 14.3 ms -> 2115.8 ms total (1.26 ms/launch at 172032, ~352 MB KV per launch = ~279 GB/s = ~17% of the 1.63 TB/s sustained ceiling) because the 24x16 grid never scales with depth -- each block serially walks ~10752 KV positions. The kernel carries an instantiated split ladder {1,2,3,4,6,8,12,16,24,32,47} selectable per launch via NV_FLASH_SPLITS_RUNG under NV_FLASH_SM_RUNGS=1 (kFlashSmRungWaveTarget notes rounds 14/15 measured winners at 1-2x SM count). default-16 vs explicit rung16 is the null pair since the trace shows the default resolving to 16 at both depths. If rung 47 wins big at 172032 and rung 16 stays best at 8192, the follow-on is a depth-scaled rung selection (a knee, like the g4moe foldgate) rather than a static flip. 250W cells per #278.",
+ "baseline_arm": "default-16",
+ "null_pair": [
+  "default-16",
+  "rung16"
+ ],
+ "arms": [
+  {
+   "name": "default-16",
+   "env": {}
+  },
+  {
+   "name": "rung16",
+   "env": {
+    "NV_FLASH_SPLITS_RUNG": "16"
+   }
+  },
+  {
+   "name": "rung24",
+   "env": {
+    "NV_FLASH_SPLITS_RUNG": "24"
+   }
+  },
+  {
+   "name": "rung32",
+   "env": {
+    "NV_FLASH_SPLITS_RUNG": "32"
+   }
+  },
+  {
+   "name": "rung47",
+   "env": {
+    "NV_FLASH_SPLITS_RUNG": "47"
+   }
+  }
+ ]
+}

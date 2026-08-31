@@ -3,6 +3,7 @@ use candle_core::{DType, Device, Tensor};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
+use nv_layers::weight_load::load_rmsnorm;
 use nv_weights::WeightLoader;
 #[cfg(feature = "cuda")]
 use nv_weights::{QuantScheme, QuantizationConfig};
@@ -211,6 +212,21 @@ fn megakernel_fuse1_enabled() -> bool {
     })
 }
 
+const NORM_GEMV_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_INPUT_LAYERNORM_AS_ITS_OWN_GRAPH_NODE:
+    bool = false;
+
+fn input_layernorm_rides_the_qkv_gemv_env_nv_norm_gemv_fused() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        NORM_GEMV_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_INPUT_LAYERNORM_AS_ITS_OWN_GRAPH_NODE
+            || std::env::var("NV_NORM_GEMV_FUSED")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .is_some_and(|rows_per_warp_rung| rows_per_warp_rung > 0)
+    })
+}
+
 impl Gemma4Attention {
     #[cfg(feature = "cuda")]
     fn prefill_qkv(&self, m: usize) -> Option<&Linear> {
@@ -360,6 +376,9 @@ pub struct Gemma4 {
         cudarc::driver::CudaSlice<f32>,
     )>,
 
+    #[cfg(feature = "cuda")]
+    i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing: bool,
+
     sliding_rope: Rope,
 
     full_rope: Rope,
@@ -385,7 +404,7 @@ impl Gemma4 {
         weights: &WeightLoader,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_loader_inner(config, weights, None, device)
+        Self::from_loader_inner(config, weights, None, false, device)
     }
 
     #[cfg(feature = "cuda")]
@@ -398,14 +417,29 @@ impl Gemma4 {
         if matches!(qconfig.scheme, QuantScheme::None) {
             return Self::from_loader(config, weights, device);
         }
-        Self::from_loader_inner(config, weights, Some(qconfig), device)
+        Self::from_loader_inner(config, weights, Some(qconfig), false, device)
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn from_loader_quantized_without_the_i8_verify_head_because_adapter_serving_engines_never_verify(
+        config: Gemma4Config,
+        weights: &WeightLoader,
+        qconfig: &QuantizationConfig,
+        device: &Device,
+    ) -> Result<Self> {
+        if matches!(qconfig.scheme, QuantScheme::None) {
+            return Self::from_loader_inner(config, weights, None, true, device);
+        }
+        Self::from_loader_inner(config, weights, Some(qconfig), true, device)
+    }
+
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     fn from_loader_inner(
         config: Gemma4Config,
         weights: &WeightLoader,
         #[cfg(feature = "cuda")] qconfig: Option<&QuantizationConfig>,
         #[cfg(not(feature = "cuda"))] _qconfig: Option<&()>,
+        skip_the_i8_verify_head_because_this_engine_never_verifies: bool,
         device: &Device,
     ) -> Result<Self> {
         anyhow::ensure!(
@@ -509,10 +543,13 @@ impl Gemma4 {
         }
 
         #[cfg(feature = "cuda")]
-        let lm_head_i8 = if std::env::var("NV_VERIFY_LMHEAD_INT8").as_deref() != Ok("0")
+        let lm_head_i8 = if !skip_the_i8_verify_head_because_this_engine_never_verifies
+            && std::env::var("NV_VERIFY_LMHEAD_INT8").as_deref() != Ok("0")
             && matches!(device, Device::Cuda(_))
         {
-            Some(crate::gemma4_e4b::quantize_lm_head_i8(&lm_head_weight)?)
+            Some(nv_layers::lm_head_resident_quant::rowquant_i8_dev(
+                &lm_head_weight,
+            )?)
         } else {
             None
         };
@@ -529,6 +566,9 @@ impl Gemma4 {
             lm_head,
             #[cfg(feature = "cuda")]
             lm_head_i8,
+            #[cfg(feature = "cuda")]
+            i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing:
+                skip_the_i8_verify_head_because_this_engine_never_verifies,
             sliding_rope,
             full_rope,
             embed_scale,
@@ -551,6 +591,15 @@ impl Gemma4 {
     }
     pub fn lm_head(&self) -> &Linear {
         &self.lm_head
+    }
+    #[cfg(feature = "cuda")]
+    pub fn lm_head_i8_quantized_copy_absent_when_nv_verify_lmhead_int8_is_0(
+        &self,
+    ) -> Option<&(
+        cudarc::driver::CudaSlice<i8>,
+        cudarc::driver::CudaSlice<f32>,
+    )> {
+        self.lm_head_i8.as_ref()
     }
     pub fn sliding_rope(&self) -> &Rope {
         &self.sliding_rope
@@ -771,9 +820,56 @@ impl Gemma4 {
             Some(n) if n < seq => hidden.narrow(1, seq - n.max(1), n.max(1))?.contiguous()?,
             _ => hidden,
         };
-        let normed = self.final_norm.forward(&hidden_lr)?;
+        self.final_norm_then_lm_head_rows(&hidden_lr)
+    }
+
+    fn final_norm_then_lm_head_rows(&self, hidden_lr: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if decode_lmhead_i8_arm_enabled_env_nv_g4_lmhead_i8_shared_with_the_batch_graph_step_arm() {
+            if let Some(logits) = self.lm_head_i8_normed_rows_when_the_mk_kernel_serves_this_row_count(hidden_lr)? {
+                return Ok(logits);
+            }
+        }
+        let normed = self.final_norm.forward(hidden_lr)?;
         let logits = self.lm_head.forward(&normed)?;
         Ok(logits)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn lm_head_i8_normed_rows_when_the_mk_kernel_serves_this_row_count(
+        &self,
+        hidden_lr: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let dims = hidden_lr.dims();
+        anyhow::ensure!(
+            dims.len() == 3 && dims[0] == 1 && dims[2] == self.config.hidden_size,
+            "lm_head epilogue expects [1, rows, hidden], got {dims:?}"
+        );
+        let rows = dims[1];
+        let Some((wq, rs)) = self.lm_head_i8.as_ref() else {
+            if self.i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing
+            {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "NV_G4_LMHEAD_I8=1 needs the i8 lm_head copy; it is absent because \
+                 NV_VERIFY_LMHEAD_INT8=0 disabled building it"
+            );
+        };
+        if rows > lm_head_i8_rows_per_call(self.config.hidden_size) {
+            return Ok(None);
+        }
+        let dev = match &self.device {
+            Device::Cuda(d) => d.clone(),
+            _ => anyhow::bail!("lm_head_i8 epilogue requires a CUDA device"),
+        };
+        let hflat = hidden_lr.reshape((rows, self.config.hidden_size))?;
+        let rstd = crate::gemma4_e4b::rstd_op(&hflat, self.config.rms_norm_eps as f32)?;
+        let wn = self.final_norm.weight_bf16();
+        let raw = nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
+            wq, rs, &hflat, wn, &rstd, rows, &dev,
+        )?;
+        Ok(Some(raw.reshape((1usize, rows, self.config.vocab_size))?))
     }
 
     #[cfg(feature = "cuda")]
@@ -916,8 +1012,7 @@ impl Gemma4 {
         rowdiff_rows("v_normed", layer_idx, &v_normed, 1, b);
 
         let (q_rot, k_rot) = rope.apply(&q_normed, &k_normed, positions)?;
-        let (q_rot, k_rot) =
-            crate::hadamard_kv::maybe_rotate_qk(q_rot, k_rot, head_dim)?;
+        let (q_rot, k_rot) = crate::hadamard_kv::maybe_rotate_qk(q_rot, k_rot, head_dim)?;
         let q_rot = q_rot.contiguous()?;
         let k_rot = k_rot.contiguous()?;
         let v_for_cache = v_normed.contiguous()?;
@@ -1087,7 +1182,9 @@ impl Gemma4 {
 
         let residual_attn = x.clone();
 
-        let attn_out = if megakernel_fuse1_enabled() {
+        let attn_out = if megakernel_fuse1_enabled()
+            || input_layernorm_rides_the_qkv_gemv_env_nv_norm_gemv_fused()
+        {
             self.attention_forward_masked(
                 idx,
                 x,
@@ -1115,22 +1212,24 @@ impl Gemma4 {
         if det_sub {
             det_hash_tensor("o_proj", idx, &attn_out);
         }
-        let attn_post = layer.post_attention_layernorm.forward(&attn_out)?;
-
-        let (normed_pre_mlp, after_attn) = layer
-            .pre_feedforward_layernorm
-            .forward_residual(&attn_post, &residual_attn)?;
+        let (normed_pre_mlp, after_attn) = decode_post_attn_pre_ff(
+            &layer.post_attention_layernorm,
+            &layer.pre_feedforward_layernorm,
+            &attn_out,
+            &residual_attn,
+            &self.device,
+        )?;
 
         let residual_mlp = after_attn.clone();
         let mlp_out = mlp_forward(&layer.mlp, &normed_pre_mlp)?;
         if det_sub {
             det_hash_tensor("mlp_out", idx, &mlp_out);
         }
-        let mlp_post = layer.post_feedforward_layernorm.forward(&mlp_out)?;
 
-        residual_add_scale_bf16_op(
+        decode_post_ff_residual(
+            &layer.post_feedforward_layernorm,
+            &mlp_out,
             &residual_mlp,
-            &mlp_post,
             layer.layer_scalar_host,
             &self.device,
         )
@@ -1171,8 +1270,7 @@ impl Gemma4 {
         let v_normed = attn.v_norm.forward(&v)?;
 
         let (q_rot, k_rot) = rope.apply(&q_normed, &k_normed, positions)?;
-        let (q_rot, k_rot) =
-            crate::hadamard_kv::maybe_rotate_qk(q_rot, k_rot, head_dim)?;
+        let (q_rot, k_rot) = crate::hadamard_kv::maybe_rotate_qk(q_rot, k_rot, head_dim)?;
         let q_rot = q_rot.contiguous()?;
         let k_rot = k_rot.contiguous()?;
         let v_for_cache = v_normed.contiguous()?;
@@ -2893,6 +2991,23 @@ fn lm_head_i8_rows_per_call(hidden: usize) -> usize {
     )
 }
 
+pub const LMHEAD_I8_DECODE_ARM_DEFAULT_ON: bool = false;
+
+pub const LMHEAD_I8_DECODE_ARM_IS_DEFAULT_OFF_BECAUSE_I8_LOGITS_ARE_NOT_BIT_IDENTICAL_TO_THE_BF16_HEAD_AND_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_BF16_HEAD: &str =
+    "NV_G4_LMHEAD_I8 arms the resident int8 lm_head copy on the m=1 decode epilogue as well as \
+     on the Gemma4BatchGraphFamily step it already armed. The copy itself is built by default \
+     (unless NV_VERIFY_LMHEAD_INT8=0) and forward_verify_dev already reads it, so this arm moves \
+     no weights -- it moves which copy the decode epilogue reads: 2.819 GB of bf16 rows become \
+     1.409 GB of i8 rows plus f32 row scales, and the separate final RMSNorm launch is folded \
+     into the mk kernel through rstd_op. It stays default-off because the logits are not \
+     bit-identical to the bf16 head.";
+
+#[cfg(feature = "cuda")]
+pub fn decode_lmhead_i8_arm_enabled_env_nv_g4_lmhead_i8_shared_with_the_batch_graph_step_arm(
+) -> bool {
+    crate::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_G4_LMHEAD_I8")
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn current_stream_is_mid_graph_capture(dev: &candle_core::CudaDevice) -> bool {
     use cudarc::driver::sys as drv;
@@ -2913,6 +3028,73 @@ pub fn verify_norm_fused_from(raw: Option<&str>) -> bool {
 
 pub fn spec_prefill_flash_from(deterministic: bool, raw: Option<&str>) -> bool {
     !deterministic && raw != Some("0")
+}
+
+pub const NV_SPEC_PREFILL_HD512_BF16_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_OFF_THE_DEFAULT_CANDLE_FLASH_WHOSE_SM120_HDIM512_FORWARD_CANDLE_011_FIXED_ONTO_CHUNKED_BF16_TENSOR_CORE_QK_PV_GEMMS_WITH_FUSED_SOFTMAX_THE_BATTLE_TESTED_RECOVERY_ROUTE_FLASH_BEATS_1_06X_AT_1200_TO_1_21X_AT_32K_ON_THE_HD512_FLASHVSBF16_ROWS:
+    &str = "NV_SPEC_PREFILL_HD512_BF16";
+
+pub const NV_SPEC_PREFILL_HD512_EAGER_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_ONTO_CHUNKED_EAGER_F32_THE_REFERENCE_ROUTE_WHICH_WINS_OVER_THE_BF16_ESCAPE_WHEN_BOTH_ARE_SET_AND_PAYS_THE_2_4X_AT_32K_WALL_THE_HD512_FLASHVSBF16_ROWS_MEASURED:
+    &str = "NV_SPEC_PREFILL_HD512_EAGER";
+
+pub fn spec_prefill_flash_head_dim_from(
+    head_dim: usize,
+    bf16_raw: Option<&str>,
+    eager_raw: Option<&str>,
+) -> bool {
+    head_dim < 512 || (bf16_raw != Some("1") && eager_raw != Some("1"))
+}
+
+pub fn spec_prefill_hd512_bf16_from(bf16_raw: Option<&str>, eager_raw: Option<&str>) -> bool {
+    bf16_raw == Some("1") && eager_raw != Some("1")
+}
+
+#[cfg(feature = "cuda")]
+fn spec_prefill_hd512_bf16_raw() -> Option<&'static str> {
+    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    RAW.get_or_init(|| {
+        std::env::var(NV_SPEC_PREFILL_HD512_BF16_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_OFF_THE_DEFAULT_CANDLE_FLASH_WHOSE_SM120_HDIM512_FORWARD_CANDLE_011_FIXED_ONTO_CHUNKED_BF16_TENSOR_CORE_QK_PV_GEMMS_WITH_FUSED_SOFTMAX_THE_BATTLE_TESTED_RECOVERY_ROUTE_FLASH_BEATS_1_06X_AT_1200_TO_1_21X_AT_32K_ON_THE_HD512_FLASHVSBF16_ROWS).ok()
+    }).as_deref()
+}
+
+#[cfg(feature = "cuda")]
+fn spec_prefill_hd512_eager_raw() -> Option<&'static str> {
+    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    RAW.get_or_init(|| {
+        std::env::var(NV_SPEC_PREFILL_HD512_EAGER_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_ONTO_CHUNKED_EAGER_F32_THE_REFERENCE_ROUTE_WHICH_WINS_OVER_THE_BF16_ESCAPE_WHEN_BOTH_ARE_SET_AND_PAYS_THE_2_4X_AT_32K_WALL_THE_HD512_FLASHVSBF16_ROWS_MEASURED).ok()
+    }).as_deref()
+}
+
+#[cfg(feature = "cuda")]
+fn spec_prefill_flash_allows_head_dim(head_dim: usize) -> bool {
+    spec_prefill_flash_head_dim_from(
+        head_dim,
+        spec_prefill_hd512_bf16_raw(),
+        spec_prefill_hd512_eager_raw(),
+    )
+}
+
+pub const SHADOW_JIT_WARM_AT_CACHE_CREATION_BECAUSE_FIRST_USE_PTX_JIT_OF_THE_CANDLE_CAST_CMP_AFFINE_REDUCE_MODULES_MEASURED_5_9S_ON_THE_FIRST_PREFILL_SHADOW_CALL_WHEN_THE_DRIVER_JIT_CACHE_CANNOT_PERSIST_AND_MUST_NOT_LAND_ON_FIRST_DEEP_PROMPT_TTFT:
+    usize = 2;
+
+#[cfg(feature = "cuda")]
+fn shadow_route_jit_warm_once_at_cache_creation(dev: &Device) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let s = SHADOW_JIT_WARM_AT_CACHE_CREATION_BECAUSE_FIRST_USE_PTX_JIT_OF_THE_CANDLE_CAST_CMP_AFFINE_REDUCE_MODULES_MEASURED_5_9S_ON_THE_FIRST_PREFILL_SHADOW_CALL_WHEN_THE_DRIVER_JIT_CACHE_CANNOT_PERSIST_AND_MUST_NOT_LAND_ON_FIRST_DEEP_PROMPT_TTFT;
+        let warm = (|| -> Result<()> {
+            let q = Tensor::zeros((1usize, s, s, 8), DType::BF16, dev)?;
+            let kv = Tensor::zeros((1usize, s, 1, 8), DType::BF16, dev)?;
+            causal_attention_chunked_bf16(&q, &kv, &kv, s, 1, 8, s, 0)?;
+            causal_attention_chunked(&q, &kv, &kv, s, 1, 8, s, 0)?;
+            Ok(())
+        })();
+        let _ = warm;
+    });
+}
+
+#[cfg(feature = "cuda")]
+fn spec_prefill_hd512_bf16_enabled() -> bool {
+    spec_prefill_hd512_bf16_from(spec_prefill_hd512_bf16_raw(), spec_prefill_hd512_eager_raw())
 }
 
 #[cfg(feature = "cuda")]
@@ -3163,6 +3345,7 @@ impl Gemma4 {
             Device::Cuda(d) => d.clone(),
             _ => anyhow::bail!("verify cache requires cuda"),
         };
+        shadow_route_jit_warm_once_at_cache_creation(&self.device);
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let use_fp8 = verify_kv_use_fp8();
         let mut row_stride = Vec::with_capacity(self.layers.len());
@@ -3415,8 +3598,12 @@ impl Gemma4 {
                         return Ok(None);
                     };
                     let q4 = q_rot.reshape((1usize, k, n_q, hd))?;
-                    let out = if spec_prefill_flash_enabled() {
+                    let out = if spec_prefill_flash_enabled()
+                        && spec_prefill_flash_allows_head_dim(hd)
+                    {
                         flash_attention(&q4, &ks, &vs, n_q, n_kv, hd, k, None)?
+                    } else if spec_prefill_flash_enabled() && spec_prefill_hd512_bf16_enabled() {
+                        causal_attention_chunked_bf16(&q4, &ks, &vs, n_q, n_kv, hd, k, committed)?
                     } else {
                         causal_attention_chunked(&q4, &ks, &vs, n_q, n_kv, hd, k, committed)?
                     };
@@ -4184,7 +4371,7 @@ impl Gemma4 {
 
                             let max_m = lm_head_i8_rows_per_call(hidden_size);
                             if rows <= max_m {
-                                crate::gemma4_e4b::lm_head_i8_normed_mk_op(
+                                nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
                                     wq, rs, &hflat, wn, &rstd, rows, &dev,
                                 )?
                             } else {
@@ -4203,9 +4390,11 @@ impl Gemma4 {
                                     let m = (rows - off).min(max_m);
                                     let xc = hflat.narrow(0, off, m)?.contiguous()?;
                                     let rc = rstd.narrow(0, off, m)?.contiguous()?;
-                                    chunks.push(crate::gemma4_e4b::lm_head_i8_normed_mk_op(
-                                        wq, rs, &xc, wn, &rc, m, &dev,
-                                    )?);
+                                    chunks.push(
+                                        nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
+                                            wq, rs, &xc, wn, &rc, m, &dev,
+                                        )?,
+                                    );
                                     off += m;
                                 }
                                 Tensor::cat(&chunks, 0)?
@@ -4233,8 +4422,90 @@ impl Gemma4 {
     }
 }
 
+const DECODE_NORM_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_THREE_LAUNCH_NORM_CHAIN:
+    bool = false;
+
 #[cfg(feature = "cuda")]
-fn verify_post_attn_pre_ff(
+fn decode_norm_fused_enabled_env_nv_g4_decode_norm_fused_rides_the_post_norm_on_the_residual_norm_dispatch(
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        DECODE_NORM_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_THREE_LAUNCH_NORM_CHAIN
+            || std::env::var("NV_G4_DECODE_NORM_FUSED").as_deref() == Ok("1")
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn decode_post_attn_pre_ff(
+    post_ln: &RmsNorm,
+    pre_ln: &RmsNorm,
+    attn_out: &Tensor,
+    residual: &Tensor,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    if decode_norm_fused_enabled_env_nv_g4_decode_norm_fused_rides_the_post_norm_on_the_residual_norm_dispatch()
+        && attn_out.dtype() == DType::BF16
+        && residual.dtype() == DType::BF16
+        && attn_out.dims() == residual.dims()
+        && post_ln.eps() == pre_ln.eps()
+        && matches!(device, Device::Cuda(_))
+    {
+        if let Some(out) = rmsnorm2_residual_op(post_ln, pre_ln, attn_out, residual, device)? {
+            return Ok(out);
+        }
+    }
+    let attn_post = post_ln.forward(attn_out)?;
+    pre_ln.forward_residual(&attn_post, residual)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn decode_post_attn_pre_ff(
+    post_ln: &RmsNorm,
+    pre_ln: &RmsNorm,
+    attn_out: &Tensor,
+    residual: &Tensor,
+    _device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let attn_post = post_ln.forward(attn_out)?;
+    pre_ln.forward_residual(&attn_post, residual)
+}
+
+#[cfg(feature = "cuda")]
+fn decode_post_ff_residual(
+    post_ln: &RmsNorm,
+    mlp_out: &Tensor,
+    after_attn: &Tensor,
+    scale: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    if decode_norm_fused_enabled_env_nv_g4_decode_norm_fused_rides_the_post_norm_on_the_residual_norm_dispatch()
+        && mlp_out.dtype() == DType::BF16
+        && after_attn.dtype() == DType::BF16
+        && mlp_out.dims() == after_attn.dims()
+        && matches!(device, Device::Cuda(_))
+    {
+        if let Some(t) = rmsnorm_residual_scale_op(post_ln, mlp_out, after_attn, scale, device)? {
+            return Ok(t);
+        }
+    }
+    let mlp_post = post_ln.forward(mlp_out)?;
+    residual_add_scale_bf16_op(after_attn, &mlp_post, scale, device)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn decode_post_ff_residual(
+    post_ln: &RmsNorm,
+    mlp_out: &Tensor,
+    after_attn: &Tensor,
+    scale: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    let mlp_post = post_ln.forward(mlp_out)?;
+    residual_add_scale_bf16_op(after_attn, &mlp_post, scale, device)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn verify_post_attn_pre_ff(
     post_ln: &RmsNorm,
     pre_ln: &RmsNorm,
     attn_out: &Tensor,
@@ -4359,7 +4630,7 @@ fn rmsnorm2_residual_op(
 }
 
 #[cfg(feature = "cuda")]
-fn verify_post_ff_residual(
+pub(crate) fn verify_post_ff_residual(
     post_ln: &RmsNorm,
     mlp_out: &Tensor,
     after_attn: &Tensor,
@@ -4992,6 +5263,91 @@ fn gelu_tanh_mul_candle(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn causal_attention_chunked_bf16(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_q: usize,
+    n_kv: usize,
+    head_dim: usize,
+    seq: usize,
+    offset: usize,
+) -> Result<Tensor> {
+    let dev = q.device().clone();
+    let out_dtype = q.dtype();
+    let group = n_q / n_kv;
+    anyhow::ensure!(group * n_kv == n_q, "GQA group must divide n_q");
+    let total = k.dims()[1];
+    anyhow::ensure!(
+        total == offset + seq,
+        "causal_attention_chunked_bf16: keys {total} != offset {offset} + seq {seq}"
+    );
+
+    let q_t = q
+        .to_dtype(DType::BF16)?
+        .permute((0, 2, 1, 3))?
+        .reshape((n_q, seq, head_dim))?
+        .contiguous()?;
+    let k_perm = k
+        .to_dtype(DType::BF16)?
+        .permute((0, 2, 3, 1))?
+        .reshape((n_kv, head_dim, total))?
+        .contiguous()?;
+    let v_t = v
+        .to_dtype(DType::BF16)?
+        .permute((0, 2, 1, 3))?
+        .reshape((n_kv, total, head_dim))?
+        .contiguous()?;
+    let js = Tensor::arange(0f32, total as f32, &dev)?.reshape((1usize, total))?;
+
+    let budget_rows = ((1usize << 28) / (2 * n_q * total.max(1))).max(16);
+    let qchunk = budget_rows.min(512).min(seq).max(1);
+
+    let mut chunks: Vec<Tensor> = Vec::with_capacity(seq.div_ceil(qchunk));
+    let mut start = 0usize;
+    while start < seq {
+        let len = qchunk.min(seq - start);
+
+        let q_chunk = q_t
+            .reshape((n_kv, group, seq, head_dim))?
+            .narrow(2, start, len)?
+            .reshape((n_kv, group * len, head_dim))?
+            .contiguous()?;
+        let scores = q_chunk.matmul(&k_perm)?;
+
+        let vis_lo = (offset + start + 1) as f32;
+        let vis = Tensor::arange(vis_lo, vis_lo + len as f32, &dev)?.reshape((len, 1usize))?;
+        let bias = js
+            .broadcast_lt(&vis)?
+            .to_dtype(DType::F32)?
+            .affine(1.0e30, -1.0e30)?
+            .to_dtype(DType::BF16)?
+            .reshape((1usize, 1usize, len, total))?;
+
+        let scores = scores
+            .reshape((n_kv, group, len, total))?
+            .broadcast_add(&bias)?;
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let out = probs.reshape((n_kv, group * len, total))?.matmul(&v_t)?;
+
+        let out = out
+            .reshape((n_q, len, head_dim))?
+            .permute((1, 0, 2))?
+            .contiguous()?
+            .reshape((1usize, len, n_q, head_dim))?;
+        chunks.push(out);
+        start += len;
+    }
+
+    let full = if chunks.len() == 1 {
+        chunks.pop().unwrap()
+    } else {
+        Tensor::cat(&chunks.iter().collect::<Vec<_>>()[..], 1)?
+    };
+    Ok(full.to_dtype(out_dtype)?)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn causal_attention_chunked(
     q: &Tensor,
     k: &Tensor,
@@ -5592,23 +5948,6 @@ fn xattn_prefill_bias_mass(
     Ok((bias_t, kept_total, cand_total))
 }
 
-pub(crate) fn load_rmsnorm(
-    weights: &WeightLoader,
-    name: &str,
-    dim: usize,
-    eps: f64,
-    dtype: DType,
-) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("rmsnorm {name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(RmsNorm::new(w, eps))
-}
-
 #[cfg(feature = "cuda")]
 fn split_cols_bf16_raw(fused: &Tensor, parts: &[(usize, usize)]) -> Result<Vec<Tensor>> {
     use cudarc::driver::sys as cu_sys;
@@ -5858,6 +6197,25 @@ fn attn_proj_scheme_from(raw: Option<&str>) -> AttnProjScheme {
     }
 }
 
+pub const ATTN_PROJ_NVFP4_ALONE_IS_A_MEASURED_QUALITY_REJECT_RESCUED_ONLY_BY_NV_NVFP4_M1_GEMV: &str =
+    "NV_ATTN_PROJ_QUANT=nvfp4 on its own scores 17.056 against a 16.308 zero-env basis on \
+     ppl_gemma4::gemma4_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode \
+     (Gemma-4-31B-IT-NVFP4, 285 prompt tokens, 512 scored, wiki corpus): +0.748 ppl, a REJECT \
+     on magnitude at 1.82x the family's own 0.41 reassociation-null spread (the +0.0973 figure \
+     once cited here is a qwen3.8 wikitext arm delta, not a floor, and binds no other \
+     family). NV_NVFP4_M1_GEMV=1 is what makes it shippable, and not by hiding it: routing the \
+     m=1 NVFP4 matmul off the padded cutlass block-scaled tile onto nvfp4_gemv_bf16act is worth \
+     -0.742 ppl on its own because the gemv skips the fp4 activation round-trip, so the pair \
+     lands at +0.038 and the three-key record at -0.018. The two keys are therefore inseparable \
+     and a serving process that quantizes the attention projections without the gemv route is \
+     serving a configuration this family's own ship gate rejects.";
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub fn attn_proj_env_selects_nvfp4_projections(raw: Option<&str>) -> bool {
+    attn_proj_quant_from(true, raw) != (false, false)
+        && attn_proj_scheme_from(raw) == AttnProjScheme::Nvfp4
+}
+
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn attn_proj_quant_from(scheme_ok: bool, raw: Option<&str>) -> (bool, bool) {
     if !scheme_ok {
@@ -6094,7 +6452,8 @@ mod falsified_knob_default_pin_tests {
     #[test]
     fn lm_head_i8_rows_per_call_defaults_to_kernel_ceiling_and_chunk4_env_restores_legacy() {
         use super::{
-            lm_head_i8_rows_per_call_gate, LM_HEAD_I8_LEGACY_CHUNK_ROWS_PREDATING_THE_MK_M16_LAUNCHER,
+            lm_head_i8_rows_per_call_gate,
+            LM_HEAD_I8_LEGACY_CHUNK_ROWS_PREDATING_THE_MK_M16_LAUNCHER,
         };
         assert_eq!(lm_head_i8_rows_per_call_gate(None, 8), 8);
         assert_eq!(lm_head_i8_rows_per_call_gate(None, 16), 16);
@@ -6141,6 +6500,42 @@ mod falsified_knob_default_pin_tests {
         assert!(spec_prefill_flash_from(false, None));
         assert!(spec_prefill_flash_from(false, Some("1")));
         assert!(!spec_prefill_flash_from(false, Some("0")));
+    }
+
+    #[test]
+    fn spec_prefill_flash_covers_hd512_by_default_and_either_escape_reroutes_it() {
+        use super::spec_prefill_flash_head_dim_from;
+        assert!(
+            spec_prefill_flash_head_dim_from(512, None, None),
+            "hd512 flash is the shipped default: candle 0.11 fixed the sm120 hdim512 forward \
+             and the hd512 flashvsbf16 decision rows show flash ahead at every depth"
+        );
+        assert!(spec_prefill_flash_head_dim_from(512, Some(""), Some("")));
+        assert!(spec_prefill_flash_head_dim_from(512, Some("0"), Some("0")));
+        assert!(spec_prefill_flash_head_dim_from(512, Some("true"), None));
+        assert!(!spec_prefill_flash_head_dim_from(512, Some("1"), None));
+        assert!(!spec_prefill_flash_head_dim_from(512, None, Some("1")));
+        assert!(!spec_prefill_flash_head_dim_from(512, Some("1"), Some("1")));
+        assert!(spec_prefill_flash_head_dim_from(256, Some("1"), Some("1")));
+        assert!(spec_prefill_flash_head_dim_from(576, None, None));
+        assert!(!spec_prefill_flash_head_dim_from(576, Some("1"), None));
+    }
+
+    #[test]
+    fn hd512_escapes_are_exact_opt_in_and_eager_wins_when_both_are_set() {
+        use super::spec_prefill_hd512_bf16_from;
+        assert!(!spec_prefill_hd512_bf16_from(None, None));
+        assert!(spec_prefill_hd512_bf16_from(Some("1"), None));
+        assert!(spec_prefill_hd512_bf16_from(Some("1"), Some("0")));
+        assert!(
+            !spec_prefill_hd512_bf16_from(Some("1"), Some("1")),
+            "with both hd512 escapes set the shadow takes chunked eager f32: the reference \
+             route outranks the bf16 recovery route"
+        );
+        assert!(!spec_prefill_hd512_bf16_from(Some(""), None));
+        assert!(!spec_prefill_hd512_bf16_from(Some("0"), None));
+        assert!(!spec_prefill_hd512_bf16_from(Some("true"), None));
+        assert!(!spec_prefill_hd512_bf16_from(None, Some("1")));
     }
 }
 
@@ -6950,6 +7345,165 @@ mod prefill_shadow_tests {
                 d < 2.5e-2,
                 "flash vs naive max diff {d} at committed={committed} len={len}"
             );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn hd512_flash_vs_chunked_probe_across_the_real_shadow_geometries() {
+        use candle_core::DType;
+        let dev = Device::new_cuda(0).unwrap();
+        let (n_q, n_kv) = (32usize, 4usize);
+        for &hd in &[256usize, 512] {
+            for &(committed, len) in &[
+                (0usize, 64usize),
+                (0, 128),
+                (0, 176),
+                (0, 512),
+                (0, 1024),
+                (512, 512),
+                (1024, 176),
+            ] {
+                let total = committed + len;
+                let q = mk(0.1, len, n_q, hd, &dev).to_dtype(DType::BF16).unwrap();
+                let ks = mk(0.2, total, n_kv, hd, &dev)
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let vs = mk(0.3, total, n_kv, hd, &dev)
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let flash =
+                    super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None).unwrap();
+                let naive =
+                    causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
+                let d = (flash.to_dtype(DType::F32).unwrap()
+                    - naive.to_dtype(DType::F32).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+                eprintln!(
+                    "hd512-probe hd={hd} committed={committed} len={len} \
+                     flash_vs_chunked_max_abs={d:.6}"
+                );
+                if hd == 256 {
+                    assert!(
+                        d < 2.5e-2,
+                        "hd256 flash vs chunked diverged {d} at committed={committed} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    const HD512_BF16_PROBE_TOL_5E2_SEPARATES_BF16_GEMM_ROUNDING_FROM_THE_ORDER_ONE_HD512_FLASH_DEFECT:
+        f32 = 5e-2;
+
+    const HD512_BF16_PROBE_QK_AMPLITUDE_0_5_PUTS_HD512_LOGITS_IN_THE_TENS_REGIME_OF_TRAINED_ATTENTION_WHERE_BF16_SCORE_QUANTA_STAY_SUB_0_1_MATCHING_THE_E4B_MASK_TRANSFER_PRECEDENT_WHILE_AMPLITUDE_1_SYNTHETIC_LOGITS_NEAR_50_QUANTIZE_AT_0_25:
+        f64 = 0.5;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn hd512_bf16_route_vs_chunked_eager_probe_across_the_real_shadow_geometries() {
+        use super::causal_attention_chunked_bf16;
+        use candle_core::DType;
+        let dev = Device::new_cuda(0).unwrap();
+        let amp = HD512_BF16_PROBE_QK_AMPLITUDE_0_5_PUTS_HD512_LOGITS_IN_THE_TENS_REGIME_OF_TRAINED_ATTENTION_WHERE_BF16_SCORE_QUANTA_STAY_SUB_0_1_MATCHING_THE_E4B_MASK_TRANSFER_PRECEDENT_WHILE_AMPLITUDE_1_SYNTHETIC_LOGITS_NEAR_50_QUANTIZE_AT_0_25;
+        let (n_q, n_kv, hd) = (32usize, 4usize, 512usize);
+        for &(committed, len) in &[
+            (0usize, 64usize),
+            (0, 128),
+            (0, 176),
+            (0, 512),
+            (0, 1024),
+            (512, 64),
+            (512, 512),
+            (512, 1024),
+            (1024, 176),
+            (1024, 1024),
+        ] {
+            let total = committed + len;
+            let q = (mk(0.1, len, n_q, hd, &dev) * amp)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let ks = (mk(0.2, total, n_kv, hd, &dev) * amp)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let vs = mk(0.3, total, n_kv, hd, &dev)
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let fast =
+                causal_attention_chunked_bf16(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
+            let naive =
+                causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
+            let d = (fast.to_dtype(DType::F32).unwrap() - naive.to_dtype(DType::F32).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            eprintln!(
+                "hd512-bf16-probe committed={committed} len={len} bf16_vs_eager_max_abs={d:.6}"
+            );
+            assert!(
+                d < HD512_BF16_PROBE_TOL_5E2_SEPARATES_BF16_GEMM_ROUNDING_FROM_THE_ORDER_ONE_HD512_FLASH_DEFECT,
+                "hd512 bf16 route diverged {d} from chunked eager at committed={committed} len={len}"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn hd512_shadow_route_walltime_probe_isolates_the_attention_call_from_the_serve_loop() {
+        use super::causal_attention_chunked_bf16;
+        use candle_core::DType;
+        let dev = Device::new_cuda(0).unwrap();
+        let (n_q, n_kv, hd) = (32usize, 4usize, 512usize);
+        for &(committed, len) in &[(0usize, 1024usize), (7168, 1024)] {
+            let total = committed + len;
+            let q = mk(0.1, len, n_q, hd, &dev).to_dtype(DType::BF16).unwrap();
+            let ks = mk(0.2, total, n_kv, hd, &dev)
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let vs = mk(0.3, total, n_kv, hd, &dev)
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let mut time_it = |name: &str, f: &dyn Fn() -> super::Result<Tensor>| {
+                f().unwrap();
+                dev.synchronize().unwrap();
+                let t0 = std::time::Instant::now();
+                for _ in 0..3 {
+                    f().unwrap();
+                }
+                dev.synchronize().unwrap();
+                eprintln!(
+                    "hd512-walltime committed={committed} len={len} {name}_ms_per_call={:.2}",
+                    t0.elapsed().as_secs_f64() * 1000.0 / 3.0
+                );
+            };
+            time_it("flash", &|| {
+                super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None)
+            });
+            time_it("eager_f32", &|| {
+                causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed)
+            });
+            time_it("bf16_tc", &|| {
+                causal_attention_chunked_bf16(&q, &ks, &vs, n_q, n_kv, hd, len, committed)
+            });
         }
     }
 }

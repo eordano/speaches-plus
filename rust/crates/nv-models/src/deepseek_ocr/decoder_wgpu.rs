@@ -6,9 +6,49 @@ use nv_kernels::wgpu_backend::WgpuContext;
 use nv_weights::WeightLoader;
 
 use super::decoder::DeepseekOcrDecoderConfig;
+use crate::nvfp4_host::{quantize_nvfp4_host, NVFP4_BLOCK};
+use crate::wgpu_ledger::bytes_to_words;
+
+pub const DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED: &str =
+    "NV_DSOCR_WGPU_QUANT";
+
+pub const NVFP4_SCALE_SWIZZLE_ROW_TILE: usize = 128;
+
+pub fn wgpu_quant_from_env_value(raw: Option<&str>) -> Result<WgpuDecQuant> {
+    match raw {
+        None | Some("") | Some("bf16") => Ok(WgpuDecQuant::Bf16),
+        Some("nvfp4") => Ok(WgpuDecQuant::Nvfp4),
+        Some("w8") => Ok(WgpuDecQuant::I8),
+        Some(other) => anyhow::bail!(
+            "{DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED}={other:?} \
+             is not a dsocr wgpu decoder weight format; use bf16, nvfp4, or w8"
+        ),
+    }
+}
+
+enum LinBody {
+    Bf16(Vec<u16>),
+    Nvfp4 {
+        w_words: Vec<u32>,
+        scales_swizzled: Vec<u8>,
+        alpha: f32,
+        input_global: f32,
+    },
+    I8 {
+        w_i8: Vec<i8>,
+        row_scales: Vec<f32>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WgpuDecQuant {
+    Bf16,
+    Nvfp4,
+    I8,
+}
 
 pub struct WgpuLin {
-    w: Vec<u16>,
+    body: LinBody,
     n: usize,
     k: usize,
 }
@@ -76,13 +116,55 @@ fn host_vec_f32(weights: &WeightLoader, name: &str, expect: &[usize]) -> Result<
     Ok(t.flatten_all()?.to_vec1::<f32>()?)
 }
 
-fn host_lin(weights: &WeightLoader, name: &str, n: usize, k: usize) -> Result<WgpuLin> {
+fn host_lin(
+    weights: &WeightLoader,
+    name: &str,
+    n: usize,
+    k: usize,
+    quant: WgpuDecQuant,
+) -> Result<WgpuLin> {
     let v = host_vec_f32(weights, name, &[n, k])?;
-    Ok(WgpuLin {
-        w: to_bf16(&v),
-        n,
-        k,
-    })
+    let w = to_bf16(&v);
+    match quant {
+        WgpuDecQuant::Nvfp4 if k.is_multiple_of(NVFP4_BLOCK) => {
+            let q = quantize_nvfp4_host(&w, n, k);
+            Ok(WgpuLin {
+                body: LinBody::Nvfp4 {
+                    w_words: bytes_to_words(&q.packed),
+                    scales_swizzled: q.scales_swizzled,
+                    alpha: q.alpha,
+                    input_global: q.input_global,
+                },
+                n,
+                k,
+            })
+        }
+        WgpuDecQuant::I8
+            if k.is_multiple_of(16) && k <= wk::gemv_bf16::MAX_SHARED_K =>
+        {
+            let mut w_i8 = vec![0i8; n * k];
+            let mut row_scales = vec![0f32; n];
+            for r in 0..n {
+                let row = &v[r * k..(r + 1) * k];
+                let amax = row.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                row_scales[r] = s;
+                for (dst, &x) in w_i8[r * k..(r + 1) * k].iter_mut().zip(row) {
+                    *dst = (x / s).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+            Ok(WgpuLin {
+                body: LinBody::I8 { w_i8, row_scales },
+                n,
+                k,
+            })
+        }
+        _ => Ok(WgpuLin {
+            body: LinBody::Bf16(w),
+            n,
+            k,
+        }),
+    }
 }
 
 fn host_norm(weights: &WeightLoader, name: &str, hidden: usize) -> Result<Vec<u16>> {
@@ -90,20 +172,34 @@ fn host_norm(weights: &WeightLoader, name: &str, hidden: usize) -> Result<Vec<u1
     Ok(to_bf16(&v))
 }
 
-fn host_mlp(weights: &WeightLoader, prefix: &str, hidden: usize, inter: usize) -> Result<WgpuMlp> {
+fn host_mlp(
+    weights: &WeightLoader,
+    prefix: &str,
+    hidden: usize,
+    inter: usize,
+    nvfp4: WgpuDecQuant,
+) -> Result<WgpuMlp> {
     Ok(WgpuMlp {
         gate: host_lin(
             weights,
             &format!("{prefix}.gate_proj.weight"),
             inter,
             hidden,
+            nvfp4,
         )?,
-        up: host_lin(weights, &format!("{prefix}.up_proj.weight"), inter, hidden)?,
+        up: host_lin(
+            weights,
+            &format!("{prefix}.up_proj.weight"),
+            inter,
+            hidden,
+            nvfp4,
+        )?,
         down: host_lin(
             weights,
             &format!("{prefix}.down_proj.weight"),
             hidden,
             inter,
+            nvfp4,
         )?,
     })
 }
@@ -113,6 +209,38 @@ impl DeepseekOcrDecoderWgpu {
         cfg: DeepseekOcrDecoderConfig,
         weights: &WeightLoader,
         max_seq: usize,
+    ) -> Result<Self> {
+        let quant = wgpu_quant_from_env_value(
+            std::env::var(DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED)
+                .ok()
+                .as_deref(),
+        )?;
+        Self::from_loader_mode(cfg, weights, max_seq, quant)
+    }
+
+    pub fn from_loader_quant(
+        cfg: DeepseekOcrDecoderConfig,
+        weights: &WeightLoader,
+        max_seq: usize,
+        nvfp4: bool,
+    ) -> Result<Self> {
+        Self::from_loader_mode(
+            cfg,
+            weights,
+            max_seq,
+            if nvfp4 {
+                WgpuDecQuant::Nvfp4
+            } else {
+                WgpuDecQuant::Bf16
+            },
+        )
+    }
+
+    pub fn from_loader_mode(
+        cfg: DeepseekOcrDecoderConfig,
+        weights: &WeightLoader,
+        max_seq: usize,
+        nvfp4: WgpuDecQuant,
     ) -> Result<Self> {
         let ctx =
             WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu adapter unavailable: {e}"))?;
@@ -148,6 +276,7 @@ impl DeepseekOcrDecoderWgpu {
                         &format!("{p}.mlp.experts.{e}"),
                         h,
                         cfg.moe_intermediate_size,
+                        nvfp4,
                     )?);
                 }
                 let shared = host_mlp(
@@ -155,6 +284,7 @@ impl DeepseekOcrDecoderWgpu {
                     &format!("{p}.mlp.shared_experts"),
                     h,
                     cfg.shared_expert_intermediate_size(),
+                    nvfp4,
                 )?;
                 WgpuFf::Moe {
                     gate_f32,
@@ -170,20 +300,21 @@ impl DeepseekOcrDecoderWgpu {
                     &format!("{p}.mlp"),
                     h,
                     cfg.intermediate_size,
+                    nvfp4,
                 )?)
             };
             layers.push(WgpuLayer {
                 input_ln: host_norm(weights, &format!("{p}.input_layernorm.weight"), h)?,
                 post_ln: host_norm(weights, &format!("{p}.post_attention_layernorm.weight"), h)?,
-                q: host_lin(weights, &format!("{p}.self_attn.q_proj.weight"), qd, h)?,
-                k: host_lin(weights, &format!("{p}.self_attn.k_proj.weight"), kvd, h)?,
-                v: host_lin(weights, &format!("{p}.self_attn.v_proj.weight"), kvd, h)?,
-                o: host_lin(weights, &format!("{p}.self_attn.o_proj.weight"), h, qd)?,
+                q: host_lin(weights, &format!("{p}.self_attn.q_proj.weight"), qd, h, nvfp4)?,
+                k: host_lin(weights, &format!("{p}.self_attn.k_proj.weight"), kvd, h, nvfp4)?,
+                v: host_lin(weights, &format!("{p}.self_attn.v_proj.weight"), kvd, h, nvfp4)?,
+                o: host_lin(weights, &format!("{p}.self_attn.o_proj.weight"), h, qd, nvfp4)?,
                 ff,
             });
         }
         let final_norm = host_norm(weights, "model.norm.weight", h)?;
-        let lm_head = host_lin(weights, "lm_head.weight", cfg.vocab_size, h)?;
+        let lm_head = host_lin(weights, "lm_head.weight", cfg.vocab_size, h, WgpuDecQuant::Bf16)?;
         let max_seq = max_seq.min(cfg.max_position_embeddings);
         let half = cfg.head_dim() / 2;
         let mut cos = vec![0f32; max_seq * half];
@@ -237,22 +368,107 @@ impl DeepseekOcrDecoderWgpu {
             .caps
             .max_storage_buffer_binding_size
             .clamp(1 << 20, 1 << 28) as usize;
-        let chunk = (limit / (lin.k * 2)).max(1);
-        let mut r0 = 0usize;
-        while r0 < lin.n {
-            let rows = chunk.min(lin.n - r0);
-            wk::gemv_bf16::gemv_bf16(
-                self.ctx,
-                &lin.w[r0 * lin.k..(r0 + rows) * lin.k],
-                x,
-                &mut y[r0..r0 + rows],
-                rows,
-                lin.k,
-            )
-            .map_err(|e| anyhow::anyhow!("gemv_bf16 [{}x{}]: {e}", lin.n, lin.k))?;
-            r0 += rows;
+        match &lin.body {
+            LinBody::Bf16(w) => {
+                let chunk = (limit / (lin.k * 2)).max(1);
+                let mut r0 = 0usize;
+                while r0 < lin.n {
+                    let rows = chunk.min(lin.n - r0);
+                    wk::gemv_bf16::gemv_bf16(
+                        self.ctx,
+                        &w[r0 * lin.k..(r0 + rows) * lin.k],
+                        x,
+                        &mut y[r0..r0 + rows],
+                        rows,
+                        lin.k,
+                    )
+                    .map_err(|e| anyhow::anyhow!("gemv_bf16 [{}x{}]: {e}", lin.n, lin.k))?;
+                    r0 += rows;
+                }
+            }
+            LinBody::Nvfp4 {
+                w_words,
+                scales_swizzled,
+                alpha,
+                input_global,
+            } => {
+                let k_blocks = lin.k / NVFP4_BLOCK;
+                let row_words = lin.k / 8;
+                let tile_scale_bytes =
+                    NVFP4_SCALE_SWIZZLE_ROW_TILE * wk::gemv_nvfp4::k_tiles(k_blocks) * 4;
+                let mut xq = vec![0u32; row_words];
+                let mut xs = vec![0u8; k_blocks];
+                wk::gemv_nvfp4::nvfp4_quantize_row_bf16(
+                    self.ctx,
+                    x,
+                    *input_global,
+                    &mut xq,
+                    &mut xs,
+                    lin.k,
+                )
+                .map_err(|e| anyhow::anyhow!("nvfp4 act quantize k={}: {e}", lin.k))?;
+                let chunk = ((limit / (row_words * 4)).max(NVFP4_SCALE_SWIZZLE_ROW_TILE)
+                    / NVFP4_SCALE_SWIZZLE_ROW_TILE)
+                    * NVFP4_SCALE_SWIZZLE_ROW_TILE;
+                let mut r0 = 0usize;
+                while r0 < lin.n {
+                    let rows = chunk.min(lin.n - r0);
+                    let s0 = (r0 / NVFP4_SCALE_SWIZZLE_ROW_TILE) * tile_scale_bytes;
+                    let s_len = wk::gemv_nvfp4::swizzled_scale_len(rows, k_blocks);
+                    wk::gemv_nvfp4::nvfp4_gemv_bf16(
+                        self.ctx,
+                        &w_words[r0 * row_words..(r0 + rows) * row_words],
+                        &scales_swizzled[s0..s0 + s_len],
+                        &xq,
+                        &xs,
+                        *alpha / *input_global,
+                        &mut y[r0..r0 + rows],
+                        rows,
+                        lin.k,
+                    )
+                    .map_err(|e| anyhow::anyhow!("gemv_nvfp4 [{}x{}]: {e}", lin.n, lin.k))?;
+                    r0 += rows;
+                }
+            }
+            LinBody::I8 { w_i8, row_scales } => {
+                let ones = vec![bf16::from_f32(1.0).to_bits(); lin.k];
+                let chunk = (limit / lin.k).max(1);
+                let mut r0 = 0usize;
+                while r0 < lin.n {
+                    let rows = chunk.min(lin.n - r0);
+                    wk::gemv_bf16::gemv_i8_normed(
+                        self.ctx,
+                        &w_i8[r0 * lin.k..(r0 + rows) * lin.k],
+                        &row_scales[r0..r0 + rows],
+                        x,
+                        &ones,
+                        1.0,
+                        &mut y[r0..r0 + rows],
+                        rows,
+                        lin.k,
+                    )
+                    .map_err(|e| anyhow::anyhow!("gemv_i8 [{}x{}]: {e}", lin.n, lin.k))?;
+                    r0 += rows;
+                }
+            }
         }
         Ok(y)
+    }
+
+    pub fn nvfp4_lin_count(&self) -> usize {
+        let lin = |l: &WgpuLin| matches!(l.body, LinBody::Nvfp4 { .. }) as usize;
+        let mlp = |m: &WgpuMlp| lin(&m.gate) + lin(&m.up) + lin(&m.down);
+        let mut count = lin(&self.lm_head);
+        for layer in &self.layers {
+            count += lin(&layer.q) + lin(&layer.k) + lin(&layer.v) + lin(&layer.o);
+            count += match &layer.ff {
+                WgpuFf::Dense(m) => mlp(m),
+                WgpuFf::Moe {
+                    experts, shared, ..
+                } => experts.iter().map(&mlp).sum::<usize>() + mlp(shared),
+            };
+        }
+        count
     }
 
     fn rmsnorm(&self, x: &[u16], w: &[u16]) -> Result<Vec<u16>> {

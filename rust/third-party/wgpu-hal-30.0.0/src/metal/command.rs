@@ -4,9 +4,10 @@ use objc2::{
 };
 use objc2_foundation::{NSRange, NSString, NSUInteger};
 use objc2_metal::{
-    MTLAccelerationStructure, MTLAccelerationStructureCommandEncoder, MTLBlitCommandEncoder,
-    MTLBlitPassDescriptor, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLCounterDontSample,
+    MTLAccelerationStructure, MTLAccelerationStructureCommandEncoder, MTLBarrierScope,
+    MTLBlitCommandEncoder, MTLBlitPassDescriptor, MTLBuffer, MTLCommandBuffer,
+    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePassDescriptor, MTLCounterDontSample, MTLDispatchType,
     MTLDevice, MTLLoadAction, MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
     MTLResidencySet, MTLResidencySetDescriptor, MTLSamplerState, MTLScissorRect, MTLSize,
     MTLStoreAction, MTLTexture, MTLVertexAmplificationViewMapping, MTLViewport,
@@ -18,6 +19,16 @@ use super::{
     conv, TimestampQuerySupport,
 };
 use crate::CommandEncoder as _;
+
+pub(super) fn concurrent_dispatch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("NV_WGPU_METAL_CONCURRENT_DISPATCH").ok().as_deref(),
+            Some("1") | Some("on") | Some("true")
+        )
+    })
+}
 use alloc::{
     borrow::{Cow, ToOwned as _},
     sync::Arc,
@@ -579,10 +590,20 @@ impl crate::CommandEncoder for super::CommandEncoder {
         //do nothing
     }
 
-    unsafe fn transition_buffers<'a, T>(&mut self, _barriers: T)
+    unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
     where
         T: Iterator<Item = crate::BufferBarrier<'a, super::Buffer>>,
     {
+        if !concurrent_dispatch_enabled() {
+            return;
+        }
+        let Some(encoder) = self.state.compute.as_ref() else {
+            return;
+        };
+        let mut barriers = barriers;
+        if barriers.next().is_some() {
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
     }
 
     unsafe fn transition_textures<'a, T>(&mut self, _barriers: T)
@@ -1695,9 +1716,18 @@ impl crate::CommandEncoder for super::CommandEncoder {
             // TimeStamp Queries and ComputePassDescriptor were both introduced in Metal 2.3 (macOS 11, iOS 14)
             // and we currently only need ComputePassDescriptor for timestamp queries
             let encoder = if self.shared.private_caps.timestamp_query_support.is_empty() {
-                raw.computeCommandEncoder().unwrap()
+                if concurrent_dispatch_enabled() {
+                    let descriptor = MTLComputePassDescriptor::new();
+                    descriptor.setDispatchType(MTLDispatchType::Concurrent);
+                    raw.computeCommandEncoderWithDescriptor(&descriptor).unwrap()
+                } else {
+                    raw.computeCommandEncoder().unwrap()
+                }
             } else {
                 let descriptor = MTLComputePassDescriptor::new();
+                if concurrent_dispatch_enabled() {
+                    descriptor.setDispatchType(MTLDispatchType::Concurrent);
+                }
 
                 let mut sba_index = 0;
                 let mut next_sba_descriptor = || {

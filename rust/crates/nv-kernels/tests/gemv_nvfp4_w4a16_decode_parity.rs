@@ -180,8 +180,13 @@ fn gemv_nvfp4_w4a16_refuses_ragged_k_and_mismatched_dual_pointers_without_launch
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- times the two-kernel nvfp4 W4A16 decode MLP on the q38 dense shapes (dual gate+up N=17408 K=5120, silu-in down N=5120 K=17408) so the per-layer cost is comparable against the padded-A4 tensor-core route the profiler measured at ~164 us/layer"]
 fn gemv_nvfp4_w4a16_decode_mlp_shape_bench() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the w4a16 decode mlp shape bench executed nothing. It \
+             is already #[ignore]d, which makes --ignored the opt-in; a second env gate behind \
+             that can only make an --ignored run print `1 passed` for a bench that measured \
+             nothing. A suite whose precondition is absent must fail or be ignored, never return \
+             green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();

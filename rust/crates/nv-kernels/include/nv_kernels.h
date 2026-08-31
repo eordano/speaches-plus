@@ -182,6 +182,37 @@ int nv_kernels_marlin_gemm_w4a16_prezeroed(
     int a_is_bf16
 );
 
+int nv_kernels_marlin_int4_fp8_preprocess(
+    void* stream,
+    const void* qweight,
+    void* out,
+    long long numel_i32
+);
+
+int nv_kernels_marlin_repack_w4a8(
+    void* stream,
+    const void* b_q_packed,
+    void* b_q_marlin_out,
+    int k,
+    int n,
+    int num_bits
+);
+
+int nv_kernels_marlin_gemm_w4a8_fp8(
+    void* stream,
+    const void* a_fp8,
+    const void* a_scales_f32,
+    const void* b_q_marlin,
+    const void* b_scales_bf16,
+    void* c_out_bf16,
+    void* workspace,
+    int m,
+    int n,
+    int k,
+    int group_size,
+    int c_prezeroed
+);
+
 int nv_kernels_multi_zero_bf16(void* stream, const void* list, int n);
 
 int nv_kernels_gemv_i8_normed_mk_max_m(int K);
@@ -262,6 +293,37 @@ int nv_kernels_gemv_e4m3_mk(
     const uint16_t* x,
     uint16_t* y,
     int N,
+    int K,
+    int M
+);
+
+int nv_kernels_gemv_e4m3_group(
+    void* stream,
+    const uint8_t* wq,
+    const float* row_scale,
+    const uint16_t* x,
+    uint16_t* y,
+    int N,
+    int K,
+    int M,
+    int rows_per_warp
+);
+
+int nv_kernels_gemv_e4m3_group_tile_v(int M, int K);
+
+int nv_kernels_gemv_e4m3_untiled_staging_reaches_this_m(int K);
+
+int nv_kernels_gemv_e4m3_mk_dual(
+    void* stream,
+    const uint8_t* wq_a,
+    const float* rs_a,
+    const uint8_t* wq_b,
+    const float* rs_b,
+    const uint16_t* x,
+    uint16_t* y_a,
+    uint16_t* y_b,
+    int n_a,
+    int n_b,
     int K,
     int M
 );
@@ -389,6 +451,11 @@ int nv_kernels_flash_decode_dev_f32_bf16out(
     void* stream, const float* q, const float* k, const float* v, uint16_t* out,
     const int* pos, int NH, int NKV, int HD, int WINDOW);
 int nv_kernels_flash_splitk_scratch_elems(int NH, int HD);
+int nv_kernels_flash_depthgate_knee_tokens(void);
+int nv_kernels_flash_decode_fp8_splits_pick(int NH, int WINDOW);
+int nv_kernels_flash_decode_fp8_splits_pick_for_a_lane_group(
+    int NH, int WINDOW, int lanes_in_flight);
+int nv_kernels_flash_sm_count(void);
 int nv_kernels_flash_decode_splitk_bf16kv(
     void* stream, const float* q, const uint16_t* k, const uint16_t* v,
     uint16_t* out, const int* pos, float* scratch, int NH, int NKV, int HD,
@@ -455,7 +522,66 @@ int nv_kernels_flash_decode_kvshare_fp8kv_paged(
     int splits,
     float scaling,
     const int* block_table,
-    int block_size
+    int block_size,
+    int delta,
+    int hole_lo_delta,
+    int hole_hi_delta
+);
+
+int nv_kernels_flash_decode_rowshared_tctile_fp8kv_mk_paged(
+    void* stream,
+    const uint16_t* q,
+    const uint8_t* k_fp8,
+    const uint8_t* v_fp8,
+    const float* k_scales,
+    const float* v_scales,
+    uint16_t* out,
+    const int* n_total_dev,
+    float* scratch,
+    unsigned int* fan_in,
+    int NH,
+    int NKV,
+    int HD,
+    int WINDOW,
+    int RING,
+    int splits,
+    int splits_cap_scratch_rows_over_m,
+    float scaling,
+    const int* block_table,
+    int block_size,
+    int delta,
+    int M,
+    int hole_from_row,
+    int hole_lo_delta,
+    int hole_hi_delta
+);
+
+int nv_kernels_flash_decode_rowshared_fp8kv_mk_paged(
+    void* stream,
+    const uint16_t* q,
+    const uint8_t* k_fp8,
+    const uint8_t* v_fp8,
+    const float* k_scales,
+    const float* v_scales,
+    uint16_t* out,
+    const int* n_total_dev,
+    float* scratch,
+    unsigned int* fan_in,
+    int NH,
+    int NKV,
+    int HD,
+    int WINDOW,
+    int RING,
+    int splits,
+    int splits_cap_scratch_rows_over_m,
+    float scaling,
+    const int* block_table,
+    int block_size,
+    int delta,
+    int M,
+    int hole_from_row,
+    int hole_lo_delta,
+    int hole_hi_delta
 );
 
 int nv_kernels_flash_decode_derivev_fp8kv_paged(
@@ -505,6 +631,45 @@ int nv_kernels_flash_decode_fused_fp8kv(
     unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
     float scaling);
 
+int nv_kernels_flash_decode_fused_fp8kv_lane_group(
+    void* stream, const uint16_t* q, const uint8_t* k_fp8,
+    const uint8_t* v_fp8, const float* k_scales, const float* v_scales,
+    uint16_t* out, const int* n_total_dev, float* scratch,
+    unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
+    float scaling, int lanes_in_flight);
+
+int nv_kernels_flash_decode_fused_fp8kv_ilp4_paged(
+    void* stream, const uint16_t* q, const uint8_t* k_fp8, const uint8_t* v_fp8,
+    const float* k_scales, const float* v_scales, uint16_t* out,
+    const int* n_total_dev, float* scratch, unsigned int* fan_in,
+    int NH, int NKV, int HD, int WINDOW, int RING, float scaling,
+    const int* block_table, int block_size
+);
+
+int nv_kernels_flash_decode_fused_fp8kv_ilp4(
+    void* stream, const uint16_t* q, const uint8_t* k_fp8,
+    const uint8_t* v_fp8, const float* k_scales, const float* v_scales,
+    uint16_t* out, const int* n_total_dev, float* scratch,
+    unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
+    float scaling);
+
+int nv_kernels_flash_gshare_scratch_elems(int NH, int HD);
+
+int nv_kernels_flash_decode_fused_fp8kv_gshare_paged(
+    void* stream, const uint16_t* q, const uint8_t* k_fp8, const uint8_t* v_fp8,
+    const float* k_scales, const float* v_scales, uint16_t* out,
+    const int* n_total_dev, float* scratch, unsigned int* fan_in,
+    int NH, int NKV, int HD, int WINDOW, int RING, float scaling,
+    const int* block_table, int block_size
+);
+
+int nv_kernels_flash_decode_fused_fp8kv_gshare(
+    void* stream, const uint16_t* q, const uint8_t* k_fp8,
+    const uint8_t* v_fp8, const float* k_scales, const float* v_scales,
+    uint16_t* out, const int* n_total_dev, float* scratch,
+    unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
+    float scaling);
+
 int nv_kernels_flash_splitk_scratch_elems_mk(int NH, int HD, int M);
 
 int nv_kernels_flash_decode_fused_bf16kv_mk(
@@ -518,6 +683,12 @@ int nv_kernels_flash_decode_fused_fp8kv_mk(
     uint16_t* out, const int* n_total_dev, int delta, int M, float* scratch,
     unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
     float scaling);
+int nv_kernels_flash_decode_fused_fp8kv_mk_hole(
+    void* stream, const uint16_t* q, const uint8_t* k_fp8,
+    const uint8_t* v_fp8, const float* k_scales, const float* v_scales,
+    uint16_t* out, const int* n_total_dev, int delta, int M, float* scratch,
+    unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
+    float scaling, int hole_from_row, int hole_lo_delta, int hole_hi_delta);
 int nv_kernels_write_kv_bf16(
     void* stream, const float* src_k, const float* src_v, uint16_t* cache_k,
     uint16_t* cache_v, const int* pos, int NKV, int HD);
@@ -540,6 +711,26 @@ int nv_kernels_nvfp4_gemv_bf16act(
     float alpha,
     int N,
     int K
+);
+
+int nv_kernels_nvfp4_gemv_prenorm_fused(void);
+
+int nv_kernels_nvfp4_gemv_prenorm_fused_force(int on);
+
+int nv_kernels_nvfp4_gemv_prenorm_fuses_this_row(int k);
+
+int nv_kernels_nvfp4_gemv_bf16act_prenorm(
+    void* stream,
+    const uint8_t* W_packed,
+    const uint8_t* W_scales,
+    const uint16_t* x_raw,
+    const uint16_t* norm_w,
+    uint16_t* xn_scratch,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K,
+    float eps
 );
 
 int nv_kernels_nvfp4_gemv_bf16(
@@ -609,6 +800,7 @@ int nv_kernels_gemm_nvfp4_w4a16_mk_dual(
     float alpha_b,
     int M,
     int N,
+    int y_stride,
     int K
 );
 
@@ -637,6 +829,25 @@ int nv_kernels_gemv_nvfp4_w4a8_dual_m1(
     float alpha_a,
     float alpha_b,
     int N,
+    int K
+);
+
+int nv_kernels_gemv_nvfp4_w4a8_dual_argmax_m1(
+    void* stream,
+    const uint8_t* wq_a,
+    const uint8_t* sc_a,
+    const uint8_t* wq_b,
+    const uint8_t* sc_b,
+    const int8_t* x_q8,
+    const float* x_dequant_scale,
+    uint64_t* packed_best_scratch,
+    uint32_t* out_id,
+    float* out_logit,
+    float alpha_a,
+    float alpha_b,
+    int N,
+    int N_bot,
+    int bot_id_base,
     int K
 );
 
@@ -758,6 +969,7 @@ int nv_kernels_gemv_nvfp4_w4a8_dual_mk(
     float alpha_b,
     int M,
     int N,
+    int N_b,
     int K
 );
 
@@ -791,6 +1003,31 @@ int nv_kernels_qkv_norm_rope_kvstore_fp8_decode(
     float* v_scales_base,
     uint16_t* q_out,
     uint16_t* q_sig_out,
+    int n_q,
+    int n_kv,
+    int hd,
+    int q_row_stride,
+    int rotary_dim,
+    float eps
+);
+
+int nv_kernels_qkv_norm_rope_kvstore_fp8_rows(
+    void* stream,
+    const uint16_t* q_raw,
+    const uint16_t* k_raw,
+    const uint16_t* v_raw,
+    const uint16_t* q_norm_w,
+    const uint16_t* k_norm_w,
+    const float* cos_tab,
+    const float* sin_tab,
+    const int* positions,
+    uint8_t* k_fp8_base,
+    uint8_t* v_fp8_base,
+    float* k_scales_base,
+    float* v_scales_base,
+    uint16_t* q_out,
+    uint16_t* q_sig_out,
+    int rows,
     int n_q,
     int n_kv,
     int hd,
@@ -1034,6 +1271,40 @@ int nv_kernels_moe_grouped_fp4_gemv_m1_bf16(
     long long d_group_stride_elems
 );
 
+int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
+    void* stream,
+    const uint8_t* a_packed,
+    const uint8_t* a_scales,
+    const uint8_t* gate_w,
+    const uint8_t* gate_sf,
+    const float* gate_alphas,
+    const uint8_t* up_w,
+    const uint8_t* up_sf,
+    const float* up_alphas,
+    const float* dn_mini,
+    const int32_t* group_expert_ids,
+    uint8_t* y_act_fp4,
+    uint8_t* y_act_sf,
+    int num_groups,
+    int num_experts_total,
+    int n,
+    int k,
+    int a_tile_stride_rows
+);
+
+int nv_kernels_moe_router_gemv_sg_xstage_small_m(
+    void* stream,
+    const uint16_t* x_bf16,
+    const uint16_t* wg_bf16,
+    const uint16_t* wsg_bf16,
+    float* logits_f32,
+    uint16_t* sg_out_bf16,
+    uint16_t* x_stage_bf16,
+    int m,
+    int E,
+    int K
+);
+
 int nv_kernels_cutlass_fp4_gemm_sm120_bf16(
     void* stream,
     const void* a_fp4,
@@ -1095,6 +1366,53 @@ int nv_kernels_gdn_recurrent_stateful_gqa_bf16out(
     int v_channel_offset
 );
 
+
+int nv_kernels_gdn_recurrent_stateful_gqa_bf16out_shfl(
+    void* stream,
+    const float* qn,
+    const float* kn,
+    const uint16_t* mixed,
+    const float* g_exp,
+    const float* beta,
+    float* state_inout,
+    uint16_t* out,
+    int B,
+    int T,
+    int H,
+    int HK,
+    int K,
+    int V,
+    int conv_dim,
+    int v_channel_offset
+);
+
+
+
+long long nv_kernels_gdn_chunk_gemm_scan_workspace_elems(int T, int H, int HK);
+
+long long nv_kernels_gdn_chunk_gemm_graph_replays_total(void);
+
+int nv_kernels_gdn_chunk_gemm_scan_f32(
+    void* stream,
+    const float* qn,
+    const float* kn,
+    const uint16_t* mixed,
+    const float* g_exp,
+    const float* beta,
+    float* state_inout,
+    uint16_t* out,
+    float* workspace,
+    long long workspace_elems,
+    int B,
+    int T,
+    int H,
+    int HK,
+    int K,
+    int V,
+    int conv_dim,
+    int v_channel_offset
+);
+
 int nv_kernels_gdn_conv1d_silu_bt_bf16(
     void* stream,
     const uint16_t* x,
@@ -1118,6 +1436,18 @@ int nv_kernels_gdn_prefill_rmsnorm_gate_bf16(
     int v_dim,
     float rms_eps
 );
+
+int nv_kernels_norm_m1_wide_block(void);
+
+int nv_kernels_norm_m1_wide_force(int block);
+
+int nv_kernels_norm_m1_split_ctas(void);
+
+int nv_kernels_norm_m1_split_force(int ctas);
+
+int nv_kernels_norm_m1_wide_block_for_launch(size_t batch, size_t hidden);
+
+int nv_kernels_norm_m1_split_ctas_for_launch(size_t batch, size_t hidden);
 
 int nv_kernels_rmsnorm_residual_bf16(
     void* stream,
@@ -1151,6 +1481,19 @@ int nv_kernels_gdn_conv_decode_silu_bf16(
     int k
 );
 
+int nv_kernels_gdn_conv_decode_silu_group_bf16(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* const* conv_states,
+    const uint16_t* w,
+    uint16_t* y,
+    int conv_dim,
+    int k,
+    int lanes,
+    int x_lane_stride,
+    int y_lane_stride
+);
+
 int nv_kernels_gdn_decode_step_bf16(
     void* stream,
     const uint16_t* mixed,
@@ -1167,6 +1510,56 @@ int nv_kernels_gdn_decode_step_bf16(
     int d_k,
     int d_v,
     float rms_eps
+);
+
+int nv_kernels_gdn_decode_step_group_vec4_arm_set(int arm);
+
+int nv_kernels_gdn_decode_step_split_group_bf16(
+    void* stream,
+    const uint16_t* mixed,
+    const uint16_t* z,
+    const uint16_t* a_in,
+    const uint16_t* b_in,
+    const uint16_t* A_log,
+    const uint16_t* dt_bias,
+    const uint16_t* norm_w,
+    float* const* states,
+    uint16_t* out,
+    float* qn_scratch,
+    float* kn_scratch,
+    float* g_exp_scratch,
+    float* beta_scratch,
+    uint16_t* core_scratch,
+    int n_k,
+    int n_v,
+    int d_k,
+    int d_v,
+    float rms_eps,
+    int lanes,
+    int ab_lane_stride
+);
+
+int nv_kernels_gdn_decode_step_group_bf16(
+    void* stream,
+    const uint16_t* mixed,
+    const uint16_t* z,
+    const uint16_t* a_in,
+    const uint16_t* b_in,
+    const uint16_t* A_log,
+    const uint16_t* dt_bias,
+    const uint16_t* norm_w,
+    float* const* states,
+    uint16_t* out,
+    int n_k,
+    int n_v,
+    int d_k,
+    int d_v,
+    float rms_eps,
+    int lanes,
+    int mixed_lane_stride,
+    int z_lane_stride,
+    int ab_lane_stride,
+    int out_lane_stride
 );
 
 int nv_kernels_gdn_decode_step_split_bf16(
@@ -1268,7 +1661,8 @@ int nv_kernels_gdn_decode_chunk_bf16(
     int d_k,
     int d_v,
     float rms_eps,
-    int t
+    int t,
+    int ab_row_stride
 );
 
 int nv_kernels_gdn_decode_chunk_split_bf16(
@@ -1294,7 +1688,49 @@ int nv_kernels_gdn_decode_chunk_split_bf16(
     int d_k,
     int d_v,
     float rms_eps,
+    int t,
+    int ab_row_stride
+);
+
+int nv_kernels_gdn_conv_decode_chunk_silu_tree_bf16(
+    void* stream,
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const uint16_t* w,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    const int* parents,
+    int conv_dim,
+    int k,
     int t
+);
+
+int nv_kernels_gdn_decode_chunk_split_tree_bf16(
+    void* stream,
+    const uint16_t* mixed,
+    const uint16_t* z,
+    const uint16_t* a_in,
+    const uint16_t* b_in,
+    const uint16_t* A_log,
+    const uint16_t* dt_bias,
+    const uint16_t* norm_w,
+    const float* state_in,
+    float* ckpt_state,
+    float* live_state_out,
+    uint16_t* out,
+    float* qn_scratch,
+    float* kn_scratch,
+    float* g_exp_scratch,
+    float* beta_scratch,
+    uint16_t* core_scratch,
+    const int* parents,
+    int n_k,
+    int n_v,
+    int d_k,
+    int d_v,
+    float rms_eps,
+    int t,
+    int ab_row_stride
 );
 
 int nv_kernels_gdn_gating_bf16(
@@ -1465,6 +1901,19 @@ int nv_kernels_moe_unpermute_scatter_tail(
     int y_sorted_row_stride
 );
 
+int nv_kernels_moe_unpermute_scatter_shared_sig_tail(
+    void* stream,
+    const uint16_t* y_sorted_bf16,
+    const float* topk_weights,
+    const int32_t* inv_perm,
+    const uint16_t* shared_gate_logit_bf16,
+    uint16_t* out_bf16,
+    int n_tokens,
+    int k,
+    int hidden,
+    int y_sorted_row_stride
+);
+
 int nv_kernels_moe_gemv_swiglu_bf16_m1(
     void* stream,
     const uint16_t* gate,
@@ -1566,7 +2015,7 @@ int nv_kernels_moe_route_topk_shared_tail(
     int shared_tail_id
 );
 
-int nv_kernels_moe_route_gather_quant_m1(
+int nv_kernels_moe_route_gather_quant_small_m(
     void* stream,
     const float* logits,
     const float* bias,
@@ -1579,6 +2028,7 @@ int nv_kernels_moe_route_gather_quant_m1(
     float* dn_mini,
     uint8_t* x_fp4,
     uint8_t* x_sf,
+    int n_tokens,
     int E,
     int K,
     int mode,
@@ -1587,7 +2037,8 @@ int nv_kernels_moe_route_gather_quant_m1(
     float routed_scaling,
     int shared_tail_id,
     int hidden,
-    int min_tile
+    int min_tile,
+    int quant_ctas
 );
 
 int nv_kernels_gather_f32_by_ids(
@@ -1916,6 +2367,32 @@ int nv_kernels_rope_bf16_oop(
     size_t n_kv_heads,
     size_t head_dim
 );
+
+int nv_kernels_attn_gate_sigmoid_mul_bf16(
+    void* stream,
+    const uint16_t* attn,
+    const uint16_t* q_raw,
+    uint16_t* out,
+    size_t rows,
+    size_t n_heads,
+    size_t head_dim
+);
+
+int nv_kernels_rope_bf16_partial_oop(
+    void* stream,
+    const uint16_t* q_in,
+    const uint16_t* k_in,
+    uint16_t* q_out,
+    uint16_t* k_out,
+    const float* cos_tbl,
+    const float* sin_tbl,
+    const int32_t* positions,
+    size_t batch,
+    size_t n_heads,
+    size_t n_kv_heads,
+    size_t head_dim,
+    size_t rotary_dim
+);
 int nv_kernels_token_map_u32(
     void* stream, const uint32_t* map, const uint32_t* idx, uint32_t* out);
 int nv_kernels_argmax_f32_rows(
@@ -1934,6 +2411,23 @@ int nv_kernels_cutlass_fp4_gemm_sm120_bf16_streamk(
     size_t workspace_bytes,
     size_t* required_workspace
 );
+int nv_kernels_dequant_weight_nvfp4_swizzled_to_bf16_rowmajor(
+    void* stream,
+    const uint8_t* w_packed,
+    const uint8_t* w_scales_swizzled,
+    uint16_t* out_bf16,
+    float alpha,
+    int n,
+    int k
+);
+int nv_kernels_dequant_weight_e4m3_rowscale_to_bf16_rowmajor(
+    void* stream,
+    const uint8_t* wq,
+    const float* row_scale,
+    uint16_t* out_bf16,
+    int n,
+    int k
+);
 int nv_kernels_cutlass_fp4_gemm_sm120_bf16_tiled(
     void* stream,
     const void* a_fp4,
@@ -1948,6 +2442,16 @@ int nv_kernels_cutlass_fp4_gemm_sm120_bf16_tiled(
     void* workspace,
     size_t workspace_bytes,
     size_t* required_workspace
+);
+int nv_kernels_nvfp4_gemm_sm120_v192_bf16(
+    void* stream,
+    const void* a_fp4,
+    const void* a_sf,
+    const void* b_fp4,
+    const void* b_sf,
+    const float* global_sf,
+    void* d_bf16,
+    int m, int n, int k
 );
 
 #ifdef __cplusplus

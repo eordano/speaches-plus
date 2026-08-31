@@ -61,17 +61,27 @@ env:
   NVK_REFRESH   set to 1 to force-regenerate the cached dev env
   NVK_VULKAN_LOADER  dir holding libvulkan.so.1 (default: newest in /nix/store);
                 needed or every wgpu GPU test SKIPs while still printing "ok"
+  NVK_ORT_CUDA  cuda shells only: the devshell pins a CPU-only onnxruntime, so
+                after sourcing, ORT_DYLIB_PATH is repointed at a CUDA-EP-capable
+                libonnxruntime.so (default: a /nix/store lib of the SAME
+                onnxruntime version carrying libonnxruntime_providers_cuda.so).
+                Set a dir to pin one, 0 to keep the devshell CPU dylib. GPU
+                STT/kokoro/diarization key off this: without the CUDA EP the
+                STT default stays CPU whisper
   NVK_CCACHE    1 (default) to route nvcc + cmake CUDA through ccache so
                 concurrent lanes share compiled objects; 0 to disable
   NVK_CCACHE_DIR    ccache storage (default: $CACHE/ccache)
   NVK_CCACHE_SIZE   ccache cap (default: 20G; a full nv-kernels + whisper-rs-sys
                 + ct2rs build costs ~300 MB)
-  NVK_SCCACHE   1 to route rustc (RUSTC_WRAPPER) through sccache, sharing compiled
-                rust crates across lanes; sets CARGO_INCREMENTAL=0, so a warm
-                in-lane edit loop keeps incremental only with this off. Default 0:
-                a cold-lane nv-kernels rebuild is 3m39s bare vs 3m28s on a warm
-                sccache (~5%, under the 20% default-on bar -- the wall is the
-                nv-kernels crate + linking + build scripts, none cacheable).
+  NVK_SCCACHE   1 to route rustc (RUSTC_WRAPPER) through sccache; sets
+                CARGO_INCREMENTAL=0, so a warm in-lane edit loop keeps
+                incremental only with this off. Default 0, and it does NOT
+                share rust artifacts across lanes: the cache key includes the
+                per-lane target-dir path, so a fresh lane hits 0% (nv-models
+                --release: 5m52s vs 5m31s bare -- a net loss). It pays only
+                when a lane is rebuilt under the SAME name after a reap
+                (100% hits, 4m39s vs 5m31s, ~16% -- the wall is linking,
+                build scripts and proc-macro crates, none cacheable).
                 nvcc stays on ccache even here: sccache 0.17 cannot parse the
                 '#$ compiler-bindir=' line nixpkgs cuda_nvcc's nvcc.profile adds
                 to --dryrun output (is_envvar_line_re wants [_A-Z]+=) and dies
@@ -86,7 +96,24 @@ EOF
 }
 
 lane_last_used_epoch() {
-  find "$1" -maxdepth 2 -printf '%T@\n' 2>/dev/null | sort -rn | awk 'NR==1{printf "%d",$1;exit}' || true
+  python3 - "$1" <<'PYEOF' 2>/dev/null || true
+import os, sys
+root = sys.argv[1]
+best = 0
+for cur, dirs, files in os.walk(root):
+    depth = os.path.relpath(cur, root).count(os.sep)
+    if depth >= 2:
+        dirs[:] = []
+        continue
+    for n in dirs + files:
+        try:
+            m = os.lstat(os.path.join(cur, n)).st_mtime
+        except OSError:
+            continue
+        if m > best:
+            best = m
+print(int(best), end="")
+PYEOF
 }
 
 lane_live_consumers() {
@@ -217,10 +244,20 @@ if [ "${NVK_REFRESH:-0}" = "1" ] || [ ! -s "$ENVFILE" ] || [ "$STALE_SELF" = "1"
   printf '%s\n' "$STAMP" >"$STAMPFILE"
 fi
 
+CALLER_MODEL_ENV_WINS_OVER_CACHED_DEVENV="NV_CHAT_MODEL_DIR NV_CHAT_MODEL_DIRS NV_WGPU_CHAT_MODEL_DIRS HF_HUB_CACHE"
+for v in $CALLER_MODEL_ENV_WINS_OVER_CACHED_DEVENV; do
+  if [ -n "${!v+x}" ]; then eval "NVK_CALLER_$v=\${$v}"; fi
+done
+
 set +u
 # shellcheck disable=SC1090
 . "$ENVFILE"
 set -u
+
+for v in $CALLER_MODEL_ENV_WINS_OVER_CACHED_DEVENV; do
+  saved="NVK_CALLER_$v"
+  if [ -n "${!saved+x}" ]; then eval "export $v=\${$saved}"; fi
+done
 
 export TMPDIR="$TGT/tmp"
 mkdir -p "$TMPDIR"
@@ -237,6 +274,29 @@ fi
 VKLOADER="${NVK_VULKAN_LOADER:-$(printf '%s\n' /nix/store/*-vulkan-loader-*/lib | sort | tail -1 || true)}"
 if [ -n "$VKLOADER" ] && [ -e "$VKLOADER/libvulkan.so.1" ]; then
   export LD_LIBRARY_PATH="$VKLOADER${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+if [ "${NVK_ORT_CUDA:-1}" != "0" ] && [ -n "${ORT_DYLIB_PATH:-}" ]; then
+  case "$SHELL_ATTR" in
+    *cuda*)
+      if [ ! -e "$(dirname "$ORT_DYLIB_PATH")/libonnxruntime_providers_cuda.so" ]; then
+        ORTCUDA="${NVK_ORT_CUDA:-1}"
+        if [ "$ORTCUDA" = "1" ]; then
+          ORTNAME=$(basename "$(dirname "$(dirname "$ORT_DYLIB_PATH")")")
+          ORTNAME="${ORTNAME#*-}"
+          ORTCUDA=$(for d in /nix/store/*-"$ORTNAME"/lib; do
+            if [ -e "$d/libonnxruntime_providers_cuda.so" ] && [ -e "$d/libonnxruntime.so" ]; then
+              printf '%s\n' "$d"
+            fi
+          done | sort | tail -1 || true)
+        fi
+        if [ -n "$ORTCUDA" ] && [ -e "$ORTCUDA/libonnxruntime.so" ]; then
+          export ORT_DYLIB_PATH="$ORTCUDA/libonnxruntime.so"
+          echo "nvk: devshell onnxruntime lacks the CUDA EP; ORT_DYLIB_PATH -> $ORT_DYLIB_PATH (NVK_ORT_CUDA=0 restores the CPU dylib)" >&2
+        fi
+      fi
+      ;;
+  esac
 fi
 
 if [ "${NVK_SCCACHE:-0}" != "0" ]; then
@@ -282,9 +342,13 @@ case "$SUB" in
   probe)
     SUB='test'
     ARGS="--release $ARGS"
-    GPU_LOCK="${NVK_GPU_LOCK:-/tmp/nvk-gpu0.lock}"
+    GPU_LOCK="${NVK_GPU_LOCK:-/tmp/claude-$(id -u)/nvk-gpu0.lock}"
     mkdir -p "$(dirname "$GPU_LOCK")"
-    LOCKWRAP="flock $GPU_LOCK"
+    if command -v flock >/dev/null 2>&1; then
+      LOCKWRAP="flock $GPU_LOCK"
+    else
+      LOCKWRAP="python3 $REPO/rust/scripts/gpu-flock.py $GPU_LOCK"
+    fi
     echo "nvk: probe mode -- release profile, exclusive GPU lock $GPU_LOCK (waits if another probe holds it)" >&2
     ;;
 esac

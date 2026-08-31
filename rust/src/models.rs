@@ -66,7 +66,8 @@ impl Models {
         let mut whisper_unavailable: Option<String> = None;
         let whisper = match WhisperEngine::load(&model_dir) {
             Ok(engine) => {
-                let stt_backend = match engine.handle() {
+                let handle = engine.handle();
+                let stt_backend = match &handle {
                     WhisperHandle::Ct2 { .. } => "ct2",
                     WhisperHandle::WhisperCpp { .. } => "whisper.cpp",
                     WhisperHandle::Parakeet { .. } => "parakeet-tdt",
@@ -74,6 +75,7 @@ impl Models {
                 tracing::info!(
                     elapsed_ms = t.elapsed().as_millis() as u64,
                     backend = stt_backend,
+                    ep = handle.ep().unwrap_or("whisper.cpp-internal"),
                     "Whisper loaded"
                 );
                 Some(engine)
@@ -94,7 +96,11 @@ impl Models {
                 "Kokoro loaded; kokoro TTS ready"
             );
         } else {
-            tracing::info!("kokoro TTS disabled (missing or unloadable model/voices.bin)");
+            tracing::warn!(
+                "kokoro-v1.0.onnx/voices.bin missing or unloadable under {} -- kokoro voices on \
+                 /v1/audio/speech disabled",
+                model_dir.display()
+            );
         }
 
         let t = std::time::Instant::now();
@@ -115,8 +121,10 @@ impl Models {
                     }
                 }
             } else {
-                tracing::info!(
-                    "diarization segmentation not present at {} (run scripts/export-diarizen-onnx.py to enable)",
+                tracing::warn!(
+                    "diarizen-segmentation.onnx not found at {} -- /v1/audio/diarization and \
+                     diarized_json disabled (nix build .#diarizen-segmentation-onnx, or enter \
+                     the python dev shell to symlink rust/models)",
                     p.display()
                 );
                 None
@@ -141,8 +149,10 @@ impl Models {
                     }
                 }
             } else {
-                tracing::info!(
-                    "speaker embedding not present at {} (run scripts/fetch-models.sh to enable)",
+                tracing::warn!(
+                    "wespeaker-resnet293-LM.onnx not found at {} -- speaker embeddings, \
+                     diarization speaker labels and /v1/audio/embeddings disabled (run \
+                     scripts/fetch-models.sh to enable)",
                     p.display()
                 );
                 None

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# wedge-watch — find stalled/wedged workflow agents by transcript mtime.
+#
+# Scans a subagents/workflows tree: an agent is STALE when its transcript
+# (agent-*.jsonl) hasn't grown for --stale minutes AND its journal has a
+# `started` entry with no matching `result` (i.e. the workflow still expects
+# output from it). Also reports journals with started>result imbalance
+# (21 of 361 starts in the last 72h never produced a result).
+#
+#   wedge-watch [--root DIR] [--stale MIN] [--window H]
+#
+# Read-only. Exit 1 if any stale agent found (so it can drive an alert/nudge).
+set -u
+ROOT="${WEDGE_WATCH_ROOT:-$HOME/.claude/projects/PROJECT/SESSION/subagents/workflows}"
+STALE_MIN=20
+WINDOW_H=24
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) ROOT="$2"; shift 2 ;;
+    --stale) STALE_MIN="$2"; shift 2 ;;
+    --window) WINDOW_H="$2"; shift 2 ;;
+    *) echo "unknown arg $1" >&2; exit 2 ;;
+  esac
+done
+
+now=$(date +%s)
+found=0
+for wf in "$ROOT"/*/; do
+  j="$wf/journal.jsonl"
+  [ -f "$j" ] || continue
+  # only workflows touched inside the window
+  jm=$(stat -c %Y "$j")
+  [ $(( (now-jm) / 3600 )) -ge "$WINDOW_H" ] && continue
+  # agents started but with no result line
+  pending=$(awk -F'"agentId":"' '
+    /"type":"started"/ {split($2,a,"\""); s[a[1]]=1}
+    /"type":"result"/  {split($2,a,"\""); delete s[a[1]]}
+    END {for (k in s) print k}' "$j")
+  [ -n "$pending" ] || continue
+  for aid in $pending; do
+    t="$wf/agent-$aid.jsonl"
+    if [ ! -f "$t" ]; then
+      echo "MISSING  $(basename "$wf") agent-$aid (started, no transcript)"
+      found=1
+      continue
+    fi
+    tm=$(stat -c %Y "$t")
+    age_min=$(( (now-tm) / 60 ))
+    if [ "$age_min" -ge "$STALE_MIN" ]; then
+      echo "STALE    $(basename "$wf") agent-$aid idle=${age_min}m last=$(date -d @"$tm" +%m-%d\ %H:%M) size=$(stat -c %s "$t")"
+      found=1
+    else
+      echo "active   $(basename "$wf") agent-$aid idle=${age_min}m"
+    fi
+  done
+done
+[ "$found" -eq 0 ] && echo "no stale agents (window=${WINDOW_H}h stale>=${STALE_MIN}m)"
+exit "$found"

@@ -94,6 +94,7 @@ fn args(base: &Path, data: &Path, out: &Path, steps: usize) -> TrainArgs {
     TrainArgs {
         base: base.to_path_buf(),
         data: data.to_path_buf(),
+        eval_data: None,
         out: out.to_path_buf(),
         rank: 8,
         alpha: 16.0,

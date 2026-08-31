@@ -4,7 +4,9 @@ use axum::http::HeaderMap;
 
 pub const HEADER: &str = "x-request-timeout-ms";
 pub const MAX_VAR: &str = "NV_MAX_REQUEST_TIMEOUT_MS";
-pub const DEFAULT_MAX_MS: u64 = 120_000;
+pub const DEFAULT_MAX_MS_600S_SO_A_196K_PREFILL_PLUS_FULL_DECODE_FITS_A_CALLER_BUDGET_WITHOUT_NV_MAX_REQUEST_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_MAX_MS: u64 =
+    DEFAULT_MAX_MS_600S_SO_A_196K_PREFILL_PLUS_FULL_DECODE_FITS_A_CALLER_BUDGET_WITHOUT_NV_MAX_REQUEST_TIMEOUT_MS;
 pub const FLOOR_MS: u64 = 50;
 
 pub fn floor() -> Duration {
@@ -149,6 +151,19 @@ mod tests {
     }
 
     #[test]
+    fn a_ten_minute_caller_budget_for_a_196k_prefill_is_honoured_by_the_default_ceiling() {
+        assert_eq!(
+            resolve_with_max(Some(ms(600_000)), ms(3000), ms(DEFAULT_MAX_MS)),
+            ms(600_000)
+        );
+        assert_eq!(
+            resolve_with_max(Some(ms(300_000)), ms(3000), ms(DEFAULT_MAX_MS)),
+            ms(300_000),
+            "a 5-minute x-request-timeout-ms must not be cut to 120 s and shed"
+        );
+    }
+
+    #[test]
     fn a_zero_or_tiny_client_budget_is_lifted_to_the_floor() {
         assert_eq!(resolve_with_max(Some(ms(0)), ms(3000), ms(120_000)), ms(50));
         assert_eq!(resolve_with_max(Some(ms(7)), ms(3000), ms(120_000)), ms(50));
@@ -186,7 +201,11 @@ mod tests {
         assert_eq!(max_ms_from(Some("30000")), 30_000);
         assert_eq!(max_ms_from(Some(" 30000 ")), 30_000);
         assert_eq!(max_ms_from(Some("5")), FLOOR_MS);
-        assert_eq!(DEFAULT_MAX_MS, 120_000);
+        assert_eq!(
+            DEFAULT_MAX_MS, 600_000,
+            "the default ceiling must admit a caller budget covering a 196k prefill plus a full \
+             decode; 120_000 shed those requests (limits census ARB-5)"
+        );
         assert_eq!(FLOOR_MS, 50);
     }
 

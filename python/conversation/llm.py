@@ -113,9 +113,12 @@ async def complete_stream_messages(
     cfg: LlmConfig,
     messages: list[ChatMessage],
     cancel: asyncio.Event | None = None,
+    trajectory_tag: str | None = None,
 ) -> AsyncIterator[str]:
     queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=64)
-    task = asyncio.create_task(_stream_messages_into(cfg, messages, queue, cancel))
+    task = asyncio.create_task(
+        _stream_messages_into(cfg, messages, queue, cancel, trajectory_tag)
+    )
     try:
         while True:
             kind, payload = await queue.get()
@@ -138,6 +141,7 @@ async def _stream_messages_into(
     messages: list[ChatMessage],
     queue: asyncio.Queue[tuple[str, object]],
     cancel: asyncio.Event | None,
+    trajectory_tag: str | None = None,
 ) -> None:
     try:
         url = f"{cfg.base_url.rstrip('/')}/chat/completions"
@@ -149,6 +153,8 @@ async def _stream_messages_into(
         headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
         if cfg.api_key:
             headers["Authorization"] = f"Bearer {cfg.api_key}"
+        if trajectory_tag and trajectory_tag.strip():
+            headers["x-trajectory-tag"] = trajectory_tag.strip()
 
         emitted_any = False
         async with httpx.AsyncClient(timeout=None) as client:

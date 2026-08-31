@@ -41,13 +41,7 @@ pub fn embed_row_route(kind: WgpuModelKind) -> Result<MmRoute, &'static str> {
              Serve this checkpoint's images/audio on the cuda gemma4 engine, or land the e4b \
              embed-row splice next to the gemma4_wgpu one first.",
         ),
-        WgpuModelKind::Qwen3_5Moe => Err(
-            "qwen3.5-moe (nv-models::qwen3_5_moe_wgpu) has a decoder-level embed-row splice \
-             (prefill_with_splices, pinned by crates/nv-models/tests/qwen36_moe_vision_splice.rs) \
-             but the serving seam loads no vision tower for this kind and no image oracle has \
-             been recorded against a real qwen3.6-moe checkpoint, so serving it would be an \
-             unmeasured path.",
-        ),
+        WgpuModelKind::Qwen3_5Moe => Ok(MmRoute::Qwen3Vision),
         WgpuModelKind::Laguna => Err(
             "laguna-xs (nv-models::laguna_wgpu) is a text-only checkpoint: it carries no \
              vision_config and no audio_config, so there is no tower to turn media into rows.",
@@ -131,6 +125,18 @@ pub fn detect(
 ) -> Result<Option<MmSpec>> {
     match embed_row_route(kind) {
         Err(_) => Ok(None),
+        Ok(MmRoute::Qwen3Vision)
+            if kind == WgpuModelKind::Qwen3_5Moe
+                && !model_dir.join("model_visual.safetensors").is_file() =>
+        {
+            tracing::warn!(
+                dir = %model_dir.display(),
+                "qwen3.6-moe checkpoint dir carries a vision_config but no \
+                 model_visual.safetensors (the text-only nix-hug profile excludes it); text \
+                 serving continues and media requests are refused by name"
+            );
+            Ok(None)
+        }
         Ok(MmRoute::Qwen3Vision) => Ok(Qwen3MmSpec::from_model_dir(model_dir, raw_cfg, tokenizer)?
             .map(|s| MmSpec::Qwen3(Box::new(s)))),
         Ok(MmRoute::Gemma4Towers) => {

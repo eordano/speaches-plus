@@ -1,0 +1,71 @@
+{
+ "ladder": "laguna-splits-residual",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "laguna splits residual",
+  "model": "laguna-xs-2.1-nvfp4",
+  "backend": "cuda",
+  "pkg": "nv-models",
+  "features": "cuda",
+  "suite": "laguna_ctx_scaling",
+  "exact": "laguna_cuda_decode_ms_per_token_vs_context_depth_step_graph_whole_step_capture_synthetic_cache_fill",
+  "parse": "ctx-scaling",
+  "timeout": "2400"
+ },
+ "base_env": {
+  "NV_LAGUNA_CTX_TEST": "1"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  8192,
+  24576,
+  98304,
+  200704
+ ],
+ "depths_per_run": false,
+ "notes": "#283's cheap gate: price what the round-82 depth-gate bands leave between their knees before anyone writes Stream-K; if no pinned split beats the gate beyond the null anywhere, the Laguna leg of Stream-K dies here",
+ "rationale": "The depthgate (default on since round 82) picks 16 splits through scanned 16384 and 47 from 32768 up; its knees are exact fit points and FLOOR-TABLE's Stream-K writeup says the bands are 'exact only AT the knees and ragged between them' with the residual unmeasured. Depths chosen off-knee: 8192 (inside band 1), 24576 (BETWEEN the knees, the ragged zone), 98304 and 200704 (deep in band 2). Arms: the gate default twice (identical env dicts are the null pair, the specoff precedent), then the gate disabled with pinned NV_LAGUNA_M1_SPLITS in {24, 32, 47, 64}. Read: if some pinned split beats the gate at 24576 or deep beyond the measured null, the between-knees residual is real and Stream-K's Laguna leg has a quantified prize; if the gate matches the best pinned split everywhere, the bands are near-optimal and #283's Laguna justification collapses to the occupancy argument alone. laguna_flash_decode_gqa is 73.2% of steady deep GPU time (phase-validated), so kernel-level deltas surface ~0.7x in tok/s. 250W cells per #278.",
+ "baseline_arm": "gate-default",
+ "null_pair": [
+  "gate-default",
+  "gate-again"
+ ],
+ "arms": [
+  {
+   "name": "gate-default",
+   "env": {}
+  },
+  {
+   "name": "gate-again",
+   "env": {}
+  },
+  {
+   "name": "pin24",
+   "env": {
+    "NV_LAGUNA_M1_DEPTHGATE": "0",
+    "NV_LAGUNA_M1_SPLITS": "24"
+   }
+  },
+  {
+   "name": "pin32",
+   "env": {
+    "NV_LAGUNA_M1_DEPTHGATE": "0",
+    "NV_LAGUNA_M1_SPLITS": "32"
+   }
+  },
+  {
+   "name": "pin47",
+   "env": {
+    "NV_LAGUNA_M1_DEPTHGATE": "0",
+    "NV_LAGUNA_M1_SPLITS": "47"
+   }
+  },
+  {
+   "name": "pin64",
+   "env": {
+    "NV_LAGUNA_M1_DEPTHGATE": "0",
+    "NV_LAGUNA_M1_SPLITS": "64"
+   }
+  }
+ ]
+}

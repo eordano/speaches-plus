@@ -18,6 +18,29 @@ pub const FP8_E4M3_MAX: f32 = 448.0;
 
 const SCRATCH_BYTES: u32 = WORKGROUP_SIZE * 4 + 4;
 
+pub fn e4m3_encode_helpers_sliced_verbatim_from_wgsl_so_the_rn_division_and_rounding_text_exists_once(
+) -> String {
+    let const_start = WGSL
+        .find("const KV_FP8_E4M3_MAX")
+        .expect("kv_fp8.wgsl lost const KV_FP8_E4M3_MAX");
+    let const_line = &WGSL[const_start..const_start
+        + WGSL[const_start..]
+            .find('\n')
+            .expect("kv_fp8.wgsl const KV_FP8_E4M3_MAX line unterminated")];
+    let div_start = WGSL
+        .find("fn kv_div_rn")
+        .expect("kv_fp8.wgsl lost fn kv_div_rn");
+    let reduce_start = WGSL
+        .find("fn kv_reduce_max")
+        .expect("kv_fp8.wgsl lost fn kv_reduce_max");
+    let fns = &WGSL[div_start..reduce_start];
+    assert!(
+        fns.contains("fn kv_encode_e4m3") && !fns.contains("@group") && !fns.contains("var<workgroup>"),
+        "kv_fp8.wgsl helper region drifted; the slice must stay pure fns for reuse in fused_attn_chain"
+    );
+    format!("{const_line}\n{fns}")
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct KvFp8Params {

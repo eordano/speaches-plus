@@ -142,6 +142,9 @@ pub fn normalize_module_name(module: &str) -> String {
     if let Some(rest) = module.strip_prefix("model.layers.") {
         return format!("model.language_model.layers.{rest}");
     }
+    if let Some(rest) = module.strip_prefix("language_model.model.layers.") {
+        return format!("model.language_model.layers.{rest}");
+    }
     if module == "model.embed_tokens" {
         return "model.language_model.embed_tokens".to_string();
     }

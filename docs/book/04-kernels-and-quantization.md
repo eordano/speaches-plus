@@ -109,7 +109,9 @@ pre-transposed contiguous copy built by `Linear::new`.
 `Linear::new_no_pretranspose` skips it: the differentiable training path reads
 only `weight`, and on a large dense model the transposed copy doubles the
 resident bf16 footprint. `matmul_bf16` (`nv-layers/src/linear.rs`) dispatches:
-non-CUDA or non-bf16 input → `matmul_fallback` (candle matmul, f32 upcast on
+a CUDA autograd input → `Bf16LinearOp` (the serving bt GEMM forward with a
+dy @ W dx-only backward, the frozen weight held inside the op); non-CUDA or
+non-bf16 input → `matmul_fallback` (candle matmul, f32 upcast on
 CPU); `leading == 1`, `in_features` even, not forced dense → hand-written
 `nv_kernels_gemv_bf16`; `weight_t` present →
 `TensorCoreGemm::bf16_matmul_row_major_offs`; 2..=16 rows with `NV_BF16_SMALLM_DET`

@@ -854,7 +854,7 @@ impl LagunaDflash {
             )?;
             let o_proj = lin(&format!("{p}.self_attn.o_proj.weight"), h, q_rows)?;
             #[cfg(feature = "cuda")]
-            let w8 = if std::env::var_os("NV_DFLASH_ATTN_FP8").is_some()
+            let w8 = if nv_config::env_arm_present_at_all_reread_every_call("NV_DFLASH_ATTN_FP8")
                 && matches!(device, Device::Cuda(_))
             {
                 let built = crate::laguna::LagunaAttnW8::build(
@@ -990,7 +990,7 @@ impl LagunaDflash {
         let mut cache = DflashCtxCache::new(self.layers.len());
         #[cfg(feature = "cuda")]
         if matches!(self.device, Device::Cuda(_))
-            && std::env::var_os("NV_DFLASH_HOST_CTX").is_none()
+            && !nv_config::env_arm_present_at_all_reread_every_call("NV_DFLASH_HOST_CTX")
         {
             match self.new_ctx_ring() {
                 Ok(r) => cache.ring = Some(r),
@@ -2288,24 +2288,19 @@ impl crate::gemma4::Gemma4Cache for SpecTargetCache {
 #[cfg(feature = "cuda")]
 pub(crate) mod decandle_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-
-    static COUNT_ENABLED: OnceLock<bool> = OnceLock::new();
-    static DEVICE_DRAFTS: OnceLock<bool> = OnceLock::new();
-    static DEVICE_ROUND: OnceLock<bool> = OnceLock::new();
     pub static HTOD: AtomicU64 = AtomicU64::new(0);
     pub static DTOH: AtomicU64 = AtomicU64::new(0);
     pub static SYNC: AtomicU64 = AtomicU64::new(0);
 
     pub fn count_enabled() -> bool {
-        *COUNT_ENABLED.get_or_init(|| std::env::var_os("NV_DFLASH_SYNC_COUNT").is_some())
+        nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_DFLASH_SYNC_COUNT")
     }
     pub fn device_drafts_enabled() -> bool {
-        *DEVICE_DRAFTS.get_or_init(|| std::env::var_os("NV_DFLASH_DEVICE_DRAFTS").is_some())
+        nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_DFLASH_DEVICE_DRAFTS")
     }
 
     pub fn device_round_enabled() -> bool {
-        *DEVICE_ROUND.get_or_init(|| std::env::var_os("NV_DFLASH_DEVICE_ROUND").is_some())
+        nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_DFLASH_DEVICE_ROUND")
     }
     pub fn tick_htod() {
         if count_enabled() {
@@ -2604,7 +2599,7 @@ impl<'a> LagunaDflashEngine<'a> {
         let mask_id = self.draft.config.dflash_config.mask_token_id;
 
         #[cfg(feature = "cuda")]
-        let mut target_cache = if std::env::var_os("NV_LAGUNA_FP8_KV").is_some() {
+        let mut target_cache = if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV") {
             match self.target.new_kv_cache_fp8(max_seq) {
                 Ok(c) => SpecTargetCache::Fp8(c),
                 Err(e) => {
@@ -2677,7 +2672,7 @@ impl<'a> LagunaDflashEngine<'a> {
             l.extend(anchor);
         }
 
-        let prof = std::env::var_os("NV_DFLASH_PROF").is_some();
+        let prof = nv_config::env_arm_present_at_all_reread_every_call("NV_DFLASH_PROF");
 
         let block_size = self.draft.config.dflash_config.block_size;
         let entropy_stop = use_draft && spec_entropy_stop_enabled();
@@ -2745,7 +2740,7 @@ impl<'a> LagunaDflashEngine<'a> {
             std::collections::HashMap::new();
         #[cfg(feature = "cuda")]
         let dev_accept = matches!(device, Device::Cuda(_))
-            && std::env::var_os("NV_DFLASH_HOST_ACCEPT").is_none();
+            && !nv_config::env_arm_present_at_all_reread_every_call("NV_DFLASH_HOST_ACCEPT");
         let mut t_draft = 0f64;
         let mut t_verify = 0f64;
         let mut t_ctx = 0f64;

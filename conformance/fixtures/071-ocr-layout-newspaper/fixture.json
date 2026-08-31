@@ -21,7 +21,7 @@
   "skip_when_no_model": true,
   "scoring": {
     "raw": "character edit distance against expected_text verbatim",
-    "neutral": "same distance after nv-ocr tests/markup_neutral.rs::markup_neutral (port of real5/score.py::strip_markup + whitespace collapse); this is the gating number"
+    "neutral": "same distance after nv-ocr tests/e2e_fixtures.rs::markup_neutral (HTML tags and markdown decoration dropped, whitespace collapsed, applied to both sides); this is the gating number"
   },
   "notes": "two-column newspaper with masthead and headlines"
 }

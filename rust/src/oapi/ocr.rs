@@ -33,8 +33,8 @@ pub struct OcrAppState {
 }
 
 #[derive(Clone)]
-struct OcrRuntime {
-    app: OcrAppState,
+pub(super) struct OcrRuntime {
+    pub(super) app: OcrAppState,
     generative: Arc<SurfaceGate>,
     classical: Option<Arc<SurfaceGate>>,
 }
@@ -44,6 +44,13 @@ impl OcrRuntime {
         match backend {
             Backend::Tesseract => self.classical.as_deref(),
             Backend::DeepSeek | Backend::Dots | Backend::Got => Some(self.generative.as_ref()),
+        }
+    }
+
+    pub(super) fn gate_arc_for(&self, backend: Backend) -> Option<Arc<SurfaceGate>> {
+        match backend {
+            Backend::Tesseract => self.classical.clone(),
+            Backend::DeepSeek | Backend::Dots | Backend::Got => Some(self.generative.clone()),
         }
     }
 
@@ -66,6 +73,9 @@ pub fn router_with_classical_gate(state: OcrAppState, classical: Arc<SurfaceGate
     rt.classical = Some(classical);
     Router::new()
         .route("/v1/ocr", post(handle_ocr))
+        .route("/v1/ocr/stream", post(super::ocr_stream::handle_ocr_stream))
+        .route("/v1/ocr/load_lora_adapter", post(handle_ocr_load_lora))
+        .route("/v1/ocr/unload_lora_adapter", post(handle_ocr_unload_lora))
         .with_state(rt)
 }
 
@@ -143,7 +153,102 @@ fn log_default_backend_at_boot(state: &OcrAppState) {
 pub fn router(state: OcrAppState) -> Router {
     Router::new()
         .route("/v1/ocr", post(handle_ocr))
+        .route("/v1/ocr/stream", post(super::ocr_stream::handle_ocr_stream))
+        .route("/v1/ocr/load_lora_adapter", post(handle_ocr_load_lora))
+        .route("/v1/ocr/unload_lora_adapter", post(handle_ocr_unload_lora))
         .with_state(OcrRuntime::from(state))
+}
+
+#[derive(serde::Deserialize)]
+struct OcrLoadLoraBody {
+    lora_path: String,
+}
+
+fn ocr_lora_gate_or_dots(rt: &OcrRuntime) -> Result<Arc<OcrEngine>, Response> {
+    if !super::lora_runtime::enabled() {
+        return Err(openai_error(
+            StatusCode::FORBIDDEN,
+            "runtime adapter updating is disabled; set NV_ALLOW_RUNTIME_LORA_UPDATING=1",
+            kind::INVALID_REQUEST,
+            None,
+            Some("runtime_lora_disabled"),
+        ));
+    }
+    rt.app.dots.clone().ok_or_else(|| {
+        openai_error(
+            StatusCode::BAD_REQUEST,
+            "ocr backend not loaded: dots -- set NV_OCR_DOTS_DIR or NV_OCR_DOTS=1",
+            kind::INVALID_REQUEST,
+            None,
+            Some("ocr_backend_not_loaded"),
+        )
+    })
+}
+
+async fn handle_ocr_load_lora(
+    State(rt): State<OcrRuntime>,
+    Json(body): Json<OcrLoadLoraBody>,
+) -> Response {
+    let engine = match ocr_lora_gate_or_dots(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    let dir = PathBuf::from(&body.lora_path);
+    let joined = tokio::task::spawn_blocking(move || {
+        engine.dots_reload_adapter(Some(dir.as_path()))
+    })
+    .await;
+    match joined {
+        Ok(Ok(resident)) => Json(serde_json::json!({
+            "loaded": true,
+            "lora_resident": resident,
+            "lora_path": body.lora_path,
+        }))
+        .into_response(),
+        Ok(Err(err)) => openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("{err}"),
+            kind::INVALID_REQUEST,
+            None,
+            Some("ocr_adapter_load_failed"),
+        ),
+        Err(join) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("adapter load worker: {join}"),
+            kind::SERVER,
+            None,
+            Some("ocr_adapter_load_failed"),
+        ),
+    }
+}
+
+async fn handle_ocr_unload_lora(State(rt): State<OcrRuntime>) -> Response {
+    let engine = match ocr_lora_gate_or_dots(&rt) {
+        Ok(e) => e,
+        Err(resp) => return resp,
+    };
+    let joined = tokio::task::spawn_blocking(move || engine.dots_reload_adapter(None)).await;
+    match joined {
+        Ok(Ok(resident)) => Json(serde_json::json!({
+            "loaded": false,
+            "lora_resident": resident,
+        }))
+        .into_response(),
+        Ok(Err(err)) => openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("{err}"),
+            kind::INVALID_REQUEST,
+            None,
+            Some("ocr_adapter_unload_failed"),
+        ),
+        Err(join) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("adapter unload worker: {join}"),
+            kind::SERVER,
+            None,
+            Some("ocr_adapter_unload_failed"),
+        ),
+    }
 }
 
 fn tessdata_root() -> Option<PathBuf> {
@@ -472,7 +577,7 @@ struct DeepSeekPipelineModel {
 
 const DSOCR_INFLIGHT_TICK: Duration = Duration::from_secs(15);
 
-fn elapsed_ms(t: Instant) -> f64 {
+pub(super) fn elapsed_ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
@@ -678,26 +783,37 @@ fn ocr_device() -> candle_core::Device {
         return candle_core::Device::Cpu;
     }
     #[cfg(feature = "cuda")]
-    if pref == DevicePref::Auto {
-        if let Ok(d) = candle_core::Device::new_cuda(0) {
-            return d;
-        }
-    }
-    #[cfg(feature = "metal")]
-    {
-        match candle_core::Device::new_metal(0) {
+    let cuda_denial: String = if pref == DevicePref::Auto {
+        match candle_core::Device::new_cuda(0) {
             Ok(d) => return d,
-            Err(err) => warn!(
-                error = %err,
-                requested = if pref == DevicePref::Metal { "metal" } else { "auto" },
-                "metal device unavailable; using cpu"
-            ),
+            Err(err) => format!("cuda device 0 failed to open: {err}"),
         }
-    }
+    } else {
+        "NV_OCR_DEVICE=metal skips cuda".to_string()
+    };
+    #[cfg(not(feature = "cuda"))]
+    let cuda_denial: String = "this binary was compiled without the cuda feature".to_string();
+    #[cfg(feature = "metal")]
+    let metal_denial: String = match candle_core::Device::new_metal(0) {
+        Ok(d) => return d,
+        Err(err) => format!("metal device 0 failed to open: {err}"),
+    };
     #[cfg(not(feature = "metal"))]
-    if pref == DevicePref::Metal {
-        warn!("NV_OCR_DEVICE=metal requires the metal feature; using cpu");
-    }
+    let metal_denial: String =
+        "this binary was compiled without the metal feature, so an Apple GPU is unreachable \
+         (rebuild with --features metal and set NV_OCR_DEVICE=metal)"
+            .to_string();
+    let msg = format!(
+        "[ocr] DEVICE DOWNGRADE: NV_OCR_DEVICE={} resolved to cpu ({cuda_denial}; {metal_denial}); \
+         every generative ocr backend now runs CPU F32, roughly 100x slower than a GPU; set \
+         NV_OCR_DEVICE=cpu to accept the cpu silently",
+        if pref == DevicePref::Metal {
+            "metal"
+        } else {
+            "auto (accelerator preferred)"
+        },
+    );
+    eprintln!("{msg}");
     candle_core::Device::Cpu
 }
 
@@ -734,17 +850,25 @@ fn device_label(d: &candle_core::Device) -> &'static str {
 
 fn load_deepseek_from_env() -> Option<Arc<OcrEngine>> {
     let dir = deepseek_dir()?;
-    let precision = match std::env::var("NV_OCR_DEEPSEEK_QUANT").as_deref() {
-        Ok("nvfp4") => DecoderPrecision::Nvfp4,
-        _ => DecoderPrecision::Bf16,
-    };
     let max_new_tokens = std::env::var("NV_OCR_DEEPSEEK_MAX_NEW")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4096);
     let chain = ocr_device_chain();
     let last = chain.len() - 1;
+    let quant_env = std::env::var(
+        nv_models::deepseek_ocr::pipeline::DSOCR_QUANT_ENV_NVFP4_IS_THE_CUDA_DEFAULT_PER_CER_AB_0_0286_BF16_0_0288_NVFP4_IN_PERF_RUNS_AND_BF16_IS_THE_ESCAPE,
+    )
+    .ok();
     for (i, device) in chain.into_iter().enumerate() {
+        let precision = DecoderPrecision::for_device(&device);
+        if quant_env.is_none() && device.is_cuda() && precision == DecoderPrecision::Bf16 {
+            eprintln!(
+                "[ocr] PRECISION DOWNGRADE: deepseek on cuda defaults to nvfp4, but this binary \
+                 was compiled without nv-models/cuda so bf16 is what runs; set \
+                 NV_OCR_DEEPSEEK_QUANT=bf16 to accept this silently"
+            );
+        }
         match DeepSeekOcr2Pipeline::load(&dir, &device, precision) {
             Ok(pipeline) => {
                 let batch = BatchOptions::from_env();
@@ -794,6 +918,36 @@ struct DotsPipelineModel {
     max_new_tokens: usize,
 }
 
+const VISION_TOKENS_DOMINATE_GENERATED_PAST_THIS_RATIO_SO_TELL_THE_OPERATOR_ABOUT_NV_DOTS_MAX_PIXELS:
+    f64 = 8.0;
+
+fn dots_vision_tokens_from_grid(grid: (usize, usize)) -> usize {
+    use nv_models::dots_ocr::preprocess::MERGE_SIZE;
+    grid.0 * grid.1 / (MERGE_SIZE * MERGE_SIZE)
+}
+
+fn dots_page_is_prefill_bound(vision_tokens: usize, generated_tokens: usize) -> bool {
+    vision_tokens as f64
+        > generated_tokens.max(1) as f64
+            * VISION_TOKENS_DOMINATE_GENERATED_PAST_THIS_RATIO_SO_TELL_THE_OPERATOR_ABOUT_NV_DOTS_MAX_PIXELS
+}
+
+fn warn_if_prefill_bound(res: &nv_models::dots_ocr::DotsPageResult) {
+    let vision_tokens = dots_vision_tokens_from_grid(res.grid);
+    if dots_page_is_prefill_bound(vision_tokens, res.generated_tokens) {
+        tracing::warn!(
+            vision_tokens,
+            generated_tokens = res.generated_tokens,
+            prompt_tokens = res.prompt_tokens,
+            grid_h = res.grid.0,
+            grid_w = res.grid.1,
+            "dots.ocr page is PREFILL-BOUND: vision tokens outnumber generated tokens more than {}x, so most of the wall clock is image prefill, not text -- lower NV_DOTS_MAX_PIXELS (default {}) to shrink the vision grid and restart",
+            VISION_TOKENS_DOMINATE_GENERATED_PAST_THIS_RATIO_SO_TELL_THE_OPERATOR_ABOUT_NV_DOTS_MAX_PIXELS,
+            nv_models::dots_ocr::preprocess::DEFAULT_MAX_PIXELS,
+        );
+    }
+}
+
 fn dots_mode(mode: DotsOcrMode) -> DotsMode {
     match mode {
         DotsOcrMode::LayoutAll => DotsMode::LayoutAll,
@@ -809,6 +963,15 @@ impl DotsOcrModel for DotsPipelineModel {
         mode: DotsOcrMode,
     ) -> Result<OcrResult, nv_ocr::Error> {
         Ok(self.recognize_layout(image_bytes, mode)?.result)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn reload_adapter(&self, adapter_dir: Option<&Path>) -> Result<bool, nv_ocr::Error> {
+        self.pipeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reload_adapter(adapter_dir)
+            .map_err(|e| nv_ocr::Error::Backend(format!("{e:#}")))
     }
 
     fn recognize_layout(
@@ -841,9 +1004,10 @@ impl DotsOcrModel for DotsPipelineModel {
             e.into_inner()
         });
         let res = guard
-            .recognize(&img, dots_mode(mode), &opts)
+            .recognize_auto(&img, dots_mode(mode), &opts)
             .map_err(|e| nv_ocr::Error::Backend(format!("dots.ocr: {e:#}")))?;
         drop(guard);
+        warn_if_prefill_bound(&res);
         let elements = res
             .page
             .elements
@@ -906,6 +1070,7 @@ fn load_dots_from_env() -> Option<Arc<OcrEngine>> {
                     dir = %dir.display(),
                     device = device_label(&device),
                     fell_back = i > 0,
+                    precision = ?pipeline.precision(),
                     style = ?PromptStyle::from_env(),
                     budget = ?PixelBudget::from_env(),
                     max_new_tokens,
@@ -1066,7 +1231,7 @@ pub fn load_got_from_env() -> Option<Arc<OcrEngine>> {
 macro_rules! declare_backends {
     ($($variant:ident),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum Backend {
+        pub(super) enum Backend {
             $($variant),+
         }
 
@@ -1077,7 +1242,7 @@ macro_rules! declare_backends {
 
 declare_backends!(Tesseract, DeepSeek, Dots, Got);
 
-fn backend_name(b: Backend) -> &'static str {
+pub(super) fn backend_name(b: Backend) -> &'static str {
     match b {
         Backend::Tesseract => "tesseract",
         Backend::DeepSeek => "deepseek",
@@ -1086,7 +1251,7 @@ fn backend_name(b: Backend) -> &'static str {
     }
 }
 
-fn parse_backend(s: &str) -> Option<Backend> {
+pub(super) fn parse_backend(s: &str) -> Option<Backend> {
     match s {
         "tesseract" | "classical" => Some(Backend::Tesseract),
         "deepseek" => Some(Backend::DeepSeek),
@@ -1096,7 +1261,7 @@ fn parse_backend(s: &str) -> Option<Backend> {
     }
 }
 
-fn loaded_backends(state: &OcrAppState) -> Vec<Backend> {
+pub(super) fn loaded_backends(state: &OcrAppState) -> Vec<Backend> {
     let mut out = Vec::with_capacity(3);
     if state.tesseract.is_some() {
         out.push(Backend::Tesseract);
@@ -1113,7 +1278,7 @@ fn loaded_backends(state: &OcrAppState) -> Vec<Backend> {
     out
 }
 
-fn configured_default_backend() -> Option<Backend> {
+pub(super) fn configured_default_backend() -> Option<Backend> {
     let raw = std::env::var("NV_OCR_DEFAULT_BACKEND").ok()?;
     let raw = raw.trim();
     if raw.is_empty() {
@@ -1143,13 +1308,13 @@ fn describe_backends(loaded: &[Backend]) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BackendPickError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+pub(super) struct BackendPickError {
+    pub(super) status: StatusCode,
+    pub(super) code: &'static str,
+    pub(super) message: String,
 }
 
-fn pick_default_backend(
+pub(super) fn pick_default_backend(
     loaded: &[Backend],
     configured: Option<Backend>,
 ) -> Result<Backend, BackendPickError> {
@@ -1265,7 +1430,7 @@ fn json_boxes_unsupported(b: Backend) -> String {
 
 const OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS: usize = 131072;
 
-fn parse_max_new_tokens(v: &str) -> Result<Option<usize>, String> {
+pub(super) fn parse_max_new_tokens(v: &str) -> Result<Option<usize>, String> {
     let v = v.trim();
     if v.is_empty() {
         return Ok(None);
@@ -1284,7 +1449,7 @@ fn parse_max_new_tokens(v: &str) -> Result<Option<usize>, String> {
     }
 }
 
-fn bad_request(message: String, param: &str) -> Response {
+pub(super) fn bad_request(message: String, param: &str) -> Response {
     openai_error(
         StatusCode::BAD_REQUEST,
         message,
@@ -1591,10 +1756,14 @@ async fn handle_ocr(
         Backend::Dots => {
             let dmode = dots_mode_req;
             let joined = tokio::task::spawn_blocking(move || {
-                engine.recognize_dots_layout_budgeted(&image_bytes, dmode, max_new_override)
+                let input_near_blank = near_blank_input(&image_bytes);
+                (
+                    input_near_blank,
+                    engine.recognize_dots_layout_budgeted(&image_bytes, dmode, max_new_override),
+                )
             })
             .await;
-            let result = match joined {
+            let (input_near_blank, result) = match joined {
                 Ok(r) => r,
                 Err(err) => return join_error(err),
             };
@@ -1612,7 +1781,13 @@ async fn handle_ocr(
                     let truncated = res.result.truncated || res.layout.truncated;
                     let looped = res.result.looped;
                     let suspect =
-                        super::ocr_suspect::suspect_reason(&res.result.text, expected_script);
+                        super::ocr_suspect::blank_page_suspect(input_near_blank, &res.result.text)
+                            .or_else(|| {
+                                super::ocr_suspect::suspect_reason(
+                                    &res.result.text,
+                                    expected_script,
+                                )
+                            });
                     let resp = match format {
                         Format::LayoutJson => Json(res.layout).into_response(),
                         Format::JsonBoxes => Json(res).into_response(),
@@ -1646,11 +1821,16 @@ async fn handle_ocr(
             if profiling {
                 dsocr_prof::reset();
             }
+            let generative = backend != Backend::Tesseract;
             let joined = tokio::task::spawn_blocking(move || {
-                engine.recognize_hinted_budgeted(&image_bytes, dmode, hint, max_new_override)
+                let input_near_blank = generative && near_blank_input(&image_bytes);
+                (
+                    input_near_blank,
+                    engine.recognize_hinted_budgeted(&image_bytes, dmode, hint, max_new_override),
+                )
             })
             .await;
-            let result = match joined {
+            let (input_near_blank, result) = match joined {
                 Ok(r) => r,
                 Err(err) => return join_error(err),
             };
@@ -1675,7 +1855,11 @@ async fn handle_ocr(
                         "ocr request complete"
                     );
                     let (truncated, looped) = (res.truncated, res.looped);
-                    let suspect = super::ocr_suspect::suspect_reason(&res.text, expected_script);
+                    let suspect =
+                        super::ocr_suspect::blank_page_suspect(input_near_blank, &res.text)
+                            .or_else(|| {
+                                super::ocr_suspect::suspect_reason(&res.text, expected_script)
+                            });
                     let resp = match format {
                         Format::LayoutJson | Format::JsonBoxes => Json(res).into_response(),
                         Format::Text => (
@@ -1702,6 +1886,15 @@ async fn handle_ocr(
                 }
             }
         }
+    }
+}
+
+fn near_blank_input(bytes: &[u8]) -> bool {
+    match super::ocr_batch::decode_rgb(bytes) {
+        Ok(img) => {
+            super::ocr_suspect::near_blank(&nv_ocr::binarize::histogram(&grey_from_rgb(&img)))
+        }
+        Err(_) => false,
     }
 }
 
@@ -1781,6 +1974,30 @@ mod tests {
                 "a metal build on a metal box must not silently serve OCR from the CPU"
             );
         }
+    }
+
+    #[test]
+    fn prefill_bound_warning_fires_on_the_archival_scan_not_on_a_dense_text_page() {
+        assert!(
+            dots_page_is_prefill_bound(14162, 586),
+            "a 21 MP archival scan under the default budget is 14162 vision tokens against 586 \
+             generated (~24x); the operator must hear about NV_DOTS_MAX_PIXELS"
+        );
+        assert!(
+            !dots_page_is_prefill_bound(14162, 2048),
+            "a dense full-budget page generating 2048 tokens sits near 7x, under the 8x line; \
+             warning on every dense page would train operators to ignore it"
+        );
+        assert!(
+            dots_page_is_prefill_bound(9, 0),
+            "zero generated tokens must not divide-by-zero and a 9-vision-token page that \
+             produced nothing is prefill-only by definition"
+        );
+        assert_eq!(
+            dots_vision_tokens_from_grid((238, 238)),
+            14161,
+            "vision tokens are grid_h*grid_w over the 2x2 merge"
+        );
     }
 
     #[test]
@@ -2423,5 +2640,29 @@ mod tests {
             describe_backends(&[Backend::DeepSeek, Backend::Dots]),
             "deepseek, dots"
         );
+    }
+
+    #[test]
+    fn the_adapter_routes_gate_on_the_runtime_env_then_on_the_dots_backend() {
+        let _env = crate::oapi::lock_serializing_every_test_that_mutates_the_process_global_env();
+        let rt = OcrRuntime::with_gates(
+            OcrAppState::default(),
+            SurfaceGate::new("/v1/ocr", 1, 40),
+            None,
+        );
+        std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV);
+        let err = match ocr_lora_gate_or_dots(&rt) {
+            Err(resp) => resp,
+            Ok(_) => panic!("disabled env must refuse"),
+        };
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        std::env::set_var(super::super::lora_runtime::RUNTIME_LORA_ENV, "1");
+        let err = match ocr_lora_gate_or_dots(&rt) {
+            Err(resp) => resp,
+            Ok(_) => panic!("no dots backend must refuse"),
+        };
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV);
     }
 }

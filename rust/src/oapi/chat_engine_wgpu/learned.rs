@@ -10,7 +10,11 @@ use nv_models::gemma4_assistant_wgpu::{
     Gemma4AssistantWgpu, PackedHiddenSrc,
 };
 use nv_models::gemma4_e4b_wgpu::Gemma4E4bWgpu;
-use nv_specdecode::gemma4_assistant::{AssistantLayerType, FixedSharedKv, Gemma4AssistantDrafter};
+use nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu;
+use nv_specdecode::gemma4_assistant::{
+    AssistantLayerType, FixedSharedKv, Gemma4AssistantDrafter, MoeAssistantHost,
+    MoeSharedKvEngineTap, MoeSharedKvGeometry,
+};
 
 use super::spec::{SpecKnobs, SPEC_ASSISTANT_DIR_ENV, SPEC_DRAFTER_ENV, SPEC_K_MAX};
 
@@ -547,6 +551,171 @@ impl AssistantSpecDrafter {
             full: (fk, fv),
         };
         self.propose_from_parts(last_token, last_hidden, committed, k, &kv)
+    }
+}
+
+pub const SPEC_G4MOE_ASSISTANT_ENV: &str = "NV_WGPU_SPEC_G4MOE_ASSISTANT";
+pub const SPEC_G4MOE_ASSISTANT_DIR_ENV: &str = "NV_WGPU_SPEC_G4MOE_ASSISTANT_DIR";
+const G4MOE_ASSISTANT_REPO_CACHE: &str =
+    ".cache/huggingface/hub/models--google--gemma-4-26B-A4B-it-assistant/snapshots";
+
+pub fn g4moe_assistant_opted_in() -> bool {
+    std::env::var(SPEC_G4MOE_ASSISTANT_ENV).ok().as_deref() == Some("1")
+}
+
+fn default_g4moe_assistant_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let root = Path::new(&home).join(G4MOE_ASSISTANT_REPO_CACHE);
+    for entry in std::fs::read_dir(&root).ok()? {
+        let p = entry.ok()?.path();
+        if p.is_dir() && p.join("model.safetensors").is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub struct MoeEngineTap<'a>(pub &'a Gemma4MoeWgpu);
+
+fn moe_layer_type_for(lt: AssistantLayerType) -> nv_models::gemma4::LayerType {
+    match lt {
+        AssistantLayerType::Sliding => nv_models::gemma4::LayerType::SlidingAttention,
+        AssistantLayerType::Full => nv_models::gemma4::LayerType::FullAttention,
+    }
+}
+
+impl MoeSharedKvEngineTap for MoeEngineTap<'_> {
+    fn committed_kv_rows(&self) -> usize {
+        self.0.current_pos()
+    }
+
+    fn shared_kv_geometry(&self, lt: AssistantLayerType) -> Result<MoeSharedKvGeometry> {
+        let g = self.0.assistant_kv_geometry(moe_layer_type_for(lt))?;
+        Ok(MoeSharedKvGeometry {
+            n_kv: g.n_kv,
+            head_dim: g.head_dim,
+        })
+    }
+
+    fn shared_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
+        &self,
+        lt: AssistantLayerType,
+        start: usize,
+        len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let g = self.0.assistant_kv_geometry(moe_layer_type_for(lt))?;
+        let (k, v) = self
+            .0
+            .assistant_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
+                moe_layer_type_for(lt),
+                start,
+                len,
+            )?;
+        Ok((
+            Tensor::from_vec(k, (len, g.n_kv, g.head_dim), &Device::Cpu)?,
+            Tensor::from_vec(v, (len, g.n_kv, g.head_dim), &Device::Cpu)?,
+        ))
+    }
+}
+
+pub struct MoeAssistantSpecDrafter {
+    host: MoeAssistantHost,
+}
+
+impl MoeAssistantSpecDrafter {
+    pub fn from_env(model_dir: &Path, model: &Gemma4MoeWgpu) -> Option<Self> {
+        if !g4moe_assistant_opted_in() || !SpecKnobs::from_env().enabled {
+            return None;
+        }
+        if nv_models::gemma4_moe_wgpu::flash_decode_enabled() {
+            tracing::warn!(
+                "{SPEC_G4MOE_ASSISTANT_ENV}=1 but the flash decode graph is active and \
+                 verify_chain refuses it; set NV_G4MOE_FLASH_DECODE=0 to serve with the \
+                 assistant drafter"
+            );
+            return None;
+        }
+        if model.verify_max_rows() == 0 {
+            tracing::warn!(
+                "{SPEC_G4MOE_ASSISTANT_ENV}=1 but this graph has no verify epilogue \
+                 (chunked prefill off or an int8 head); assistant drafting disabled"
+            );
+            return None;
+        }
+        let assistant_dir = match std::env::var(SPEC_G4MOE_ASSISTANT_DIR_ENV) {
+            Ok(d) => PathBuf::from(d),
+            Err(_) => match default_g4moe_assistant_dir() {
+                Some(d) => d,
+                None => {
+                    tracing::warn!(
+                        "{SPEC_G4MOE_ASSISTANT_ENV}=1 but no checkpoint in the HF cache and \
+                         {SPEC_G4MOE_ASSISTANT_DIR_ENV} unset; assistant drafting disabled"
+                    );
+                    return None;
+                }
+            },
+        };
+        for lt in [AssistantLayerType::Sliding, AssistantLayerType::Full] {
+            if let Err(e) = MoeEngineTap(model).shared_kv_geometry(lt) {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "gemma4-moe assistant kv tap unavailable; assistant drafting disabled"
+                );
+                return None;
+            }
+        }
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e}"),
+                    "no cuda device for the gemma4-moe assistant drafter; drafting on candle CPU"
+                );
+                Device::Cpu
+            }
+        };
+        match MoeAssistantHost::load(
+            &assistant_dir,
+            model_dir,
+            model.config().base.hidden_size,
+            model.max_seq(),
+            &device,
+        ) {
+            Ok(host) => {
+                let (sliding_layer, full_layer) =
+                    model.assistant_shared_kv_layers_last_kv_writing_sliding_then_full();
+                tracing::info!(
+                    assistant_dir = %assistant_dir.display(),
+                    sliding_layer = ?sliding_layer,
+                    full_layer = ?full_layer,
+                    device = ?device,
+                    "gemma4-moe wgpu spec decode uses the learned assistant drafter"
+                );
+                Some(Self { host })
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "gemma4-moe assistant drafter failed to load; assistant drafting disabled"
+                );
+                None
+            }
+        }
+    }
+
+    pub fn begin_request(&mut self) {
+        self.host.clear_mirrors();
+    }
+
+    pub fn propose(
+        &mut self,
+        model: &Gemma4MoeWgpu,
+        last_token: u32,
+        last_hidden: &[f32],
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        self.host
+            .propose_from_engine(&MoeEngineTap(model), last_token, last_hidden, k)
     }
 }
 

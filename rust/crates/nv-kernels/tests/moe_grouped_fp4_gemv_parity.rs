@@ -290,8 +290,12 @@ fn compare(label: &str, groups: usize, n: usize, cutlass: &[bf16], gemv: &[bf16]
 #[ignore]
 fn moe_grouped_fp4_gemv_m1_parity_sweep() {
     if std::env::var("NV_MOE_M1_TEST").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_MOE_M1_TEST=1 to run moe_grouped_fp4_gemv_m1_parity_sweep");
-        return;
+        panic!(
+            "NV_MOE_M1_TEST is not 1, so this parity sweep executed nothing. It is already \
+             #[ignore]d, which makes --ignored the opt-in; a second env gate behind that can only \
+             make an --ignored run print `1 passed` for a sweep that compared nothing. A suite \
+             whose precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = CudaContext::new(0)
         .expect("NV_MOE_M1_TEST=1 but no CUDA device 0 -- this gate panics rather than skipping");
@@ -311,7 +315,7 @@ fn moe_grouped_fp4_gemv_m1_parity_sweep() {
         for seed in 1u64..=3 {
             let mut rng = Rng::new(seed.wrapping_mul(0x9e3779b97f4a7c15) ^ (n as u64) << 20);
             let w = build_weights(&stream, &mut rng, n, k);
-            for &groups in &[1usize, 2, 8, 64, 256] {
+            for &groups in &[1usize, 2, 8, 18, 27, 45, 64, 256] {
                 let a = build_acts(&stream, &mut rng, groups, k);
                 let cutlass_out = run_cutlass(&stream, &w, &a);
                 let gemv_out = run_gemv(&stream, &w, &a);

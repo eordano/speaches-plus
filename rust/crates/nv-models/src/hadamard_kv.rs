@@ -9,7 +9,7 @@ pub const HADAMARD_KV_CUTS_CHUNK_ERROR_AMPLIFICATION_MEASURED_IN_PERF_RUNS_JSONL
     HADAMARD_KV_ENV;
 
 pub fn hadamard_kv_enabled() -> bool {
-    matches!(std::env::var(HADAMARD_KV_ENV).as_deref(), Ok("1"))
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(HADAMARD_KV_ENV)
 }
 
 pub fn rotatable(head_dim: usize) -> bool {
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn the_rotation_is_off_until_its_env_var_is_set() {
         assert!(
-            !hadamard_kv_enabled() || std::env::var(HADAMARD_KV_ENV).as_deref() == Ok("1"),
+            !hadamard_kv_enabled() || nv_config::env_arm_opt_in_eq_some_1_reread_every_call(HADAMARD_KV_ENV),
             "the rotation changes stored K bit-for-bit, so it is a numerical default and may \
              not arrive without being asked for"
         );

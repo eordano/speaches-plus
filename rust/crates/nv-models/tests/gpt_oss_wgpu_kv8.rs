@@ -18,7 +18,7 @@ struct Kv8EnvGuard {
     _serialized: std::sync::MutexGuard<'static, ()>,
 }
 
-fn kv8_env_on_serialized_because_build_reads_the_env() -> Kv8EnvGuard {
+fn kv8_env_on_serialized_because_build_reads_the_env_and_attn_i8_pinned_off_because_the_oracles_are_kv_value_identity() -> Kv8EnvGuard {
     static ONE_ENV_AT_A_TIME: std::sync::OnceLock<std::sync::Mutex<()>> =
         std::sync::OnceLock::new();
     let g = ONE_ENV_AT_A_TIME
@@ -130,7 +130,7 @@ fn kv8_decode_tracks_the_cpu_reference_within_the_fp8_band_and_holds_argmax() {
     if !have_gpu() {
         return;
     }
-    let _env = kv8_env_on_serialized_because_build_reads_the_env();
+    let _env = kv8_env_on_serialized_because_build_reads_the_env_and_attn_i8_pinned_off_because_the_oracles_are_kv_value_identity();
     let cfg = hd32_config_because_the_shared_fold_strides_head_dim_in_32_lane_strips();
     let hw = tiny_weights(&cfg, 0x6055_8801);
     let mut gpu = gow::GptOssWgpu::new(cfg.clone(), &hw, 32).expect("build kv8 wgpu model");
@@ -176,7 +176,7 @@ fn kv8_full_layer_attention_stays_in_band_with_the_serial_arm_on_identical_state
     if !have_gpu() {
         return;
     }
-    let _env = kv8_env_on_serialized_because_build_reads_the_env();
+    let _env = kv8_env_on_serialized_because_build_reads_the_env_and_attn_i8_pinned_off_because_the_oracles_are_kv_value_identity();
     let cfg = hd32_config_because_the_shared_fold_strides_head_dim_in_32_lane_strips();
     let full_li = cfg
         .layer_types
@@ -215,7 +215,7 @@ fn kv8_chunked_prefill_rows_land_in_the_fp8_cache_bit_identically_to_stepped_row
     if !have_gpu() {
         return;
     }
-    let _env = kv8_env_on_serialized_because_build_reads_the_env();
+    let _env = kv8_env_on_serialized_because_build_reads_the_env_and_attn_i8_pinned_off_because_the_oracles_are_kv_value_identity();
     let cfg = hd32_config_because_the_shared_fold_strides_head_dim_in_32_lane_strips();
     let hw = tiny_weights(&cfg, 0x6055_8803);
     let prompt: Vec<u32> = (0..21u32).map(|i| (i * 5 + 2) % 60 + 1).collect();
@@ -250,7 +250,7 @@ fn kv8_sinks_stay_load_bearing_through_the_fp8_stage2() {
     if !have_gpu() {
         return;
     }
-    let _env = kv8_env_on_serialized_because_build_reads_the_env();
+    let _env = kv8_env_on_serialized_because_build_reads_the_env_and_attn_i8_pinned_off_because_the_oracles_are_kv_value_identity();
     let cfg = hd32_config_because_the_shared_fold_strides_head_dim_in_32_lane_strips();
     let mut hw = tiny_weights(&cfg, 0x6055_8804);
     let tokens: [u32; 6] = [5, 17, 4, 33, 21, 9];

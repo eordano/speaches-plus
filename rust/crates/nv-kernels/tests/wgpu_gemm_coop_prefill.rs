@@ -1276,9 +1276,35 @@ fn build_wq16_act(
     k: u32,
     cfg: (u32, u32, u32, u32),
 ) -> Rig {
+    build_wq16_act_y(ctx, fmt, act, wb, wsf, payload, m, n, k, cfg, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_wq16_act_y(
+    ctx: &WgpuContext,
+    fmt: coop::WqFmt,
+    act: coop::WqAct,
+    wb: &Replicas,
+    wsf: &Replicas,
+    payload: &ActPayload,
+    m: u32,
+    n: u32,
+    k: u32,
+    cfg: (u32, u32, u32, u32),
+    y16: bool,
+) -> Rig {
     let (tm, tn, sg, ku) = cfg;
-    let src = coop::source_wq16_act(fmt, act, tm, tn, sg, ku);
-    let entry = coop::entry_wq16_act(fmt, act, tm, tn, sg, ku);
+    let (src, entry) = if y16 {
+        (
+            coop::source_wq16_act_y16(fmt, act, tm, tn, sg, ku),
+            coop::entry_wq16_act_y16(fmt, act, tm, tn, sg, ku),
+        )
+    } else {
+        (
+            coop::source_wq16_act(fmt, act, tm, tn, sg, ku),
+            coop::entry_wq16_act(fmt, act, tm, tn, sg, ku),
+        )
+    };
     let pipeline = dispatch::compute_pipeline(ctx, "wq16-act-coop", &src, &entry)
         .unwrap_or_else(|e| panic!("{fmt:?}x{act:?} pipeline tm={tm} tn={tn} sg={sg} ku={ku}: {e}"));
     let (xbuf, xsfbuf) = match payload {
@@ -1292,7 +1318,12 @@ fn build_wq16_act(
             Some(dispatch::storage_from_slice(ctx, "wq16-xsf", scales)),
         ),
     };
-    let y = dispatch::storage_zeroed(ctx, "wq16-y", (m as u64) * (n as u64) * 4);
+    let y_bytes = if y16 {
+        (m as u64) * (n as u64) * 2
+    } else {
+        (m as u64) * (n as u64) * 4
+    };
+    let y = dispatch::storage_zeroed(ctx, "wq16-y", y_bytes);
     let zero = dispatch::storage_from_slice(ctx, "wq16-zero", &vec![0f32; 256]);
     let cols = 16 * tn * sg;
     let bn = n.div_ceil(cols);
@@ -1305,7 +1336,7 @@ fn build_wq16_act(
         blocks_n: bn,
         y_stride: n,
         groups_x: groups.0,
-        pad0: 0,
+        pad0: if y16 { 1.0f32.to_bits() } else { 0 },
         pad1: 0,
     };
     let pbuf = dispatch::uniform_from(ctx, "wq16-p", &p);
@@ -1536,6 +1567,232 @@ fn wq16_act_rate_at_qwen_shapes() {
                     best * 1e3 / m as f64,
                     baseline / best
                 );
+            }
+        }
+    }
+}
+
+const Q38_PF_SHAPES_ARE_THE_M256_CHUNK_PREFILL_GEMMS_OF_QWEN38_27B: [(
+    &str,
+    Option<coop::WqFmt>,
+    u32,
+    u32,
+); 10] = [
+    ("mlp_gu_w4  17408x5120", Some(coop::WqFmt::Nvfp4Block16), 17408, 5120),
+    ("mlp_dn_w4  5120x17408", Some(coop::WqFmt::Nvfp4Block16), 5120, 17408),
+    ("mlp_gu_w8  17408x5120", Some(coop::WqFmt::Fp8RowscalePlain), 17408, 5120),
+    ("mlp_dn_w8  5120x17408", Some(coop::WqFmt::Fp8RowscalePlain), 5120, 17408),
+    ("dn_qkv_w8  10240x5120", Some(coop::WqFmt::Fp8RowscalePlain), 10240, 5120),
+    ("dn_z_w8     6144x5120", Some(coop::WqFmt::Fp8RowscalePlain), 6144, 5120),
+    ("oproj_w8    5120x6144", Some(coop::WqFmt::Fp8RowscalePlain), 5120, 6144),
+    ("at_q_w8    12288x5120", Some(coop::WqFmt::Fp8RowscalePlain), 12288, 5120),
+    ("at_kv_w8    1024x5120", Some(coop::WqFmt::Fp8RowscalePlain), 1024, 5120),
+    ("dn_ab_f16     96x5120", None, 96, 5120),
+];
+
+const Y16_YSH_F32_BYTES_PER_SUBGROUP: u32 = 1024;
+
+const WORKGROUP_STORAGE_LIMIT_BYTES: u32 = 49152;
+
+fn pf_routed_cfg(n: u32, k: u32) -> (u32, u32, u32, u32) {
+    let (tm, tn, sg) = if k > n { (8, 1, 1) } else { (8, 2, 2) };
+    let cols = 16 * tn * sg;
+    let mut ku = 1;
+    for cand in [4u32, 2] {
+        if k.is_multiple_of(16 * cand)
+            && cols * 16 * cand <= coop::W4A16_STAGE_BUDGET_F16_IS_HALF_THE_48K_WORKGROUP_LIMIT
+        {
+            ku = cand;
+            break;
+        }
+    }
+    (tm, tn, sg, ku)
+}
+
+fn pf_ladder_cfgs(m: u32, n: u32, k: u32, staged: bool) -> Vec<(u32, u32, u32, u32)> {
+    let mut v = Vec::new();
+    for tm in [1u32, 2, 4, 8] {
+        if !m.is_multiple_of(16 * tm) || (n >= 4096 && tm < 4) {
+            continue;
+        }
+        for tn in [1u32, 2, 4] {
+            if tm * tn > 16 {
+                continue;
+            }
+            for sg in [1u32, 2, 4, 8] {
+                if sg == 8 && tn > 2 {
+                    continue;
+                }
+                let cols = 16 * tn * sg;
+                if cols > 16 && cols > n {
+                    continue;
+                }
+                for ku in [2u32, 4] {
+                    if !k.is_multiple_of(16 * ku) {
+                        continue;
+                    }
+                    if staged {
+                        let stage = cols * 16 * ku;
+                        if stage > coop::W4A16_STAGE_BUDGET_F16_IS_HALF_THE_48K_WORKGROUP_LIMIT
+                            || stage * 2 + sg * Y16_YSH_F32_BYTES_PER_SUBGROUP
+                                > WORKGROUP_STORAGE_LIMIT_BYTES
+                        {
+                            continue;
+                        }
+                    }
+                    v.push((tm, tn, sg, ku));
+                }
+            }
+        }
+    }
+    v
+}
+
+#[test]
+fn pf_gemm_route_table_configs_are_bit_equal_to_the_default_route() {
+    let ctx = ctx();
+    let g = require_coop(ctx);
+    assert!(g.tile == 16);
+    for (kind, n, k, cfg256, cfg512) in
+        coop::Q38_PF_ROUTE_M256_M512_ADJUDICATED_BY_THE_IN_MODEL_PREFILL_PROFILE_OVER_THE_STANDALONE_LADDER
+    {
+        for (m, cfg) in [(256u32, cfg256), (512, cfg512)] {
+        assert_eq!(
+            coop::q38_pf_route(m, kind, n, k),
+            Some(cfg),
+            "the lookup must return the table row for {kind:?} {n}x{k} m={m}"
+        );
+        let default_cfg = pf_routed_cfg(n, k);
+        let x = shared_values((m as usize) * (k as usize), 0xbbbb_cccc);
+        let w = shared_values((n as usize) * (k as usize), 0x9999_aaaa);
+        let (got_r, got_d) = match kind {
+            Some(fmt) => {
+                let (wb, wsf, _deq, _) = quantize_weights(fmt, &w, n, k, 1, ctx);
+                let payload = ActPayload::F16(to_f16(&x));
+                let run = |c: (u32, u32, u32, u32)| -> Vec<u32> {
+                    let rig = build_wq16_act_y(
+                        ctx,
+                        fmt,
+                        coop::WqAct::F16,
+                        &wb,
+                        &wsf,
+                        &payload,
+                        m,
+                        n,
+                        k,
+                        c,
+                        true,
+                    );
+                    let _ = bench(ctx, &rig, 1, 1);
+                    dispatch::read_back(ctx, &rig.y, (m as usize) * (n as usize) / 2).unwrap()
+                };
+                (run(cfg), run(default_cfg))
+            }
+            None => {
+                let wb = replicas(ctx, "route-par-wf16", &to_f16(&w), 1);
+                let run = |c: (u32, u32, u32, u32)| -> Vec<u32> {
+                    let rig = build_coop_ab(ctx, g, &wb, &x, m, n, k, c);
+                    let _ = bench(ctx, &rig, 1, 1);
+                    dispatch::read_back(ctx, &rig.y, (m as usize) * (n as usize)).unwrap()
+                };
+                (run(cfg), run(default_cfg))
+            }
+        };
+        let ndiff = got_r
+            .iter()
+            .zip(got_d.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            ndiff,
+            0,
+            "{kind:?} {n}x{k} m={m}: route cfg {cfg:?} vs default {default_cfg:?} must be \
+             bit-equal because every config accumulates the same 16-wide fragments in the same \
+             ascending-k order; {ndiff} of {} words differ, so the route table would change \
+             numerics and needs a ppl pair before any flip",
+            got_r.len()
+        );
+        eprintln!("  {kind:?} {n}x{k} m={m}: {cfg:?} bit-equal to default {default_cfg:?}");
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn coop_pf_gemm_route_ladder_at_qwen38_prefill_shapes() {
+    let ctx = ctx();
+    let g = require_coop(ctx);
+    assert!(g.tile == 16);
+    eprintln!("adapter: {}", ctx.summary());
+    eprintln!("shape                  M    cfg              ms/dispatch  TFLOP/s   vs-routed");
+    for (label, fmt, n, k) in Q38_PF_SHAPES_ARE_THE_M256_CHUNK_PREFILL_GEMMS_OF_QWEN38_27B {
+        let w = shared_values((n as usize) * (k as usize), 0x5555_6666);
+        let (wb, wsf) = match fmt {
+            Some(f) => {
+                let (wb, wsf, _deq, _) = quantize_weights(f, &w, n, k, SLC_DEFEAT_BYTES, ctx);
+                (wb, Some(wsf))
+            }
+            None => (replicas(ctx, "pf-lad-wf16", &to_f16(&w), SLC_DEFEAT_BYTES), None),
+        };
+        drop(w);
+        eprintln!(
+            "  {label}: {} weight replicas x {:.1} MiB",
+            wb.count,
+            wb.stride as f64 / 1048576.0
+        );
+        let routed = pf_routed_cfg(n, k);
+        let mut carried: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for m in [256u32, 512, 1024] {
+            let x = shared_values((m as usize) * (k as usize), 0x7777_8888);
+            let payload = ActPayload::F16(to_f16(&x));
+            let mut cfgs = if m == 256 {
+                pf_ladder_cfgs(m, n, k, fmt.is_some())
+            } else {
+                carried.clone()
+            };
+            if !cfgs.contains(&routed) {
+                cfgs.push(routed);
+            }
+            let passes = if (n as u64) * (k as u64) > 20_000_000 { 8 } else { 30 };
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            let mut timed: Vec<(f64, (u32, u32, u32, u32))> = Vec::new();
+            let mut t_routed = f64::INFINITY;
+            for cfg in cfgs {
+                let rig = match fmt {
+                    Some(f) => build_wq16_act_y(
+                        ctx,
+                        f,
+                        coop::WqAct::F16,
+                        &wb,
+                        wsf.as_ref().unwrap(),
+                        &payload,
+                        m,
+                        n,
+                        k,
+                        cfg,
+                        true,
+                    ),
+                    None => build_coop_ab(ctx, g, &wb, &x, m, n, k, cfg),
+                };
+                let t = bench(ctx, &rig, passes, 2);
+                if cfg == routed {
+                    t_routed = t;
+                }
+                timed.push((t, cfg));
+            }
+            timed.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (t, cfg) in &timed {
+                let (tm, tn, sg, ku) = *cfg;
+                eprintln!(
+                    "{label}  {m:<4} tm{tm} tn{tn} sg{sg} ku{ku}  {:>9.3}  {:>7.2}   {:>5.2}x{}",
+                    t * 1e3,
+                    flops / t / 1e12,
+                    t_routed / t,
+                    if *cfg == routed { "  <- routed" } else { "" }
+                );
+            }
+            if m == 256 {
+                carried = timed.iter().take(3).map(|(_, c)| *c).collect();
             }
         }
     }

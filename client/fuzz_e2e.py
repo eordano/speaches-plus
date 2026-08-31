@@ -1,13 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "aiortc>=1.13.0,<1.14",
-#   "httpx>=0.28",
-#   "numpy>=2.0",
-#   "av>=14.0,<14.3",
-# ]
-# ///
 
 """
 End-to-end fuzzer for speaches-plus realtime sessions.
@@ -77,18 +68,16 @@ import dataclasses
 import datetime
 import json
 import logging
-import math
 import os
 import random
-import shutil
 import signal
 import socket
 import subprocess
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import httpx
 import numpy as np

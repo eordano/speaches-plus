@@ -1,7 +1,149 @@
 use anyhow::{bail, Context, Result};
+use candle_core::quantized::GgmlDType;
 use nv_weights::GgufLoader;
+use std::path::PathBuf;
 
 use crate::gemma4_moe::Gemma4MoeConfig;
+
+pub const G4MOE_SERVE_QAT_Q4_OPT_IN_ENV: &str = "NV_G4MOE_SERVE_QAT_Q4";
+pub const QAT_Q4_GGUF_STAYS_OPT_IN_TOP1_ACC_0_4531_VS_BF16_0_5254_SAME_SESSION: &str =
+    "the qat q4 gguf weights arm scored top-1 acc 0.4531 / ppl 32.344 against the same-session \
+     bf16 arm's 0.5254 / 31.900 on g4moe_chat_wrapped_continuation_teacher_forced_ppl_via_wgpu_serving_decode \
+     (perf/runs.jsonl rows pr-20260820-110824-17060-0 vs pr-20260820-104659-4092313-0); accuracy \
+     fell out of the recorded 0.5195-0.5254 band, so this weights source must never become the \
+     silent default -- the suspected mechanism is double quantization, Q4_K dequant then the \
+     wgpu w4 gs=32 requant";
+pub const G4MOE_QAT_GGUF_ENV: &str = "NV_G4MOE_GGUF";
+pub const G4MOE_QAT_GGUF_HUB_REPO: &str = "models--unsloth--gemma-4-26B-A4B-it-qat-GGUF";
+pub const G4MOE_QAT_GGUF_FILE: &str = "gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf";
+pub const G4MOE_QAT_GGUF_HOME_CACHE_DIR_MATCHING_THE_GGUF_GEMMA26B_SUITES: &str =
+    ".cache/gguf-gemma26b";
+pub const G4MOE_GATE_UP_EXPERTS_CARRY_MOST_WEIGHT_BYTES_SO_THEY_PROVE_4BIT: &str =
+    "blk.0.ffn_gate_up_exps.weight";
+
+pub fn qat_q4_gguf_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(G4MOE_SERVE_QAT_Q4_OPT_IN_ENV)
+}
+
+pub fn qat_q4_weights_decision(
+    opted_in: bool,
+    verified_candidate: Option<PathBuf>,
+) -> Option<PathBuf> {
+    assert!(
+        !QAT_Q4_GGUF_STAYS_OPT_IN_TOP1_ACC_0_4531_VS_BF16_0_5254_SAME_SESSION.is_empty(),
+        "the opt-in rationale constant must state the failing numbers"
+    );
+    if !opted_in {
+        return None;
+    }
+    verified_candidate
+}
+
+pub fn qat_q4_gguf_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(p) = std::env::var(G4MOE_QAT_GGUF_ENV) {
+        out.push(PathBuf::from(p));
+        return out;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(
+            PathBuf::from(&home)
+                .join(G4MOE_QAT_GGUF_HOME_CACHE_DIR_MATCHING_THE_GGUF_GEMMA26B_SUITES)
+                .join(G4MOE_QAT_GGUF_FILE),
+        );
+    }
+    let mut hubs: Vec<PathBuf> = Vec::new();
+    if let Some(h) = std::env::var_os("HF_HUB_CACHE") {
+        hubs.push(PathBuf::from(h));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        hubs.push(PathBuf::from(home).join(".cache/huggingface/hub"));
+    }
+    for hub in hubs {
+        let snaps = hub.join(G4MOE_QAT_GGUF_HUB_REPO).join("snapshots");
+        let Ok(rd) = std::fs::read_dir(&snaps) else {
+            continue;
+        };
+        let mut cands: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path().join(G4MOE_QAT_GGUF_FILE))
+            .collect();
+        cands.sort();
+        out.extend(cands);
+    }
+    out
+}
+
+pub fn verify_qat_q4_gguf_serves_this_snapshot(
+    path: &std::path::Path,
+    snapshot_cfg: &Gemma4MoeConfig,
+) -> Result<()> {
+    let g = GgufLoader::open(path, &candle_core::Device::Cpu)
+        .with_context(|| format!("open qat gguf {}", path.display()))?;
+    let dt = g
+        .gguf_tensor_dtype(G4MOE_GATE_UP_EXPERTS_CARRY_MOST_WEIGHT_BYTES_SO_THEY_PROVE_4BIT)
+        .with_context(|| {
+            format!(
+                "{} has no {G4MOE_GATE_UP_EXPERTS_CARRY_MOST_WEIGHT_BYTES_SO_THEY_PROVE_4BIT}",
+                path.display()
+            )
+        })?;
+    if !matches!(dt, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q4K) {
+        bail!(
+            "{}: expert gate_up tensors are {dt:?}, not a 4-bit class; refusing to call this \
+             checkpoint a 4-bit default",
+            path.display()
+        );
+    }
+    let gc = gemma4_moe_config_from_gguf(&g)?;
+    let same = |name: &str, a: usize, b: usize| -> Result<()> {
+        if a != b {
+            bail!(
+                "{}: gguf {name} {a} != served snapshot {name} {b}; this gguf is not the same \
+                 model as the snapshot it would silently replace",
+                path.display()
+            );
+        }
+        Ok(())
+    };
+    same("hidden_size", gc.base.hidden_size, snapshot_cfg.base.hidden_size)?;
+    same(
+        "num_hidden_layers",
+        gc.base.num_hidden_layers,
+        snapshot_cfg.base.num_hidden_layers,
+    )?;
+    same("vocab_size", gc.base.vocab_size, snapshot_cfg.base.vocab_size)?;
+    same("num_experts", gc.num_experts, snapshot_cfg.num_experts)?;
+    same(
+        "moe_intermediate_size",
+        gc.moe_intermediate_size,
+        snapshot_cfg.moe_intermediate_size,
+    )?;
+    Ok(())
+}
+
+pub fn opted_in_qat_q4_gguf_for_snapshot(snapshot_cfg: &Gemma4MoeConfig) -> Option<PathBuf> {
+    if !qat_q4_gguf_opted_in() {
+        return None;
+    }
+    let candidate = qat_q4_gguf_candidates().into_iter().find_map(|p| {
+        if !p.is_file() {
+            return None;
+        }
+        match verify_qat_q4_gguf_serves_this_snapshot(&p, snapshot_cfg) {
+            Ok(()) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "[g4moe-q4-optin] {} rejected: {e:#}; continuing with the given weights \
+                     unless another candidate verifies",
+                    p.display()
+                );
+                None
+            }
+        }
+    });
+    qat_q4_weights_decision(true, candidate)
+}
 
 pub fn gemma4_moe_config_from_gguf(g: &GgufLoader) -> Result<Gemma4MoeConfig> {
     let json = gemma4_moe_config_json_from_gguf(g)?;
@@ -133,4 +275,42 @@ pub fn gemma4_moe_config_json_from_gguf(g: &GgufLoader) -> Result<String> {
     });
 
     Ok(cfg_json.to_string())
+}
+
+#[cfg(test)]
+mod qat_q4_default_tests {
+    use super::*;
+
+    #[test]
+    fn without_the_opt_in_a_verified_gguf_is_still_not_served() {
+        assert_eq!(
+            qat_q4_weights_decision(false, Some(PathBuf::from("/x/q4.gguf"))),
+            None
+        );
+    }
+
+    #[test]
+    fn opted_in_with_no_verified_candidate_serves_the_given_weights() {
+        assert_eq!(qat_q4_weights_decision(true, None), None);
+    }
+
+    #[test]
+    fn opted_in_with_a_verified_candidate_serves_the_gguf() {
+        assert_eq!(
+            qat_q4_weights_decision(true, Some(PathBuf::from("/x/q4.gguf"))),
+            Some(PathBuf::from("/x/q4.gguf"))
+        );
+    }
+
+    #[test]
+    fn env_override_short_circuits_every_other_candidate() {
+        let prev = std::env::var_os(G4MOE_QAT_GGUF_ENV);
+        unsafe { std::env::set_var(G4MOE_QAT_GGUF_ENV, "/override/only.gguf") };
+        let cands = qat_q4_gguf_candidates();
+        match prev {
+            Some(v) => unsafe { std::env::set_var(G4MOE_QAT_GGUF_ENV, v) },
+            None => unsafe { std::env::remove_var(G4MOE_QAT_GGUF_ENV) },
+        }
+        assert_eq!(cands, vec![PathBuf::from("/override/only.gguf")]);
+    }
 }

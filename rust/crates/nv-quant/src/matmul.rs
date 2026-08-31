@@ -295,19 +295,13 @@ mod cuda {
     }
 
     pub fn nondeterministic_reduction_was_explicitly_allowed() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| {
-            std::env::var("NV_BF16_ALLOW_NONDET_REDUCTION").ok().as_deref() == Some("1")
-        })
+        nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_BF16_ALLOW_NONDET_REDUCTION")
     }
 
     pub fn splitk_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("NV_BF16_SPLITK")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        })
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!(
+            "NV_BF16_SPLITK"
+        )
     }
 
     pub fn deterministic_mode() -> bool {

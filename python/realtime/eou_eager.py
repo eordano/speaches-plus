@@ -48,7 +48,9 @@ async def try_eager_dispatch(
     from .session import Intent
 
     if session.intent is Intent.CONVERSATION:
-        llm_handle = await _spawn_predicted_llm_for_session(session, cfg, score)
+        llm_handle = await _spawn_predicted_llm_for_session(
+            session, cfg, stt_runner, trajectory_tag=predicted_id
+        )
 
     started_ok = False
     epoch_out: int | None = None
@@ -106,7 +108,10 @@ def _to_audio_list(audio: Any) -> list[float]:
         return list(audio)
 
 async def _spawn_predicted_llm_for_session(
-    session: "Session", cfg: "EouConfig", score: float
+    session: "Session",
+    cfg: "EouConfig",
+    stt_runner: Any,
+    trajectory_tag: str | None = None,
 ) -> PredictedLlmRunnerHandle | None:
     try:
         from conversation.llm import (
@@ -129,17 +134,28 @@ async def _spawn_predicted_llm_for_session(
         log.warning("predicted-llm message build failed: %s", err)
         return None
 
-    msgs = list(msgs)
-    msgs.append(
-        {
-            "role": "user",
-            "content": f"[predicted-end-of-turn p={score:.2f}; partial transcription pending]",
-        }
-    )
-    chat_msgs = [ChatMessage(role=m.get("role", "user"), content=m.get("content", "")) for m in msgs]
+    base_msgs = [
+        ChatMessage(role=m.get("role", "user"), content=m.get("content", ""))
+        for m in list(msgs)
+    ]
 
-    def _factory():
-        return complete_stream_messages(llm_cfg, chat_msgs)
+    shared_ref: list[Any] = []
 
-    runner = spawn_predicted_llm(_factory, cfg.predicted_token_buffer_cap)
+    async def _stream():
+        from .eou_predicted import await_predicted_stt
+
+        ok, err = await await_predicted_stt(stt_runner)
+        partial = (ok or "").strip()
+        if err is not None or not partial:
+            return
+        if shared_ref:
+            shared_ref[0].prompt_user_text = partial
+        chat_msgs = base_msgs + [ChatMessage(role="user", content=partial)]
+        async for delta in complete_stream_messages(
+            llm_cfg, chat_msgs, trajectory_tag=trajectory_tag
+        ):
+            yield delta
+
+    runner = spawn_predicted_llm(_stream, cfg.predicted_token_buffer_cap)
+    shared_ref.append(runner.shared)
     return PredictedLlmRunnerHandle.from_runner(runner)

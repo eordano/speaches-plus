@@ -1,14 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "aiortc>=1.13.0,<1.14",
-#   "httpx>=0.28",
-#   "numpy>=2.0",
-#   "soundfile>=0.13",
-#   "av>=14.0,<14.3",  # 14.0-14.2 have macOS arm64 wheels; 14.3+ are sdist-only
-# ]
-# ///
 
 from __future__ import annotations
 
@@ -22,7 +12,6 @@ import os
 import re
 import sys
 import time
-import wave
 from dataclasses import dataclass, field
 from pathlib import Path
 

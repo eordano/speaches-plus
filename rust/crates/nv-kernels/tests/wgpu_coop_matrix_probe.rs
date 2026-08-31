@@ -466,8 +466,8 @@ fn coop_probe_4_mma_throughput() {
     }
     eprintln!(
         "  every number above was measured on `{}` ({}); the 27.2 TFLOP/s FP32 FMA figure this \
-         line used to carry is a spec-sheet number for a different (Apple silicon) machine and is \
-         not a reference for this one",
+         line used to carry is an M2 Ultra 76-core SPEC number for a different machine and is not \
+         a reference for this one",
         ctx.caps.adapter_name, ctx.caps.driver
     );
 }

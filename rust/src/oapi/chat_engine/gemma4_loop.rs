@@ -237,6 +237,7 @@ pub(crate) async fn run_sampling_gemma4(
     if tx.send(ChatEvent::Started { prompt_tokens }).await.is_err() {
         return Ok(());
     }
+    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
     if prompt_ids.is_empty() {
         let _ = tx
             .send(ChatEvent::Done {
@@ -435,7 +436,7 @@ pub(crate) async fn run_sampling_gemma4(
     let mut completion_tokens: u32 = 0;
     let mut finish_reason = "length".to_string();
 
-    let total_decode_ms;
+
     let mut total_detok_ms = 0.0f64;
     let mut total_send_ms = 0.0f64;
     let mut total_fwd_ms = 0.0f64;
@@ -454,7 +455,7 @@ pub(crate) async fn run_sampling_gemma4(
     if use_graph {
         tokio::task::block_in_place(|| -> anyhow::Result<()> {
             let mut graphed =
-                nv_models::gemma4_graph::GraphedGemma4Decoder::new(&*model, cache, &device)?;
+                nv_models::gemma4_graph::GraphedGemma4Decoder::new(&model, cache, &device)?;
             for step in 0..max_new {
                 if tx.is_closed() {
                     log_sse_abort(SsePush::Closed, "gemma4-nonspec");
@@ -512,7 +513,7 @@ pub(crate) async fn run_sampling_gemma4(
                 );
             }
             let mut graphed =
-                nv_models::gemma4_graph::GraphedGemma4Decoder::new(&*model, cache, &device)
+                nv_models::gemma4_graph::GraphedGemma4Decoder::new(&model, cache, &device)
                     .context("construct GraphedGemma4Decoder (guided path)")?;
             for step in 0..max_new {
                 if tx.is_closed() {
@@ -572,7 +573,7 @@ pub(crate) async fn run_sampling_gemma4(
             Ok(())
         })?;
     }
-    total_decode_ms = decode_loop_start.elapsed().as_secs_f64() * 1000.0;
+    let total_decode_ms = decode_loop_start.elapsed().as_secs_f64() * 1000.0;
 
     drop(permit.take());
 
@@ -2321,7 +2322,7 @@ pub(crate) async fn run_sampling_gemma4_spec_ungraphed(
     let aux_layers = eagle.aux_layers.clone();
 
     let mut verifier = nv_specdecode::gemma4_verifier::Gemma4Verifier::new(
-        &*model,
+        &model,
         device.clone(),
         aux_layers.clone(),
     );
@@ -2569,6 +2570,7 @@ pub(crate) async fn run_sampling_gemma4_e4b(
     if tx.send(ChatEvent::Started { prompt_tokens }).await.is_err() {
         return Ok(());
     }
+    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
     if prompt_ids.is_empty() {
         let _ = tx
             .send(ChatEvent::Done {
@@ -2643,11 +2645,11 @@ pub(crate) async fn run_sampling_gemma4_e4b(
                     completion_tokens = generated_ids.len() as u32;
                     let new_text = detok.push(last)?;
                     let (piece, stop_hit) = emitter.step(new_text);
-                    if !piece.is_empty() {
-                        if tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
+                    if !piece.is_empty()
+                        && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
                             return Ok(());
                         }
-                    }
+                    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
                     if stop_hit {
                         finish_reason = "stop".into();
                         break;
@@ -2709,11 +2711,10 @@ pub(crate) async fn run_sampling_gemma4_e4b(
 
         let new_text = detok.push(last)?;
         let (piece, stop_hit) = emitter.step(new_text);
-        if !piece.is_empty() {
-            if tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
+        if !piece.is_empty()
+            && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
                 return Ok(());
             }
-        }
         if req.logprobs
             && tx
                 .send(ChatEvent::Logprob(build_logprob_entry(
@@ -2724,6 +2725,7 @@ pub(crate) async fn run_sampling_gemma4_e4b(
         {
             return Ok(());
         }
+        yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
         if stop_hit {
             finish_reason = "stop".into();
             break;

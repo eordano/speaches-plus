@@ -526,9 +526,11 @@ When the EOU score reaches `eager_p_threshold` mid-utterance,
    `eager_interval_ms`.
 2. Spawns a speculative STT runner over the buffered audio
    (`spawn_predicted_stt`).
-3. Spawns an LLM runner (`spawn_predicted_llm`) streaming chat
-   completions into a `PredictedLlmShared` buffer bounded by
-   `predicted_token_buffer_cap`.
+3. Spawns an LLM runner (`spawn_predicted_llm_after_stt`) that waits
+   for the speculative transcript, sends it as the user message, and
+   streams chat completions into a `PredictedLlmShared` buffer bounded
+   by `predicted_token_buffer_cap`; a failed or empty transcript skips
+   the LLM call.
 4. Records `RespPhase::Predicted { runner, llm_runner, .. }`; I7
    (`Predicted => wireEmitted == false`) holds because
    `Session::emit{,_event}` short-circuits when topic is `Response` and
@@ -561,15 +563,21 @@ the transition (I9), so the wire sees the same `response_id` on
 | `response.cancel` during Predicted | `cancel_event` | `handle_response_cancel` |
 | `EouKind::Integrated` turn resumes | `turn_resumed` | `handle_stt_turn_resumed` |
 | Token buffer exceeds cap | `predicted_overflow` (preceded by `EouPredictedOverflow`) | `commit_after_eou` |
-| Partial vs. final transcript Jaccard < `1 - EAGER_TRANSCRIPT_MISMATCH_RATIO` | `transcript_mismatch` | `commit_after_eou` |
 
 Rollback aborts both runners (`PredictedRunner::task.abort()`,
 `PredictedLlmRunner::abort`), bumps the epoch via
 `resp_retire_predicted_full`, clears the throttle, and emits both
 `PredictedRollback` (back-compat) and `EouPredictedRollback` (spec
-lane). The mismatch heuristic is character-set Jaccard on
-whitespace-stripped, lowercased strings; threshold
-`EAGER_TRANSCRIPT_MISMATCH_RATIO = 0.5` (sets must overlap >= 50%).
+lane). There is no partial-vs-final transcript-mismatch rollback: the
+eager LLM's user message is the speculative STT transcript itself
+(`spawn_predicted_llm_after_stt`), and `commit_after_eou` commits that
+same transcript, so the prompt the LLM consumed and the committed
+transcript cannot diverge. The Go tree keeps a promote-time Jaccard
+compare (`transcriptsMateriallyDiffer`) because its eager prompt is a
+streaming partial that can differ from its commit-time STT; any change
+here that introduces a second transcript source -- commit-time
+re-transcription, streaming-partial prompts -- must reintroduce that
+compare at the promotion seam.
 
 ## Hard-cap race (§6.3)
 

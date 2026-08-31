@@ -23,6 +23,33 @@ pub enum DecoderPrecision {
     #[default]
     Bf16,
     Nvfp4,
+    W4,
+    W8,
+}
+
+pub const DSOCR_QUANT_ENV_NVFP4_IS_THE_CUDA_DEFAULT_PER_CER_AB_0_0286_BF16_0_0288_NVFP4_IN_PERF_RUNS_AND_BF16_IS_THE_ESCAPE:
+    &str = "NV_OCR_DEEPSEEK_QUANT";
+
+impl DecoderPrecision {
+    pub fn from_quant_env_value(raw: Option<&str>, nvfp4_capable: bool) -> Self {
+        match raw {
+            Some("nvfp4") => Self::Nvfp4,
+            Some("bf16") => Self::Bf16,
+            Some("w4") => Self::W4,
+            Some("w8") => Self::W8,
+            _ if nvfp4_capable => Self::Nvfp4,
+            _ => Self::Bf16,
+        }
+    }
+
+    pub fn for_device(device: &Device) -> Self {
+        Self::from_quant_env_value(
+            std::env::var(DSOCR_QUANT_ENV_NVFP4_IS_THE_CUDA_DEFAULT_PER_CER_AB_0_0286_BF16_0_0288_NVFP4_IN_PERF_RUNS_AND_BF16_IS_THE_ESCAPE)
+                .ok()
+                .as_deref(),
+            cfg!(feature = "cuda") && device.is_cuda(),
+        )
+    }
 }
 
 pub struct DeepSeekOcr2Pipeline {
@@ -32,12 +59,12 @@ pub struct DeepSeekOcr2Pipeline {
     device: Device,
     #[cfg(feature = "cuda")]
     graph: Mutex<Option<DsocrDecodeGraph>>,
+    #[cfg(feature = "cuda")]
+    graph_eligible_checked_once_so_nvfp4_never_reattempts_capture_per_page: bool,
 }
 
 fn retry_alternate_prompt() -> bool {
-    std::env::var("NV_DSOCR_LOOP_RETRY")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_LOOP_RETRY")
 }
 
 impl DeepSeekOcr2Pipeline {
@@ -79,15 +106,36 @@ impl DeepSeekOcr2Pipeline {
                 #[cfg(not(feature = "cuda"))]
                 anyhow::bail!("nvfp4 decoder precision requires the cuda feature")
             }
+            DecoderPrecision::W4 => DeepseekOcrDecoder::from_loader_ggml(
+                cfg,
+                &weights,
+                device,
+                super::decoder::env_decoder_dtype(),
+                candle_core::quantized::GgmlDType::Q4K,
+            )
+            .context("load DeepSeek-OCR-2 decoder w4 (ggml Q4K)")?,
+            DecoderPrecision::W8 => DeepseekOcrDecoder::from_loader_ggml(
+                cfg,
+                &weights,
+                device,
+                super::decoder::env_decoder_dtype(),
+                candle_core::quantized::GgmlDType::Q8_0,
+            )
+            .context("load DeepSeek-OCR-2 decoder w8 (ggml Q8_0)")?,
         };
         let tokenizer = nv_tokenizer::load_tokenizer(&dir.join("tokenizer.json"))?;
+        let decoder = Arc::new(decoder);
+        #[cfg(feature = "cuda")]
+        let graph_eligible = super::decoder_graph::graph_supported(&decoder).is_ok();
         let me = Self {
             vision,
-            decoder: Arc::new(decoder),
+            decoder,
             tokenizer,
             device: device.clone(),
             #[cfg(feature = "cuda")]
             graph: Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            graph_eligible_checked_once_so_nvfp4_never_reattempts_capture_per_page: graph_eligible,
         };
         me.warmup();
         Ok(me)
@@ -174,7 +222,10 @@ impl DeepSeekOcr2Pipeline {
     ) -> Result<(Vec<u32>, Option<LoopDetection>)> {
         let tokens = build_prompt_tokens(|s| self.encode_text(s), prompt, n_vision_tokens)?;
         #[cfg(feature = "cuda")]
-        if super::decoder_graph::graph_enabled() && self.device.is_cuda() {
+        if super::decoder_graph::graph_enabled()
+            && self.device.is_cuda()
+            && self.graph_eligible_checked_once_so_nvfp4_never_reattempts_capture_per_page
+        {
             let mut slot = self
                 .graph
                 .lock()
@@ -268,6 +319,51 @@ impl DeepSeekOcr2Pipeline {
     ) -> Result<String> {
         let (text, _) = self.recognize_flagged(img, prompt, mode, opts)?;
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod precision_default_tests {
+    use super::DecoderPrecision;
+
+    #[test]
+    fn unset_env_defaults_nvfp4_where_capable_and_bf16_elsewhere() {
+        assert_eq!(
+            DecoderPrecision::from_quant_env_value(None, true),
+            DecoderPrecision::Nvfp4
+        );
+        assert_eq!(
+            DecoderPrecision::from_quant_env_value(None, false),
+            DecoderPrecision::Bf16
+        );
+    }
+
+    #[test]
+    fn explicit_nvfp4_opts_in_and_fails_loudly_off_cuda_instead_of_silently_downgrading() {
+        assert_eq!(
+            DecoderPrecision::from_quant_env_value(Some("nvfp4"), false),
+            DecoderPrecision::Nvfp4
+        );
+    }
+
+    #[test]
+    fn bf16_escape_restores_the_graphed_bf16_decoder_even_where_nvfp4_is_capable() {
+        assert_eq!(
+            DecoderPrecision::from_quant_env_value(Some("bf16"), true),
+            DecoderPrecision::Bf16
+        );
+    }
+
+    #[test]
+    fn unknown_values_follow_the_capability_default_like_unset() {
+        assert_eq!(
+            DecoderPrecision::from_quant_env_value(Some("int8"), true),
+            DecoderPrecision::Nvfp4
+        );
+        assert_eq!(
+            DecoderPrecision::from_quant_env_value(Some("int8"), false),
+            DecoderPrecision::Bf16
+        );
     }
 }
 

@@ -2,4 +2,4 @@
 import type { ResponsesInput } from "./ResponsesInput";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type ResponsesRequest = { model?: string | null, input?: ResponsesInput | null, instructions?: string | null, store?: boolean | null, previous_response_id?: string | null, stream?: boolean | null, max_output_tokens?: number | null, temperature?: number | null, top_p?: number | null, metadata?: { [key in string]: JsonValue } | null, tools: Array<JsonValue>, };
+export type ResponsesRequest = { model?: string | null, input?: ResponsesInput | null, instructions?: string | null, store?: boolean | null, previous_response_id?: string | null, stream?: boolean | null, max_output_tokens?: number | null, temperature?: number | null, top_p?: number | null, metadata?: { [key in string]: JsonValue } | null, tools: Array<JsonValue>, tool_choice?: JsonValue | null, parallel_tool_calls?: boolean | null, };

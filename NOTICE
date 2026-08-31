@@ -41,7 +41,7 @@ License:  CC-BY-NC-4.0 (NON-COMMERCIAL ONLY)
        license (e.g. pyannote-segmentation-3.0 under MIT), or
     b) Train an equivalent on commercially-licensed data.
 
-  See `rust/src/realtime/diarization/` for the integration surface;
+  See `rust/src/diarization/segmentation.rs` for the integration surface;
   the wrapper accepts any ONNX with the same `(B, 1, samples) -> (B, T, C)`
   powerset shape.
 
@@ -69,3 +69,11 @@ Smart Turn v3       -- pipecat-ai/smart-turn-v3 / BSD-2-Clause
 The Whisper, Kokoro, Silero, and Smart-Turn weights are commercial-use-
 compatible. The DiariZen weights are not. Configure your deployment
 accordingly.
+
+The chat/embedding/omni checkpoints pinned by flake.nix carry their own
+terms: the Gemma-family weights (google/gemma-4-E4B-it and variants,
+nvidia/Gemma-4-31B-IT-NVFP4) ship under the Google Gemma Terms of Use,
+a use-restricted custom license -- review it before any deployment; the
+Qwen-family weights (Qwen/Qwen3.5-*, Qwen3-Embedding, Qwen3-Omni,
+Qwen3-TTS, Qwen3-ForcedAligner, unsloth/Qwen3.8-27B-NVFP4) ship under
+Apache-2.0.

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const PPL_CORPUS_SLICE_TOKENS_N_2048_CHOSEN_SO_31B_LOAD_PLUS_FOUR_EAGER_512_BLOCKS_FITS_2_TO_3_MIN: usize =
     2048;
 
@@ -27,7 +29,7 @@ pub fn corpus_text_from_nv_ppl_corpus_env_failing_loudly() -> String {
     let p = std::env::var("NV_PPL_CORPUS").unwrap_or_else(|_| {
         panic!(
             "NV_PPL_CORPUS is unset: point it at the shared corpus file \
-             (e.g. a wikitext dump at /tmp/nv-corpus/wiki.txt)"
+             (the corpus agent writes /home/user/tmp/wf/quant/corpus/wiki.txt)"
         )
     });
     let path = std::path::PathBuf::from(&p);
@@ -244,4 +246,129 @@ pub fn checkpoint_label_from_snapshot_dir(dir: &std::path::Path) -> String {
         .unwrap_or_else(|| "unknown-repo".into());
     let short = &snap[..snap.len().min(8)];
     format!("{repo}@{short}")
+}
+pub fn eprintln_ppl_skipped_when_any_true_token_exceeded_the_logit_width(
+    skipped_beyond_logit_width: usize,
+) {
+    if skipped_beyond_logit_width > 0 {
+        eprintln!(
+            "PPL-SKIPPED {skipped_beyond_logit_width} positions whose true token id exceeds the \
+             model's logit width (tokenizer vocab is padded past the lm head); scored positions \
+             exclude them on every config identically"
+        );
+    }
+}
+
+pub fn score_tail_teacher_forced_decode_stepping_converting_only_scored_rows(
+    step_logits: &mut dyn FnMut(usize, u32) -> candle_core::Tensor,
+    ids: &[u32],
+    score_start: usize,
+) -> TeacherForcedNllFp32SoftmaxF64Sum {
+    let len = ids.len();
+    let mut acc = TeacherForcedNllFp32SoftmaxF64Sum::new();
+    let mut skipped_beyond_logit_width = 0usize;
+    for p in 0..len - 1 {
+        let logits = step_logits(p, ids[p]);
+        if p + 1 < score_start {
+            continue;
+        }
+        let row: Vec<f32> = logits
+            .to_dtype(candle_core::DType::F32)
+            .expect("f32")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("host");
+        if ids[p + 1] as usize >= row.len() {
+            skipped_beyond_logit_width += 1;
+            continue;
+        }
+        acc.add_position_full_vocab_row(&row, ids[p + 1]);
+    }
+    eprintln_ppl_skipped_when_any_true_token_exceeded_the_logit_width(skipped_beyond_logit_width);
+    acc
+}
+
+pub fn score_tail_teacher_forced_wgpu_decode_step_logits_full_vocab_row(
+    decode_step_logits_row: &mut dyn FnMut(usize, u32) -> Vec<f32>,
+    vocab: usize,
+    ids: &[u32],
+    score_start: usize,
+) -> TeacherForcedNllFp32SoftmaxF64Sum {
+    let mut acc = TeacherForcedNllFp32SoftmaxF64Sum::new();
+    for p in 0..ids.len() - 1 {
+        let row = decode_step_logits_row(p, ids[p]);
+        if p + 1 < score_start {
+            continue;
+        }
+        assert_eq!(
+            row.len(),
+            vocab,
+            "decode_step_logits must return the full vocab row, not a top-k slice"
+        );
+        acc.add_position_full_vocab_row(&row, ids[p + 1]);
+    }
+    acc
+}
+
+pub fn score_corpus_in_blocks_first_token_input_only_one_prefill_per_fresh_cache(
+    block_flat_f32_logits: &mut dyn FnMut(&[u32], usize) -> Vec<f32>,
+    corpus_tokens: &[u32],
+) -> TeacherForcedNllFp32SoftmaxF64Sum {
+    let block = ppl_block_len_with_debug_override_which_makes_the_run_noncanonical();
+    let mut acc = TeacherForcedNllFp32SoftmaxF64Sum::new();
+    let mut skipped_beyond_logit_width = 0usize;
+    let mut bstart = 0usize;
+    while bstart < corpus_tokens.len() {
+        let bend = (bstart + block).min(corpus_tokens.len());
+        let ids = &corpus_tokens[bstart..bend];
+        let k = ids.len();
+        let flat = block_flat_f32_logits(ids, bstart);
+        assert_eq!(flat.len() % k, 0, "logit rows not divisible by block len");
+        let vocab = flat.len() / k;
+        let nll_before = acc.sum_neg_ln_p_f64;
+        let scored_before = acc.scored_positions;
+        for i in 0..k - 1 {
+            if ids[i + 1] as usize >= vocab {
+                skipped_beyond_logit_width += 1;
+                continue;
+            }
+            acc.add_position_full_vocab_row(&flat[i * vocab..(i + 1) * vocab], ids[i + 1]);
+        }
+        eprintln!(
+            "PPL-BLOCK start={bstart} scored={} mean_nll={:.3}",
+            acc.scored_positions - scored_before,
+            (acc.sum_neg_ln_p_f64 - nll_before) / (acc.scored_positions - scored_before) as f64
+        );
+        bstart = bend;
+    }
+    eprintln_ppl_skipped_when_any_true_token_exceeded_the_logit_width(skipped_beyond_logit_width);
+    acc
+}
+
+pub fn shuffle_tail_score_both_arms_assert_equal_positions_and_print_machine_line(
+    family: &str,
+    label: &str,
+    ids: &[u32],
+    score_start: usize,
+    score: &mut dyn FnMut(&[u32]) -> TeacherForcedNllFp32SoftmaxF64Sum,
+) {
+    let real = score(ids);
+    let mut shuffled_ids = ids.to_vec();
+    deterministic_xorshift_fisher_yates_shuffle_fixed_seed_so_every_config_scores_the_same_control(
+        &mut shuffled_ids[score_start..],
+    );
+    let shuffled = score(&shuffled_ids);
+    assert_eq!(
+        real.scored_positions, shuffled.scored_positions,
+        "real and shuffled arms scored different position counts"
+    );
+    print_machine_line_with_acc_and_assert_real_beats_shuffled(
+        family,
+        label,
+        real.scored_positions,
+        real.perplexity_exp_of_mean_neg_ln_p(),
+        shuffled.perplexity_exp_of_mean_neg_ln_p(),
+        real.top1_accuracy(),
+    );
 }

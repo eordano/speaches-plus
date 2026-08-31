@@ -359,6 +359,17 @@ class OutboundEvent:
         )
 
     @classmethod
+    def response_tool_progress(
+        cls,
+        response_id: str,
+        tools: list[dict[str, Any]],
+    ) -> OutboundEvent:
+        return cls(
+            _Tag.RESPONSE_TOOL_PROGRESS,
+            {"response_id": response_id, "tools": tools},
+        )
+
+    @classmethod
     def response_done(cls, response: ResponsePayload) -> OutboundEvent:
         return cls(_Tag.RESPONSE_DONE, {"response": response})
 

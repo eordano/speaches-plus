@@ -86,6 +86,57 @@ impl AdapterCatalog {
     }
 }
 
+pub const STAMPED_ID_KEY: &str = "nv_adapter_id";
+
+pub fn stamp_adapter_id(dir: &Path, id: &str) -> anyhow::Result<()> {
+    let cfg_path = dir.join(ADAPTER_CONFIG_FILE);
+    let raw = std::fs::read_to_string(&cfg_path)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", cfg_path.display()))?;
+    let mut v: serde_json::Value = serde_json::from_str(&raw)?;
+    let obj = v
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{} is not a json object", cfg_path.display()))?;
+    obj.insert(
+        STAMPED_ID_KEY.into(),
+        serde_json::Value::String(id.to_string()),
+    );
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&v)?)
+        .map_err(|e| anyhow::anyhow!("write {}: {e}", cfg_path.display()))?;
+    Ok(())
+}
+
+pub const CURRENT_LINKS_DIR_HOLDS_ONE_SYMLINK_PER_MODEL_SUFFIX_SO_BOOT_LOADS_THE_ROLLING_ADAPTER_NOT_EVERY_PAST_JOB:
+    &str = "current";
+
+pub fn rolling_link_name(ft_model: &str) -> Option<&str> {
+    ft_model
+        .rsplit_once(':')
+        .map(|(prefix, _)| prefix)
+        .filter(|p| p.contains(':'))
+}
+
+pub fn roll_current_adapter_symlink(
+    current_root: &Path,
+    ft_model: &str,
+    out_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let name = rolling_link_name(ft_model).ok_or_else(|| {
+        anyhow::anyhow!("adapter id {ft_model:?} has no ft:<model>:<suffix>:<job> shape to roll")
+    })?;
+    std::fs::create_dir_all(current_root)
+        .map_err(|e| anyhow::anyhow!("create {}: {e}", current_root.display()))?;
+    let target = std::path::absolute(out_dir)
+        .map_err(|e| anyhow::anyhow!("absolutize {}: {e}", out_dir.display()))?;
+    let link = current_root.join(name);
+    let staged = current_root.join(format!(".{name}.staged"));
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(&target, &staged)
+        .map_err(|e| anyhow::anyhow!("symlink {} -> {}: {e}", staged.display(), target.display()))?;
+    std::fs::rename(&staged, &link)
+        .map_err(|e| anyhow::anyhow!("rename over {}: {e}", link.display()))?;
+    Ok(link)
+}
+
 pub fn validate_id(id: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!id.is_empty(), "adapter id is empty");
     anyhow::ensure!(
@@ -126,8 +177,16 @@ pub fn probe_adapter(dir: &Path, id: Option<&str>) -> anyhow::Result<AdapterEntr
         weights.is_file(),
         "no {ADAPTER_WEIGHTS_FILE} (the loader reads exactly that name)"
     );
-    let id = match id {
-        Some(s) => s.to_string(),
+    let stamped = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get(STAMPED_ID_KEY)
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .filter(|s| !s.is_empty());
+    let id = match id.map(str::to_string).or(stamped) {
+        Some(s) => s,
         None => dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -281,6 +340,7 @@ fn registered_lock() -> &'static std::sync::Mutex<AdapterCatalog> {
 }
 
 pub fn register_adapter(entry: AdapterEntry) {
+    unloaded_lock().lock().unwrap().remove(&entry.id);
     let mut cat = registered_lock().lock().unwrap();
     cat.entries.retain(|e| e.id != entry.id);
     tracing::info!(
@@ -290,6 +350,20 @@ pub fn register_adapter(entry: AdapterEntry) {
         "fine-tuned lora adapter registered as a servable model id"
     );
     cat.entries.push(entry);
+}
+
+static UNLOADED_TOMBSTONES_HIDE_BOOT_ADAPTERS_THE_IMMUTABLE_SERVED_CATALOG_STILL_LISTS:
+    std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn unloaded_lock() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    UNLOADED_TOMBSTONES_HIDE_BOOT_ADAPTERS_THE_IMMUTABLE_SERVED_CATALOG_STILL_LISTS
+        .get_or_init(Default::default)
+}
+
+pub fn deregister_adapter(id: &str) {
+    registered_lock().lock().unwrap().entries.retain(|e| e.id != id);
+    unloaded_lock().lock().unwrap().insert(id.to_string());
 }
 
 pub fn registered() -> AdapterCatalog {
@@ -302,6 +376,8 @@ pub fn all_entries() -> Vec<AdapterEntry> {
         out.retain(|x| x.id != e.id);
         out.push(e.clone());
     }
+    let unloaded = unloaded_lock().lock().unwrap();
+    out.retain(|e| !unloaded.contains(&e.id));
     out
 }
 
@@ -417,5 +493,92 @@ mod unknown_model_env_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod rolling_symlink_tests {
+    use super::*;
+
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lora-roll-{label}-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_min_adapter(dir: &Path, stamped_id: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let cfg = serde_json::json!({
+            "r": 4,
+            "lora_alpha": 8.0,
+            "target_modules": ["q_proj"],
+            STAMPED_ID_KEY: stamped_id,
+        });
+        std::fs::write(dir.join(ADAPTER_CONFIG_FILE), cfg.to_string()).unwrap();
+        std::fs::write(dir.join(ADAPTER_WEIGHTS_FILE), b"").unwrap();
+    }
+
+    #[test]
+    fn rolling_link_name_requires_the_ft_model_suffix_shape() {
+        assert_eq!(rolling_link_name("ft:e4b:traj:abcd1234"), Some("ft:e4b:traj"));
+        assert_eq!(rolling_link_name("no-colons"), None);
+        assert_eq!(rolling_link_name("one:colon"), None);
+    }
+
+    #[test]
+    fn rolling_twice_leaves_one_link_and_boot_scan_finds_only_the_newest_stamped_id() {
+        let root = scratch("roll");
+        let current = root.join("current");
+        let v1 = root.join("job1").join("adapter");
+        let v2 = root.join("job2").join("adapter");
+        write_min_adapter(&v1, "ft:e4b:traj:aaaa1111");
+        write_min_adapter(&v2, "ft:e4b:traj:bbbb2222");
+
+        roll_current_adapter_symlink(&current, "ft:e4b:traj:aaaa1111", &v1).unwrap();
+        let link = roll_current_adapter_symlink(&current, "ft:e4b:traj:bbbb2222", &v2).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), std::path::absolute(&v2).unwrap());
+
+        let entries: Vec<_> = std::fs::read_dir(&current)
+            .unwrap()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert_eq!(entries.len(), 1);
+
+        let cat = catalog_from_specs(&[(None, current.clone())]);
+        let ids: Vec<_> = cat.entries().iter().map(|e| e.id.clone()).collect();
+        assert_eq!(ids, vec!["ft:e4b:traj:bbbb2222".to_string()]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_weekly_round_pair_of_suffixes_rolls_independently() {
+        let root = scratch("multi");
+        let current = root.join("current");
+        let a = root.join("ja").join("adapter");
+        let b = root.join("jb").join("adapter");
+        write_min_adapter(&a, "ft:e4b:traj:aaaa1111");
+        write_min_adapter(&b, "ft:e4b:voice:cccc3333");
+        roll_current_adapter_symlink(&current, "ft:e4b:traj:aaaa1111", &a).unwrap();
+        roll_current_adapter_symlink(&current, "ft:e4b:voice:cccc3333", &b).unwrap();
+        let cat = catalog_from_specs(&[(None, current.clone())]);
+        let mut ids: Vec<_> = cat.entries().iter().map(|e| e.id.clone()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                "ft:e4b:traj:aaaa1111".to_string(),
+                "ft:e4b:voice:cccc3333".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

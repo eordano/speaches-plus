@@ -266,7 +266,7 @@ mod e2e {
         .to_string()
     }
 
-    fn bench_engine_prefill(dir: &PathBuf, tag: &str, image_sizes: &[(u32, u32)]) {
+    fn bench_engine_prefill(dir: &std::path::Path, tag: &str, image_sizes: &[(u32, u32)]) {
         let engine = Arc::new(WgpuChatEngine::load(dir).expect("wgpu engine load"));
         assert!(
             engine.supports_mm_input(),

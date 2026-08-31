@@ -121,7 +121,7 @@ pub fn complete_stream(
         role: "user".into(),
         content: user_text.to_string(),
     });
-    complete_stream_messages(cfg, messages)
+    complete_stream_messages(cfg, messages, None)
 }
 
 #[derive(Clone, Debug)]
@@ -133,11 +133,12 @@ pub struct ChatMessage {
 pub fn complete_stream_messages(
     cfg: &LlmConfig,
     messages: Vec<ChatMessage>,
+    trajectory_tag: Option<String>,
 ) -> mpsc::Receiver<Result<String>> {
     let (tx, rx) = mpsc::channel(64);
     let cfg = cfg.clone();
     tokio::spawn(async move {
-        if let Err(err) = stream_messages_into(cfg, messages, tx.clone()).await {
+        if let Err(err) = stream_messages_into(cfg, messages, trajectory_tag, tx.clone()).await {
             let _ = tx.send(Err(err)).await;
         }
     });
@@ -147,6 +148,7 @@ pub fn complete_stream_messages(
 async fn stream_messages_into(
     cfg: LlmConfig,
     messages: Vec<ChatMessage>,
+    trajectory_tag: Option<String>,
     tx: mpsc::Sender<Result<String>>,
 ) -> Result<()> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
@@ -165,6 +167,13 @@ async fn stream_messages_into(
         .header("Accept", "text/event-stream");
     if let Some(key) = &cfg.api_key {
         req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    if let Some(tag) = trajectory_tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        req = req.header(crate::oapi::trajectory::TAG_HEADER, tag);
     }
     let resp = req.send().await.context("LLM request send")?;
     if !resp.status().is_success() {
@@ -468,6 +477,54 @@ mod tests {
         let out = c.feed("line one\nline two");
         assert_eq!(out, vec!["line one"]);
         assert_eq!(c.flush(), Some("line two".to_string()));
+    }
+
+    #[tokio::test]
+    async fn trajectory_tag_rides_as_the_tag_header_and_none_sends_no_header() {
+        let captured: Arc<StdMutex<Vec<Option<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_for_route = captured.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_route.clone();
+                async move {
+                    captured.lock().unwrap().push(
+                        headers
+                            .get(crate::oapi::trajectory::TAG_HEADER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(String::from),
+                    );
+                    Response::builder()
+                        .status(200)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base = format!("http://{addr}/v1");
+        let user = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let mut rx =
+            complete_stream_messages(&cfg(base.clone()), user.clone(), Some("resp_tag_1".into()));
+        while rx.recv().await.is_some() {}
+        let mut rx = complete_stream_messages(&cfg(base), user, None);
+        while rx.recv().await.is_some() {}
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some("resp_tag_1".to_string()), None],
+            "the tagged call carries x-trajectory-tag and the untagged call omits it"
+        );
     }
 
     #[tokio::test]

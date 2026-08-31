@@ -1,5 +1,6 @@
 #![cfg(feature = "cuda")]
 
+mod ctx_timing_common;
 mod ppl_common;
 
 use candle_core::Device;
@@ -311,8 +312,72 @@ fn score_tail_via_serving_decode_stepping(
     acc
 }
 
+const THE_EAGER_BF16_KV_SCORER_AND_THE_GRAPHED_FP8_KV_SCORER_ARE_THE_SAME_M1_STEPPING_WITH_A_DIFFERENT_CACHE_DTYPE_AND_A_CAPTURE: &str =
+    "score_tail_via_serving_decode_stepping walks the tail one token at a time through \
+     Gemma4::forward_with_cache on a bf16 KV cache, which is the arithmetic every weight-route \
+     and epilogue arm changes but is NOT the cache serving allocates. \
+     NV_PPL_GRAPHED=1 runs the identical walk through GraphedGemma4Decoder over \
+     new_kv_cache_fp8_windowed -- the cache and the capture run_sampling_gemma4 builds. \
+     Both are needed: the graphed scorer is the serving shape, and the eager scorer is the \
+     reference the family's published gemma4-chat numbers were measured on.";
+
+fn score_tail_via_graphed_serving_decoder_over_the_windowed_fp8_kv_cache(
+    model: &Gemma4,
+    device: &Device,
+    ids: &[u32],
+    score_start: usize,
+) -> TeacherForcedNllFp32SoftmaxF64Sum {
+    let len = ids.len();
+    let cache = model
+        .new_kv_cache_fp8_windowed(len + 8)
+        .expect("windowed fp8 kv cache");
+    let mut dec = nv_models::gemma4_graph::GraphedGemma4Decoder::new(model, cache, device)
+        .expect("graphed serving decoder");
+    let mut acc = TeacherForcedNllFp32SoftmaxF64Sum::new();
+    for p in 0..len - 1 {
+        let row = dec
+            .forward_decode_logits_vec(ids[p])
+            .unwrap_or_else(|err| panic!("graphed decode step {p}: {err:#}"));
+        if p + 1 < score_start {
+            continue;
+        }
+        acc.add_position_full_vocab_row(&row, ids[p + 1]);
+    }
+    assert!(
+        dec.capture_active(),
+        "the graphed scorer must replay a capture or it scored the eager path under another name"
+    );
+    acc
+}
+
+fn score_tail_on_the_selected_path(
+    model: &Gemma4,
+    device: &Device,
+    ids: &[u32],
+    score_start: usize,
+) -> TeacherForcedNllFp32SoftmaxF64Sum {
+    if std::env::var("NV_PPL_GRAPHED").ok().as_deref() == Some("1") {
+        score_tail_via_graphed_serving_decoder_over_the_windowed_fp8_kv_cache(
+            model,
+            device,
+            ids,
+            score_start,
+        )
+    } else {
+        score_tail_via_serving_decode_stepping(model, device, ids, score_start)
+    }
+}
+
+fn ppl_scoring_path_label() -> &'static str {
+    if std::env::var("NV_PPL_GRAPHED").ok().as_deref() == Some("1") {
+        "graphed_decoder_windowed_fp8_kv"
+    } else {
+        "eager_stepping_bf16_kv"
+    }
+}
+
 #[test]
-#[ignore = "loads the 31B; set NV_PPL_TEST=1 -- the ONLY valid gemma4 PPL: chat-wrapped, scored on the serving decode path (raw-corpus gemma4 PPL is an invalid eval, see #94)"]
+#[ignore = "loads the 31B; set NV_PPL_TEST=1 -- the ONLY valid gemma4 PPL: chat-wrapped, scored on the serving decode path (raw-corpus gemma4 PPL is an invalid eval, see #94); NV_PPL_GRAPHED=1 scores through the GraphedGemma4Decoder + windowed fp8 KV cache run_sampling_gemma4 actually builds"]
 fn gemma4_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode() {
     require_nv_ppl_test_gate_because_this_suite_must_never_silently_skip();
     let corpus = corpus_text_from_nv_ppl_corpus_env_failing_loudly();
@@ -325,18 +390,19 @@ fn gemma4_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode() {
     let model = load_gemma4(&dir, &device);
     let label = checkpoint_label_from_snapshot_dir(&dir);
     eprintln!(
-        "PPL basis: {label} chat_wrapped prompt_tokens={score_start} scored_tokens={} backend=cuda batch=1 path=decode_stepping",
-        ids.len() - score_start
+        "PPL basis: {label} chat_wrapped prompt_tokens={score_start} scored_tokens={} backend=cuda batch=1 path={}",
+        ids.len() - score_start,
+        ppl_scoring_path_label()
     );
 
-    let real = score_tail_via_serving_decode_stepping(&model, &device, &ids, score_start);
+    let real = score_tail_on_the_selected_path(&model, &device, &ids, score_start);
 
     let mut shuffled_ids = ids.clone();
     deterministic_xorshift_fisher_yates_shuffle_fixed_seed_so_every_config_scores_the_same_control(
         &mut shuffled_ids[score_start..],
     );
     let shuffled =
-        score_tail_via_serving_decode_stepping(&model, &device, &shuffled_ids, score_start);
+        score_tail_on_the_selected_path(&model, &device, &shuffled_ids, score_start);
 
     assert_eq!(
         real.scored_positions, shuffled.scored_positions,
@@ -815,16 +881,18 @@ fn greedy_generation_through_the_same_decode_path_shows_whether_the_model_is_act
 
     let prime_len = ids.len();
 
+    let steps = greedy_chain_steps();
     fn greedy_via<C: nv_models::gemma4::Gemma4Cache>(
         model: &Gemma4,
         device: &Device,
         ids: &[u32],
         prime_len: usize,
+        steps: usize,
         cache: &mut C,
     ) -> Vec<u32> {
         let mut generated: Vec<u32> = Vec::new();
         let mut next_input = 0u32;
-        for p in 0..prime_len + 39 {
+        for p in 0..prime_len + steps - 1 {
             let feed = if p < prime_len { ids[p] } else { next_input };
             let tokens = candle_core::Tensor::from_vec(vec![feed], (1usize, 1usize), device)
                 .expect("token");
@@ -840,17 +908,7 @@ fn greedy_generation_through_the_same_decode_path_shows_whether_the_model_is_act
                 .expect("flatten")
                 .to_vec1()
                 .expect("host");
-            let argmax = row
-                .iter()
-                .enumerate()
-                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (j, &v)| {
-                    if v > bv {
-                        (j, v)
-                    } else {
-                        (bi, bv)
-                    }
-                })
-                .0 as u32;
+            let argmax = first_index_argmax_same_tie_rule_on_every_arm(&row);
             if p >= prime_len - 1 {
                 generated.push(argmax);
                 next_input = argmax;
@@ -859,17 +917,117 @@ fn greedy_generation_through_the_same_decode_path_shows_whether_the_model_is_act
         generated
     }
 
-    let generated = if std::env::var("NV_GREEDY_FP8_CACHE").is_ok() {
-        let mut cache = model.new_kv_cache_fp8(prime_len + 48).expect("fp8 kv cache");
-        greedy_via(&model, &device, &ids, prime_len, &mut cache)
+    let (generated, mode) = if std::env::var("NV_GREEDY_GRAPH").is_ok() {
+        (
+            greedy_through_the_graphed_serving_decoder_over_the_windowed_fp8_kv_cache(
+                &model, &device, &ids, prime_len, steps,
+            ),
+            "graphed_decoder_windowed_fp8_kv",
+        )
+    } else if std::env::var("NV_GREEDY_FP8_CACHE").is_ok() {
+        let mut cache = model
+            .new_kv_cache_fp8(prime_len + steps + 8)
+            .expect("fp8 kv cache");
+        (
+            greedy_via(&model, &device, &ids, prime_len, steps, &mut cache),
+            "eager_contiguous_fp8_kv",
+        )
     } else {
-        let mut cache = model.new_kv_cache(prime_len + 48).expect("kv cache");
-        greedy_via(&model, &device, &ids, prime_len, &mut cache)
+        let mut cache = model
+            .new_kv_cache(prime_len + steps + 8)
+            .expect("kv cache");
+        (
+            greedy_via(&model, &device, &ids, prime_len, steps, &mut cache),
+            "eager_bf16_kv",
+        )
     };
     let prime_text = tok.decode(&ids[1..], false).unwrap_or_default();
     let gen_text = tok.decode(&generated, false).unwrap_or_default();
     eprintln!("GREEDY prime ...{:?}", &prime_text[prime_text.len().saturating_sub(120)..]);
     eprintln!("GREEDY continuation {gen_text:?}");
+    eprintln!(
+        "GREEDY-CHAIN arm={} mode={mode} steps={} tokens={:?}",
+        greedy_chain_arm_label(),
+        generated.len(),
+        generated
+    );
+}
+
+const GREEDY_CHAIN_STEPS_128_IS_THE_QUALITY_PROTOCOL_MINIMUM_FOR_A_QUANTIZATION_CLASS_ARM: usize =
+    128;
+
+fn greedy_chain_steps() -> usize {
+    match std::env::var("NV_GEMMA4_CHAIN_STEPS") {
+        Ok(v) => v.trim().parse::<usize>().expect("NV_GEMMA4_CHAIN_STEPS").max(1),
+        Err(_) => GREEDY_CHAIN_STEPS_128_IS_THE_QUALITY_PROTOCOL_MINIMUM_FOR_A_QUANTIZATION_CLASS_ARM,
+    }
+}
+
+fn greedy_chain_arm_label() -> String {
+    ctx_timing_common::arm_label_from_the_resolved_value_of_every_gate_accessor_because_a_presence_label_lies_after_a_default_flip(
+        &ctx_timing_common::GEMMA4_DECODE_NUMERICS_GATES_EVERY_ONE_APPEARS_RESOLVED_IN_THE_ARM_LABEL,
+    )
+}
+
+fn first_index_argmax_same_tie_rule_on_every_arm(row: &[f32]) -> u32 {
+    row.iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (j, &v)| {
+            if v > bv {
+                (j, v)
+            } else {
+                (bi, bv)
+            }
+        })
+        .0 as u32
+}
+
+fn greedy_through_the_graphed_serving_decoder_over_the_windowed_fp8_kv_cache(
+    model: &Gemma4,
+    device: &Device,
+    ids: &[u32],
+    prime_len: usize,
+    steps: usize,
+) -> Vec<u32> {
+    let mut cache = model
+        .new_kv_cache_fp8_windowed(prime_len + steps + 8)
+        .expect("windowed fp8 kv cache");
+    let mut generated: Vec<u32> = Vec::new();
+    let mut last = 0u32;
+    for p in 0..prime_len {
+        let tokens =
+            candle_core::Tensor::from_vec(vec![ids[p]], (1usize, 1usize), device).expect("token");
+        let positions =
+            candle_core::Tensor::from_vec(vec![p as i32], 1usize, device).expect("position");
+        let logits = model
+            .forward_with_cache(&tokens, &positions, &mut cache)
+            .unwrap_or_else(|err| panic!("prime step {p}: {err:#}"));
+        if p + 1 == prime_len {
+            let row: Vec<f32> = logits
+                .to_dtype(candle_core::DType::F32)
+                .expect("f32")
+                .flatten_all()
+                .expect("flatten")
+                .to_vec1()
+                .expect("host");
+            last = first_index_argmax_same_tie_rule_on_every_arm(&row);
+            generated.push(last);
+        }
+    }
+    let mut dec = nv_models::gemma4_graph::GraphedGemma4Decoder::new(model, cache, device)
+        .expect("graphed serving decoder");
+    while generated.len() < steps {
+        let row = dec
+            .forward_decode_logits_vec(last)
+            .unwrap_or_else(|err| panic!("graphed chain step {}: {err:#}", generated.len()));
+        last = first_index_argmax_same_tie_rule_on_every_arm(&row);
+        generated.push(last);
+    }
+    assert!(
+        dec.capture_active(),
+        "the graphed chain must replay a capture or it is just the eager path under another name"
+    );
+    generated
 }
 
 #[test]

@@ -420,3 +420,197 @@ fn q3w_delta_head_fused(
     }
     q3w_out_tail(h, e0, v0, v1, do_red[0]);
 }
+
+const FW_DK_128: u32 = 128u;
+const FW_DV_128: u32 = 128u;
+const FW_ROWS_PER_CHUNK_32: u32 = 32u;
+
+var<workgroup> fw_part: array<f32, 512>;
+var<workgroup> fw_delta: array<f32, 128>;
+
+@compute @workgroup_size(512)
+fn q3w_delta_head_fused_wide(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let h = wid.x;
+    let col = lid.x & (FW_DV_128 - 1u);
+    let rc = lid.x / FW_DV_128;
+    let kh = h / dq_p.v_per_k;
+    if (rc == 0u) {
+        let qv = dq_mixed[kh * FW_DK_128 + col];
+        let kv = dq_mixed[dq_p.key_dim + kh * FW_DK_128 + col];
+        dq_rq[col] = qv * qv;
+        dq_rk[col] = kv * kv;
+        fh_q[col] = qv;
+        fh_k[col] = kv;
+    }
+    if (lid.x == 0u) {
+        let gb = q3w_gate_values(h);
+        fh_g = gb.x;
+        fh_beta = gb.y;
+    }
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (rc == 0u && col < s) {
+            dq_rq[col] = dq_rq[col] + dq_rq[col + s];
+            dq_rk[col] = dq_rk[col] + dq_rk[col + s];
+        }
+        workgroupBarrier();
+    }
+    let nq = sqrt(dq_rq[0] + 1e-6);
+    let nk = sqrt(dq_rk[0] + 1e-6);
+    if (rc == 0u) {
+        fh_q[col] = (fh_q[col] / nq) * dq_p.scale;
+        fh_k[col] = fh_k[col] / nk;
+    }
+    workgroupBarrier();
+    let ge = fh_g;
+    let bt = fh_beta;
+    let r0 = rc * FW_ROWS_PER_CHUNK_32;
+    let sbase = h * FW_DK_128 * FW_DV_128 + col;
+    var part = 0.0;
+    for (var i = 0u; i < FW_ROWS_PER_CHUNK_32; i = i + 1u) {
+        let s = dr_state[sbase + (r0 + i) * FW_DV_128] * ge;
+        part = fma(s, fh_k[r0 + i], part);
+    }
+    fw_part[lid.x] = part;
+    workgroupBarrier();
+    if (rc == 0u) {
+        let vv = dq_mixed[2u * dq_p.key_dim + h * FW_DV_128 + col];
+        let kv_mem = fw_part[col] + fw_part[col + 128u] + fw_part[col + 256u]
+            + fw_part[col + 384u];
+        fw_delta[col] = (vv - kv_mem) * bt;
+    }
+    workgroupBarrier();
+    let delta = fw_delta[col];
+    var outp = 0.0;
+    for (var i = 0u; i < FW_ROWS_PER_CHUNK_32; i = i + 1u) {
+        let p = sbase + (r0 + i) * FW_DV_128;
+        let u = fma(fh_k[r0 + i], delta, dr_state[p] * ge);
+        dr_state[p] = u;
+        outp = fma(u, fh_q[r0 + i], outp);
+    }
+    fw_part[lid.x] = outp;
+    workgroupBarrier();
+    if (rc == 0u) {
+        fh_core[col] = fw_part[col] + fw_part[col + 128u] + fw_part[col + 256u]
+            + fw_part[col + 384u];
+    }
+    workgroupBarrier();
+    let e0 = 2u * col;
+    var v0 = 0.0;
+    var v1 = 0.0;
+    if (rc == 0u) {
+        if (e0 < FW_DV_128) {
+            v0 = bf16_decode(bf16_encode(fh_core[e0]));
+            v1 = bf16_decode(bf16_encode(fh_core[e0 + 1u]));
+        }
+        do_red[col] = v0 * v0 + v1 * v1;
+    }
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (rc == 0u && col < s) {
+            do_red[col] = do_red[col] + do_red[col + s];
+        }
+        workgroupBarrier();
+    }
+    if (rc == 0u && e0 < FW_DV_128) {
+        q3w_out_tail(h, e0, v0, v1, do_red[0]);
+    }
+}
+
+const SPLIT_DV32_REQUIRES_DK_128: u32 = 128u;
+const SPLIT_DV32_REQUIRES_DV_128: u32 = 128u;
+const SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP: u32 = 32u;
+const SPLIT_DV32_CHUNKS_16_STATE_CROSSES_GLOBAL_ONCE_EACH_WAY: u32 = 16u;
+const SPLIT_DV32_ROWS_PER_CHUNK_8: u32 = SPLIT_DV32_REQUIRES_DK_128
+    / SPLIT_DV32_CHUNKS_16_STATE_CROSSES_GLOBAL_ONCE_EACH_WAY;
+const SPLIT_DV32_GRID_Y_4_MLX_STYLE_DV_GROUPS_QUADRUPLE_THE_HEAD_WORKGROUPS: u32 =
+    SPLIT_DV32_REQUIRES_DV_128 / SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP;
+
+@compute @workgroup_size(512)
+fn q3w_delta_head_split_dv32(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let h = wid.x;
+    let dk = SPLIT_DV32_REQUIRES_DK_128;
+    let dv = SPLIT_DV32_REQUIRES_DV_128;
+    let col_l = lid.x & (SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP - 1u);
+    let chunk = lid.x / SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP;
+    let colg = wid.y * SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP + col_l;
+    let kh = h / dq_p.v_per_k;
+    if (lid.x < dk) {
+        let qv = dq_mixed[kh * dk + lid.x];
+        let kv = dq_mixed[dq_p.key_dim + kh * dk + lid.x];
+        dq_rq[lid.x] = qv * qv;
+        dq_rk[lid.x] = kv * kv;
+        fh_q[lid.x] = qv;
+        fh_k[lid.x] = kv;
+    }
+    if (lid.x == 0u) {
+        let gb = q3w_gate_values(h);
+        fh_g = gb.x;
+        fh_beta = gb.y;
+    }
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid.x < s) {
+            dq_rq[lid.x] = dq_rq[lid.x] + dq_rq[lid.x + s];
+            dq_rk[lid.x] = dq_rk[lid.x] + dq_rk[lid.x + s];
+        }
+        workgroupBarrier();
+    }
+    let nq = sqrt(dq_rq[0] + 1e-6);
+    let nk = sqrt(dq_rk[0] + 1e-6);
+    if (lid.x < dk) {
+        fh_q[lid.x] = (fh_q[lid.x] / nq) * dq_p.scale;
+        fh_k[lid.x] = fh_k[lid.x] / nk;
+    }
+    workgroupBarrier();
+    let ge = fh_g;
+    let bt = fh_beta;
+    let r0 = chunk * SPLIT_DV32_ROWS_PER_CHUNK_8;
+    let sbase = h * dk * dv + colg;
+    var st: array<f32, SPLIT_DV32_ROWS_PER_CHUNK_8>;
+    var part = 0.0;
+    for (var i = 0u; i < SPLIT_DV32_ROWS_PER_CHUNK_8; i = i + 1u) {
+        let s = dr_state[sbase + (r0 + i) * dv] * ge;
+        st[i] = s;
+        part = fma(s, fh_k[r0 + i], part);
+    }
+    fw_part[lid.x] = part;
+    workgroupBarrier();
+    for (var s = SPLIT_DV32_CHUNKS_16_STATE_CROSSES_GLOBAL_ONCE_EACH_WAY / 2u; s > 0u;
+        s = s >> 1u) {
+        if (chunk < s) {
+            fw_part[lid.x] = fw_part[lid.x]
+                + fw_part[lid.x + s * SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP];
+        }
+        workgroupBarrier();
+    }
+    let kv_mem = fw_part[col_l];
+    let vv = dq_mixed[2u * dq_p.key_dim + h * dv + colg];
+    let delta = bt * (vv - kv_mem);
+    var outp = 0.0;
+    for (var i = 0u; i < SPLIT_DV32_ROWS_PER_CHUNK_8; i = i + 1u) {
+        let u = fma(fh_k[r0 + i], delta, st[i]);
+        dr_state[sbase + (r0 + i) * dv] = u;
+        outp = fma(u, fh_q[r0 + i], outp);
+    }
+    workgroupBarrier();
+    fw_part[lid.x] = outp;
+    workgroupBarrier();
+    for (var s = SPLIT_DV32_CHUNKS_16_STATE_CROSSES_GLOBAL_ONCE_EACH_WAY / 2u; s > 0u;
+        s = s >> 1u) {
+        if (chunk < s) {
+            fw_part[lid.x] = fw_part[lid.x]
+                + fw_part[lid.x + s * SPLIT_DV32_COLS_32_ONE_COALESCED_STATE_SEGMENT_PER_WARP];
+        }
+        workgroupBarrier();
+    }
+    if (chunk == 0u) {
+        dr_out[h * dv + colg] = fw_part[col_l];
+    }
+}

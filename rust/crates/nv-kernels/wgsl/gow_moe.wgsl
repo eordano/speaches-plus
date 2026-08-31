@@ -52,6 +52,52 @@ fn gow_router_topk() {
     }
 }
 
+@compute @workgroup_size(32)
+fn gow_router_topk_sg32(@builtin(subgroup_invocation_id) lane: u32) {
+    let live = lane < grt_p.n_experts;
+    var v = -3.4028235e38;
+    if (live) {
+        v = bitcast<f32>(grt_logits[lane]);
+    }
+    var taken = !live;
+    var chosen: array<f32, 16>;
+    for (var j = 0u; j < grt_p.k; j = j + 1u) {
+        var bv = select(v, -3.4028235e38, taken);
+        var bi = lane;
+        for (var s = 16u; s > 0u; s = s >> 1u) {
+            let ov = subgroupShuffleXor(bv, s);
+            let oi = subgroupShuffleXor(bi, s);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == bi) {
+            taken = true;
+        }
+        if (lane == 0u) {
+            grt_ids[j] = bi;
+        }
+        chosen[j] = bv;
+    }
+    if (lane != 0u) {
+        return;
+    }
+    var m = chosen[0];
+    for (var j = 1u; j < grt_p.k; j = j + 1u) {
+        m = max(m, chosen[j]);
+    }
+    var s = 0.0;
+    for (var j = 0u; j < grt_p.k; j = j + 1u) {
+        let e = exp(chosen[j] - m);
+        chosen[j] = e;
+        s = s + e;
+    }
+    for (var j = 0u; j < grt_p.k; j = j + 1u) {
+        grt_w[j] = chosen[j] / s;
+    }
+}
+
 struct GowSwParams {
     n_words: u32,
     inter_words: u32,
@@ -227,4 +273,11 @@ fn gow_argmax_stage2(@builtin(local_invocation_id) lid: vec3<u32>) {
     if (tid == 0u) {
         gam_out[0] = gam_i[0];
     }
+}
+
+@group(0) @binding(50) var<storage, read_write> gnd_scratch: array<u32>;
+
+@compute @workgroup_size(1)
+fn gow_null_dispatch_read_modify_writes_its_own_scratch_so_wgpu_must_serialise_it() {
+    gnd_scratch[0] = gnd_scratch[0] + 1u;
 }

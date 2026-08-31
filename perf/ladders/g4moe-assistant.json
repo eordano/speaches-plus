@@ -1,0 +1,60 @@
+{
+ "ladder": "g4moe-assistant",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "g4moe wgpu assistant drafter",
+  "model": "gemma4-26b-a4b",
+  "backend": "wgpu-vulkan",
+  "pkg": "nv-specdecode",
+  "features": "cuda,wgpu",
+  "suite": "g4moe_assistant_serving_ctx",
+  "exact": "g4moe_wgpu_effective_decode_tok_s_vs_context_depth_real_chunked_prefill_assistant_vs_plain",
+  "parse": "ctx-scaling",
+  "timeout": "3600"
+ },
+ "base_env": {
+  "NV_G4MOE_ASSISTANT_SERVING_TEST": "1",
+  "NV_G4DRAFT_CORPUS": "/home/user/tmp/wf/g4serve/corpus.txt",
+  "NV_G4DRAFT_ASSISTANT_DIR": "/home/user/tmp/wf/g4serve/ckpt",
+  "NV_G4DRAFT_K": "4",
+  "NV_TIMED_EMITTED_TOKENS": "256"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  256,
+  16384
+ ],
+ "depths_per_run": false,
+ "notes": "#233 phase 2: the gate-passed google/gemma-4-26B-A4B-it-assistant drafter served through the g4moe wgpu engine's new assistant taps; corpus and drafter checkpoint paths are lane-local on this box (wf/g4serve), re-fetch per README in the drafter repo if absent. The 196608 rung is UNMEASURED BY RULE: real-context drafting cannot ride the synthfill depth instrument (garbage KV collapses acceptance), and a real 196k chunked prefill costs ~3.8h/arm (measured 14.3 tok/s prime on the one plain-default deep row in runs.jsonl), which the standing no-multi-hour-primes directive bars without explicit user sanction -- the depth tail stays an open question, not a claim",
+ "rationale": "The assistant arm cannot run on the flash decode default: Gemma4MoeWgpu::verify_chain refuses flash_decode_enabled() because the m-row pm_attn argmax mismatches the flash decode stream at softcap near-ties, so NV_G4MOE_FLASH_DECODE=0 rides in the assistant arm env as a real serving requirement, not a tuning knob. plain-noflash isolates that decode-graph cost so the assistant read decomposes into (flash-off penalty) + (spec round economics); the arm's own verify/draft/decode medians land in its [G4ASSIST-COST] line per the gate-3 verify-cost statement. plain-default {} and plain-null {NV_G4MOE_ASSISTANT_ARM:0} are a genuine null pair: assistant_arm_on() is an exact string-1 compare, so unset and 0 run the identical plain decode_step loop on the identical graph. Effective tok/s on the assistant arm counts emitted tokens over wall clock across whole spec rounds -- accept-rate collapse shows up as a slow arm, not a hidden one. NV_TIMED_EMITTED_TOKENS=256 bounds round-granularity noise at k=4. Real chat-wrapped corpus prompts per the always-real-templates rule; one engine build serves all three depths per arm.",
+ "baseline_arm": "plain-default",
+ "null_pair": [
+  "plain-default",
+  "plain-null"
+ ],
+ "arms": [
+  {
+   "name": "plain-default",
+   "env": {}
+  },
+  {
+   "name": "plain-null",
+   "env": {
+    "NV_G4MOE_ASSISTANT_ARM": "0"
+   }
+  },
+  {
+   "name": "plain-noflash",
+   "env": {
+    "NV_G4MOE_FLASH_DECODE": "0"
+   }
+  },
+  {
+   "name": "assistant",
+   "env": {
+    "NV_G4MOE_ASSISTANT_ARM": "1",
+    "NV_G4MOE_FLASH_DECODE": "0"
+   }
+  }
+ ]
+}

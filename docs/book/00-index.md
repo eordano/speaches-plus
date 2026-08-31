@@ -15,8 +15,8 @@ Read the chapters in order the first time. Each chapter names the files that
 implement what it describes, so it doubles as a map of the tree.
 
 > **There is no provenance register, and a number cites its own basis or is
-> marked UNVERIFIED.** There is no `INDEX.md`, no `§`-numbered section register,
-> no `F-NN` flag ids --
+> marked UNVERIFIED.** `docs/measurements/` holds dated per-round pages and
+> nothing else -- no `INDEX.md`, no `§`-numbered sections, no `F-NN` flag ids --
 > so a citation naming any of those is citing something that does not exist and
 > reads as evidence while being none. A number earns its place one of two ways:
 > it names a **suite in the tree that reproduces it**, or it carries its **basis
@@ -81,6 +81,14 @@ implement what it describes, so it doubles as a map of the tree.
 - [6.4 Notebook digitizer](06.4-notebooks.md) -- scanned notebook pages to per-page markdown
 - [6.5 LoRA design](06.5-lora-design.md) -- normative multi-adapter serving design, vLLM-cited; §12 is the wgpu/Metal path
 - [6.6 LoRA training](06.6-lora-training.md) -- train an adapter and serve it here, end to end
+- [6.7 Continual LoRA](06.7-continual-lora.md) -- trajectory capture, runtime adapter load/unload, the consolidation loop
+- [6.8 Cross-language wire types](06.8-cross-language-wire-types.md) -- one Rust source, typeshare-generated TS/Kotlin/Go, drift gates
+- [6.9 Roll-over beats](06.9-roll-over-beats.md) -- what "beats base" has to mean: a
+  veto ladder of typed beats, results keyed by the hash of what they verified, and
+  UNRESOLVED as a verdict that does not roll
+- [6.10 dots.ocr QLoRA](06.10-dots-qlora.md) -- handwriting adaptation over the served
+  4-bit snapshot: frozen affine-u4 base, fp32 adapters, serving-exact vision-row dumps,
+  and the open items to full completion
 
 **7 -- Speech stack**
 
@@ -89,6 +97,7 @@ implement what it describes, so it doubles as a map of the tree.
 **8 -- Build and testing**
 
 - [8.1 Quality harness](08.1-quality-harness.md) -- the only sanctioned way to measure output quality, and what each model's prompt framing costs
+- [8.2 Quality verdicts](08.2-quality-verdicts.md) -- how an arm is decided SHIP / REJECT / UNRESOLVED, and why a band is meaningless without its measured noise floor
 - [8.3 Rocq proof notes](08.3-rocq-proof-notes.md) -- what code each proof mirrors and what is deliberately not claimed
 - [8.4 PERFORMANCE](08.4-PERFORMANCE.md) -- how to quote a number: the basis-tuple rule
 

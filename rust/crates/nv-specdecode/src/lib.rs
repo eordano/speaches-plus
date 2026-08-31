@@ -9,6 +9,7 @@ pub use nv_lookup::suffix_automaton;
 pub mod gemma4_verifier;
 pub mod lora_spec;
 pub mod qwen38_mtp;
+pub mod qwen38_sufspec;
 mod util;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_spec;

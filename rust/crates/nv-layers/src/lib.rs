@@ -12,6 +12,8 @@ pub mod conv;
 pub mod cuda_stream;
 pub mod linear;
 pub mod linear_attn;
+#[cfg(feature = "cuda")]
+pub mod lm_head_resident_quant;
 pub mod lora_slots;
 pub mod mlp;
 pub mod moe;
@@ -21,6 +23,7 @@ pub mod moe_grouped;
 #[cfg(feature = "wgpu")]
 pub mod moe_wgpu;
 pub mod norm;
+pub mod weight_load;
 pub mod rope;
 pub mod sampler;
 

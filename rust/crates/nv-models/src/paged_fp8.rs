@@ -361,7 +361,7 @@ mod cuda {
     const DERIVE_ANGLE_MODE_F64: i32 = 2;
 
     pub fn derive_v_enabled() -> bool {
-        matches!(std::env::var(DERIVE_V_ENV).as_deref(), Ok("1"))
+        nv_config::env_arm_opt_in_eq_some_1_reread_every_call(DERIVE_V_ENV)
     }
 
     #[derive(Clone, Debug)]
@@ -1185,19 +1185,19 @@ mod cuda {
     }
 
     pub fn paged_attn_fp8_enabled() -> bool {
-        !matches!(std::env::var("NV_PAGED_ATTN_FP8").as_deref(), Ok("0"))
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_PAGED_ATTN_FP8")
     }
 
     pub const PAGED_PREFILL_FP8_ENV: &str = "NV_PAGED_PREFILL_FP8";
 
     pub fn paged_prefill_fp8_enabled() -> bool {
-        matches!(std::env::var(PAGED_PREFILL_FP8_ENV).as_deref(), Ok("1"))
+        nv_config::env_arm_opt_in_eq_some_1_reread_every_call(PAGED_PREFILL_FP8_ENV)
     }
 
     pub const PAGED_ATTN_FP8_RING_ENV: &str = "NV_PAGED_ATTN_FP8_RING";
 
     pub fn paged_attn_fp8_ring_enabled() -> bool {
-        !matches!(std::env::var(PAGED_ATTN_FP8_RING_ENV).as_deref(), Ok("0"))
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(PAGED_ATTN_FP8_RING_ENV)
     }
 
     pub struct PagedGemma4Cache {

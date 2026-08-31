@@ -2,6 +2,8 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <cstdlib>
+#include "nv_kernels.h"
 
 namespace {
 
@@ -285,6 +287,132 @@ __global__ void nvfp4_gemv_bf16act_kernel(
     if (lane == 0) y[n] = __float2bfloat16(acc * alpha);
 }
 
+constexpr int kGemvPrenormBlockIs256TheSameShapeAsRmsnormCuSoTheFoldedRowIsBitwise =
+    kGemvActWarps * kWarpSize;
+
+constexpr int kGemvPrenormRowSmemCapIs48KiBTheDynamicSharedLimitWithoutAnOptIn = 49152;
+
+__device__ __forceinline__ float gemv_prenorm_block_sum_same_shape_as_rmsnorm_cu(float v) {
+    constexpr int kWarps =
+        kGemvPrenormBlockIs256TheSameShapeAsRmsnormCuSoTheFoldedRowIsBitwise / kWarpSize;
+    __shared__ float warp_sums[kWarps];
+    __shared__ float total;
+    int lane = threadIdx.x & (kWarpSize - 1);
+    int warp = threadIdx.x / kWarpSize;
+    #pragma unroll
+    for (int o = kWarpSize / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) warp_sums[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        float s = (lane < kWarps) ? warp_sums[lane] : 0.0f;
+        #pragma unroll
+        for (int o = kWarps / 2; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+        if (lane == 0) total = s;
+    }
+    __syncthreads();
+    return total;
+}
+
+template <int ROWS_PER_WARP>
+__global__ void nvfp4_gemv_bf16act_prenorm_kernel(
+    const uint8_t* __restrict__ W_packed,
+    const uint8_t* __restrict__ W_scales,
+    const __nv_bfloat16* __restrict__ x_raw,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ y,
+    float alpha,
+    int N,
+    int K,
+    float eps
+) {
+    extern __shared__ __align__(16) unsigned char
+        the_whole_normed_row_lives_in_smem_so_every_warp_reads_it_once_instead_of_from_l1[];
+    __nv_bfloat16* xn = reinterpret_cast<__nv_bfloat16*>(
+        the_whole_normed_row_lives_in_smem_so_every_warp_reads_it_once_instead_of_from_l1);
+
+    constexpr int BLOCK = kGemvPrenormBlockIs256TheSameShapeAsRmsnormCuSoTheFoldedRowIsBitwise;
+    float local = 0.f;
+    for (int i = threadIdx.x; i < K; i += BLOCK) {
+        float v = __bfloat162float(x_raw[i]);
+        local += v * v;
+    }
+    float sum = gemv_prenorm_block_sum_same_shape_as_rmsnorm_cu(local);
+    float rms = rsqrtf(sum / (float)K + eps);
+    for (int i = threadIdx.x; i < K; i += BLOCK) {
+        float v = __bfloat162float(x_raw[i]) * rms * __bfloat162float(norm_w[i]);
+        xn[i] = __float2bfloat16(v);
+    }
+    __syncthreads();
+
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int n0 = (blockIdx.x * kGemvActWarps + warp) * ROWS_PER_WARP;
+    if (n0 >= N) return;
+    int n_blocks = K / 16;
+    const uint16_t* xb = reinterpret_cast<const uint16_t*>(xn);
+
+    float acc[ROWS_PER_WARP];
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) acc[r] = 0.f;
+
+    for (int kb = lane; kb < n_blocks; kb += 32) {
+        uint4 x0 = *reinterpret_cast<const uint4*>(xb + (size_t)kb * 16);
+        uint4 x1 = *reinterpret_cast<const uint4*>(xb + (size_t)kb * 16 + 8);
+        #pragma unroll
+        for (int r = 0; r < ROWS_PER_WARP; ++r) {
+            int n = n0 + r;
+            if (ROWS_PER_WARP > 1 && n >= N) break;
+            float scale =
+                decode_ue4m3_branchless_dev(W_scales[swizzled_scale_dst(n, kb, n_blocks)]) * 16384.f;
+            uint2 wq = *reinterpret_cast<const uint2*>(
+                W_packed + (size_t)n * (K / 2) + (size_t)kb * 8);
+
+            float bd = 0.f;
+            unsigned w0 = wq.x;
+            unsigned w1 = wq.y;
+            unsigned xw;
+            xw = x0.x;
+            bd = fmaf(e2m1_lo_times_2e14(w0), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w0), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x0.y;
+            bd = fmaf(e2m1_lo_times_2e14(w0 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w0 >> 8), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x0.z;
+            bd = fmaf(e2m1_lo_times_2e14(w0 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w0 >> 16), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x0.w;
+            bd = fmaf(e2m1_lo_times_2e14(w0 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w0 >> 24), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x1.x;
+            bd = fmaf(e2m1_lo_times_2e14(w1), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w1), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x1.y;
+            bd = fmaf(e2m1_lo_times_2e14(w1 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w1 >> 8), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x1.z;
+            bd = fmaf(e2m1_lo_times_2e14(w1 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w1 >> 16), bf16_bits_to_f32(xw >> 16), bd);
+            xw = x1.w;
+            bd = fmaf(e2m1_lo_times_2e14(w1 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
+            bd = fmaf(e2m1_hi_times_2e14(w1 >> 24), bf16_bits_to_f32(xw >> 16), bd);
+
+            acc[r] = fmaf(scale, bd, acc[r]);
+        }
+    }
+
+    #pragma unroll
+    for (int r = 0; r < ROWS_PER_WARP; ++r) {
+        int n = n0 + r;
+        if (ROWS_PER_WARP > 1 && n >= N) break;
+        float a = acc[r];
+        #pragma unroll
+        for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            a += __shfl_xor_sync(0xffffffff, a, offset);
+        }
+        if (lane == 0) y[n] = __float2bfloat16(a * alpha);
+    }
+}
+
 extern "C" int nv_kernels_nvfp4_gemv_bf16act(
     void* stream,
     const uint8_t* W_packed,
@@ -309,6 +437,94 @@ extern "C" int nv_kernels_nvfp4_gemv_bf16act(
         N, K
     );
     return (int)cudaGetLastError();
+}
+
+static const int
+    kGemvPrenormFuseOffBecauseEveryPublishedGemma4DecodeNumberWasMeasuredOnTheSeparateNormLaunch = 0;
+
+static const int
+    kGemvPrenormRowsPerWarpLadderIs1To8BecauseTheFoldedRowIsReReadOncePerBlockAndOnlyMoreRowsPerBlockAmortisesIt =
+        8;
+
+static int g_gemv_prenorm_fused_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
+    -2;
+
+static inline int nvk_gemv_prenorm_rung_clamp(int r) {
+    if (r < 1 ||
+        r > kGemvPrenormRowsPerWarpLadderIs1To8BecauseTheFoldedRowIsReReadOncePerBlockAndOnlyMoreRowsPerBlockAmortisesIt ||
+        (r & (r - 1)) != 0) {
+        return kGemvPrenormFuseOffBecauseEveryPublishedGemma4DecodeNumberWasMeasuredOnTheSeparateNormLaunch;
+    }
+    return r;
+}
+
+extern "C" int nv_kernels_nvfp4_gemv_prenorm_fused() {
+    if (g_gemv_prenorm_fused_selected_once_at_first_launch_so_the_default_path_pays_no_getenv ==
+        -2) {
+        const char* e = getenv("NV_NORM_GEMV_FUSED");
+        g_gemv_prenorm_fused_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
+            nvk_gemv_prenorm_rung_clamp(e ? atoi(e) : 0);
+    }
+    return g_gemv_prenorm_fused_selected_once_at_first_launch_so_the_default_path_pays_no_getenv;
+}
+
+extern "C" int nv_kernels_nvfp4_gemv_prenorm_fused_force(int rows_per_warp) {
+    g_gemv_prenorm_fused_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
+        nvk_gemv_prenorm_rung_clamp(rows_per_warp);
+    return g_gemv_prenorm_fused_selected_once_at_first_launch_so_the_default_path_pays_no_getenv;
+}
+
+extern "C" int nv_kernels_nvfp4_gemv_prenorm_fuses_this_row(int k) {
+    return (nv_kernels_nvfp4_gemv_prenorm_fused() > 0 && k > 0 && (k & 15) == 0 &&
+            (size_t)k * sizeof(uint16_t) <=
+                (size_t)kGemvPrenormRowSmemCapIs48KiBTheDynamicSharedLimitWithoutAnOptIn)
+               ? 1
+               : 0;
+}
+
+extern "C" int nv_kernels_nvfp4_gemv_bf16act_prenorm(
+    void* stream,
+    const uint8_t* W_packed,
+    const uint8_t* W_scales,
+    const uint16_t* x_raw,
+    const uint16_t* norm_w,
+    uint16_t* xn_scratch,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K,
+    float eps
+) {
+    if (N <= 0 || K <= 0) return 0;
+    if ((K & 15) != 0) return -1;
+    cudaStream_t s = (cudaStream_t)stream;
+    if (nv_kernels_nvfp4_gemv_prenorm_fuses_this_row(K)) {
+        int rpw = nv_kernels_nvfp4_gemv_prenorm_fused();
+        dim3 block(kGemvActWarps * kWarpSize);
+        size_t smem = (size_t)K * sizeof(__nv_bfloat16);
+#define NVK_GEMV_PRENORM_LAUNCH(R)                                                              \
+    do {                                                                                        \
+        dim3 grid((unsigned)((N + kGemvActWarps * (R)-1) / (kGemvActWarps * (R))));              \
+        nvfp4_gemv_bf16act_prenorm_kernel<R><<<grid, block, smem, s>>>(                          \
+            W_packed, W_scales, reinterpret_cast<const __nv_bfloat16*>(x_raw),                   \
+            reinterpret_cast<const __nv_bfloat16*>(norm_w),                                      \
+            reinterpret_cast<__nv_bfloat16*>(y), alpha, N, K, eps);                              \
+    } while (0)
+        if (rpw == 1) {
+            NVK_GEMV_PRENORM_LAUNCH(1);
+        } else if (rpw == 2) {
+            NVK_GEMV_PRENORM_LAUNCH(2);
+        } else if (rpw == 4) {
+            NVK_GEMV_PRENORM_LAUNCH(4);
+        } else {
+            NVK_GEMV_PRENORM_LAUNCH(8);
+        }
+#undef NVK_GEMV_PRENORM_LAUNCH
+        return (int)cudaGetLastError();
+    }
+    int rc = nv_kernels_rmsnorm_bf16(stream, x_raw, norm_w, xn_scratch, 1, (size_t)K, eps);
+    if (rc != 0) return rc;
+    return nv_kernels_nvfp4_gemv_bf16act(stream, W_packed, W_scales, xn_scratch, y, alpha, N, K);
 }
 
 extern "C" int nv_kernels_nvfp4_gemv_bf16(

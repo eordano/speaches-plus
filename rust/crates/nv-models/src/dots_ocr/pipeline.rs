@@ -1,16 +1,32 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device};
+use candle_core::{DType, Device, Tensor};
 use nv_weights::WeightLoader;
 use tokenizers::Tokenizer;
 
 use super::decoder::{
-    build_prompt_tokens, DotsDecoder, DotsDecoderConfig, GenerateOptions, PromptStyle,
+    build_prompt_tokens, DotsDecoder, DotsDecoderConfig, GenerateOptions, GenerateOutcome,
+    PromptStyle, EOS_TOKEN_IDS,
 };
-use super::parse::{parse_layout_json, plain_text_fallback, LayoutPage};
-use super::preprocess::{prepare, PixelBudget, PreparedImage};
+#[cfg(feature = "wgpu")]
+use super::decoder_wgpu::DotsQ3dDecoder;
+#[cfg(feature = "wgpu")]
+use super::decoder_wgpu_graph::{DotsDecoderWgpuGraph, DotsGraphQuant};
+use super::parse::{parse_layout_json, plain_text_fallback, LayoutElement, LayoutPage};
+use super::preprocess::{prepare, sample_ink, InkPoints, PixelBudget, PreparedImage, DEFAULT_MIN_PIXELS};
+use super::regions::{
+    category_prefix, env_pixels, layout_is_usable, plan_regions, CROP_MAX_PIXELS_ENV,
+    DEFAULT_CROP_MAX_PIXELS_500K_IS_ABOUT_640_VISION_TOKENS,
+    DEFAULT_LAYOUT_MAX_PIXELS_1MP_KEEPS_THE_DETECT_PASS_CHEAP, LAYOUT_MAX_PIXELS_ENV,
+};
+
+const LAYOUT_RETRY_TRIPLES_THE_BUDGET_BECAUSE_A_LOOPING_DETECT_PASS_MEANS_UNDERRESOLVED_INK: usize =
+    3;
+const LAYOUT_KEEPS_AT_LEAST_A_NINTH_OF_SOURCE_PIXELS_OR_HANDWRITING_LOOPS: usize = 9;
 use super::vision::{DotsVisionConfig, DotsVisionTower};
+#[cfg(feature = "wgpu")]
+use super::vision_wgpu::DotsVisionTowerWgpu;
 use crate::deepseek_ocr::preprocess::RgbImage;
 
 pub const PROMPT_LAYOUT_ALL_EN: &str = "Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.\n\n1. Bbox format: [x1, y1, x2, y2]\n\n2. Layout Categories: The possible categories are ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'].\n\n3. Text Extraction & Formatting Rules:\n    - Picture: For the 'Picture' category, the text field should be omitted.\n    - Formula: Format its text as LaTeX.\n    - Table: Format its text as HTML.\n    - All Others (Text, Title, etc.): Format their text as Markdown.\n\n4. Constraints:\n    - The output text must be the original text from the image, with no translation.\n    - All layout elements must be sorted according to human reading order.\n\n5. Final Output: The entire output must be a single JSON object.\n";
@@ -18,6 +34,206 @@ pub const PROMPT_LAYOUT_ALL_EN: &str = "Please output the layout information fro
 pub const PROMPT_LAYOUT_ONLY_EN: &str = "Please output the layout information from this PDF image, including each layout's bbox and its category. The bbox should be in the format [x1, y1, x2, y2]. The layout categories for the PDF document include ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title']. Do not output the corresponding text. The layout result should be in JSON format.";
 
 pub const PROMPT_OCR: &str = "Extract the text content from this image.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DotsPrecision {
+    Bf16,
+    Nvfp4,
+    W4,
+    W8,
+}
+
+pub const DOTS_PRECISION_ENV: &str = "NV_DOTS_DEC_PRECISION";
+
+pub const W4_IS_THE_METAL_SERVING_DEFAULT_AND_BF16_STAYS_THE_MASTER_NUMERICS_ARM: &str =
+    "The metal serving default is affine gs=64 on the graph, by the fastest-possible-defaults \
+     directive: the consistent w4 arm holds all twelve stable pages at exactly CER 0.0000, its \
+     numerics are the mlx-community 4-bit release bit for bit, it serves 121 ms/page faster \
+     today (4419.0 vs 4539.9 canonical means), and it is the only arm whose decode floor keeps \
+     dropping with byte-bound wins -- 0.96 GB/step against bf16's immovable 3.4. \
+     NV_DOTS_DEC_PRECISION=bf16 is the master-numerics arm, one env away. The mixed \
+     composition -- bf16 kv cache with quantised decode weights -- broke a stable page and is \
+     reachable only through the explicit NV_DOTS_DEC_W4 measurement env, never through any \
+     default. Cost carried by the default: quantising the trunk at load, measured 8.5 s \
+     against bf16's 3.3 s cold start. CUDA and CPU defaults are unchanged.";
+
+impl DotsPrecision {
+    pub fn default_for(device: &Device) -> Self {
+        let _ = W4_IS_THE_METAL_SERVING_DEFAULT_AND_BF16_STAYS_THE_MASTER_NUMERICS_ARM;
+        if cfg!(feature = "wgpu") && device.is_metal() {
+            return DotsPrecision::W4;
+        }
+        DotsPrecision::Bf16
+    }
+
+    pub fn from_env_for(device: &Device) -> Result<Self> {
+        Self::parse(
+            std::env::var(DOTS_PRECISION_ENV).ok().as_deref(),
+            Self::default_for(device),
+        )
+    }
+
+    pub fn parse(raw: Option<&str>, default: Self) -> Result<Self> {
+        match raw {
+            None | Some("") => Ok(default),
+            Some("bf16") => Ok(DotsPrecision::Bf16),
+            Some("nvfp4") => Ok(DotsPrecision::Nvfp4),
+            Some("w4") => Ok(DotsPrecision::W4),
+            Some("w8") => Ok(DotsPrecision::W8),
+            Some(other) => anyhow::bail!(
+                "{DOTS_PRECISION_ENV}={other:?} is not a dots.ocr decoder precision; use bf16, \
+                 nvfp4 (cuda), w4 (affine gs=64 on the metal graph, ggml Q4K via candle \
+                 elsewhere), or w8 (ggml Q8_0, any device)"
+            ),
+        }
+    }
+}
+
+pub const DOTS_VISION_BACKEND_ENV: &str = "NV_DOTS_VISION_BACKEND";
+
+pub const DOTS_FAST_PATH_DEFAULTS_ARE_SCOPED_TO_METAL_BECAUSE_THAT_IS_THE_ONLY_ADAPTER_THEY_WERE_MEASURED_ON: &str =
+    "The wgpu tower and the graphed wgpu decoder default on for a Metal serving device and \
+     nowhere else. Every number that justifies them -- the tower's 1.78 s/page over the candle \
+     tower at identical trajectories, the graph's 9.93 s against 35.47 s composed over an invoice \
+     page -- was taken on an Apple M2 Ultra, and the kernels behind them are fitted to an 8x8x8 \
+     cooperative-matrix adapter with a 32768 byte workgroup budget. A CUDA box builds the same \
+     wgpu feature and would silently inherit a default nobody measured there, so the predicate is \
+     the serving device and not the feature flag. NV_DOTS_VISION_BACKEND and NV_DOTS_DEC_ENGINE \
+     still name either arm explicitly on any device, and =candle restores the pre-flip path.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DotsVisionBackend {
+    Candle,
+    Wgpu,
+}
+
+impl Default for DotsVisionBackend {
+    fn default() -> Self {
+        DotsVisionBackend::Candle
+    }
+}
+
+impl DotsVisionBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            DotsVisionBackend::Candle => "candle",
+            DotsVisionBackend::Wgpu => "wgpu",
+        }
+    }
+
+    pub fn default_for(device: &Device) -> Self {
+        let _ = DOTS_FAST_PATH_DEFAULTS_ARE_SCOPED_TO_METAL_BECAUSE_THAT_IS_THE_ONLY_ADAPTER_THEY_WERE_MEASURED_ON;
+        if cfg!(feature = "wgpu") && device.is_metal() {
+            DotsVisionBackend::Wgpu
+        } else {
+            DotsVisionBackend::Candle
+        }
+    }
+
+    pub fn parse(raw: Option<&str>, default: Self) -> Result<Self> {
+        match raw {
+            None | Some("") => Ok(default),
+            Some("0") | Some("candle") => Ok(DotsVisionBackend::Candle),
+            Some("wgpu") => Ok(DotsVisionBackend::Wgpu),
+            Some(other) => anyhow::bail!(
+                "{DOTS_VISION_BACKEND_ENV}={other:?} is not a dots.ocr vision backend; \
+                 use wgpu (the default on metal) or candle (also =0)"
+            ),
+        }
+    }
+
+    pub fn from_env_for(device: &Device) -> Result<Self> {
+        Self::parse(
+            std::env::var(DOTS_VISION_BACKEND_ENV).ok().as_deref(),
+            Self::default_for(device),
+        )
+    }
+}
+
+pub const LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING: &str =
+    "graph_generate returns None only when there is no graph, so a live graph serves EVERY
+     generate and the candle decoder beside it is never called. Building it anyway put a second
+     full copy of the trunk in memory -- about 3 GiB of bf16 beside the graph's own 7.1 GiB --
+     which is why the decoder is built only when the graph is not serving. This mattered the
+     moment the graph became the default on metal: before that the duplicate was rare because
+     the graph was opt-in, and after it, it was on every single load. It is also the first thing
+     to suspect behind an out-of-memory kill on a small box, ahead of anything a 4-bit weight
+     format would fix.";
+
+pub const DOTS_DEC_ENGINE_ENV: &str = "NV_DOTS_DEC_ENGINE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DotsDecoderEngine {
+    Candle,
+    Graph,
+    Q3d,
+}
+
+impl Default for DotsDecoderEngine {
+    fn default() -> Self {
+        DotsDecoderEngine::Candle
+    }
+}
+
+impl DotsDecoderEngine {
+    pub fn name(self) -> &'static str {
+        match self {
+            DotsDecoderEngine::Candle => "candle",
+            DotsDecoderEngine::Graph => "graph",
+            DotsDecoderEngine::Q3d => "q3d",
+        }
+    }
+
+    pub fn default_for(device: &Device, precision: DotsPrecision) -> Self {
+        let _ = DOTS_FAST_PATH_DEFAULTS_ARE_SCOPED_TO_METAL_BECAUSE_THAT_IS_THE_ONLY_ADAPTER_THEY_WERE_MEASURED_ON;
+        let _ = THE_GRAPH_CARRIES_NO_GGML_ARM_SO_A_GGML_PRECISION_MUST_KEEP_THE_CANDLE_ENGINE;
+        let graphable = matches!(
+            precision,
+            DotsPrecision::Bf16 | DotsPrecision::Nvfp4 | DotsPrecision::W4
+        );
+        if cfg!(feature = "wgpu") && device.is_metal() && graphable {
+            DotsDecoderEngine::Graph
+        } else {
+            DotsDecoderEngine::Candle
+        }
+    }
+
+    pub fn parse(raw: Option<&str>, default: Self) -> Result<Self> {
+        match raw {
+            None | Some("") => Ok(default),
+            Some("0") | Some("candle") => Ok(DotsDecoderEngine::Candle),
+            Some("graph") => Ok(DotsDecoderEngine::Graph),
+            Some("q3d") => Ok(DotsDecoderEngine::Q3d),
+            Some(other) => anyhow::bail!(
+                "{DOTS_DEC_ENGINE_ENV}={other:?} is not a dots.ocr decoder engine; \
+                 use graph (the graphed wgpu decoder, the default on metal at a graphable \
+                 precision), candle (also =0), or q3d (the qwen2-bias arm of the q3d wgpu \
+                 graph fed from the mlx-community 4-bit snapshot)"
+            ),
+        }
+    }
+
+    pub fn from_env_for(device: &Device, precision: DotsPrecision) -> Result<Self> {
+        Self::parse(
+            std::env::var(DOTS_DEC_ENGINE_ENV).ok().as_deref(),
+            Self::default_for(device, precision),
+        )
+    }
+}
+
+pub const THE_GRAPH_CARRIES_NO_GGML_ARM_SO_A_GGML_PRECISION_MUST_KEEP_THE_CANDLE_ENGINE: &str =
+    "w8 (ggml Q8_0) has no graph arm and is served by the candle decoder through candle's \
+     QMatMul; asking for graph+w8 explicitly errors rather than silently downgrading, because \
+     a caller who names both has stated an intent the engine cannot honour. w4 on the graph is \
+     NOT ggml: it quantizes the bf16 master to mlx affine gs=64 at load -- the exact tensors of \
+     the mlx-community 4-bit release -- serves prefill from their dequantisation and decode \
+     from the packed codes. With engine=candle, w4 keeps its old ggml Q4K meaning.";
+
+enum VisionTower {
+    Candle(DotsVisionTower),
+    #[cfg(feature = "wgpu")]
+    Wgpu(DotsVisionTowerWgpu),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DotsMode {
@@ -53,13 +269,181 @@ pub struct DotsPageResult {
     pub grid: (usize, usize),
 }
 
+pub const INK_RECALL_RESCUES_SPARSE_SHEETS_THE_PAGE_AREA_FLOOR_WRONGLY_SENDS_BACK_TO_SINGLE_PASS: &str =
+    "layout_is_usable gates on region area over PAGE area (0.15), which reads a large sheet \
+     with small text -- an A0 plan at 50MP measures 0.02 -- as a detector miss and falls back \
+     to the whole-page pass that cannot resolve exactly that input. The ink check accepts the \
+     layout instead when the region union contains at least 85 percent of sampled dark-luma \
+     points, which is what a detector that actually saw the page produces; light-grey \
+     linework sits above the luma threshold on purpose so drawings do not count as text ink. \
+     Pages with almost no dark samples return None and keep the old page-area verdict.";
+
+pub const INK_RECALL_USABLE_MIN_085_A_DETECTOR_BOXING_85PCT_OF_THE_INK_SAW_THE_PAGE: f64 = 0.85;
+pub const MIN_INK_POINTS_200_BELOW_WHICH_THE_PAGE_IS_BLANK_TO_THE_INK_CHECK: usize = 200;
+
+fn ink_recall(ink: &InkPoints, regions: &[super::regions::Region]) -> Option<f64> {
+    if ink.xs.len() < MIN_INK_POINTS_200_BELOW_WHICH_THE_PAGE_IS_BLANK_TO_THE_INK_CHECK {
+        return None;
+    }
+    let hit = ink
+        .xs
+        .iter()
+        .zip(&ink.ys)
+        .filter(|&(&x, &y)| {
+            regions
+                .iter()
+                .any(|r| x >= r.bbox[0] && x <= r.bbox[2] && y >= r.bbox[1] && y <= r.bbox[3])
+        })
+        .count();
+    Some(hit as f64 / ink.xs.len() as f64)
+}
+
+pub const HEADING_ONLY_CROPS_BAIT_WHITESPACE_ESSAYS_SO_HEADINGS_MERGE_INTO_THE_BLOCK_BELOW: &str =
+    "a crop holding just a large-font heading is mostly white space, and the decoder answers \
+     it with an invented essay or an eleven-fold repetition of the heading (measured on the \
+     090-scale corpus: Appendix B grew a 500-token vibration-survey essay, Ordering and Lead \
+     Times repeated eleven times). Merging a Title/Section-header/Page-header region into the \
+     next region in reading order, when it sits directly above it, removes the bait: the crop \
+     then reads heading plus body like any dense page. A heading left unmerged (page end, no \
+     block below) keeps a 256-token cap instead -- long generation from a one-line crop is \
+     the failure signature, never legitimate output.";
+
+fn heading_like(category: Option<&str>) -> bool {
+    matches!(
+        category,
+        Some("Title") | Some("Section-header") | Some("Page-header")
+    )
+}
+
+const HEADING_MERGE_MAX_GAP_2X_HEADING_HEIGHT: f32 = 2.0;
+const UNMERGED_HEADING_CROP_TOKEN_CAP: usize = 256;
+
+pub const LAYOUT_ONLY_STAYS_SINGLE_PASS_BECAUSE_A_BOXES_ONLY_CALLER_MUST_NOT_PAY_CROP_OCR: &str =
+    "recognize_cropped answers every engaged mode with per-region plain OCR, which is the \
+     LayoutAll contract (bbox, category, text; Picture regions are omitted because \
+     plan_regions drops them for cropping) and the PlainOcr contract stitched in reading \
+     order -- but a LayoutOnly caller asked for boxes without text, and tiling would spend \
+     the whole crop-OCR wall producing text it did not ask for. LayoutOnly therefore always \
+     rides the single detect pass, whose own cost the recognize_cropped ladder already \
+     bounds at a 3MP-class budget when it is the one calling.";
+
+struct RegionOcr {
+    elements: Vec<LayoutElement>,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    looped: bool,
+    hit_eos: bool,
+}
+
+pub const T1_BATCH_ENV: &str = "NV_DOTS_T1_BATCH";
+
+pub const T1_BATCH_MAX_CROP_VISION_TOKENS_256_MEASURED_ON_THE_4K_SCREEN_REGRESSION: usize = 256;
+
+pub const T1_BATCH_MAX_PROMPT_KEEPS_LONG_PROMPT_PAGES_ON_STEEL_PREFILL: &str =
+    "region prefill rides 32/128-row ranged chunks with the naive attention variant, while \
+     the serial path prefills a 640-960-vision-token crop as one padded steel chunk; on the \
+     4K screen (11 regions whose code pane runs to 640 vision tokens) the batched arm read \
+     10.9 s against 6.5 serial -- the big crops' prefill loss outweighed the decode win, \
+     and a median gate hid them behind the tiny sidebar crops. ANY crop over 256 vision \
+     tokens keeps the whole page serial; the gazette class (90-130 tokens a crop, where \
+     decode dominates and batching measured 22.9 s against 37.5 sequential) engages. The \
+     open lever is a steel-ranged prefill arm, which would lift this ceiling.";
+
+pub const BATCHED_T1_RIDES_THE_GRAPHS_REGION_MACHINERY_AND_ESCAPES_TO_SERIAL_CROPS: &str =
+    "crop decode is 54 percent of the sequential tiered wall and the graph's batched region \
+     step serves 32 concurrent generations at 1.4 ms/token against 7.8 serial (5.5x, \
+     region-prefill at cost parity), so tiled OCR decodes its crops through region strides \
+     with retire-and-refill. Vision stays per-crop; a region whose prompt cannot fit the \
+     1023-row stride sends the whole set down the serial path, as does NV_DOTS_T1_BATCH=0, \
+     a non-graph engine, or a single region. Ngram bans stop a region instead of re-arguing \
+     its logits, and loop truncation applies at onset host-side exactly as the serial path \
+     truncates plain OCR.";
+
+pub const CROP_PACKING_IS_A_MEASURED_NEGATIVE_UNION_BOXES_SHIP_WHITESPACE_THROUGH_THE_TOWER: &str =
+    "stacking consecutive same-column Text regions into one crop halved T1 prefill on the \
+     121-entry gazette (12.0 to 6.0 s over 130 to 41 crops) but the union boxes carried \
+     the inter-entry gaps as pixels, growing vision from 6.4 to 8.4 s, and multi-entry \
+     crops reintroduced entry skips (ncer 0.0199 to 0.0289; a whole entry dropped) -- net \
+     -2.8 s wall for worse text on the one page shaped for it, and a quality wash \
+     elsewhere. The packer is deleted on that measurement; the standing T1 levers are \
+     batched B>1 vision over SMALL crops (steel attention is batch-native) and \
+     multi-sequence decode, which own 17 and 54 percent of the sequential wall.";
+
+fn merge_headings_into_following_regions(
+    regions: Vec<super::regions::Region>,
+) -> Vec<super::regions::Region> {
+    let mut out: Vec<super::regions::Region> = Vec::with_capacity(regions.len());
+    let mut it = regions.into_iter().peekable();
+    while let Some(r) = it.next() {
+        if heading_like(r.category.as_deref()) {
+            if let Some(next) = it.peek() {
+                let gap = next.bbox[1] - r.bbox[3];
+                let x_overlap = next.bbox[0] < r.bbox[2] && r.bbox[0] < next.bbox[2];
+                if x_overlap
+                    && gap > -r.height()
+                    && gap < r.height() * HEADING_MERGE_MAX_GAP_2X_HEADING_HEIGHT
+                {
+                    let mut merged = it.next().expect("peeked region present");
+                    merged.bbox = [
+                        r.bbox[0].min(merged.bbox[0]),
+                        r.bbox[1].min(merged.bbox[1]),
+                        r.bbox[2].max(merged.bbox[2]),
+                        r.bbox[3].max(merged.bbox[3]),
+                    ];
+                    merged.category = None;
+                    out.push(merged);
+                    continue;
+                }
+            }
+        }
+        out.push(r);
+    }
+    out
+}
+
+pub const RELOAD_REBUILDS_BESIDE_THE_RESIDENT_DECODER_SO_PEAK_IS_TWICE_ONE_ARM: &str =
+    "reload_adapter constructs the replacement decoder while the old one still holds the \
+     slot, so peak decoder memory during a reload is twice one arm (~23 GiB on the w4 \
+     graph); dropping the old arm first would halve the peak but a failed rebuild would \
+     then leave the pipeline with no decoder at all, and an explicit unload-then-load \
+     already gives a caller that trade when memory is tight. reload_adapter(None) is a \
+     true unload: the explicit argument wins over NV_DOTS_GRAPH_LORA_DIR, which only the \
+     boot path reads.";
+
+#[cfg(feature = "wgpu")]
+fn graph_quant_for(precision: DotsPrecision) -> Result<DotsGraphQuant> {
+    match precision {
+        DotsPrecision::Bf16 => Ok(DotsGraphQuant::Bf16),
+        DotsPrecision::Nvfp4 => Ok(DotsGraphQuant::Nvfp4),
+        DotsPrecision::W4 => Ok(DotsGraphQuant::AffineW4),
+        other => anyhow::bail!(
+            "{DOTS_DEC_ENGINE_ENV}=graph carries no ggml arm, so it cannot serve \
+             {DOTS_PRECISION_ENV}={other:?}; use bf16, nvfp4 or w4"
+        ),
+    }
+}
+
 pub struct DotsOcrPipeline {
-    vision: DotsVisionTower,
-    decoder: DotsDecoder,
+    vision: VisionTower,
+    vision_backend: DotsVisionBackend,
+    decoder: Option<DotsDecoder>,
+    engine: DotsDecoderEngine,
+    #[cfg(feature = "wgpu")]
+    graph: Option<std::sync::Mutex<DotsDecoderWgpuGraph>>,
+    #[cfg(feature = "wgpu")]
+    q3d: Option<std::sync::Mutex<DotsQ3dDecoder>>,
     tokenizer: Tokenizer,
     budget: PixelBudget,
     style: PromptStyle,
     device: Device,
+    precision: DotsPrecision,
+    dir: std::path::PathBuf,
+}
+
+pub fn dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(
+    device: &Device,
+) -> DType {
+    device.bf16_default_to_f32()
 }
 
 fn default_rope_span() -> usize {
@@ -71,35 +455,227 @@ fn default_rope_span() -> usize {
 
 impl DotsOcrPipeline {
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
+        Self::load_with_precision(dir, device, DotsPrecision::from_env_for(device)?)
+    }
+
+    pub fn load_with_precision(
+        dir: &Path,
+        device: &Device,
+        precision: DotsPrecision,
+    ) -> Result<Self> {
+        let engine = DotsDecoderEngine::from_env_for(device, precision)?;
+        #[cfg(not(feature = "cuda"))]
+        if precision == DotsPrecision::Nvfp4 && engine != DotsDecoderEngine::Graph {
+            anyhow::bail!(
+                "dots.ocr: the candle DotsPrecision::Nvfp4 decoder requires the cuda feature; \
+                 rebuild with --features cuda, or use DotsPrecision::Bf16, or set \
+                 {DOTS_DEC_ENGINE_ENV}=graph whose nvfp4 arm is wgpu and runs on any adapter"
+            );
+        }
         let weights = WeightLoader::open_dir(dir, device)
             .with_context(|| format!("open dots.ocr checkpoint dir {}", dir.display()))?;
         let cfg = DotsDecoderConfig::from_hf_json_file(&dir.join("config.json"))
             .context("load dots.ocr config.json")?;
-        let dtype = if device.is_cuda() {
-            DType::BF16
-        } else {
-            DType::F32
+        let dtype = dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(device);
+        let vision_backend = DotsVisionBackend::from_env_for(device)?;
+        let vision = match vision_backend {
+            DotsVisionBackend::Candle => VisionTower::Candle(
+                DotsVisionTower::from_loader(
+                    &weights,
+                    "vision_tower.",
+                    DotsVisionConfig::default(),
+                    device,
+                    dtype,
+                )
+                .context("load dots.ocr vision tower")?,
+            ),
+            #[cfg(feature = "wgpu")]
+            DotsVisionBackend::Wgpu => VisionTower::Wgpu(
+                DotsVisionTowerWgpu::from_loader(
+                    &weights,
+                    "vision_tower.",
+                    DotsVisionConfig::default(),
+                )
+                .context("load dots.ocr wgpu vision tower")?,
+            ),
+            #[cfg(not(feature = "wgpu"))]
+            DotsVisionBackend::Wgpu => anyhow::bail!(
+                "{DOTS_VISION_BACKEND_ENV}=wgpu requires the wgpu feature; \
+                 rebuild with NVK_FEATURES=cuda,wgpu"
+            ),
         };
-        let vision = DotsVisionTower::from_loader(
-            &weights,
-            "vision_tower.",
-            DotsVisionConfig::default(),
-            device,
-            dtype,
-        )
-        .context("load dots.ocr vision tower")?;
-        let decoder = DotsDecoder::from_loader(cfg, &weights, device, dtype, default_rope_span())
-            .context("load dots.ocr decoder")?;
+        #[cfg(feature = "wgpu")]
+        let q3d = match engine {
+            DotsDecoderEngine::Q3d => {
+                let d = DotsQ3dDecoder::from_snapshot()
+                    .context("load dots.ocr q3d wgpu decoder from the mlx 4-bit snapshot")?;
+                eprintln!(
+                    "[dots] {DOTS_DEC_ENGINE_ENV}=q3d: mlx-affine w4, {} passes per decode step",
+                    d.pass_count()
+                );
+                Some(std::sync::Mutex::new(d))
+            }
+            _ => None,
+        };
+        #[cfg(feature = "wgpu")]
+        let graph = match engine {
+            DotsDecoderEngine::Candle | DotsDecoderEngine::Q3d => None,
+            DotsDecoderEngine::Graph => {
+                let quant = graph_quant_for(precision)?;
+                let g = DotsDecoderWgpuGraph::from_loader(
+                    cfg.clone(),
+                    &weights,
+                    default_rope_span(),
+                    quant,
+                )
+                .context("load dots.ocr graphed wgpu decoder")?;
+                eprintln!(
+                    "[dots] {DOTS_DEC_ENGINE_ENV}=graph: {} quant, {} passes per decode step, \
+                     {:.3} GiB",
+                    quant.name(),
+                    g.pass_count(),
+                    g.vram_report().total_bytes as f64 / (1u64 << 30) as f64
+                );
+                Some(std::sync::Mutex::new(g))
+            }
+        };
+        #[cfg(not(feature = "wgpu"))]
+        if engine == DotsDecoderEngine::Graph {
+            anyhow::bail!(
+                "{DOTS_DEC_ENGINE_ENV}=graph requires the wgpu feature; \
+                 rebuild with NVK_FEATURES=metal,wgpu"
+            );
+        }
+        #[cfg(feature = "wgpu")]
+        let graph_serves_every_generate = graph.is_some() || q3d.is_some();
+        #[cfg(not(feature = "wgpu"))]
+        let graph_serves_every_generate = false;
+        let _ = LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING;
+        let decoder = if graph_serves_every_generate {
+            None
+        } else {
+            Some(match precision {
+            DotsPrecision::Bf16 => {
+                DotsDecoder::from_loader(cfg, &weights, device, dtype, default_rope_span())
+                    .context("load dots.ocr decoder bf16")?
+            }
+            DotsPrecision::Nvfp4 => {
+                #[cfg(feature = "cuda")]
+                {
+                    DotsDecoder::from_loader_nvfp4(cfg, &weights, device, default_rope_span())
+                        .context("load dots.ocr decoder nvfp4")?
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    DotsDecoder::from_loader(cfg, &weights, device, dtype, default_rope_span())
+                        .context(
+                            "load the bf16 candle decoder that stands unused behind the graph's \
+                             own nvfp4 arm, which is the one that serves on a non-cuda build",
+                        )?
+                }
+            }
+            DotsPrecision::W4 => DotsDecoder::from_loader_ggml(
+                cfg,
+                &weights,
+                device,
+                dtype,
+                candle_core::quantized::GgmlDType::Q4K,
+                default_rope_span(),
+            )
+            .context("load dots.ocr decoder w4 (ggml Q4K)")?,
+            DotsPrecision::W8 => DotsDecoder::from_loader_ggml(
+                cfg,
+                &weights,
+                device,
+                dtype,
+                candle_core::quantized::GgmlDType::Q8_0,
+                default_rope_span(),
+            )
+            .context("load dots.ocr decoder w8 (ggml Q8_0)")?,
+            })
+        };
         let tokenizer = nv_tokenizer::load_tokenizer(&dir.join("tokenizer.json"))
             .context("load dots.ocr tokenizer.json")?;
         Ok(Self {
             vision,
+            vision_backend,
             decoder,
+            engine,
+            #[cfg(feature = "wgpu")]
+            graph,
+            #[cfg(feature = "wgpu")]
+            q3d,
             tokenizer,
             budget: PixelBudget::from_env(),
             style: PromptStyle::from_env(),
             device: device.clone(),
+            precision,
+            dir: dir.to_path_buf(),
         })
+    }
+
+    pub fn precision(&self) -> DotsPrecision {
+        self.precision
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn reload_q3d_with_adapter(
+        &mut self,
+        adapter_dir: Option<&std::path::Path>,
+    ) -> Result<bool> {
+        let Some(slot) = &self.q3d else {
+            anyhow::bail!(
+                "adapter hot-load rides the q3d decoder arm and this pipeline serves \
+                 {}; set {DOTS_DEC_ENGINE_ENV}=q3d (or =graph, which also hot-loads)",
+                self.engine.name()
+            );
+        };
+        let d = DotsQ3dDecoder::from_snapshot_with_lora(adapter_dir)
+            .context("rebuild dots q3d decoder with adapter")?;
+        let resident = d.lora_resident();
+        *slot.lock().expect("q3d decoder mutex") = d;
+        Ok(resident)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn reload_adapter(&mut self, adapter_dir: Option<&std::path::Path>) -> Result<bool> {
+        let _ = RELOAD_REBUILDS_BESIDE_THE_RESIDENT_DECODER_SO_PEAK_IS_TWICE_ONE_ARM;
+        match self.engine {
+            DotsDecoderEngine::Q3d => self.reload_q3d_with_adapter(adapter_dir),
+            DotsDecoderEngine::Graph => {
+                let Some(slot) = &self.graph else {
+                    anyhow::bail!(
+                        "engine says graph but no graph decoder is resident; refusing a \
+                         blind rebuild"
+                    );
+                };
+                let cfg = DotsDecoderConfig::from_hf_json_file(&self.dir.join("config.json"))
+                    .context("reload dots.ocr config.json")?;
+                let lora = adapter_dir
+                    .map(|d| super::decoder_wgpu_graph::DgLora::from_peft_dir(d, &cfg))
+                    .transpose()
+                    .context("load dots graph lora adapter")?;
+                let weights = WeightLoader::open_dir(&self.dir, &self.device).with_context(
+                    || format!("reopen dots.ocr checkpoint dir {}", self.dir.display()),
+                )?;
+                let quant = graph_quant_for(self.precision)?;
+                let resident = lora.is_some();
+                let g = DotsDecoderWgpuGraph::from_loader_with_lora(
+                    cfg,
+                    &weights,
+                    default_rope_span(),
+                    quant,
+                    lora,
+                )
+                .context("rebuild dots graph decoder with adapter")?;
+                *slot.lock().expect("graph decoder mutex") = g;
+                Ok(resident)
+            }
+            DotsDecoderEngine::Candle => anyhow::bail!(
+                "adapter hot-load rides the q3d or graph decoder arms and this pipeline \
+                 serves candle; set {DOTS_DEC_ENGINE_ENV}=graph or =q3d"
+            ),
+        }
     }
 
     pub fn prompt_style(&self) -> PromptStyle {
@@ -114,12 +690,133 @@ impl DotsOcrPipeline {
         &self.device
     }
 
-    pub fn decoder(&self) -> &DotsDecoder {
-        &self.decoder
+    pub fn decoder(&self) -> Option<&DotsDecoder> {
+        let _ = LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING;
+        self.decoder.as_ref()
     }
 
-    pub fn vision(&self) -> &DotsVisionTower {
-        &self.vision
+    pub fn vision(&self) -> Option<&DotsVisionTower> {
+        match &self.vision {
+            VisionTower::Candle(t) => Some(t),
+            #[cfg(feature = "wgpu")]
+            VisionTower::Wgpu(_) => None,
+        }
+    }
+
+    pub fn vision_backend(&self) -> DotsVisionBackend {
+        self.vision_backend
+    }
+
+    pub fn decoder_engine(&self) -> DotsDecoderEngine {
+        self.engine
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn graph_generate(
+        &self,
+        tokens: &[u32],
+        vision_start: usize,
+        feats: &Tensor,
+        opts: &GenerateOptions,
+    ) -> Result<Option<GenerateOutcome>> {
+        #[cfg(not(feature = "wgpu"))]
+        {
+            let _ = (tokens, vision_start, feats, opts);
+            return Ok(None);
+        }
+        #[cfg(feature = "wgpu")]
+        {
+        let Some(graph) = &self.graph else {
+            return Ok(None);
+        };
+        let t_dl = std::time::Instant::now();
+        let rows: Vec<f32> = feats.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        if super::decoder_wgpu_graph::page_profile_enabled() {
+            eprintln!(
+                "DOTS-PAGE-PROFILE   vision_download_to_host_s={:.3} ({} values)",
+                t_dl.elapsed().as_secs_f64(),
+                rows.len()
+            );
+        }
+        let mut graph = graph
+            .lock()
+            .map_err(|e| anyhow::anyhow!("dots.ocr graph decoder lock: {e}"))?;
+        Ok(Some(graph.generate(
+            tokens,
+            vision_start,
+            Some(&rows),
+            opts,
+        )?))
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn q3d_generate(
+        &self,
+        tokens: &[u32],
+        vision_start: usize,
+        feats: &Tensor,
+        opts: &GenerateOptions,
+    ) -> Result<Option<GenerateOutcome>> {
+        let Some(q3d) = &self.q3d else {
+            return Ok(None);
+        };
+        let rows: Vec<f32> = feats.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let mut d = q3d
+            .lock()
+            .map_err(|e| anyhow::anyhow!("dots.ocr q3d decoder lock: {e}"))?;
+        Ok(Some(d.generate(tokens, vision_start, Some(&rows), opts)?))
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn q3d_generate(
+        &self,
+        _tokens: &[u32],
+        _vision_start: usize,
+        _feats: &Tensor,
+        _opts: &GenerateOptions,
+    ) -> Result<Option<GenerateOutcome>> {
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn graph_generate(
+        &self,
+        _tokens: &[u32],
+        _vision_start: usize,
+        _feats: &Tensor,
+        _opts: &GenerateOptions,
+    ) -> Result<Option<GenerateOutcome>> {
+        Ok(None)
+    }
+
+    pub fn encode_vision(&self, prep: &PreparedImage) -> Result<Tensor> {
+        match &self.vision {
+            VisionTower::Candle(t) => t.encode(prep),
+            #[cfg(feature = "wgpu")]
+            VisionTower::Wgpu(t) => {
+                let merged = t.encode(prep)?;
+                let rows = prep.num_vision_tokens();
+                let cols = t.config().hidden_size;
+                anyhow::ensure!(
+                    merged.len() == rows * cols,
+                    "wgpu vision tower produced {} values, expected {rows} x {cols}",
+                    merged.len()
+                );
+                let dtype = dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(&self.device);
+                let t = std::time::Instant::now();
+                let out = Tensor::from_vec(merged, (rows, cols), &Device::Cpu)?
+                    .to_dtype(dtype)?
+                    .to_device(&self.device)?;
+                if super::decoder_wgpu_graph::page_profile_enabled() {
+                    eprintln!(
+                        "DOTS-PAGE-PROFILE   vision_stage_to_candle_s={:.3} ({rows}x{cols})",
+                        t.elapsed().as_secs_f64()
+                    );
+                }
+                Ok(out)
+            }
+        }
     }
 
     pub fn pixel_budget(&self) -> PixelBudget {
@@ -149,19 +846,53 @@ impl DotsOcrPipeline {
         mode: DotsMode,
         opts: &GenerateOptions,
     ) -> Result<DotsPageResult> {
-        let prep = self.prepare(img)?;
-        let feats = self.vision.encode(&prep)?;
+        self.recognize_with_budget(img, mode, opts, self.budget)
+    }
+
+    pub fn recognize_with_budget(
+        &self,
+        img: &RgbImage,
+        mode: DotsMode,
+        opts: &GenerateOptions,
+        budget: PixelBudget,
+    ) -> Result<DotsPageResult> {
+        #[cfg(feature = "wgpu")]
+        let profile = super::decoder_wgpu_graph::page_profile_enabled();
+        #[cfg(not(feature = "wgpu"))]
+        let profile = false;
+        let t0 = std::time::Instant::now();
+        let prep = prepare(img, budget)?;
+        let prepare_s = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let feats = self.encode_vision(&prep)?;
+        let vision_s = t1.elapsed().as_secs_f64();
         let n_vis = prep.num_vision_tokens();
         anyhow::ensure!(
             feats.dim(0)? == n_vis,
             "vision produced {} tokens, expected {n_vis}",
             feats.dim(0)?
         );
+        let t2 = std::time::Instant::now();
         let (tokens, vision_start) =
             build_prompt_tokens(|s| self.encode_text(s), mode.prompt(), n_vis, self.style)?;
-        let outcome = self
-            .decoder
-            .generate(&tokens, vision_start, Some(&feats), opts)?;
+        let prompt_s = t2.elapsed().as_secs_f64();
+        let t3 = std::time::Instant::now();
+        let outcome = match self.q3d_generate(&tokens, vision_start, &feats, opts)? {
+            Some(o) => o,
+            None => match self.graph_generate(&tokens, vision_start, &feats, opts)? {
+                Some(o) => o,
+                None => self
+                    .decoder
+                    .as_ref()
+                    .context(
+                        "dots.ocr: no wgpu-engine outcome and no candle decoder; the candle \
+                         decoder is built only when neither wgpu engine is serving",
+                    )?
+                    .generate(&tokens, vision_start, Some(&feats), opts)?,
+            },
+        };
+        let generate_s = t3.elapsed().as_secs_f64();
+        let t4 = std::time::Instant::now();
         let mut out_tokens = outcome.tokens;
         let looped = outcome.loop_detection.is_some();
         if let Some(d) = &outcome.loop_detection {
@@ -184,6 +915,16 @@ impl DotsOcrPipeline {
             prep.orig_h as f32 / prep.resized_h as f32,
         );
         let text = page.to_plain_text();
+        if profile {
+            let post_s = t4.elapsed().as_secs_f64();
+            let wall = t0.elapsed().as_secs_f64();
+            eprintln!(
+                "DOTS-PAGE-PROFILE wall_s={wall:.3} = prepare {prepare_s:.3} + vision \
+                 {vision_s:.3} + prompt {prompt_s:.3} + generate {generate_s:.3} + post \
+                 {post_s:.3}  (residual {:.3})",
+                wall - prepare_s - vision_s - prompt_s - generate_s - post_s
+            );
+        }
         Ok(DotsPageResult {
             page,
             text,
@@ -193,6 +934,440 @@ impl DotsOcrPipeline {
             looped,
             hit_eos: outcome.hit_eos,
             grid: (prep.grid_h, prep.grid_w),
+        })
+    }
+
+    pub fn recognize_auto(
+        &self,
+        img: &RgbImage,
+        mode: DotsMode,
+        opts: &GenerateOptions,
+    ) -> Result<DotsPageResult> {
+        let _ = LAYOUT_ONLY_STAYS_SINGLE_PASS_BECAUSE_A_BOXES_ONLY_CALLER_MUST_NOT_PAY_CROP_OCR;
+        let policy = super::tiered::TierPolicy::from_env()?;
+        if mode != DotsMode::LayoutOnly
+            && super::tiered::engages(img.w, img.h, self.budget, policy)?
+        {
+            if mode == DotsMode::PlainOcr {
+                if let Some(res) = self.recognize_tiled_classical(img, opts)? {
+                    return Ok(res);
+                }
+            }
+            self.recognize_cropped(img, opts)
+        } else {
+            self.recognize(img, mode, opts)
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn ocr_regions_batched(
+        &self,
+        img: &RgbImage,
+        regions: &[super::regions::Region],
+        opts: &GenerateOptions,
+    ) -> Result<Option<RegionOcr>> {
+        let _ = BATCHED_T1_RIDES_THE_GRAPHS_REGION_MACHINERY_AND_ESCAPES_TO_SERIAL_CROPS;
+        if std::env::var(T1_BATCH_ENV).ok().as_deref() == Some("0") || regions.len() < 2 {
+            return Ok(None);
+        }
+        let Some(graph) = &self.graph else {
+            return Ok(None);
+        };
+        let mut graph = graph
+            .lock()
+            .map_err(|e| anyhow::anyhow!("dots.ocr graph decoder lock: {e}"))?;
+        let Some((slots, cap)) = graph.region_capacity() else {
+            return Ok(None);
+        };
+        let crop_max = env_pixels(
+            CROP_MAX_PIXELS_ENV,
+            DEFAULT_CROP_MAX_PIXELS_500K_IS_ABOUT_640_VISION_TOKENS,
+        );
+        let img_px = img.w * img.h;
+        struct RegionJob {
+            tokens: Vec<u32>,
+            vision_start: usize,
+            rows: Vec<f32>,
+            max_new: usize,
+            generated: Vec<u32>,
+            hit_eos: bool,
+            banned_stop: bool,
+            done: bool,
+        }
+        let mut preps = Vec::with_capacity(regions.len());
+        for region in regions {
+            let (x0, y0, x1, y1) = region.pixel_bounds(img.w, img.h);
+            let crop = img.crop(x0, y0, x1, y1);
+            let crop_px = (x1 - x0) * (y1 - y0);
+            let dpi_floor = if img_px > self.budget.max_pixels {
+                crop_px * self.budget.max_pixels / img_px
+            } else {
+                crop_px
+            };
+            let crop_budget = PixelBudget {
+                min_pixels: DEFAULT_MIN_PIXELS,
+                max_pixels: crop_max.max(dpi_floor),
+            };
+            preps.push(prepare(&crop, crop_budget)?);
+        }
+        let _ = T1_BATCH_MAX_PROMPT_KEEPS_LONG_PROMPT_PAGES_ON_STEEL_PREFILL;
+        if preps
+            .iter()
+            .any(|p| p.num_vision_tokens() > T1_BATCH_MAX_CROP_VISION_TOKENS_256_MEASURED_ON_THE_4K_SCREEN_REGRESSION)
+        {
+            return Ok(None);
+        }
+        let mut jobs: Vec<RegionJob> = Vec::with_capacity(regions.len());
+        for (region, prep) in regions.iter().zip(&preps) {
+            let feats = self.encode_vision(prep)?;
+            let rows: Vec<f32> = feats
+                .to_dtype(candle_core::DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let n_vis = prep.num_vision_tokens();
+            let (tokens, vision_start) =
+                build_prompt_tokens(|s| self.encode_text(s), PROMPT_OCR, n_vis, self.style)?;
+            let max_new = if heading_like(region.category.as_deref()) {
+                opts.max_new_tokens.min(UNMERGED_HEADING_CROP_TOKEN_CAP)
+            } else {
+                opts.max_new_tokens
+            };
+            if tokens.len() + max_new.min(64) >= cap {
+                return Ok(None);
+            }
+            jobs.push(RegionJob {
+                tokens,
+                vision_start,
+                rows,
+                max_new,
+                generated: Vec::new(),
+                hit_eos: false,
+                banned_stop: false,
+                done: false,
+            });
+        }
+        graph.reset()?;
+        let stride = cap + 1;
+        let mut active: Vec<(usize, super::decoder_wgpu_graph::RegionRow)> = Vec::new();
+        let mut next_job = 0usize;
+        let mut fill =
+            |graph: &mut super::decoder_wgpu_graph::DotsDecoderWgpuGraph,
+             active: &mut Vec<(usize, super::decoder_wgpu_graph::RegionRow)>,
+             next_job: &mut usize,
+             jobs: &[RegionJob]|
+             -> Result<()> {
+                let mut used: Vec<bool> = vec![false; slots];
+                for (_, r) in active.iter() {
+                    used[r.base as usize / stride] = true;
+                }
+                while active.len() < slots && *next_job < jobs.len() {
+                    let slot = (0..slots).find(|s| !used[*s]).expect("a free slot exists");
+                    used[slot] = true;
+                    let j = &jobs[*next_job];
+                    let len = graph.region_prefill(
+                        slot,
+                        &j.tokens,
+                        j.vision_start,
+                        Some(&j.rows),
+                    )?;
+                    active.push((
+                        *next_job,
+                        super::decoder_wgpu_graph::RegionRow {
+                            token: *j.tokens.last().expect("prompt is non-empty"),
+                            base: (slot * stride) as u32,
+                            len: len as u32,
+                        },
+                    ));
+                    *next_job += 1;
+                }
+                Ok(())
+            };
+        fill(&mut graph, &mut active, &mut next_job, &jobs)?;
+        while !active.is_empty() {
+            let rows: Vec<super::decoder_wgpu_graph::RegionRow> =
+                active.iter().map(|(_, r)| *r).collect();
+            let toks = graph.bstep_tokens(&rows)?;
+            let mut retired = false;
+            for (i, tok) in toks.iter().enumerate() {
+                let (ji, row) = &mut active[i];
+                let job = &mut jobs[*ji];
+                job.generated.push(*tok);
+                row.len += 1;
+                row.token = *tok;
+                if EOS_TOKEN_IDS.contains(tok) {
+                    job.hit_eos = true;
+                    job.done = true;
+                } else if job.generated.len() >= job.max_new
+                    || (row.len as usize + 1) >= cap
+                {
+                    job.done = true;
+                } else if let Some(n) = opts.ngram_size.filter(|n| *n > 0) {
+                    let banned = crate::deepseek_ocr::decoder::banned_tokens_windowed_ngram(
+                        &job.generated,
+                        n,
+                        opts.ngram_window,
+                        &opts.ngram_whitelist,
+                    );
+                    if !banned.is_empty() {
+                        job.banned_stop = true;
+                        job.done = true;
+                    }
+                }
+                retired |= job.done;
+            }
+            if retired {
+                active.retain(|(ji, _)| !jobs[*ji].done);
+                fill(&mut graph, &mut active, &mut next_job, &jobs)?;
+            }
+        }
+        drop(graph);
+        let mut out = RegionOcr {
+            elements: Vec::with_capacity(regions.len()),
+            prompt_tokens: 0,
+            generated_tokens: 0,
+            looped: false,
+            hit_eos: true,
+        };
+        for (region, job) in regions.iter().zip(jobs.iter_mut()) {
+            let mut toks = std::mem::take(&mut job.generated);
+            if job.hit_eos {
+                toks.pop();
+            }
+            let detection = crate::deepseek_ocr::decoder::detect_loop(&toks);
+            let looped = detection.is_some() || job.banned_stop;
+            if let Some(d) = &detection {
+                toks.truncate(d.onset);
+            }
+            out.prompt_tokens += job.tokens.len();
+            out.generated_tokens += toks.len();
+            out.looped |= looped;
+            out.hit_eos &= job.hit_eos;
+            let raw = self
+                .tokenizer
+                .decode(&toks, true)
+                .map_err(|e| anyhow::anyhow!("tokenizer decode: {e}"))?;
+            let body = raw.trim();
+            let text = format!(
+                "{}{}",
+                category_prefix(region.category.as_deref(), body),
+                body
+            );
+            out.elements.push(LayoutElement {
+                bbox: Some(region.bbox),
+                category: region.category.clone(),
+                text: Some(text),
+            });
+        }
+        Ok(Some(out))
+    }
+
+    fn ocr_regions(
+        &self,
+        img: &RgbImage,
+        regions: &[super::regions::Region],
+        opts: &GenerateOptions,
+    ) -> Result<RegionOcr> {
+        #[cfg(feature = "wgpu")]
+        if let Some(batched) = self.ocr_regions_batched(img, regions, opts)? {
+            return Ok(batched);
+        }
+        let crop_max = env_pixels(
+            CROP_MAX_PIXELS_ENV,
+            DEFAULT_CROP_MAX_PIXELS_500K_IS_ABOUT_640_VISION_TOKENS,
+        );
+        let _ = CROP_PACKING_IS_A_MEASURED_NEGATIVE_UNION_BOXES_SHIP_WHITESPACE_THROUGH_THE_TOWER;
+        let img_px = img.w * img.h;
+        let mut out = RegionOcr {
+            elements: Vec::with_capacity(regions.len()),
+            prompt_tokens: 0,
+            generated_tokens: 0,
+            looped: false,
+            hit_eos: true,
+        };
+        for region in regions {
+            let (x0, y0, x1, y1) = region.pixel_bounds(img.w, img.h);
+            let crop = img.crop(x0, y0, x1, y1);
+            let crop_px = (x1 - x0) * (y1 - y0);
+            let dpi_floor_matching_a_whole_page_pass_at_the_serving_budget =
+                if img_px > self.budget.max_pixels {
+                    crop_px * self.budget.max_pixels / img_px
+                } else {
+                    crop_px
+                };
+            let crop_budget = PixelBudget {
+                min_pixels: DEFAULT_MIN_PIXELS,
+                max_pixels: crop_max
+                    .max(dpi_floor_matching_a_whole_page_pass_at_the_serving_budget),
+            };
+            let crop_opts = if heading_like(region.category.as_deref()) {
+                GenerateOptions {
+                    max_new_tokens: opts.max_new_tokens.min(UNMERGED_HEADING_CROP_TOKEN_CAP),
+                    ..opts.clone()
+                }
+            } else {
+                opts.clone()
+            };
+            let res =
+                self.recognize_with_budget(&crop, DotsMode::PlainOcr, &crop_opts, crop_budget)?;
+            out.prompt_tokens += res.prompt_tokens;
+            out.generated_tokens += res.generated_tokens;
+            out.looped |= res.looped;
+            out.hit_eos &= res.hit_eos;
+            let body = res.text.trim();
+            let text = format!(
+                "{}{}",
+                category_prefix(region.category.as_deref(), body),
+                body
+            );
+            out.elements.push(LayoutElement {
+                bbox: Some(region.bbox),
+                category: region.category.clone(),
+                text: Some(text),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn recognize_tiled_classical(
+        &self,
+        img: &RgbImage,
+        opts: &GenerateOptions,
+    ) -> Result<Option<DotsPageResult>> {
+        let t_t0 = std::time::Instant::now();
+        let Some(scouted) = super::tiered::classical_scout(img) else {
+            return Ok(None);
+        };
+        let regions = plan_regions(&scouted, img.w, img.h, false);
+        if regions.is_empty() {
+            return Ok(None);
+        }
+        let t0_s = t_t0.elapsed().as_secs_f64();
+        let t_t1 = std::time::Instant::now();
+        let t1 = self.ocr_regions(img, &regions, opts)?;
+        #[cfg(feature = "wgpu")]
+        if super::decoder_wgpu_graph::page_profile_enabled() {
+            eprintln!(
+                "DOTS-TIER-PROFILE scout=classical t0_scout_s={t0_s:.3} t1_regions_s={:.3} \
+                 regions={} src_px={}x{}",
+                t_t1.elapsed().as_secs_f64(),
+                regions.len(),
+                img.w,
+                img.h,
+            );
+        }
+        let page = LayoutPage {
+            elements: t1.elements,
+            truncated: !t1.hit_eos,
+        };
+        let text = page.to_plain_text();
+        Ok(Some(DotsPageResult {
+            page,
+            text,
+            raw: String::new(),
+            prompt_tokens: t1.prompt_tokens,
+            generated_tokens: t1.generated_tokens,
+            looped: t1.looped,
+            hit_eos: t1.hit_eos,
+            grid: (0, 0),
+        }))
+    }
+
+    pub fn recognize_cropped(
+        &self,
+        img: &RgbImage,
+        opts: &GenerateOptions,
+    ) -> Result<DotsPageResult> {
+        let _ = INK_RECALL_RESCUES_SPARSE_SHEETS_THE_PAGE_AREA_FLOOR_WRONGLY_SENDS_BACK_TO_SINGLE_PASS;
+        let ink = sample_ink(img);
+        let usable_by_ink = |planned: &[super::regions::Region]| {
+            ink_recall(&ink, planned)
+                .is_some_and(|r| r >= INK_RECALL_USABLE_MIN_085_A_DETECTOR_BOXING_85PCT_OF_THE_INK_SAW_THE_PAGE)
+        };
+        #[cfg(feature = "wgpu")]
+        let profile = super::decoder_wgpu_graph::page_profile_enabled();
+        #[cfg(not(feature = "wgpu"))]
+        let profile = false;
+        let t_t0 = std::time::Instant::now();
+        let layout_max = env_pixels(
+            LAYOUT_MAX_PIXELS_ENV,
+            DEFAULT_LAYOUT_MAX_PIXELS_1MP_KEEPS_THE_DETECT_PASS_CHEAP,
+        );
+        let retry_max =
+            LAYOUT_RETRY_TRIPLES_THE_BUDGET_BECAUSE_A_LOOPING_DETECT_PASS_MEANS_UNDERRESOLVED_INK
+                * layout_max;
+        let downscale_floor =
+            img.w * img.h / LAYOUT_KEEPS_AT_LEAST_A_NINTH_OF_SOURCE_PIXELS_OR_HANDWRITING_LOOPS;
+        let first_max = downscale_floor.clamp(layout_max, retry_max);
+        let mut ladder = vec![first_max];
+        if retry_max > first_max {
+            ladder.push(retry_max);
+        }
+        let mut layout = None;
+        let mut regions = Vec::new();
+        for max_pixels in ladder {
+            let budget = PixelBudget {
+                min_pixels: DEFAULT_MIN_PIXELS,
+                max_pixels,
+            };
+            let attempt = self.recognize_with_budget(img, DotsMode::LayoutOnly, opts, budget)?;
+            let planned = plan_regions(&attempt.page, img.w, img.h, false);
+            let usable = !attempt.page.truncated
+                && (layout_is_usable(&planned, img.w, img.h) || usable_by_ink(&planned));
+            let keep = usable || layout.is_none() || planned.len() > regions.len();
+            if keep {
+                layout = Some(attempt);
+                regions = planned;
+            }
+            if usable {
+                break;
+            }
+        }
+        let layout = layout.expect("both layout attempts recorded a result");
+        let t0_s = t_t0.elapsed().as_secs_f64();
+        if !(layout_is_usable(&regions, img.w, img.h) || usable_by_ink(&regions)) {
+            if profile {
+                eprintln!(
+                    "DOTS-TIER-PROFILE t0_layout_s={t0_s:.3} regions={} UNUSABLE -> whole-page \
+                     plain ocr fallback",
+                    regions.len()
+                );
+            }
+            return self.recognize(img, DotsMode::PlainOcr, opts);
+        }
+        let _ = HEADING_ONLY_CROPS_BAIT_WHITESPACE_ESSAYS_SO_HEADINGS_MERGE_INTO_THE_BLOCK_BELOW;
+        let regions = merge_headings_into_following_regions(regions);
+        let t_t1 = std::time::Instant::now();
+        let t1 = self.ocr_regions(img, &regions, opts)?;
+        let prompt_tokens = layout.prompt_tokens + t1.prompt_tokens;
+        let generated_tokens = layout.generated_tokens + t1.generated_tokens;
+        let looped = layout.looped | t1.looped;
+        let hit_eos = t1.hit_eos;
+        let t1_s = t_t1.elapsed().as_secs_f64();
+        let t_t2 = std::time::Instant::now();
+        let page = LayoutPage {
+            elements: t1.elements,
+            truncated: layout.page.truncated || !hit_eos,
+        };
+        let text = page.to_plain_text();
+        if profile {
+            eprintln!(
+                "DOTS-TIER-PROFILE t0_layout_s={t0_s:.3} t1_regions_s={t1_s:.3} \
+                 t2_stitch_s={:.3} regions={} src_px={}x{}",
+                t_t2.elapsed().as_secs_f64(),
+                regions.len(),
+                img.w,
+                img.h,
+            );
+        }
+        Ok(DotsPageResult {
+            page,
+            text,
+            raw: layout.raw,
+            prompt_tokens,
+            generated_tokens,
+            looped,
+            hit_eos,
+            grid: layout.grid,
         })
     }
 }
@@ -212,6 +1387,207 @@ mod tests {
             msg.contains("dots.ocr"),
             "error should name the model: {msg}"
         );
+    }
+
+    #[test]
+    fn a_ggml_precision_never_defaults_into_the_graph_because_the_graph_would_reject_it() {
+        for device in [Device::Cpu] {
+            for precision in [DotsPrecision::W4, DotsPrecision::W8] {
+                assert_eq!(
+                    DotsDecoderEngine::default_for(&device, precision),
+                    DotsDecoderEngine::Candle,
+                    "{precision:?} has no cpu graph arm, so defaulting the graph on would turn \
+                     every load at this precision into an error instead of a slower page"
+                );
+            }
+        }
+        if let Ok(metal) = Device::new_metal(0) {
+            assert_eq!(
+                DotsDecoderEngine::default_for(&metal, DotsPrecision::W8),
+                DotsDecoderEngine::Candle,
+                "w8 is still ggml-only and must keep candle even where the graph is default"
+            );
+            for precision in [DotsPrecision::W4, DotsPrecision::Bf16] {
+                assert_eq!(
+                    DotsDecoderEngine::default_for(&metal, precision),
+                    DotsDecoderEngine::Graph,
+                    "{precision:?} is graphable and metal is where the graph was measured"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_default_precision_is_w4_and_bf16_is_the_one_env_master_numerics_escape() {
+        if let Ok(metal) = Device::new_metal(0) {
+            assert_eq!(
+                DotsPrecision::default_for(&metal),
+                if cfg!(feature = "wgpu") {
+                    DotsPrecision::W4
+                } else {
+                    DotsPrecision::Bf16
+                },
+                "the metal serving default is the affine-w4 graph wherever wgpu can serve it"
+            );
+            assert_eq!(
+                DotsPrecision::parse(Some("bf16"), DotsPrecision::default_for(&metal)).unwrap(),
+                DotsPrecision::Bf16,
+                "bf16 must stay one env away as the master-numerics arm"
+            );
+        }
+        assert_eq!(
+            DotsPrecision::parse(Some("w4"), DotsPrecision::Bf16).unwrap(),
+            DotsPrecision::W4
+        );
+    }
+
+    #[test]
+    fn vision_backend_unset_takes_the_device_default_and_zero_or_candle_still_escape_to_the_prior_tower(
+    ) {
+        for raw in [None, Some("")] {
+            for default in [DotsVisionBackend::Candle, DotsVisionBackend::Wgpu] {
+                assert_eq!(
+                    DotsVisionBackend::parse(raw, default).unwrap(),
+                    default,
+                    "{raw:?} must defer to the device default, not pin one arm"
+                );
+            }
+        }
+        for raw in [Some("0"), Some("candle")] {
+            assert_eq!(
+                DotsVisionBackend::parse(raw, DotsVisionBackend::Wgpu).unwrap(),
+                DotsVisionBackend::Candle,
+                "{raw:?} is the escape and must beat a wgpu default"
+            );
+        }
+        assert_eq!(
+            DotsVisionBackend::parse(Some("wgpu"), DotsVisionBackend::Candle).unwrap(),
+            DotsVisionBackend::Wgpu
+        );
+        let err = DotsVisionBackend::parse(Some("metal"), DotsVisionBackend::Candle).unwrap_err();
+        assert!(
+            err.to_string().contains(DOTS_VISION_BACKEND_ENV),
+            "rejection must name the env var: {err}"
+        );
+    }
+
+    #[test]
+    fn decoder_engine_unset_takes_the_device_default_and_zero_or_candle_still_escape_to_the_candle_decoder(
+    ) {
+        for raw in [None, Some("")] {
+            for default in [DotsDecoderEngine::Candle, DotsDecoderEngine::Graph] {
+                assert_eq!(
+                    DotsDecoderEngine::parse(raw, default).unwrap(),
+                    default,
+                    "{raw:?} must defer to the device default, not pin one arm"
+                );
+            }
+        }
+        for raw in [Some("0"), Some("candle")] {
+            assert_eq!(
+                DotsDecoderEngine::parse(raw, DotsDecoderEngine::Graph).unwrap(),
+                DotsDecoderEngine::Candle,
+                "{raw:?} is the escape and must beat a graph default"
+            );
+        }
+        assert_eq!(
+            DotsDecoderEngine::parse(Some("graph"), DotsDecoderEngine::Candle).unwrap(),
+            DotsDecoderEngine::Graph
+        );
+        let err = DotsDecoderEngine::parse(Some("wgpu"), DotsDecoderEngine::Candle).unwrap_err();
+        assert!(
+            err.to_string().contains(DOTS_DEC_ENGINE_ENV),
+            "rejection must name the env var: {err}"
+        );
+    }
+
+    #[test]
+    fn precision_escape_env_overrides_and_garbage_is_rejected() {
+        let default = DotsPrecision::default_for(&Device::Cpu);
+        assert_eq!(DotsPrecision::parse(None, default).unwrap(), default);
+        assert_eq!(DotsPrecision::parse(Some(""), default).unwrap(), default);
+        assert_eq!(
+            DotsPrecision::parse(Some("bf16"), DotsPrecision::Nvfp4).unwrap(),
+            DotsPrecision::Bf16
+        );
+        assert_eq!(
+            DotsPrecision::parse(Some("nvfp4"), DotsPrecision::Bf16).unwrap(),
+            DotsPrecision::Nvfp4
+        );
+        let err = DotsPrecision::parse(Some("int4"), default).unwrap_err();
+        assert!(err.to_string().contains(DOTS_PRECISION_ENV));
+    }
+
+    #[test]
+    fn cpu_default_precision_is_bf16_nvfp4_kernels_are_cuda_only() {
+        assert_eq!(
+            DotsPrecision::default_for(&Device::Cpu),
+            DotsPrecision::Bf16
+        );
+    }
+
+    #[test]
+    fn weight_dtype_follows_device_bf16_capability_not_a_cuda_only_test_so_metal_stops_paying_f32()
+    {
+        assert_eq!(
+            dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(
+                &Device::Cpu
+            ),
+            DType::F32,
+            "cpu has no bf16 gemm and must stay f32"
+        );
+        assert!(
+            !Device::Cpu.supports_bf16(),
+            "the selection delegates to candle's own capability predicate, which reports \
+             Cuda and Metal as bf16-capable and Cpu as not; a cuda-only test silently \
+             dropped Metal to f32 and doubled its weight traffic"
+        );
+        #[cfg(feature = "cuda")]
+        if let Ok(cuda) = Device::new_cuda(0) {
+            assert_eq!(
+                dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(
+                    &cuda
+                ),
+                DType::BF16
+            );
+        }
+    }
+
+    #[test]
+    fn heading_regions_merge_into_the_block_below_and_lone_headings_survive() {
+        use super::super::regions::Region;
+        let heading = Region {
+            bbox: [100.0, 100.0, 500.0, 160.0],
+            category: Some("Section-header".to_string()),
+        };
+        let body = Region {
+            bbox: [90.0, 180.0, 900.0, 400.0],
+            category: Some("Text".to_string()),
+        };
+        let merged = merge_headings_into_following_regions(vec![heading.clone(), body.clone()]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bbox, [90.0, 100.0, 900.0, 400.0]);
+        assert_eq!(merged[0].category, None, "merged crop reads as plain text");
+
+        let far_body = Region {
+            bbox: [90.0, 700.0, 900.0, 900.0],
+            category: Some("Text".to_string()),
+        };
+        let kept = merge_headings_into_following_regions(vec![heading.clone(), far_body]);
+        assert_eq!(kept.len(), 2, "a distant block must not merge");
+
+        let beside = Region {
+            bbox: [600.0, 100.0, 900.0, 160.0],
+            category: Some("Text".to_string()),
+        };
+        let kept = merge_headings_into_following_regions(vec![heading.clone(), beside]);
+        assert_eq!(kept.len(), 2, "a block with no x overlap must not merge");
+
+        let lone = merge_headings_into_following_regions(vec![heading]);
+        assert_eq!(lone.len(), 1);
+        assert!(heading_like(lone[0].category.as_deref()));
+        assert!(!heading_like(Some("Text")));
+        assert!(!heading_like(None));
     }
 
     #[test]

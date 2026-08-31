@@ -1,8 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = []
-# ///
 """gate_probe -- emit the gated-fusion combined score Python produces for
 a fixed set of (partial, audio_ms, p_text, p_audio) tuples. Used to seed
 the Go and Rust parity tests so all three implementations evaluate to

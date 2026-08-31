@@ -9,7 +9,8 @@ use nv_layers::{
 use nv_weights::WeightLoader;
 
 use crate::dense::DenseLinear;
-use crate::weight_helpers::{load_linear, load_rmsnorm};
+use crate::weight_helpers::load_linear;
+use nv_layers::weight_load::load_rmsnorm;
 
 pub const NUM_EXTRA_CODEBOOKS: usize = 15;
 

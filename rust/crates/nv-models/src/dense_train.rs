@@ -6,10 +6,10 @@ use nv_layers::norm::RmsNorm;
 use nv_layers::rope::Rope;
 use nv_weights::TensorSource;
 
-use crate::gemma4_moe::build_rope;
 use crate::gemma4::{
     mlp_forward, Gemma4Attention, Gemma4Config, Gemma4Layer, Gemma4Mlp, LayerType,
 };
+use crate::gemma4_moe::build_rope;
 
 pub fn max_layers_from_env(num_hidden_layers: usize) -> usize {
     match std::env::var("NV_TRAIN_MAX_LAYERS")
@@ -58,6 +58,16 @@ impl DenseTrainModel {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        Self::from_loader_dtype_resident(config, weights, device, dtype, None)
+    }
+
+    pub fn from_loader_dtype_resident<S: TensorSource>(
+        config: Gemma4Config,
+        weights: &S,
+        device: &Device,
+        dtype: DType,
+        resident: Option<&ResidentLinearIngest>,
+    ) -> Result<Self> {
         let full_num_layers = config.num_hidden_layers;
         let n_build = max_layers_from_env(full_num_layers);
 
@@ -78,10 +88,17 @@ impl DenseTrainModel {
 
         let mut layers = Vec::with_capacity(n_build);
         for i in 0..n_build {
-            layers.push(load_dense_layer(&config, i, weights, device, dtype)?);
+            layers.push(load_dense_layer(&config, i, weights, device, dtype, resident)?);
         }
 
-        let final_norm = load_rmsnorm(weights, "model.language_model.norm.weight", config.hidden_size, config.rms_norm_eps, dtype, device)?;
+        let final_norm = load_rmsnorm(
+            weights,
+            "model.language_model.norm.weight",
+            config.hidden_size,
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
         let lm_head_weight = if config.tie_word_embeddings {
             embed_weight.clone()
         } else {
@@ -148,8 +165,9 @@ impl DenseTrainModel {
 
         let mut hidden = self.embed_forward(tokens, seq)?;
 
+        let mut kv_stash: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
         for li in 0..self.layers.len() {
-            hidden = self.layer_forward(li, &hidden, &row_positions, seq)?;
+            hidden = self.layer_forward(li, &hidden, &row_positions, seq, &mut kv_stash)?;
         }
 
         let normed = self.final_norm.forward_candle(&hidden)?;
@@ -171,12 +189,13 @@ impl DenseTrainModel {
         x: &Tensor,
         positions: &Tensor,
         seq: usize,
+        kv_stash: &mut Vec<Option<(Tensor, Tensor)>>,
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
 
         let residual_attn = x.clone();
         let normed_pre_attn = layer.input_layernorm.forward_candle(x)?;
-        let attn_out = self.attention_forward(idx, &normed_pre_attn, positions, seq)?;
+        let attn_out = self.attention_forward(idx, &normed_pre_attn, positions, seq, kv_stash)?;
         let attn_post = layer.post_attention_layernorm.forward_candle(&attn_out)?;
 
         let after_attn = attn_post.add(&residual_attn)?;
@@ -192,12 +211,49 @@ impl DenseTrainModel {
         Ok(after_attn.add(&mlp_post)?.broadcast_mul(&scale)?)
     }
 
+    fn layer_kv(
+        &self,
+        idx: usize,
+        normed_x: &Tensor,
+        positions: &Tensor,
+        seq: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let attn = &self.layers[idx].self_attn;
+        let kind = attn.kind;
+        let head_dim = self.config.head_dim_for(kind);
+        let n_kv = self.config.num_kv_heads_for(kind);
+        let rope = match kind {
+            LayerType::SlidingAttention => &self.sliding_rope,
+            LayerType::FullAttention => &self.full_rope,
+        };
+        let bsz = normed_x.dims()[0];
+        let (_, k_raw, v_raw) = self.qkv_split(attn, normed_x)?;
+        let k = k_raw.reshape((bsz, seq, n_kv, head_dim))?;
+        let k_normed = attn.k_norm.forward_candle(&k)?;
+        let v = v_raw.reshape((bsz, seq, n_kv, head_dim))?;
+        let v_normed = attn.v_norm.forward_candle(&v)?;
+        let (_, k_rot) = rope.apply_candle(&k_normed, &k_normed, positions)?;
+        Ok((k_rot.contiguous()?, v_normed.contiguous()?))
+    }
+
+    fn source_kv_from_boundary(
+        &self,
+        src: usize,
+        boundary_in: &Tensor,
+        positions: &Tensor,
+        seq: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let normed = self.layers[src].input_layernorm.forward_candle(boundary_in)?;
+        self.layer_kv(src, &normed, positions, seq)
+    }
+
     fn attention_forward(
         &self,
         idx: usize,
         x: &Tensor,
         positions: &Tensor,
         seq: usize,
+        kv_stash: &mut Vec<Option<(Tensor, Tensor)>>,
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
         let attn = &layer.self_attn;
@@ -215,20 +271,31 @@ impl DenseTrainModel {
         };
 
         let bsz = x.dims()[0];
-        let (q_raw, k_raw, v_raw) = self.qkv_split(attn, x)?;
-        let q = q_raw.reshape((bsz, seq, n_q, head_dim))?;
-        let q_normed = attn.q_norm.forward_candle(&q)?;
-        let k = k_raw.reshape((bsz, seq, n_kv, head_dim))?;
-        let k_normed = attn.k_norm.forward_candle(&k)?;
-        let v = v_raw.reshape((bsz, seq, n_kv, head_dim))?;
-        let v_normed = attn.v_norm.forward_candle(&v)?;
+        let (q_rot, k_rot, v_for) = if let Some(src) = self.config.kv_source_layer(idx) {
+            let q_raw = attn.qkv_proj.forward(x)?;
+            let q = q_raw.reshape((bsz, seq, n_q, head_dim))?;
+            let q_normed = attn.q_norm.forward_candle(&q)?;
+            let (q_rot, _) = rope.apply_candle(&q_normed, &q_normed, positions)?;
+            let (k_rot, v_for) = kv_stash[src]
+                .as_ref()
+                .with_context(|| {
+                    format!("layer {idx} shares kv from layer {src} but no stash was written")
+                })?
+                .clone();
+            (q_rot.contiguous()?, k_rot, v_for)
+        } else {
+            let (q_raw, _, _) = self.qkv_split(attn, x)?;
+            let q = q_raw.reshape((bsz, seq, n_q, head_dim))?;
+            let q_normed = attn.q_norm.forward_candle(&q)?;
+            let (q_rot, _) = rope.apply_candle(&q_normed, &q_normed, positions)?;
+            let (k_rot, v_for) = self.layer_kv(idx, x, positions, seq)?;
+            kv_stash[idx] = Some((k_rot.clone(), v_for.clone()));
+            (q_rot.contiguous()?, k_rot, v_for)
+        };
 
-        let (q_rot, k_rot) = rope.apply_candle(&q_normed, &k_normed, positions)?;
-        let q_rot = q_rot.contiguous()?;
-        let k_rot = k_rot.contiguous()?;
-        let v_for = v_normed.contiguous()?;
-
-        let attn_out = naive_sdpa(&q_rot, &k_rot, &v_for, bsz, n_q, n_kv, head_dim, seq, window)?;
+        let attn_out = naive_sdpa(
+            &q_rot, &k_rot, &v_for, bsz, n_q, n_kv, head_dim, seq, window,
+        )?;
         let attn_out_flat = attn_out
             .to_dtype(x.dtype())?
             .reshape((bsz, seq, n_q * head_dim))?;
@@ -332,7 +399,7 @@ pub fn naive_sdpa(
         .matmul(&k3e.transpose(1, 2)?.contiguous()?)?
         .affine(scale, 0.0)?;
     let scores = raw_scores.broadcast_add(&mask_t)?;
-    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let probs = nv_layers::attn::softmax_last_dim_that_keeps_q_and_k_on_the_graph(&scores)?;
     let out = probs.matmul(&v3e)?;
     Ok(out
         .reshape((batch, n_q, seq, head_dim))?
@@ -340,12 +407,15 @@ pub fn naive_sdpa(
         .contiguous()?)
 }
 
+pub type ResidentLinearIngest<'a> = dyn Fn(&[String], Tensor) -> Result<Linear> + 'a;
+
 fn load_dense_layer<S: TensorSource>(
     config: &Gemma4Config,
     idx: usize,
     weights: &S,
     device: &Device,
     dtype: DType,
+    resident: Option<&ResidentLinearIngest>,
 ) -> Result<Gemma4Layer> {
     let prefix = format!("model.language_model.layers.{idx}");
     let hidden = config.hidden_size;
@@ -359,7 +429,14 @@ fn load_dense_layer<S: TensorSource>(
     let kv_dim = n_kv * head_dim;
 
     let norm = |name: &str, dim: usize| -> Result<RmsNorm> {
-        load_rmsnorm(weights, &format!("{prefix}.{name}.weight"), dim, eps, dtype, device)
+        load_rmsnorm(
+            weights,
+            &format!("{prefix}.{name}.weight"),
+            dim,
+            eps,
+            dtype,
+            device,
+        )
     };
     let input_layernorm = norm("input_layernorm", hidden)?;
     let post_attention_layernorm = norm("post_attention_layernorm", hidden)?;
@@ -396,18 +473,49 @@ fn load_dense_layer<S: TensorSource>(
         }
         Ok(t)
     };
-    let q_w = get_proj("q_proj", q_dim, hidden)?;
-    let k_w = get_proj("k_proj", kv_dim, hidden)?;
-    let fused = if has_v {
-        let v_w = get_proj("v_proj", kv_dim, hidden)?;
-        Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.contiguous()?
-    } else {
-        Tensor::cat(&[&q_w, &k_w], 0)?.contiguous()?
+    let build = |components: &[&str], w: Tensor| -> Result<Linear> {
+        match resident {
+            Some(ingest) => {
+                let names: Vec<String> = components
+                    .iter()
+                    .map(|c| format!("{prefix}.{c}"))
+                    .collect();
+                ingest(&names, w)
+            }
+            None => Linear::new_no_pretranspose(w, None),
+        }
     };
-    let qkv_proj = Linear::new_no_pretranspose(fused, None)?;
-    let o_proj = Linear::new_no_pretranspose(get_proj("o_proj", hidden, q_dim)?, None)?;
+    let kv_shared = config.kv_source_layer(idx).is_some();
+    let q_w = get_proj("q_proj", q_dim, hidden)?;
+    let (fused, fused_components, kv_dim, has_v) = if kv_shared {
+        (q_w, vec!["self_attn.q_proj"], 0usize, false)
+    } else {
+        let k_w = get_proj("k_proj", kv_dim, hidden)?;
+        if has_v {
+            let v_w = get_proj("v_proj", kv_dim, hidden)?;
+            (
+                Tensor::cat(&[&q_w, &k_w, &v_w], 0)?.contiguous()?,
+                vec!["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+                kv_dim,
+                has_v,
+            )
+        } else {
+            (
+                Tensor::cat(&[&q_w, &k_w], 0)?.contiguous()?,
+                vec!["self_attn.q_proj", "self_attn.k_proj"],
+                kv_dim,
+                has_v,
+            )
+        }
+    };
+    let qkv_proj = build(&fused_components, fused)?;
+    let o_proj = build(&["self_attn.o_proj"], get_proj("o_proj", hidden, q_dim)?)?;
     let q_norm = norm("self_attn.q_norm", head_dim)?;
-    let k_norm = norm("self_attn.k_norm", head_dim)?;
+    let k_norm = if kv_shared {
+        RmsNorm::new(Tensor::ones(head_dim, dtype, device)?, eps)
+    } else {
+        norm("self_attn.k_norm", head_dim)?
+    };
     let v_norm = RmsNorm::new(Tensor::ones(head_dim, dtype, device)?, eps);
     let self_attn = Gemma4Attention {
         kind,
@@ -442,11 +550,11 @@ fn load_dense_layer<S: TensorSource>(
         );
     }
     let mlp = Gemma4Mlp {
-        gate_up_proj: Linear::new_no_pretranspose(
+        gate_up_proj: build(
+            &["mlp.gate_proj", "mlp.up_proj"],
             Tensor::cat(&[&gate_w, &up_w], 0)?.contiguous()?,
-            None,
         )?,
-        down_proj: Linear::new_no_pretranspose(down_w, None)?,
+        down_proj: build(&["mlp.down_proj"], down_w)?,
     };
 
     Ok(Gemma4Layer {
@@ -470,13 +578,7 @@ fn load_rmsnorm<S: TensorSource>(
     dtype: DType,
     device: &Device,
 ) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?
-        .to_device(device)?;
-    if w.dims() != [dim] {
-        anyhow::bail!("{name}: expected [{dim}], got {:?}", w.dims());
-    }
+    let w = nv_layers::weight_load::load_tensor(weights, name, &[dim], dtype)?.to_device(device)?;
     Ok(RmsNorm::new(w, eps))
 }
 
@@ -496,14 +598,14 @@ pub fn lmhead_chunk_from_env() -> usize {
 impl DenseTrainModel {
     pub fn train_step_checkpointed(
         &self,
-        batch: &[Vec<u32>],
+        batch: &[nv_train::TokenRow],
         vars: &[Var],
         chunk: usize,
     ) -> Result<StepGrads> {
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut total_loss = 0f32;
-        for ids in batch {
-            let (loss, seq_grads) = self.seq_backward_checkpointed(ids, vars, chunk)?;
+        for row in batch {
+            let (loss, seq_grads) = self.seq_backward_checkpointed(row, vars, chunk)?;
             total_loss += loss;
             for (a, g) in acc.iter_mut().zip(seq_grads) {
                 if let Some(g) = g {
@@ -522,11 +624,12 @@ impl DenseTrainModel {
 
     fn seq_backward_checkpointed(
         &self,
-        ids: &[u32],
+        row: &nv_train::TokenRow,
         vars: &[Var],
         chunk: usize,
     ) -> Result<(f32, Vec<Option<Tensor>>)> {
         let dev = &self.device;
+        let ids = &row.ids;
         let seq = ids.len();
         if seq < 2 {
             anyhow::bail!("seq_backward_checkpointed: need >=2 tokens, got {seq}");
@@ -536,23 +639,58 @@ impl DenseTrainModel {
 
         let mut boundaries: Vec<Tensor> = Vec::with_capacity(self.layers.len() + 1);
         boundaries.push(self.embed_forward(&tokens, seq)?.detach());
+        let mut kv_stash: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
         for li in 0..self.layers.len() {
             let inp = boundaries[li].clone();
-            let out = self.layer_forward(li, &inp, &positions, seq)?.detach();
+            let out = self
+                .layer_forward(li, &inp, &positions, seq, &mut kv_stash)?
+                .detach();
             boundaries.push(out);
+        }
+        for e in kv_stash.iter_mut().flatten() {
+            *e = (e.0.detach(), e.1.detach());
         }
         let h_last = boundaries.last().unwrap().clone();
 
-        let denom = (seq - 1) as f32;
+        let mask = row.target_mask_where_predicting_a_prompt_token_weighs_zero();
         let targets = &ids[1..];
-        let (loss, mut grad_next) = self.head_loss_grad(&h_last, targets, denom, chunk)?;
+        let (loss, mut grad_next) = self.head_loss_grad(&h_last, targets, &mask, chunk)?;
 
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
+        let mut shared_boundary_grads: Vec<Option<Tensor>> = vec![None; self.layers.len()];
         for li in (0..self.layers.len()).rev() {
             let inp_var = Var::from_tensor(&boundaries[li])?;
-            let out = self.layer_forward(li, inp_var.as_tensor(), &positions, seq)?;
+            let src_recompute = match self.config.kv_source_layer(li) {
+                Some(src) => {
+                    let src_in_var = Var::from_tensor(&boundaries[src])?;
+                    let live_kv = self.source_kv_from_boundary(
+                        src,
+                        src_in_var.as_tensor(),
+                        &positions,
+                        seq,
+                    )?;
+                    kv_stash[src] = Some(live_kv);
+                    Some((src, src_in_var))
+                }
+                None => None,
+            };
+            let mut local_stash = kv_stash.clone();
+            let out =
+                self.layer_forward(li, inp_var.as_tensor(), &positions, seq, &mut local_stash)?;
             let surrogate = out.broadcast_mul(&grad_next.detach())?.sum_all()?;
             let gs = surrogate.backward()?;
+            if let Some((src, src_in_var)) = &src_recompute {
+                if let Some(g) = gs.get(src_in_var.as_tensor()) {
+                    let g = g.clone();
+                    shared_boundary_grads[*src] = Some(match shared_boundary_grads[*src].take() {
+                        Some(p) => (p + g)?,
+                        None => g,
+                    });
+                }
+                kv_stash[*src] = kv_stash[*src]
+                    .take()
+                    .map(|(k, v)| (k.detach(), v.detach()));
+            }
             for (i, v) in vars.iter().enumerate() {
                 if let Some(g) = gs.get(v.as_tensor()) {
                     let g = g.clone();
@@ -566,6 +704,9 @@ impl DenseTrainModel {
                 .get(inp_var.as_tensor())
                 .cloned()
                 .with_context(|| format!("no grad for layer {li} checkpoint input"))?;
+            if let Some(extra) = shared_boundary_grads[li].take() {
+                grad_next = (grad_next + extra)?;
+            }
         }
         Ok((loss, acc))
     }
@@ -574,7 +715,7 @@ impl DenseTrainModel {
         &self,
         h_last: &Tensor,
         targets: &[u32],
-        denom: f32,
+        mask: &[f32],
         chunk: usize,
     ) -> Result<(f32, Tensor)> {
         let dev = &self.device;
@@ -584,7 +725,7 @@ impl DenseTrainModel {
         let normed2 = normed.squeeze(0)?;
         let seq = normed2.dim(0)?;
         let pred = normed2.narrow(0, 0, seq - 1)?;
-        let (loss, grad_pred) = self.chunked_ce(&pred.detach(), targets, denom, chunk)?;
+        let (loss, grad_pred) = self.chunked_ce(&pred.detach(), targets, mask, chunk)?;
         let zero_row = Tensor::zeros((1usize, hidden), grad_pred.dtype(), dev)?;
         let grad_normed = Tensor::cat(&[&grad_pred, &zero_row], 0)?.unsqueeze(0)?;
         let surrogate = normed.broadcast_mul(&grad_normed.detach())?.sum_all()?;
@@ -600,7 +741,7 @@ impl DenseTrainModel {
         &self,
         pred: &Tensor,
         targets: &[u32],
-        denom: f32,
+        mask: &[f32],
         chunk: usize,
     ) -> Result<(f32, Tensor)> {
         let dev = &self.device;
@@ -612,8 +753,17 @@ impl DenseTrainModel {
         let wdt = w.dtype();
         let wt = w.t()?.contiguous()?;
         let rows = pred.dim(0)?;
-        if targets.len() != rows {
-            anyhow::bail!("chunked_ce: targets {} != rows {}", targets.len(), rows);
+        if targets.len() != rows || mask.len() != rows {
+            anyhow::bail!(
+                "chunked_ce: targets {} / mask {} != rows {}",
+                targets.len(),
+                mask.len(),
+                rows
+            );
+        }
+        let denom: f32 = mask.iter().sum();
+        if denom <= 0.0 {
+            anyhow::bail!("chunked_ce: every target position is masked, the row has no loss");
         }
         let cap = self.config.final_logit_softcapping as f64;
         let mut loss = 0f32;
@@ -629,9 +779,11 @@ impl DenseTrainModel {
                 raw
             };
             let idx = Tensor::from_vec(targets[a..a + c].to_vec(), (c, 1usize), dev)?;
+            let mask_c = Tensor::from_vec(mask[a..a + c].to_vec(), (c, 1usize), dev)?;
             let logp = log_softmax(&z, D::Minus1)?;
             let picked = logp.gather(&idx, 1)?;
             loss += picked
+                .mul(&mask_c)?
                 .affine(-1.0 / denom as f64, 0.0)?
                 .sum_all()?
                 .to_scalar::<f32>()?;
@@ -639,7 +791,9 @@ impl DenseTrainModel {
             let probs = softmax_last_dim(&z)?;
             let neg_one = Tensor::from_vec(vec![-1f32; c], (c, 1usize), dev)?;
             let gz = probs.scatter_add(&idx, &neg_one, 1)?;
-            let mut gz = gz.affine(1.0 / denom as f64, 0.0)?;
+            let mut gz = gz
+                .broadcast_mul(&mask_c)?
+                .affine(1.0 / denom as f64, 0.0)?;
             if cap > 0.0 {
                 let zc = z.affine(1.0 / cap, 0.0)?;
                 let dcap = (Tensor::ones_like(&zc)? - zc.sqr()?)?;

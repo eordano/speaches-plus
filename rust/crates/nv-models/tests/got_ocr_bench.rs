@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 mod common;
 use common::cer;
@@ -18,6 +18,18 @@ use common::got_ocr_snapshot_dir as snapshot_dir;
 
 const GOT_BENCH_MAX_NEW_TOKENS: usize = 1024;
 
+fn serving_device() -> Device {
+    #[cfg(feature = "cuda")]
+    if let Ok(d) = Device::new_cuda(0) {
+        return d;
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(d) = Device::new_metal(0) {
+        return d;
+    }
+    Device::Cpu
+}
+
 #[test]
 #[ignore]
 fn got_ocr_baseline_speed_and_cer_over_070_071_fixtures() {
@@ -30,10 +42,19 @@ fn got_ocr_baseline_speed_and_cer_over_070_071_fixtures() {
         return;
     }
     let dir = snapshot_dir().expect("GOT-OCR-2.0-hf snapshot present");
-    let device = Device::new_cuda(0).expect("cuda device 0");
+    let revision = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let device = serving_device();
     let load_t0 = Instant::now();
     let pipe = GotOcrPipeline::load(&dir, &device).expect("load");
-    eprintln!("[got-bench] load elapsed {:?}", load_t0.elapsed());
+    let precision = pipe.precision();
+    eprintln!(
+        "[got-bench] load elapsed {:?} precision={precision:?}",
+        load_t0.elapsed()
+    );
 
     let mut cers: Vec<f64> = Vec::new();
     let mut wers: Vec<f64> = Vec::new();
@@ -67,6 +88,13 @@ fn got_ocr_baseline_speed_and_cer_over_070_071_fixtures() {
         cers.push(e_cer);
         wers.push(e_wer);
         if i > 0 {
+            eprintln!(
+                "GEN-ARM got-ocr2 fixture={name} prefill_tokens={} gen={} decode_steps={} decode_tok_s={:.2} cer={e_cer:.4} wer={e_wer:.4} precision={precision:?} basis=whole_recognize_wall_incl_vision_and_prefill checkpoint=stepfun-ai/GOT-OCR-2.0-hf@{revision}",
+                res.prompt_tokens,
+                res.generated_tokens,
+                res.generated_tokens,
+                res.generated_tokens as f64 / elapsed.max(1e-6),
+            );
             timed_secs.push(elapsed);
             timed_tokens.push(res.generated_tokens);
         }
@@ -85,7 +113,7 @@ fn got_ocr_baseline_speed_and_cer_over_070_071_fixtures() {
         100.0 * mean_encode_ms / mean_ms_per_image,
     );
     eprintln!(
-        "[got-bench] SUMMARY basis=stepfun-ai/GOT-OCR-2.0-hf snapshot={} device=cuda bf16 mode=Plain prompt=\"OCR: \" max_new_tokens={GOT_BENCH_MAX_NEW_TOKENS} images={n} (1 warmup discarded from timing) \
+        "[got-bench] SUMMARY basis=stepfun-ai/GOT-OCR-2.0-hf snapshot={} device={device:?} precision={precision:?} mode=Plain prompt=\"OCR: \" max_new_tokens={GOT_BENCH_MAX_NEW_TOKENS} images={n} (1 warmup discarded from timing) \
          mean_ms_per_image={mean_ms_per_image:.1} pages_per_sec={pages_per_sec:.3} total_tokens={total_tokens} tok_per_s={:.1} mean_CER={mean_cer:.4} mean_WER={mean_wer:.4}",
         dir.display(),
         total_tokens as f64 / total_secs,

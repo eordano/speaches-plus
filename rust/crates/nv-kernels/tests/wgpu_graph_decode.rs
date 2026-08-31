@@ -376,6 +376,49 @@ fn argmax_bf16_matches_cpu_oracle() {
 }
 
 #[test]
+fn argmax_bf16_skips_nonfinite_and_emits_0_on_all_nan_like_argmax_checked() {
+    let Some(ctx) = ctx_or_skip("argmax_bf16_nonfinite") else {
+        return;
+    };
+    let vocab = 65_536usize;
+    let ring_mask = 255i32;
+
+    let mut rnd = lcg(0x0ddba11);
+    let mut lf: Vec<f32> = (0..vocab).map(|_| rnd() * 5.0 - 4.0).collect();
+    lf[123] = f32::INFINITY;
+    for i in (0..vocab).step_by(7) {
+        lf[i] = f32::NAN;
+    }
+    lf[50_000] = 9.0;
+    let logits = to_bf16(&lf);
+    let mut ring = vec![0xdead_0000u32; 256];
+    let mut token = vec![u32::MAX];
+    gd::argmax_bf16(ctx, &logits, &[10], &mut token, Some(&mut ring), ring_mask, vocab).unwrap();
+    let mut best = f32::NEG_INFINITY;
+    let mut best_i = 0usize;
+    for (i, w) in logits.iter().enumerate() {
+        let v = from_bf16(*w);
+        if v.is_finite() && v > best {
+            best = v;
+            best_i = i;
+        }
+    }
+    assert_eq!(
+        token[0] as usize, best_i,
+        "+inf and NaN entries must be skipped, finite max wins"
+    );
+    assert_eq!(ring[9], best_i as u32);
+
+    let nan_row = vec![0x7fc0u16; vocab];
+    let mut ring = vec![0xdead_0000u32; 256];
+    let mut token = vec![u32::MAX];
+    gd::argmax_bf16(ctx, &nan_row, &[10], &mut token, Some(&mut ring), ring_mask, vocab).unwrap();
+    assert_eq!(token[0], 0, "all-NaN row must emit token 0, not 0x7fffffff");
+    assert_eq!(ring[9], 0, "all-NaN row must feed token 0 into the ring");
+    eprintln!("argmax_bf16 nonfinite: skip + all-NaN fold to 0 match argmax_checked");
+}
+
+#[test]
 fn argmax_f32_rows_matches_cpu_oracle() {
     let Some(ctx) = ctx_or_skip("argmax_f32_rows") else {
         return;

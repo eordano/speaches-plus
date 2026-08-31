@@ -169,7 +169,7 @@ impl GraphTeardown {
     }
 
     fn probe(&self, tag: &str) {
-        if std::env::var("NV_GRAPH_TEARDOWN_DEBUG").as_deref() != Ok("1") {
+        if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_TEARDOWN_DEBUG") {
             return;
         }
         let deferred = match self.legacy.context().check_err() {

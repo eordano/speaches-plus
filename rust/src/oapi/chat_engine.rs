@@ -22,6 +22,8 @@ mod gemma4_moe_loop;
 mod gpt_oss_loop;
 mod laguna_loop;
 #[cfg(feature = "cuda")]
+mod lora_cuda;
+#[cfg(feature = "cuda")]
 mod omni_loop;
 mod qwen;
 mod qwen38_sched;
@@ -35,7 +37,13 @@ mod stream;
 pub(crate) use build::*;
 pub use build::{
     allow_unknown_model, allow_unknown_model_from, default_engine, default_engine_from_env,
-    registry_from_env, ChatRegistry, NvEngineChat, ALLOW_UNKNOWN_MODEL_ENV,
+    live_registry, publish_live_registry, registry_from_env, ChatRegistry, NvEngineChat,
+    RemoveDenied, ALLOW_UNKNOWN_MODEL_ENV,
+};
+#[cfg(feature = "cuda")]
+pub use lora_cuda::{
+    cuda_adapter_tag_that_changes_when_the_weights_change, cuda_base_dirs, select_cuda_base,
+    CudaLoraAdapterEngine,
 };
 #[cfg(feature = "cuda")]
 pub(crate) use gemma4_loop::*;

@@ -30,9 +30,7 @@ pub(crate) fn fine_prof_enabled() -> bool {
 pub(crate) fn m1_flash_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_LAGUNA_M1_FLASH")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_LAGUNA_M1_FLASH")
     })
 }
 
@@ -44,9 +42,7 @@ struct M1FlashBufs {
 fn m1_qkv_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_LAGUNA_M1_QKV")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_LAGUNA_M1_QKV")
     })
 }
 
@@ -55,7 +51,7 @@ fn m1_qkv_q8_enabled() -> bool {
     *ON.get_or_init(|| {
         std::env::var("NV_LAGUNA_M1_QKV_Q8")
             .map(|v| v != "0")
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -349,7 +345,7 @@ pub(crate) enum ProfPoint {
     End,
 }
 
-fn bf16_ptr(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Result<u64> {
+pub(crate) fn bf16_ptr(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Result<u64> {
     let (st, l) = t.storage_and_layout();
     anyhow::ensure!(l.is_contiguous(), "step graph: tensor not contiguous");
     let cuda = match &*st {

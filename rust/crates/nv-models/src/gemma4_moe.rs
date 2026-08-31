@@ -3,6 +3,7 @@ use candle_core::{DType, Device, Tensor};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
+use nv_layers::weight_load::load_rmsnorm;
 use nv_weights::{GgufLoader, TensorSource, WeightLoader};
 use std::path::Path;
 
@@ -10,6 +11,66 @@ use crate::gemma4::{
     mlp_forward, Gemma4Attention, Gemma4Cache, Gemma4Config, Gemma4KvCache, Gemma4Mlp, LayerType,
 };
 use crate::CausalLm;
+
+#[cfg(feature = "cuda")]
+type ExpertNvfp4Runner = Option<std::sync::Arc<std::sync::Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>;
+#[cfg(not(feature = "cuda"))]
+type ExpertNvfp4Runner = Option<()>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CudaExpertResidency {
+    Bf16Stacked,
+    Nvfp4WhenEligible,
+}
+
+pub fn nv_g4moe_cuda_nvfp4_opt_in_because_post_training_quant_failed_the_ppl_band() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_G4MOE_CUDA_NVFP4")
+}
+
+pub fn nv_g4moe_expert_bt_gemm_opt_in_because_the_route_change_is_banded_not_bitwise() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_G4MOE_EXPERT_BT_GEMM")
+}
+
+pub fn serving_default_expert_residency_bf16_with_nvfp4_opt_in() -> CudaExpertResidency {
+    if nv_g4moe_cuda_nvfp4_opt_in_because_post_training_quant_failed_the_ppl_band() {
+        CudaExpertResidency::Nvfp4WhenEligible
+    } else {
+        CudaExpertResidency::Bf16Stacked
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn expert_dims_meet_nvfp4_min_tile_so_tiny_fixtures_stay_bf16(hidden: usize, inter: usize) -> bool {
+    use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
+    hidden % BLOCK_SIZE == 0
+        && inter % BLOCK_SIZE == 0
+        && hidden >= MIN_TILE
+        && inter >= MIN_TILE
+        && 2 * inter >= MIN_TILE
+}
+
+#[cfg(feature = "cuda")]
+fn expert_nvfp4_runner_for(
+    residency: CudaExpertResidency,
+    device: &Device,
+) -> Result<ExpertNvfp4Runner> {
+    match (residency, device) {
+        (CudaExpertResidency::Nvfp4WhenEligible, Device::Cuda(d)) => {
+            Ok(Some(std::sync::Arc::new(std::sync::Mutex::new(
+                nv_quant::nvfp4::Nvfp4GemmRunner::new(d.cuda_stream().clone())?,
+            ))))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn expert_nvfp4_runner_for(
+    _residency: CudaExpertResidency,
+    _device: &Device,
+) -> Result<ExpertNvfp4Runner> {
+    Ok(None)
+}
 
 #[derive(Clone, Debug)]
 pub struct Gemma4MoeConfig {
@@ -52,6 +113,27 @@ impl Gemma4MoeConfig {
     }
 }
 
+pub enum Gemma4MoeExperts {
+    Bf16Stacked {
+        gate_up: Tensor,
+        down: Tensor,
+    },
+    #[cfg(feature = "cuda")]
+    Nvfp4Resident {
+        mlps: Vec<Gemma4Mlp>,
+    },
+}
+
+impl Gemma4MoeExperts {
+    pub fn is_nvfp4_resident(&self) -> bool {
+        match self {
+            Self::Bf16Stacked { .. } => false,
+            #[cfg(feature = "cuda")]
+            Self::Nvfp4Resident { .. } => true,
+        }
+    }
+}
+
 pub struct Gemma4MoeBlock {
     pub num_experts: usize,
     pub top_k: usize,
@@ -62,24 +144,61 @@ pub struct Gemma4MoeBlock {
     pub router_scale: Tensor,
     pub per_expert_scale: Vec<f32>,
 
-    pub gate_up: Tensor,
-    pub down: Tensor,
+    pub experts: Gemma4MoeExperts,
+}
+
+pub mod moe_stall_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static ROUTE_ENQUEUE_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DRAIN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DISPATCH_HOST_NS: AtomicU64 = AtomicU64::new(0);
+    pub static FORWARDS: AtomicU64 = AtomicU64::new(0);
+    pub static EXPERT_PRETRANSPOSE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled_via_nv_g4moe_moe_prof_reread_every_call() -> bool {
+        nv_config::env_arm_present_at_all_reread_every_call("NV_G4MOE_MOE_PROF")
+    }
+
+    pub fn add(cell: &AtomicU64, ns: u128) {
+        cell.fetch_add(ns as u64, Ordering::Relaxed);
+    }
+
+    pub fn snapshot_and_reset_route_enqueue_drain_dispatch_forwards() -> [u64; 4] {
+        [
+            ROUTE_ENQUEUE_NS.swap(0, Ordering::Relaxed),
+            DRAIN_NS.swap(0, Ordering::Relaxed),
+            DISPATCH_HOST_NS.swap(0, Ordering::Relaxed),
+            FORWARDS.swap(0, Ordering::Relaxed),
+        ]
+    }
+
+    pub fn snapshot_and_reset_expert_pretranspose_bytes() -> u64 {
+        EXPERT_PRETRANSPOSE_BYTES.swap(0, Ordering::Relaxed)
+    }
+}
+
+pub struct Gemma4MoeRouting {
+    pub top_idx_host: Vec<u32>,
+    pub top_weights_host: Vec<f32>,
+    pub n_tokens: usize,
 }
 
 impl Gemma4MoeBlock {
-    pub fn forward(&self, x_router: &Tensor, x: &Tensor) -> Result<Tensor> {
-        let in_dims = x.dims().to_vec();
+    pub fn route(&self, x_router: &Tensor) -> Result<Gemma4MoeRouting> {
+        let prof = moe_stall_prof::enabled_via_nv_g4moe_moe_prof_reread_every_call();
+        let t0 = std::time::Instant::now();
+        let in_dims = x_router.dims().to_vec();
         if *in_dims.last().unwrap() != self.hidden_size {
             anyhow::bail!(
-                "Gemma4MoeBlock: last dim {} != hidden_size {}",
+                "Gemma4MoeBlock: router last dim {} != hidden_size {}",
                 in_dims.last().unwrap(),
                 self.hidden_size
             );
         }
         let n_tokens: usize = in_dims[..in_dims.len() - 1].iter().product();
-        let in_dtype = x.dtype();
-        let device = x.device().clone();
-        let x_flat = x.reshape((n_tokens, self.hidden_size))?.contiguous()?;
+        let in_dtype = x_router.dtype();
+        let device = x_router.device().clone();
         let xr_flat = x_router
             .reshape((n_tokens, self.hidden_size))?
             .contiguous()?;
@@ -103,46 +222,135 @@ impl Gemma4MoeBlock {
         let top_logits = sorted_logits.narrow(1, 0, k)?.contiguous()?;
         let top_idx = sorted_idx.narrow(1, 0, k)?.contiguous()?;
         let top_weights = candle_nn::ops::softmax_last_dim(&top_logits)?.contiguous()?;
+        let t1 = std::time::Instant::now();
 
         let top_idx_host: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
         let top_weights_host: Vec<f32> = top_weights.flatten_all()?.to_vec1::<f32>()?;
+        if prof {
+            moe_stall_prof::add(
+                &moe_stall_prof::ROUTE_ENQUEUE_NS,
+                (t1 - t0).as_nanos(),
+            );
+            moe_stall_prof::add(&moe_stall_prof::DRAIN_NS, t1.elapsed().as_nanos());
+        }
+        Ok(Gemma4MoeRouting {
+            top_idx_host,
+            top_weights_host,
+            n_tokens,
+        })
+    }
+
+    pub fn dispatch(&self, routing: &Gemma4MoeRouting, x: &Tensor) -> Result<Tensor> {
+        let prof = moe_stall_prof::enabled_via_nv_g4moe_moe_prof_reread_every_call();
+        let t0 = std::time::Instant::now();
+        let in_dims = x.dims().to_vec();
+        if *in_dims.last().unwrap() != self.hidden_size {
+            anyhow::bail!(
+                "Gemma4MoeBlock: last dim {} != hidden_size {}",
+                in_dims.last().unwrap(),
+                self.hidden_size
+            );
+        }
+        let n_tokens: usize = in_dims[..in_dims.len() - 1].iter().product();
+        anyhow::ensure!(
+            n_tokens == routing.n_tokens,
+            "Gemma4MoeBlock: dispatch over {} tokens but routing carries {}",
+            n_tokens,
+            routing.n_tokens
+        );
+        let in_dtype = x.dtype();
+        let device = x.device().clone();
+        let x_flat = x.reshape((n_tokens, self.hidden_size))?.contiguous()?;
+        let k = self.top_k;
 
         let mut expert_rows: Vec<Vec<u32>> = vec![Vec::new(); self.num_experts];
         let mut expert_w: Vec<Vec<f32>> = vec![Vec::new(); self.num_experts];
         for n in 0..n_tokens {
             for j in 0..k {
-                let e = top_idx_host[n * k + j] as usize;
+                let e = routing.top_idx_host[n * k + j] as usize;
                 expert_rows[e].push(n as u32);
-                expert_w[e].push(top_weights_host[n * k + j] * self.per_expert_scale[e]);
+                expert_w[e].push(routing.top_weights_host[n * k + j] * self.per_expert_scale[e]);
             }
         }
 
+        let mut rows_concat: Vec<u32> = Vec::with_capacity(n_tokens * k);
+        let mut w_concat: Vec<f32> = Vec::with_capacity(n_tokens * k);
+        let mut offsets: Vec<usize> = Vec::with_capacity(self.num_experts);
+        for e in 0..self.num_experts {
+            offsets.push(rows_concat.len());
+            rows_concat.extend_from_slice(&expert_rows[e]);
+            w_concat.extend_from_slice(&expert_w[e]);
+        }
+        let total = rows_concat.len();
+        let (rows_all_t, w_all_t) = if total > 0 {
+            (
+                Some(Tensor::from_vec(rows_concat, total, &device)?),
+                Some(Tensor::from_vec(w_concat, total, &device)?),
+            )
+        } else {
+            (None, None)
+        };
+
         let mut acc = Tensor::zeros((n_tokens, self.hidden_size), DType::F32, &device)?;
         for e in 0..self.num_experts {
-            let rows = &expert_rows[e];
-            if rows.is_empty() {
+            let m = expert_rows[e].len();
+            if m == 0 {
                 continue;
             }
-            let m = rows.len();
-            let idx_t = Tensor::from_vec(rows.clone(), m, &device)?;
+            let idx_t = rows_all_t.as_ref().unwrap().narrow(0, offsets[e], m)?;
             let gathered = x_flat.index_select(&idx_t, 0)?.contiguous()?;
 
-            let mlp_e = Gemma4Mlp {
-                gate_up_proj: Linear::new(
-                    self.gate_up.narrow(0, e, 1)?.squeeze(0)?.contiguous()?,
-                    None,
-                )?,
-                down_proj: Linear::new(self.down.narrow(0, e, 1)?.squeeze(0)?.contiguous()?, None)?,
+            let y_raw = match &self.experts {
+                Gemma4MoeExperts::Bf16Stacked { gate_up, down } => {
+                    let gu_e = gate_up.narrow(0, e, 1)?.squeeze(0)?;
+                    let dn_e = down.narrow(0, e, 1)?.squeeze(0)?;
+                    let mlp_e =
+                        if nv_g4moe_expert_bt_gemm_opt_in_because_the_route_change_is_banded_not_bitwise() {
+                            Gemma4Mlp {
+                                gate_up_proj: Linear::new_no_pretranspose(gu_e, None)?,
+                                down_proj: Linear::new_no_pretranspose(dn_e, None)?,
+                            }
+                        } else {
+                            if prof {
+                                moe_stall_prof::add(
+                                    &moe_stall_prof::EXPERT_PRETRANSPOSE_BYTES,
+                                    ((gu_e.elem_count() + dn_e.elem_count())
+                                        * gu_e.dtype().size_in_bytes())
+                                        as u128,
+                                );
+                            }
+                            Gemma4Mlp {
+                                gate_up_proj: Linear::new(gu_e.contiguous()?, None)?,
+                                down_proj: Linear::new(dn_e.contiguous()?, None)?,
+                            }
+                        };
+                    mlp_forward(&mlp_e, &gathered)?
+                }
+                #[cfg(feature = "cuda")]
+                Gemma4MoeExperts::Nvfp4Resident { mlps } => mlp_forward(&mlps[e], &gathered)?,
             };
-            let y_e = mlp_forward(&mlp_e, &gathered)?.to_dtype(DType::F32)?;
-            let w_t = Tensor::from_vec(expert_w[e].clone(), (m, 1), &device)?;
+            let y_e = y_raw.to_dtype(DType::F32)?;
+            let w_t = w_all_t
+                .as_ref()
+                .unwrap()
+                .narrow(0, offsets[e], m)?
+                .reshape((m, 1))?;
             let weighted = y_e.broadcast_mul(&w_t)?;
             acc = acc.index_add(&idx_t, &weighted, 0)?;
         }
 
+        if prof {
+            moe_stall_prof::add(&moe_stall_prof::DISPATCH_HOST_NS, t0.elapsed().as_nanos());
+            moe_stall_prof::FORWARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut out_dims = in_dims[..in_dims.len() - 1].to_vec();
         out_dims.push(self.hidden_size);
         Ok(acc.reshape(out_dims)?.to_dtype(in_dtype)?)
+    }
+
+    pub fn forward(&self, x_router: &Tensor, x: &Tensor) -> Result<Tensor> {
+        let routing = self.route(x_router)?;
+        self.dispatch(&routing, x)
     }
 }
 
@@ -199,7 +407,13 @@ impl Gemma4Moe {
         weights: &WeightLoader,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_loader_dtype(config, weights, device, DType::BF16)
+        Self::from_loader_dtype_residency(
+            config,
+            weights,
+            device,
+            DType::BF16,
+            serving_default_expert_residency_bf16_with_nvfp4_opt_in(),
+        )
     }
 
     pub fn from_gguf(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
@@ -214,6 +428,30 @@ impl Gemma4Moe {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
+        Self::from_loader_dtype_residency(
+            config,
+            weights,
+            device,
+            dtype,
+            CudaExpertResidency::Bf16Stacked,
+        )
+    }
+
+    pub fn experts_nvfp4_resident_layer_count(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| l.moe.experts.is_nvfp4_resident())
+            .count()
+    }
+
+    pub fn from_loader_dtype_residency<S: TensorSource>(
+        config: Gemma4MoeConfig,
+        weights: &S,
+        device: &Device,
+        dtype: DType,
+        residency: CudaExpertResidency,
+    ) -> Result<Self> {
+        let nvfp4_runner: ExpertNvfp4Runner = expert_nvfp4_runner_for(residency, device)?;
         let base = &config.base;
         let embed_name = "model.language_model.embed_tokens.weight";
         let embed_weight = weights
@@ -231,7 +469,14 @@ impl Gemma4Moe {
 
         let mut layers = Vec::with_capacity(base.num_hidden_layers);
         for i in 0..base.num_hidden_layers {
-            layers.push(load_layer(&config, i, weights, device, dtype)?);
+            layers.push(load_layer(
+                &config,
+                i,
+                weights,
+                device,
+                dtype,
+                &nvfp4_runner,
+            )?);
         }
 
         let final_norm = load_rmsnorm(
@@ -290,7 +535,9 @@ impl Gemma4Moe {
         positions: &Tensor,
         cache: &mut C,
     ) -> Result<Tensor> {
-        self.forward_with_cache_body(tokens, positions, cache, None)
+        Ok(self
+            .forward_with_cache_body(tokens, positions, cache, None)?
+            .0)
     }
 
     pub fn forward_with_cache_embeds<C: Gemma4Cache>(
@@ -300,7 +547,20 @@ impl Gemma4Moe {
         positions: &Tensor,
         cache: &mut C,
     ) -> Result<Tensor> {
-        self.forward_with_cache_body(tokens, positions, cache, Some(embeds))
+        Ok(self
+            .forward_with_cache_body(tokens, positions, cache, Some(embeds))?
+            .0)
+    }
+
+    pub fn forward_with_cache_prenorm_hidden_the_row_the_gemma4_assistant_drafter_consumes<
+        C: Gemma4Cache,
+    >(
+        &self,
+        tokens: &Tensor,
+        positions: &Tensor,
+        cache: &mut C,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_with_cache_body(tokens, positions, cache, None)
     }
 
     fn forward_with_cache_body<C: Gemma4Cache>(
@@ -309,7 +569,7 @@ impl Gemma4Moe {
         positions: &Tensor,
         cache: &mut C,
         embeds_override: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
             anyhow::bail!("Gemma4Moe.forward: tokens must be [1, seq], got {:?}", dims);
@@ -359,14 +619,15 @@ impl Gemma4Moe {
         let normed = self.final_norm.forward(&hidden)?;
         let logits = self.lm_head.forward(&normed)?.to_dtype(DType::F32)?;
         let cap = base.final_logit_softcapping;
-        if cap > 0.0 {
-            Ok(logits
+        let logits = if cap > 0.0 {
+            logits
                 .affine(1.0 / cap as f64, 0.0)?
                 .tanh()?
-                .affine(cap as f64, 0.0)?)
+                .affine(cap as f64, 0.0)?
         } else {
-            Ok(logits)
-        }
+            logits
+        };
+        Ok((logits, hidden))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -399,7 +660,6 @@ impl Gemma4Moe {
 
         let dense_out = mlp_forward(&layer.mlp, &normed_pre_mlp)?;
         let h1 = layer.post_feedforward_layernorm_1.forward(&dense_out)?;
-
         let moe_in = layer.pre_feedforward_layernorm_2.forward(&after_attn)?;
         let moe_out = layer.moe.forward(&after_attn, &moe_in)?;
         let h2 = layer.post_feedforward_layernorm_2.forward(&moe_out)?;
@@ -451,7 +711,14 @@ impl Gemma4Moe {
         let v_for_cache = v_normed.contiguous()?;
 
         cache.write_at(layer_idx, &k_rot, &v_for_cache)?;
-        let (k_full, v_full) = cache.view(layer_idx, new_total)?;
+        let (k_view, v_view) = cache.view(layer_idx, new_total)?;
+        let (k_full, v_full) = kv_that_keeps_this_steps_own_keys_and_values_on_the_graph(
+            &k_view,
+            &v_view,
+            &k_rot,
+            &v_for_cache,
+            seq,
+        )?;
 
         let attn_out = naive_sdpa(
             &q_rot,
@@ -473,8 +740,63 @@ impl Gemma4Moe {
     }
 }
 
+pub const GEMMA4_KV_CACHE_WRITE_AT_USES_SLICE_SET_WHICH_COPIES_INTO_A_PREALLOCATED_BUFFER_IN_PLACE_SO_THE_VIEW_IT_HANDS_BACK_IS_A_GRAPH_LEAF_AND_K_AND_V_WOULD_NOT_TRAIN: &str =
+    "Gemma4KvCache::write_at stores this step's keys and values with Tensor::slice_set, which \
+     writes bytes into a buffer allocated once by new_kv_cache and returns nothing. The buffer \
+     is not a Var and carries no BackpropOp, so cache.view returns Narrow(buffer) -- a graph \
+     leaf. k_rot and v_for_cache are reachable from the loss only through that write, so a \
+     trainer that attends over the cache view gets no gradient entry for k or v at all while q \
+     still trains through its own path into the scores. self_attn.k_proj and self_attn.v_proj \
+     are DEFAULT LoRA targets of train_runner::run and /v1/fine_tuning, their B factor is \
+     zero-initialised, and candle's AdamW::step silently skips a Var with no GradStore entry, so \
+     they stay exactly zero and merge as an exact no-op while the loss falls. The cache held a \
+     differentiable slice_assign until 3272bc550 (2026-08-15) traded it for the in-place write. \
+     Splicing this step's own live k and v back over the tail of the view restores the entry \
+     without moving a byte: the view already holds exactly those values, so the spliced tensor \
+     is bit-identical to it and only its provenance changes. Everything older than this step is \
+     left detached, which is correct -- a previous step's keys are a constant with respect to \
+     this step's gradient. Serving never takes it: on an untracked k the view is returned \
+     unchanged, so the decoder reads the same tensor it always did.";
+
+fn a_gradient_is_being_built_through_this_kv_write(k_new: &Tensor) -> bool {
+    if !k_new.track_op() {
+        return false;
+    }
+    std::env::var("NV_ALLOW_LEAF_GRADIENT_LOSS").ok().as_deref() != Some("1")
+}
+
+pub fn kv_that_keeps_this_steps_own_keys_and_values_on_the_graph(
+    k_view: &Tensor,
+    v_view: &Tensor,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    seq: usize,
+) -> Result<(Tensor, Tensor)> {
+    if !a_gradient_is_being_built_through_this_kv_write(k_new) {
+        let _ = GEMMA4_KV_CACHE_WRITE_AT_USES_SLICE_SET_WHICH_COPIES_INTO_A_PREALLOCATED_BUFFER_IN_PLACE_SO_THE_VIEW_IT_HANDS_BACK_IS_A_GRAPH_LEAF_AND_K_AND_V_WOULD_NOT_TRAIN;
+        return Ok((k_view.clone(), v_view.clone()));
+    }
+    let stored = k_view.dims()[1];
+    if stored < seq {
+        anyhow::bail!(
+            "gemma4_moe: the cache view holds {stored} entries but this step wrote {seq}, so the \
+             write this splice is meant to keep on the graph is not in the view"
+        );
+    }
+    let entries_older_than_this_step = stored - seq;
+    if entries_older_than_this_step == 0 {
+        return Ok((k_new.clone(), v_new.clone()));
+    }
+    let k_prefix = k_view.narrow(1, 0, entries_older_than_this_step)?;
+    let v_prefix = v_view.narrow(1, 0, entries_older_than_this_step)?;
+    Ok((
+        Tensor::cat(&[&k_prefix, k_new], 1)?.contiguous()?,
+        Tensor::cat(&[&v_prefix, v_new], 1)?.contiguous()?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn naive_sdpa(
+pub fn naive_sdpa(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -557,7 +879,7 @@ fn naive_sdpa(
     } else {
         raw_scores.broadcast_add(&mask_t)?
     };
-    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let probs = nv_layers::attn::softmax_last_dim_that_keeps_q_and_k_on_the_graph(&scores)?;
     let out = probs.matmul(&v3e)?;
     Ok(out.transpose(0, 1)?.contiguous()?)
 }
@@ -568,6 +890,7 @@ fn load_layer<S: TensorSource>(
     weights: &S,
     device: &Device,
     dtype: DType,
+    nvfp4_runner: &ExpertNvfp4Runner,
 ) -> Result<Gemma4MoeLayer> {
     let base = &config.base;
     let prefix = format!("model.language_model.layers.{idx}");
@@ -672,7 +995,7 @@ fn load_layer<S: TensorSource>(
         down_proj: Linear::new(down_w, None)?,
     };
 
-    let moe = load_moe_block(config, &prefix, weights, dtype)?;
+    let moe = load_moe_block(config, &prefix, weights, dtype, device, nvfp4_runner)?;
 
     Ok(Gemma4MoeLayer {
         kind,
@@ -695,6 +1018,8 @@ fn load_moe_block<S: TensorSource>(
     prefix: &str,
     weights: &S,
     dtype: DType,
+    device: &Device,
+    nvfp4_runner: &ExpertNvfp4Runner,
 ) -> Result<Gemma4MoeBlock> {
     let hidden = config.base.hidden_size;
     let n_e = config.num_experts;
@@ -747,6 +1072,8 @@ fn load_moe_block<S: TensorSource>(
         );
     }
 
+    let experts = build_expert_storage(n_e, inter, hidden, gate_up, down, device, nvfp4_runner)?;
+
     Ok(Gemma4MoeBlock {
         num_experts: n_e,
         top_k: config.top_k_experts,
@@ -756,25 +1083,51 @@ fn load_moe_block<S: TensorSource>(
         router_proj: Linear::new(router_proj_w, None)?,
         router_scale,
         per_expert_scale,
-        gate_up: gate_up.contiguous()?,
-        down: down.contiguous()?,
+        experts,
     })
 }
 
-fn load_rmsnorm<S: TensorSource>(
-    weights: &S,
-    name: &str,
-    dim: usize,
-    eps: f64,
-    dtype: DType,
-) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    if w.dims() != [dim] {
-        anyhow::bail!("{name}: expected [{dim}], got {:?}", w.dims());
+#[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+fn build_expert_storage(
+    n_e: usize,
+    inter: usize,
+    hidden: usize,
+    gate_up: Tensor,
+    down: Tensor,
+    device: &Device,
+    nvfp4_runner: &ExpertNvfp4Runner,
+) -> Result<Gemma4MoeExperts> {
+    #[cfg(feature = "cuda")]
+    if let (Some(runner), Device::Cuda(_)) = (nvfp4_runner, device) {
+        if expert_dims_meet_nvfp4_min_tile_so_tiny_fixtures_stay_bf16(hidden, inter) {
+            let mut mlps = Vec::with_capacity(n_e);
+            for e in 0..n_e {
+                let gu = gate_up.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
+                let dn = down.narrow(0, e, 1)?.squeeze(0)?.contiguous()?;
+                mlps.push(Gemma4Mlp {
+                    gate_up_proj: Linear::from_bf16_quantized_nvfp4_dev(
+                        &gu,
+                        None,
+                        device,
+                        runner.clone(),
+                    )
+                    .with_context(|| format!("nvfp4-quantize expert {e} gate_up"))?,
+                    down_proj: Linear::from_bf16_quantized_nvfp4_dev(
+                        &dn,
+                        None,
+                        device,
+                        runner.clone(),
+                    )
+                    .with_context(|| format!("nvfp4-quantize expert {e} down"))?,
+                });
+            }
+            return Ok(Gemma4MoeExperts::Nvfp4Resident { mlps });
+        }
     }
-    Ok(RmsNorm::new(w, eps))
+    Ok(Gemma4MoeExperts::Bf16Stacked {
+        gate_up: gate_up.contiguous()?,
+        down: down.contiguous()?,
+    })
 }
 
 pub(crate) fn build_rope(

@@ -1,11 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "fastapi>=0.115",
-#   "uvicorn>=0.30",
-# ]
-# ///
 
 from __future__ import annotations
 

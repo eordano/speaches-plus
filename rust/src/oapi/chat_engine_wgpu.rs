@@ -43,7 +43,14 @@ pub const DEFAULT_MAX_NEW_TOKENS: usize = 512;
 pub const MAX_SEQ_ENV: &str = "NV_WGPU_CHAT_MAX_SEQ";
 pub const WARMUP_ENV: &str = "NV_WGPU_WARMUP";
 
-pub const PREFIX_REUSE_ENV: &str = "NV_WGPU_PREFIX_REUSE";
+pub const PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM: &str =
+    "NV_WGPU_PREFIX_REUSE";
+
+pub const PREFIX_REUSE_GRID_ENV_DEFAULT_4096_SET_0_FOR_THE_SINGLE_CHECKPOINT_ARM: &str =
+    "NV_WGPU_PREFIX_REUSE_GRID";
+
+pub const GRID_DEFAULT_TOKENS_PER_BOUNDARY_SLOTS_ALLOCATE_LAZILY_SO_SHORT_PREFIXES_PAY_NOTHING:
+    usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WgpuModelKind {
@@ -90,25 +97,15 @@ impl WgpuModelKind {
 }
 
 pub fn classify_wgpu_model(raw_cfg: &str) -> anyhow::Result<WgpuModelKind> {
+    use crate::oapi::model_family_tags::{architectures_and_model_type_tags, qwen3_5_tag, Qwen3_5Tag};
     let v: serde_json::Value =
         serde_json::from_str(raw_cfg).map_err(|e| anyhow::anyhow!("parse config.json: {e}"))?;
-    let mut tags: Vec<String> = Vec::new();
-    if let Some(arr) = v.get("architectures").and_then(|x| x.as_array()) {
-        tags.extend(
-            arr.iter()
-                .filter_map(|a| a.as_str())
-                .map(|s| s.to_ascii_lowercase()),
-        );
-    }
-    if let Some(mt) = v.get("model_type").and_then(|x| x.as_str()) {
-        tags.push(mt.to_ascii_lowercase());
-    }
+    let tags = architectures_and_model_type_tags(&v);
     let is = |pat: &str| tags.iter().any(|t| t.starts_with(pat));
-    if is("qwen3_5moe") || is("qwen3_5_moe") || is("qwen3.5moe") || is("qwen3.5_moe") {
-        return Ok(WgpuModelKind::Qwen3_5Moe);
-    }
-    if is("qwen3_5") || is("qwen3.5") {
-        return Ok(WgpuModelKind::Qwen3_5Dense);
+    match qwen3_5_tag(&tags) {
+        Qwen3_5Tag::Moe => return Ok(WgpuModelKind::Qwen3_5Moe),
+        Qwen3_5Tag::Dense => return Ok(WgpuModelKind::Qwen3_5Dense),
+        Qwen3_5Tag::Neither => {}
     }
     if is("gpt_oss") || is("gptoss") || is("gpt-oss") {
         return Ok(WgpuModelKind::GptOss);
@@ -546,8 +543,12 @@ impl Decoder {
             Self::Qwen3_5Dense(m) => {
                 m.install_mrope_rows_for_prompt_and_shift_continuation_rows_by_delta(pos, section)
             }
+            Self::Qwen3_5Moe(m) => {
+                m.install_mrope_rows_for_prompt_and_shift_continuation_rows_by_delta(pos, section)
+            }
             other => anyhow::bail!(
-                "{}: mrope rope rows are wired only for the qwen3.5-dense wgpu graph",
+                "{}: mrope rope rows are wired only for the qwen3.5-dense and qwen3.5-moe wgpu \
+                 graphs",
                 other.kind().label()
             ),
         }
@@ -560,6 +561,7 @@ impl Decoder {
     ) -> anyhow::Result<usize> {
         match self {
             Self::Qwen3_5Dense(m) => m.prefill_tokens_with_image_rows(tokens, splices),
+            Self::Qwen3_5Moe(m) => m.prefill_tokens_with_image_rows(tokens, splices),
             Self::GptOss(m) => m.prefill_tokens_with_image_rows(tokens, splices),
             Self::Gemma4Dense(m) => m.prefill_tokens_with_embed_rows(tokens, splices),
             Self::Gemma4Moe(m) => m.prefill_tokens_with_embed_rows(tokens, splices),
@@ -651,6 +653,7 @@ impl Decoder {
     fn chain_verify_geometry(&self) -> (usize, usize) {
         match self {
             Self::Gemma4E4b(m) => (m.verify_max_rows(), m.prefill_chunk_len()),
+            Self::Gemma4Moe(m) => (m.verify_max_rows(), m.prefill_chunk_len()),
             Self::Qwen3_5Dense(m) => (m.verify_max_rows(), m.prefill_chunk_len()),
             Self::GptOss(m) => (m.verify_max_rows(), m.prefill_chunk_len()),
             _ => (0, 0),
@@ -658,10 +661,11 @@ impl Decoder {
     }
 
     fn has_chain_verify(&self) -> bool {
-        matches!(
-            self,
-            Self::Gemma4E4b(_) | Self::Qwen3_5Dense(_) | Self::GptOss(_)
-        )
+        match self {
+            Self::Gemma4E4b(_) | Self::Qwen3_5Dense(_) | Self::GptOss(_) => true,
+            Self::Gemma4Moe(m) => m.verify_max_rows() > 0,
+            _ => false,
+        }
     }
 
     fn rewind_limits(&self) -> RewindLimits {
@@ -680,11 +684,45 @@ impl Decoder {
         match self {
             Self::Gemma4Dense(m) => m.rewind_to(pos),
             Self::Gemma4E4b(m) => m.rewind_to(pos),
-            Self::Gemma4Moe(_)
-            | Self::Qwen3_5Moe(_)
-            | Self::Qwen3_5Dense(_)
-            | Self::GptOss(_)
-            | Self::Laguna(_) => Ok(false),
+            Self::Qwen3_5Dense(m) => m.rewind_to(pos),
+            Self::Gemma4Moe(_) | Self::Qwen3_5Moe(_) | Self::GptOss(_) | Self::Laguna(_) => {
+                Ok(false)
+            }
+        }
+    }
+
+    fn resume_checkpoint_pos(&self) -> Option<usize> {
+        match self {
+            Self::Qwen3_5Dense(m) => m.resume_checkpoint_pos(),
+            _ => None,
+        }
+    }
+
+    fn save_resume_checkpoint(&mut self) -> anyhow::Result<bool> {
+        match self {
+            Self::Qwen3_5Dense(m) => m.save_resume_checkpoint(),
+            _ => Ok(false),
+        }
+    }
+
+    fn save_grid_checkpoint(&mut self) -> anyhow::Result<bool> {
+        match self {
+            Self::Qwen3_5Dense(m) => m.save_grid_checkpoint(),
+            _ => Ok(false),
+        }
+    }
+
+    fn grid_checkpoint_at_or_below(&self, pos: usize) -> Option<usize> {
+        match self {
+            Self::Qwen3_5Dense(m) => m.grid_checkpoint_at_or_below(pos),
+            _ => None,
+        }
+    }
+
+    fn grid_tokens(&self) -> usize {
+        match self {
+            Self::Qwen3_5Dense(_) => prefix_reuse_grid_tokens(),
+            _ => 0,
         }
     }
 }
@@ -696,7 +734,20 @@ struct PrefixCache {
 }
 
 fn prefix_reuse_enabled() -> bool {
-    std::env::var(PREFIX_REUSE_ENV).ok().as_deref() == Some("1")
+    std::env::var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM)
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+fn prefix_reuse_grid_tokens() -> usize {
+    if !prefix_reuse_enabled() {
+        return 0;
+    }
+    std::env::var(PREFIX_REUSE_GRID_ENV_DEFAULT_4096_SET_0_FOR_THE_SINGLE_CHECKPOINT_ARM)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(GRID_DEFAULT_TOKENS_PER_BOUNDARY_SLOTS_ALLOCATE_LAZILY_SO_SHORT_PREFIXES_PAY_NOTHING)
 }
 
 fn plan_prefix_reuse(
@@ -714,10 +765,91 @@ fn plan_prefix_reuse(
     {
         return Ok(target);
     }
-    let Some(target) = decoder.rewind_limits().target(prev.frontier, lcp) else {
-        return Ok(0);
+    if let Some(target) = decoder.rewind_limits().target(prev.frontier, lcp) {
+        return Ok(if decoder.rewind_to(target)? { target } else { 0 });
+    }
+    if let Some(target) = decoder
+        .resume_checkpoint_pos()
+        .filter(|p| *p > 0 && *p <= lcp && *p <= prev.frontier)
+    {
+        return Ok(if decoder.rewind_to(target)? { target } else { 0 });
+    }
+    if let Some(target) = decoder.grid_checkpoint_at_or_below(lcp.min(prev.frontier)) {
+        return Ok(if decoder.rewind_to(target)? { target } else { 0 });
+    }
+    Ok(0)
+}
+
+const RESUME_CHUNKS_ROUND_TO_COLD_BOUNDARIES_BECAUSE_CHUNKED_PREFILL_NUMERICS_TRACK_BRACKETS:
+    &str = "a resumed chunked prefill must cut chunks at the boundaries a cold chunked prefill \
+     of the full prompt cuts (multiples of the chunk len counted from absolute position 0): the \
+     chunk graph is not bracket-alignment-invariant, so chunking the tail from `reused` makes a \
+     resumed turn's greedy stream diverge from the cold stream of the identical request";
+
+const CHECKPOINT_SAVES_AT_THE_LAST_COLD_BOUNDARY_BECAUSE_MID_BRACKET_STATE_IS_NOT_COLD_REPRODUCIBLE:
+    &str = "under chunked prefill the resume checkpoint saves at the last cold chunk boundary \
+     inside the prompt instead of last_idx: a cold prefill only materializes recurrent state at \
+     bracket edges, so a boundary checkpoint is the one state a resumed stream can extend with \
+     byte-identical brackets; the M=1 path keeps its last_idx save";
+
+fn prefill_on_cold_chunk_brackets(
+    decoder: &mut Decoder,
+    prompt_ids: &[u32],
+    reused: usize,
+    last_idx: usize,
+    save_ckpt: bool,
+    grid_tokens: usize,
+) -> anyhow::Result<(usize, bool)> {
+    let m = decoder.prefill_chunk_len();
+    let g = if grid_tokens == 0 {
+        0
+    } else {
+        grid_tokens.next_multiple_of(m)
     };
-    Ok(if decoder.rewind_to(target)? { target } else { 0 })
+    let first_bound = reused.next_multiple_of(m).min(last_idx);
+    let ckpt_bound = last_idx / m * m;
+    let mut done = reused;
+    if first_bound == reused + 1 {
+        decoder.prefill_step(prompt_ids[done])?;
+        done = first_bound;
+    } else {
+        done += decoder.prefill_tokens(&prompt_ids[done..first_bound])?;
+    }
+    if done < first_bound {
+        return Ok((done, false));
+    }
+    anyhow::ensure!(
+        done.is_multiple_of(m) || done == last_idx,
+        "{RESUME_CHUNKS_ROUND_TO_COLD_BOUNDARIES_BECAUSE_CHUNKED_PREFILL_NUMERICS_TRACK_BRACKETS}"
+    );
+    while done < ckpt_bound {
+        let next = done
+            .checked_div(g)
+            .map_or(ckpt_bound, |q| ((q + 1) * g).min(ckpt_bound));
+        done += decoder.prefill_tokens(&prompt_ids[done..next])?;
+        if done < next {
+            return Ok((done, false));
+        }
+        if g > 0 && done < ckpt_bound && done.is_multiple_of(g) {
+            anyhow::ensure!(
+                done.is_multiple_of(m),
+                "{CHECKPOINT_SAVES_AT_THE_LAST_COLD_BOUNDARY_BECAUSE_MID_BRACKET_STATE_IS_NOT_COLD_REPRODUCIBLE}"
+            );
+            decoder.save_grid_checkpoint()?;
+        }
+    }
+    let mut saved = false;
+    if save_ckpt && done == ckpt_bound && ckpt_bound > 0 {
+        anyhow::ensure!(
+            ckpt_bound.is_multiple_of(m),
+            "{CHECKPOINT_SAVES_AT_THE_LAST_COLD_BOUNDARY_BECAUSE_MID_BRACKET_STATE_IS_NOT_COLD_REPRODUCIBLE}"
+        );
+        saved = decoder.save_resume_checkpoint()?;
+    }
+    if done == ckpt_bound {
+        done += decoder.prefill_tokens(&prompt_ids[ckpt_bound..last_idx])?;
+    }
+    Ok((done, saved))
 }
 
 impl batch::BatchStepper for Decoder {
@@ -868,14 +1000,18 @@ pub fn spec_route_eligible(
     knobs.enabled
         && !needs_logits
         && (knobs.kinds.admits(kind.spec_chain_slug())
-            || (mtp_opted_in() && kind == WgpuModelKind::Qwen3_5Dense))
+            || (mtp_opted_in() && kind == WgpuModelKind::Qwen3_5Dense)
+            || (learned::g4moe_assistant_opted_in() && kind == WgpuModelKind::Gemma4Moe))
 }
 
 pub fn wgpu_spec_decode_status(
     kind: WgpuModelKind,
     knobs: spec::SpecKnobs,
 ) -> Option<&'static str> {
-    if knobs.enabled && knobs.kinds.admits(kind.spec_chain_slug()) {
+    if knobs.enabled
+        && (knobs.kinds.admits(kind.spec_chain_slug())
+            || (learned::g4moe_assistant_opted_in() && kind == WgpuModelKind::Gemma4Moe))
+    {
         Some("on")
     } else {
         None
@@ -908,6 +1044,7 @@ impl spec::ChainVerifyTarget for DecoderChainTarget<'_> {
         }
         match &mut *self.decoder {
             Decoder::Gemma4E4b(m) => m.verify_chain(batch),
+            Decoder::Gemma4Moe(m) => m.verify_chain(batch),
             Decoder::Qwen3_5Dense(m) => m.verify_chain(batch),
             Decoder::GptOss(m) => m.verify_chain(batch),
             other => anyhow::bail!("{CHAIN_VERIFY_SEAM}; {} has none", other.kind_label()),
@@ -921,10 +1058,15 @@ impl spec::ChainVerifyTarget for DecoderChainTarget<'_> {
             if self.want_hidden {
                 self.hidden_loc = Some(learned::HiddenLoc::Decode);
                 if self.want_hidden_host {
-                    let Decoder::Gemma4E4b(m) = &mut *self.decoder else {
-                        anyhow::bail!("{ASSISTANT_DRAFTER_HIDDEN_ROWS_ARE_GEMMA4_E4B_ONLY}");
-                    };
-                    self.hidden_row = Some(m.decode_hidden_row()?);
+                    match &mut *self.decoder {
+                        Decoder::Gemma4E4b(m) => self.hidden_row = Some(m.decode_hidden_row()?),
+                        Decoder::Gemma4Moe(m) => {
+                            self.hidden_row = Some(
+                                m.decode_prenorm_hidden_row_the_gemma4_assistant_drafter_consumes()?,
+                            )
+                        }
+                        _ => anyhow::bail!("{ASSISTANT_DRAFTER_HIDDEN_ROWS_ARE_GEMMA4_ONLY}"),
+                    }
                 }
             }
             return Ok(());
@@ -936,6 +1078,19 @@ impl spec::ChainVerifyTarget for DecoderChainTarget<'_> {
                     self.hidden_loc = Some(learned::HiddenLoc::Verify(n - 1));
                     if self.want_hidden_host {
                         self.hidden_row = Some(m.verify_hidden_row(n - 1)?);
+                    }
+                }
+            }
+            Decoder::Gemma4Moe(m) => {
+                m.advance(n)?;
+                if self.want_hidden {
+                    self.hidden_loc = Some(learned::HiddenLoc::Verify(n - 1));
+                    if self.want_hidden_host {
+                        self.hidden_row = Some(
+                            m.verify_prenorm_hidden_row_the_gemma4_assistant_drafter_consumes(
+                                n - 1,
+                            )?,
+                        );
                     }
                 }
             }
@@ -952,10 +1107,11 @@ impl spec::ChainVerifyTarget for DecoderChainTarget<'_> {
     }
 }
 
-pub const ASSISTANT_DRAFTER_HIDDEN_ROWS_ARE_GEMMA4_E4B_ONLY: &str =
+pub const ASSISTANT_DRAFTER_HIDDEN_ROWS_ARE_GEMMA4_ONLY: &str =
     "the learned assistant drafter reads the verifier's hidden row, which only gemma4_e4b_wgpu \
-     exposes (decode_hidden_row / verify_hidden_row); every other chain-route kind drafts from the \
-     model-free suffix automaton, so want_hidden must stay false for it";
+     (decode_hidden_row / verify_hidden_row) and gemma4_moe_wgpu (the prenorm taps) expose; \
+     every other chain-route kind drafts from the model-free suffix automaton, so want_hidden \
+     must stay false for it";
 
 struct Shared {
     model_id: String,
@@ -1211,11 +1367,17 @@ impl WgpuChatEngine {
                     Decoder::Gemma4E4b(m) => learned::AssistantSpecDrafter::from_env(&dir, m),
                     _ => None,
                 };
+                let mut moe_assistant = match &decoder {
+                    Decoder::Gemma4Moe(m) => learned::MoeAssistantSpecDrafter::from_env(&dir, m),
+                    _ => None,
+                };
                 let mut prefix = PrefixCache::default();
                 let persist_meta = persist::Meta {
                     model_id: worker_meta.model_id.clone(),
                     kind: kind.label().to_string(),
-                    adapter: adapter.as_deref().map(|p| p.display().to_string()),
+                    adapter: adapter
+                        .as_deref()
+                        .map(persist::adapter_tag_that_changes_when_the_weights_change),
                     max_seq,
                 };
                 let mut persist = persist::Session::from_env(persist_meta.clone());
@@ -1245,6 +1407,7 @@ impl WgpuChatEngine {
                             &mut decoder,
                             &mut prefix,
                             assistant.as_mut(),
+                            moe_assistant.as_mut(),
                             mm_rt.as_ref(),
                             req,
                             &tx,
@@ -2142,13 +2305,238 @@ fn build_decoder(
 
 pub fn check_lora_target_kind(kind: WgpuModelKind, adapter_dir: &Path) -> anyhow::Result<()> {
     anyhow::ensure!(
-        matches!(kind, WgpuModelKind::Gemma4E4b),
-        "lora adapters are wired only for the gemma4-e4b wgpu graph; {} has no lora sites \
-         (adapter {})",
+        matches!(
+            kind,
+            WgpuModelKind::Gemma4E4b | WgpuModelKind::Qwen3_5Dense | WgpuModelKind::Laguna
+        ),
+        "lora adapters are wired only for the gemma4-e4b, qwen3.8-dense and laguna wgpu graphs; \
+         {} has no lora sites (adapter {})",
         kind.label(),
         adapter_dir.display()
     );
     Ok(())
+}
+
+pub const E4B_SERVE_BF16_ESCAPE_ENV: &str = "NV_E4B_SERVE_BF16";
+pub const E4B_W4_DIR_ENV: &str = "NV_E4B_W4_DIR";
+pub const E4B_W4_PROBE_TENSOR: &str = "model.language_model.layers.0.mlp.down_proj.weight_packed";
+pub const E4B_W4_DEFAULT_SIBLING_HUB_REPO: &str = "models--google--gemma-4-E4B-it-qat-w4a16-ct";
+
+pub fn e4b_w4_default_decision(
+    escape_bf16: bool,
+    given_dir_is_pack_quantized: bool,
+    lora_adapter_present_so_the_base_the_adapter_was_tuned_on_stays: bool,
+    sibling: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if escape_bf16
+        || given_dir_is_pack_quantized
+        || lora_adapter_present_so_the_base_the_adapter_was_tuned_on_stays
+    {
+        return None;
+    }
+    sibling
+}
+
+fn e4b_serve_bf16_escaped() -> bool {
+    std::env::var(E4B_SERVE_BF16_ESCAPE_ENV).ok().as_deref() == Some("1")
+}
+
+fn snapshot_has_config_and_resolvable_weights(dir: &Path) -> bool {
+    if !dir.join("config.json").is_file() {
+        return false;
+    }
+    std::fs::read_dir(dir).ok().is_some_and(|rd| {
+        rd.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("model") && n.ends_with(".safetensors") && e.path().metadata().is_ok()
+        })
+    })
+}
+
+fn w4_sibling_snapshot_from(dir_env: &str, hub_repo: &str) -> Option<PathBuf> {
+    if let Ok(d) = std::env::var(dir_env) {
+        let p = PathBuf::from(d);
+        return snapshot_has_config_and_resolvable_weights(&p).then_some(p);
+    }
+    let mut hubs: Vec<PathBuf> = Vec::new();
+    if let Some(h) = std::env::var_os("HF_HUB_CACHE") {
+        hubs.push(PathBuf::from(h));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        hubs.push(PathBuf::from(home).join(".cache/huggingface/hub"));
+    }
+    for hub in hubs {
+        let snaps = hub.join(hub_repo).join("snapshots");
+        let Ok(rd) = std::fs::read_dir(&snaps) else {
+            continue;
+        };
+        let mut cands: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| snapshot_has_config_and_resolvable_weights(p))
+            .collect();
+        cands.sort();
+        if let Some(p) = cands.into_iter().next() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub fn e4b_w4_sibling_snapshot() -> Option<PathBuf> {
+    w4_sibling_snapshot_from(E4B_W4_DIR_ENV, E4B_W4_DEFAULT_SIBLING_HUB_REPO)
+}
+
+fn e4b_default_w4_loader_or_given(
+    given: nv_weights::WeightLoader,
+    model_dir: &Path,
+    adapter_dir: Option<&Path>,
+) -> nv_weights::WeightLoader {
+    let redirect = e4b_w4_default_decision(
+        e4b_serve_bf16_escaped(),
+        given.has(E4B_W4_PROBE_TENSOR),
+        adapter_dir.is_some(),
+        e4b_w4_sibling_snapshot(),
+    );
+    let Some(w4_dir) = redirect else {
+        return given;
+    };
+    match nv_weights::WeightLoader::open_dir(&w4_dir, &candle_core::Device::Cpu) {
+        Ok(w4) if w4.has(E4B_W4_PROBE_TENSOR) => {
+            tracing::info!(
+                weights = %w4_dir.display(),
+                tokenizer_and_template = %model_dir.display(),
+                escape_env = E4B_SERVE_BF16_ESCAPE_ENV,
+                "e4b serves the w4a16 pack-quantized sibling checkpoint's weights by default; \
+                 set the escape env to 1 to serve the given bf16 weights"
+            );
+            w4
+        }
+        Ok(_) => {
+            tracing::warn!(
+                dir = %w4_dir.display(),
+                "e4b w4 sibling snapshot carries no pack-quantized tensors; serving the given weights"
+            );
+            given
+        }
+        Err(e) => {
+            tracing::warn!(
+                dir = %w4_dir.display(),
+                error = format!("{e:#}"),
+                "e4b w4 sibling snapshot failed to open; serving the given weights"
+            );
+            given
+        }
+    }
+}
+
+pub const QWEN35_SERVE_BF16_ESCAPE_ENV: &str = "NV_QWEN35_SERVE_BF16";
+pub const QWEN35_W4_DIR_ENV: &str = "NV_QWEN35_W4_DIR";
+pub const QWEN35_W4_PROBE_TENSOR: &str =
+    "model.language_model.layers.0.mlp.down_proj.weight_packed";
+pub const QWEN35_W4_DEFAULT_SIBLING_HUB_REPO: &str = "models--ig1--Qwen3.5-9B-NVFP4";
+pub const QWEN35_MTP_PROBE_TENSOR: &str = "mtp.pre_fc_norm_embedding.weight";
+
+pub fn qwen35_w4_default_decision(
+    escape_bf16: bool,
+    given_dir_is_pack_quantized: bool,
+    mtp_serving_pins_the_checkpoint_that_carries_the_drafter_head: bool,
+    geometry_matches_the_sibling_so_qwen38_dirs_never_redirect: bool,
+    sibling: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if escape_bf16
+        || given_dir_is_pack_quantized
+        || mtp_serving_pins_the_checkpoint_that_carries_the_drafter_head
+        || !geometry_matches_the_sibling_so_qwen38_dirs_never_redirect
+    {
+        return None;
+    }
+    sibling
+}
+
+fn qwen35_serve_bf16_escaped() -> bool {
+    std::env::var(QWEN35_SERVE_BF16_ESCAPE_ENV).ok().as_deref() == Some("1")
+}
+
+pub fn qwen35_w4_sibling_snapshot() -> Option<PathBuf> {
+    w4_sibling_snapshot_from(QWEN35_W4_DIR_ENV, QWEN35_W4_DEFAULT_SIBLING_HUB_REPO)
+}
+
+pub fn qwen35_dense_geometry_matches(
+    a: &Qwen3_5DenseConfig,
+    b: &Qwen3_5DenseConfig,
+) -> bool {
+    (
+        a.hidden_size,
+        a.num_hidden_layers,
+        a.intermediate_size,
+        a.vocab_size,
+        a.num_attention_heads,
+        a.head_dim,
+        a.linear_num_key_heads,
+        a.linear_num_value_heads,
+    ) == (
+        b.hidden_size,
+        b.num_hidden_layers,
+        b.intermediate_size,
+        b.vocab_size,
+        b.num_attention_heads,
+        b.head_dim,
+        b.linear_num_key_heads,
+        b.linear_num_value_heads,
+    )
+}
+
+fn qwen35_default_w4_loader_or_given(
+    given: nv_weights::WeightLoader,
+    model_dir: &Path,
+    given_cfg: &Qwen3_5DenseConfig,
+) -> nv_weights::WeightLoader {
+    let sibling = qwen35_w4_sibling_snapshot();
+    let geometry_ok = sibling.as_deref().is_some_and(|p| {
+        std::fs::read_to_string(p.join("config.json"))
+            .ok()
+            .and_then(|s| Qwen3_5DenseConfig::from_hf_json_str(&s).ok())
+            .is_some_and(|sc| qwen35_dense_geometry_matches(given_cfg, &sc))
+    });
+    let redirect = qwen35_w4_default_decision(
+        qwen35_serve_bf16_escaped(),
+        given.has(QWEN35_W4_PROBE_TENSOR),
+        mtp_opted_in() && given.has(QWEN35_MTP_PROBE_TENSOR),
+        geometry_ok,
+        sibling,
+    );
+    let Some(w4_dir) = redirect else {
+        return given;
+    };
+    match nv_weights::WeightLoader::open_dir(&w4_dir, &candle_core::Device::Cpu) {
+        Ok(w4) if w4.has(QWEN35_W4_PROBE_TENSOR) => {
+            tracing::info!(
+                weights = %w4_dir.display(),
+                tokenizer_and_template = %model_dir.display(),
+                escape_env = QWEN35_SERVE_BF16_ESCAPE_ENV,
+                "qwen3.5-dense serves the nvfp4 pack-quantized sibling checkpoint's weights by \
+                 default; set the escape env to 1 to serve the given bf16 weights"
+            );
+            w4
+        }
+        Ok(_) => {
+            tracing::warn!(
+                dir = %w4_dir.display(),
+                "qwen3.5 nvfp4 sibling snapshot carries no pack-quantized tensors; serving the \
+                 given weights"
+            );
+            given
+        }
+        Err(e) => {
+            tracing::warn!(
+                dir = %w4_dir.display(),
+                error = format!("{e:#}"),
+                "qwen3.5 nvfp4 sibling snapshot failed to open; serving the given weights"
+            );
+            given
+        }
+    }
 }
 
 fn build_decoder_with_lora(
@@ -2186,8 +2574,16 @@ fn build_decoder_with_lora(
         );
         return Ok(decoder);
     }
-    let loader = nv_weights::WeightLoader::open_dir(model_dir, &candle_core::Device::Cpu)
+    let mut loader = nv_weights::WeightLoader::open_dir(model_dir, &candle_core::Device::Cpu)
         .with_context(|| format!("open weights in {}", model_dir.display()))?;
+    if matches!(kind, WgpuModelKind::Gemma4E4b) {
+        loader = e4b_default_w4_loader_or_given(loader, model_dir, adapter_dir);
+    }
+    if matches!(kind, WgpuModelKind::Qwen3_5Dense) {
+        if let Ok(cfg) = Qwen3_5DenseConfig::from_hf_json_str(raw_cfg) {
+            loader = qwen35_default_w4_loader_or_given(loader, model_dir, &cfg);
+        }
+    }
     let decoder = match kind {
         WgpuModelKind::Gemma4E4b if adapter_dir.is_some() => {
             let adir = adapter_dir.expect("checked");
@@ -2229,10 +2625,26 @@ fn build_decoder_with_lora(
         }
         WgpuModelKind::Gemma4Moe => {
             let cfg = Gemma4MoeConfig::from_hf_json_str(raw_cfg).context("parse gemma4 moe")?;
-            Decoder::Gemma4Moe(Box::new(
-                Gemma4MoeWgpu::from_loader(cfg, &loader, max_seq)
-                    .context("build Gemma4MoeWgpu from loader")?,
-            ))
+            match nv_models::gemma4_gguf::opted_in_qat_q4_gguf_for_snapshot(&cfg) {
+                Some(gguf) => {
+                    tracing::info!(
+                        weights = %gguf.display(),
+                        tokenizer_and_template = %model_dir.display(),
+                        opt_in_env = nv_models::gemma4_gguf::G4MOE_SERVE_QAT_Q4_OPT_IN_ENV,
+                        why_not_default = nv_models::gemma4_gguf::QAT_Q4_GGUF_STAYS_OPT_IN_TOP1_ACC_0_4531_VS_BF16_0_5254_SAME_SESSION,
+                        "gemma4-moe serves the 4-bit QAT GGUF weights because the opt-in env is set"
+                    );
+                    Decoder::Gemma4Moe(Box::new(
+                        Gemma4MoeWgpu::from_gguf(&gguf, max_seq).with_context(|| {
+                            format!("build Gemma4MoeWgpu from default qat gguf {}", gguf.display())
+                        })?,
+                    ))
+                }
+                None => Decoder::Gemma4Moe(Box::new(
+                    Gemma4MoeWgpu::from_loader(cfg, &loader, max_seq)
+                        .context("build Gemma4MoeWgpu from loader")?,
+                )),
+            }
         }
         WgpuModelKind::Qwen3_5Moe => {
             let cfg = Qwen3MoeConfig::from_hf_json_str(raw_cfg).context("parse qwen3.5-moe")?;
@@ -2243,14 +2655,39 @@ fn build_decoder_with_lora(
         WgpuModelKind::Qwen3_5Dense => {
             let cfg =
                 Qwen3_5DenseConfig::from_hf_json_str(raw_cfg).context("parse qwen3.5 dense")?;
-            let mut m = Qwen3_5DenseWgpu::from_loader(cfg, &loader, max_seq)
-                .context("build Qwen3_5DenseWgpu")?;
+            let lora = adapter_dir
+                .map(|adir| {
+                    nv_models::qwen3_5_dense_wgpu::Q3dLora::from_peft_dir(adir, &cfg)
+                        .with_context(|| {
+                            format!("build qwen3.8 lora sites from {}", adir.display())
+                        })
+                })
+                .transpose()?;
+            if let (Some(l), Some(adir)) = (&lora, adapter_dir) {
+                tracing::info!(
+                    adapter = %adir.display(),
+                    rank = l.rank(),
+                    matched_modules = l.matched_modules(),
+                    skipped_modules = l.skipped_modules().len(),
+                    lora_passes = l.total_pass_count(),
+                    "lora adapter resident; chunked prefill, the verify graphs, and the mtp \
+                     head all carry the lora sites"
+                );
+            }
+            let mut m =
+                Qwen3_5DenseWgpu::from_loader_with_lora(cfg, &loader, max_seq, lora.as_ref())
+                    .context("build Qwen3_5DenseWgpu")?;
             if mtp_opted_in() {
-                m.mtp_attach(&loader).context(
-                    "attach the qwen3.8 MTP drafter head (NV_Q3D_MTP=1 on a checkpoint without \
-                     mtp.* tensors cannot serve)",
-                )?;
-                tracing::info!("qwen3.8 mtp drafter head resident");
+                let merged_speculator_modules =
+                    m.mtp_attach_with_adapter(&loader, adapter_dir).context(
+                        "attach the qwen3.8 MTP drafter head (NV_Q3D_MTP=1 on a checkpoint \
+                         without mtp.* tensors cannot serve)",
+                    )?;
+                tracing::info!(
+                    merged_speculator_modules,
+                    "qwen3.8 mtp drafter head resident; a nonzero count means the adapter's \
+                     speculator/ deltas were merged into the head weights at load"
+                );
             }
             Decoder::Qwen3_5Dense(Box::new(m))
         }
@@ -2262,8 +2699,28 @@ fn build_decoder_with_lora(
         }
         WgpuModelKind::Laguna => {
             let cfg = LagunaConfig::from_hf_json_str(raw_cfg).context("parse laguna")?;
+            let lora = adapter_dir
+                .map(|adir| {
+                    nv_models::laguna_wgpu::LagunaLora::from_peft_dir(adir, &cfg)
+                        .with_context(|| {
+                            format!("build laguna lora sites from {}", adir.display())
+                        })
+                })
+                .transpose()?;
+            if let (Some(l), Some(adir)) = (&lora, adapter_dir) {
+                tracing::info!(
+                    adapter = %adir.display(),
+                    rank = l.rank(),
+                    matched_modules = l.matched_modules(),
+                    skipped_modules = l.skipped_modules().len(),
+                    lora_passes = l.total_pass_count(),
+                    "lora adapter resident; the decode, chunked-prefill and verify submissions \
+                     replay one pass list, so all of them carry the lora sites"
+                );
+            }
             Decoder::Laguna(Box::new(
-                LagunaWgpu::from_loader(cfg, &loader, max_seq).context("build LagunaWgpu")?,
+                LagunaWgpu::from_loader_with_lora(cfg, &loader, max_seq, lora.as_ref())
+                    .context("build LagunaWgpu")?,
             ))
         }
     };
@@ -2387,6 +2844,92 @@ fn push_reasoning_if_no_answer(
     let reasoning = crate::oapi::chat_template::harmony_reasoning_text(&raw);
     if !reasoning.trim().is_empty() {
         let _ = push_blocking(tx, ChatEvent::ReasoningDelta(reasoning), timeout);
+    }
+}
+
+const STREAM_ANALYSIS_ENV_OPTS_IN_TO_PER_STEP_GPTOSS_REASONING_DELTAS: &str =
+    "NV_GPTOSS_STREAM_ANALYSIS";
+
+fn stream_analysis_enabled(kind: WgpuModelKind) -> bool {
+    kind == WgpuModelKind::GptOss
+        && std::env::var(STREAM_ANALYSIS_ENV_OPTS_IN_TO_PER_STEP_GPTOSS_REASONING_DELTAS)
+            .ok()
+            .as_deref()
+            == Some("1")
+}
+
+struct AnalysisStream {
+    active: bool,
+    sent: usize,
+}
+
+impl AnalysisStream {
+    fn new(kind: WgpuModelKind) -> Self {
+        Self {
+            active: stream_analysis_enabled(kind),
+            sent: 0,
+        }
+    }
+
+    fn piece(&mut self, reasoning: &str, terminal: bool) -> Option<String> {
+        let safe = if terminal {
+            reasoning.len()
+        } else {
+            crate::oapi::chat_template::harmony_stream_safe_len(reasoning)
+        };
+        if safe <= self.sent {
+            return None;
+        }
+        if self.sent == 0 && reasoning[..safe].trim().is_empty() {
+            return None;
+        }
+        let piece = reasoning.get(self.sent..safe)?.to_string();
+        self.sent = safe;
+        Some(piece)
+    }
+
+    fn step(
+        &mut self,
+        shared: &Shared,
+        generated: &[u32],
+        tx: &mpsc::Sender<ChatEvent>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        if !self.active || generated.is_empty() {
+            return true;
+        }
+        let Ok(raw) = shared.tokenizer.decode(generated, false) else {
+            return true;
+        };
+        let reasoning = crate::oapi::chat_template::harmony_reasoning_text(&raw);
+        match self.piece(&reasoning, false) {
+            Some(p) => push_blocking(tx, ChatEvent::ReasoningDelta(p), timeout) == Push::Sent,
+            None => true,
+        }
+    }
+
+    fn finish(
+        &mut self,
+        shared: &Shared,
+        generated: &[u32],
+        visible: &str,
+        tx: &mpsc::Sender<ChatEvent>,
+        timeout: std::time::Duration,
+    ) {
+        if !self.active {
+            push_reasoning_if_no_answer(shared, generated, visible, tx, timeout);
+            return;
+        }
+        if generated.is_empty() {
+            return;
+        }
+        let Ok(raw) = shared.tokenizer.decode(generated, false) else {
+            return;
+        };
+        let reasoning = crate::oapi::chat_template::harmony_reasoning_text(&raw);
+        if let Some(p) = self.piece(&reasoning, true) {
+            let _ = push_blocking(tx, ChatEvent::ReasoningDelta(p), timeout);
+        }
     }
 }
 
@@ -2587,6 +3130,7 @@ struct StreamSlot {
     timeout: std::time::Duration,
     scanner: StopScanner,
     visible: VisibleStream,
+    analysis: AnalysisStream,
     generated: Vec<u32>,
     max_new: usize,
     finish_reason: &'static str,
@@ -2612,6 +3156,13 @@ impl batch::SlotSink for StreamSlot {
             self.aborted = true;
             return Ok(batch::SlotStep::Done);
         }
+        if !self
+            .analysis
+            .step(&self.shared, &self.generated, &self.tx, self.timeout)
+        {
+            self.aborted = true;
+            return Ok(batch::SlotStep::Done);
+        }
         if stop_hit {
             self.finish_reason = "stop";
             return Ok(batch::SlotStep::Done);
@@ -2632,13 +3183,8 @@ impl batch::SlotSink for StreamSlot {
             if !tail.is_empty() {
                 let _ = push_blocking(&self.tx, ChatEvent::TextDelta(tail), self.timeout);
             }
-            push_reasoning_if_no_answer(
-                &self.shared,
-                &self.generated,
-                &full,
-                &self.tx,
-                self.timeout,
-            );
+            self.analysis
+                .finish(&self.shared, &self.generated, &full, &self.tx, self.timeout);
         }
         if let Some(stop_sequence) = self.scanner.matched.take() {
             let _ = push_blocking(&self.tx, ChatEvent::StoppedBy { stop_sequence }, self.timeout);
@@ -2725,6 +3271,7 @@ fn run_batch_blocking(
                 timeout,
                 scanner: StopScanner::new(&req.stop),
                 visible: VisibleStream::new(shared.kind),
+                analysis: AnalysisStream::new(shared.kind),
                 generated: Vec::with_capacity(max_new),
                 max_new,
                 finish_reason: "length",
@@ -2774,6 +3321,7 @@ fn run_blocking(
     decoder: &mut Decoder,
     prefix: &mut PrefixCache,
     mut assistant: Option<&mut learned::AssistantSpecDrafter>,
+    mut moe_assistant: Option<&mut learned::MoeAssistantSpecDrafter>,
     mm_rt: Option<&mm::MmRuntime>,
     req: ChatGenerateRequest,
     tx: &mpsc::Sender<ChatEvent>,
@@ -2990,6 +3538,7 @@ fn run_blocking(
         }
         (None, None) => Vec::new(),
     };
+    let mut ckpt_saved = false;
     let chunked = if mm_active {
         anyhow::ensure!(
             chunked_prefill_enabled() && decoder.prefill_chunk_len() > 0,
@@ -3004,11 +3553,32 @@ fn run_blocking(
         );
         done
     } else if chunked_prefill_enabled() && decoder.prefill_chunk_len() > 0 && last_idx >= 2 {
-        reused + decoder.prefill_tokens(&prompt_ids[reused..last_idx])?
+        let grid_tokens = decoder.grid_tokens();
+        let (done, saved) = prefill_on_cold_chunk_brackets(
+            decoder,
+            &prompt_ids,
+            reused,
+            last_idx,
+            prefix_reuse_enabled(),
+            grid_tokens,
+        )?;
+        ckpt_saved = saved;
+        done
     } else {
         reused
     };
+    let m1_grid = if mm_active || chunked_prefill_enabled() && decoder.prefill_chunk_len() > 0 {
+        0
+    } else {
+        decoder.grid_tokens()
+    };
     for (i, t) in prompt_ids.iter().enumerate().skip(chunked) {
+        if m1_grid > 0 && i > 0 && i < last_idx && i.is_multiple_of(m1_grid) {
+            decoder.save_grid_checkpoint()?;
+        }
+        if i == last_idx && !mm_active && prefix_reuse_enabled() && !ckpt_saved {
+            decoder.save_resume_checkpoint()?;
+        }
         if i == last_idx && needs_logits {
             let (g, l) = decoder.step_logits(*t)?;
             greedy = g;
@@ -3031,6 +3601,9 @@ fn run_blocking(
     };
     let mut last = picked.token;
 
+    if let Some(a) = moe_assistant.as_mut() {
+        a.begin_request();
+    }
     let knobs = spec::SpecKnobs::from_env();
     let mut spec_state: Option<(spec::SpecLoop, VecDeque<u32>)> =
         if spec_route_eligible(shared.kind, needs_logits, knobs) && decoder.has_chain_verify() {
@@ -3065,6 +3638,7 @@ fn run_blocking(
     let mut generated: Vec<u32> = Vec::with_capacity(max_new);
     let mut scanner = StopScanner::new(&req.stop);
     let mut visible = VisibleStream::new(shared.kind);
+    let mut analysis = AnalysisStream::new(shared.kind);
     let mut completion_tokens = 0u32;
     let mut finish_reason = "length".to_string();
     let mut aborted = false;
@@ -3107,6 +3681,10 @@ fn run_blocking(
             aborted = true;
             break;
         }
+        if !analysis.step(shared, &generated, tx, timeout) {
+            aborted = true;
+            break;
+        }
         if req.logprobs {
             let entry = logprob_entry(&shared.tokenizer, last, picked.logprob, &picked.top);
             if push_blocking(tx, ChatEvent::Logprob(entry), timeout) != Push::Sent {
@@ -3134,7 +3712,7 @@ fn run_blocking(
                 );
                 let t_round = std::time::Instant::now();
                 let drafted_before = sl.stats().rounds_with_draft;
-                let assistant_on = assistant.is_some()
+                let assistant_on = (assistant.is_some() || moe_assistant.is_some())
                     && match ema_floor_override {
                         Some(f) => sl.ema_value() >= f,
                         None => gate.should_draft(probe_rounds),
@@ -3144,8 +3722,8 @@ fn run_blocking(
                     let (rows, span) = decoder.chain_verify_geometry();
                     let cap =
                         spec::chain_capacity(rows, decoder.current_pos(), span, shared.max_seq);
+                    let want = sl.knobs().k.min(cap.saturating_sub(1));
                     if let (Some(a), Decoder::Gemma4E4b(m)) = (assistant.as_mut(), &mut *decoder) {
-                        let want = sl.knobs().k.min(cap.saturating_sub(1));
                         let proposed = if want == 0 {
                             None
                         } else if a.gpu_active() {
@@ -3161,6 +3739,25 @@ fn run_blocking(
                             Some(Err(e)) => tracing::warn!(
                                 error = %format!("{e:#}"),
                                 "assistant drafter propose failed; suffix fallback this round"
+                            ),
+                        }
+                    }
+                    if let (Some(a), Decoder::Gemma4Moe(m)) =
+                        (moe_assistant.as_mut(), &mut *decoder)
+                    {
+                        let proposed = if want == 0 {
+                            None
+                        } else {
+                            drafter_hidden
+                                .as_deref()
+                                .map(|h| a.propose(m, last, h, want))
+                        };
+                        match proposed {
+                            Some(Ok(d)) if !d.is_empty() => learned_draft = Some(d),
+                            Some(Ok(_)) | None => {}
+                            Some(Err(e)) => tracing::warn!(
+                                error = %format!("{e:#}"),
+                                "gemma4-moe assistant propose failed; suffix fallback this round"
                             ),
                         }
                     }
@@ -3205,7 +3802,7 @@ fn run_blocking(
                     None if mtp_on => sl.round_with_draft(&mut tgt, last, Vec::new())?,
                     None => match learned_draft {
                         Some(d) => sl.round_with_draft(&mut tgt, last, d)?,
-                        None if assistant.is_some() => {
+                        None if assistant.is_some() || moe_assistant.is_some() => {
                             let probe = sl.propose_draft_min(
                                 spec::ChainVerifyTarget::capacity(&tgt),
                                 probe_min_match,
@@ -3334,7 +3931,7 @@ fn run_blocking(
             if !tail.is_empty() {
                 let _ = push_blocking(tx, ChatEvent::TextDelta(tail), timeout);
             }
-            push_reasoning_if_no_answer(shared, &generated, &full, tx, timeout);
+            analysis.finish(shared, &generated, &full, tx, timeout);
         }
     }
 
@@ -3609,6 +4206,20 @@ fn served_ids() -> &'static std::sync::Mutex<Vec<String>> {
     WGPU_SERVED_IDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+pub fn record_wgpu_model_id(id: &str) {
+    if let Ok(mut v) = served_ids().lock() {
+        if !v.iter().any(|x| x == id) {
+            v.push(id.to_string());
+        }
+    }
+}
+
+pub fn unrecord_wgpu_model_id(id: &str) {
+    if let Ok(mut v) = served_ids().lock() {
+        v.retain(|x| x != id);
+    }
+}
+
 pub fn registered_wgpu_model_ids() -> Vec<String> {
     served_ids().lock().map(|v| v.clone()).unwrap_or_default()
 }
@@ -3701,11 +4312,9 @@ pub fn registry_from_env_with_wgpu() -> Option<ChatRegistry> {
             let mut all: Vec<Arc<dyn ChatEngine>> = Vec::new();
             let mut taken: Vec<String> = Vec::new();
             if let Some(base) = &base {
-                for id in base.model_ids() {
-                    if let Some(e) = base.engines.get(id) {
-                        all.push(e.clone());
-                        taken.push(id.clone());
-                    }
+                for (id, e) in base.entries_in_order() {
+                    all.push(e);
+                    taken.push(id);
                 }
             }
             let mut added: Vec<Arc<dyn ChatEngine>> = Vec::new();
@@ -3725,7 +4334,14 @@ pub fn registry_from_env_with_wgpu() -> Option<ChatRegistry> {
     }
 }
 
+static WGPU_BASE_DIRS: std::sync::OnceLock<Vec<(String, PathBuf)>> = std::sync::OnceLock::new();
+
+pub fn wgpu_base_dirs() -> Vec<(String, PathBuf)> {
+    WGPU_BASE_DIRS.get().cloned().unwrap_or_default()
+}
+
 fn attach_env_adapters(out: &mut Vec<Arc<dyn ChatEngine>>, bases: &[(String, PathBuf)]) {
+    let _ = WGPU_BASE_DIRS.set(bases.to_vec());
     let configured = std::env::var_os(lora::ADAPTER_DIRS_ENV).is_some();
     let mut cat = lora::catalog_from_env();
     let base_ids: Vec<String> = bases.iter().map(|(id, _)| id.clone()).collect();
@@ -4639,5 +5255,234 @@ mod incr_detok {
             "at {n} tokens the O(n^2) full-redecode loop ({full_s:.3}s) must cost more than the \
              incremental window loop ({incr_s:.3}s)"
         );
+    }
+}
+
+#[cfg(test)]
+mod analysis_stream_tests {
+    use super::*;
+    use crate::oapi::chat_template::harmony_reasoning_text;
+
+    const HARMONY_MARKUP: [&str; 7] = [
+        "<|channel|>",
+        "<|message|>",
+        "<|start|>",
+        "<|end|>",
+        "<|return|>",
+        "<|call|>",
+        "<|constrain|>",
+    ];
+
+    fn stream_arm(raw: &str) -> Vec<String> {
+        let mut s = AnalysisStream {
+            active: true,
+            sent: 0,
+        };
+        let mut pieces = Vec::new();
+        for cut in 0..=raw.len() {
+            if !raw.is_char_boundary(cut) {
+                continue;
+            }
+            let now = harmony_reasoning_text(&raw[..cut]);
+            if let Some(p) = s.piece(&now, false) {
+                pieces.push(p);
+            }
+        }
+        if let Some(p) = s.piece(&harmony_reasoning_text(raw), true) {
+            pieces.push(p);
+        }
+        pieces
+    }
+
+    fn buffered_arm(raw: &str) -> String {
+        let reasoning = harmony_reasoning_text(raw);
+        if reasoning.trim().is_empty() {
+            String::new()
+        } else {
+            reasoning
+        }
+    }
+
+    fn assert_arms_identical(raw: &str) {
+        let pieces = stream_arm(raw);
+        for p in &pieces {
+            assert!(!p.is_empty(), "empty delta streamed for {raw:?}");
+            for m in HARMONY_MARKUP {
+                assert!(!p.contains(m), "marker {m} leaked in delta {p:?} for {raw:?}");
+            }
+        }
+        assert_eq!(
+            pieces.concat(),
+            buffered_arm(raw),
+            "streamed reasoning must reassemble to the buffered terminal flush byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn streamed_deltas_reassemble_the_buffered_flush_for_a_truncated_analysis() {
+        let raw = "<|channel|>analysis<|message|>Count: 1, 2, caf\u{E9} \u{2014} still counting";
+        assert_arms_identical(raw);
+        assert!(
+            stream_arm(raw).len() > 1,
+            "a multi-word analysis must stream as more than one delta"
+        );
+    }
+
+    #[test]
+    fn streamed_deltas_reassemble_across_channel_transitions() {
+        assert_arms_identical(
+            "<|channel|>analysis<|message|>First thought.<|end|>\
+             <|start|>assistant<|channel|>analysis<|message|>Second thought.<|end|>\
+             <|start|>assistant<|channel|>final<|message|>Four.",
+        );
+        assert_arms_identical(
+            "<|channel|>analysis<|message|>Check the request.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.f <|constrain|>json\
+             <|message|>{\"x\":1}<|call|>",
+        );
+    }
+
+    #[test]
+    fn whitespace_only_analysis_streams_nothing_like_the_buffered_arm() {
+        assert_arms_identical("<|channel|>analysis<|message|> \n ");
+        assert_arms_identical("just plain text with no channels");
+        assert_arms_identical("");
+    }
+
+    #[test]
+    fn the_env_gate_is_off_by_default_and_scoped_to_gpt_oss() {
+        std::env::set_var(
+            STREAM_ANALYSIS_ENV_OPTS_IN_TO_PER_STEP_GPTOSS_REASONING_DELTAS,
+            "1",
+        );
+        assert!(stream_analysis_enabled(WgpuModelKind::GptOss));
+        assert!(!stream_analysis_enabled(WgpuModelKind::Gemma4E4b));
+        std::env::remove_var(STREAM_ANALYSIS_ENV_OPTS_IN_TO_PER_STEP_GPTOSS_REASONING_DELTAS);
+        assert!(
+            !stream_analysis_enabled(WgpuModelKind::GptOss),
+            "streaming analysis is opt-in; the default arm stays buffered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod e4b_w4_default_tests {
+    use super::*;
+
+    fn sib() -> Option<PathBuf> {
+        Some(PathBuf::from("/hub/models--google--gemma-4-E4B-it-qat-w4a16-ct/snapshots/6cd26aaa"))
+    }
+
+    #[test]
+    fn a_bf16_e4b_dir_defaults_to_the_w4_sibling_weights() {
+        assert_eq!(e4b_w4_default_decision(false, false, false, sib()), sib());
+    }
+
+    #[test]
+    fn the_escape_env_keeps_the_given_bf16_weights() {
+        assert_eq!(e4b_w4_default_decision(true, false, false, sib()), None);
+    }
+
+    #[test]
+    fn an_already_pack_quantized_dir_is_never_redirected() {
+        assert_eq!(e4b_w4_default_decision(false, true, false, sib()), None);
+        assert_eq!(e4b_w4_default_decision(true, true, false, sib()), None);
+    }
+
+    #[test]
+    fn a_lora_adapter_pins_the_base_weights_it_was_tuned_on() {
+        assert_eq!(e4b_w4_default_decision(false, false, true, sib()), None);
+    }
+
+    #[test]
+    fn no_sibling_snapshot_means_the_given_weights_serve() {
+        assert_eq!(e4b_w4_default_decision(false, false, false, None), None);
+    }
+
+    #[test]
+    fn the_probe_tensor_is_the_first_layers_packed_down_proj() {
+        assert_eq!(
+            E4B_W4_PROBE_TENSOR,
+            "model.language_model.layers.0.mlp.down_proj.weight_packed"
+        );
+        assert!(E4B_W4_DEFAULT_SIBLING_HUB_REPO.contains("qat-w4a16-ct"));
+    }
+}
+
+#[cfg(test)]
+mod qwen35_w4_default_tests {
+    use super::*;
+
+    fn sib() -> Option<PathBuf> {
+        Some(PathBuf::from(
+            "/hub/models--ig1--Qwen3.5-9B-NVFP4/snapshots/0aa11bb2",
+        ))
+    }
+
+    #[test]
+    fn a_bf16_qwen35_9b_dir_defaults_to_the_nvfp4_sibling_weights() {
+        assert_eq!(
+            qwen35_w4_default_decision(false, false, false, true, sib()),
+            sib()
+        );
+    }
+
+    #[test]
+    fn the_escape_env_keeps_the_given_bf16_weights() {
+        assert_eq!(qwen35_w4_default_decision(true, false, false, true, sib()), None);
+    }
+
+    #[test]
+    fn an_already_pack_quantized_dir_is_never_redirected() {
+        assert_eq!(qwen35_w4_default_decision(false, true, false, true, sib()), None);
+        assert_eq!(qwen35_w4_default_decision(true, true, false, true, sib()), None);
+    }
+
+    #[test]
+    fn mtp_serving_pins_the_checkpoint_that_carries_the_drafter_head() {
+        assert_eq!(qwen35_w4_default_decision(false, false, true, true, sib()), None);
+    }
+
+    #[test]
+    fn a_geometry_mismatch_never_redirects_so_qwen38_27b_dirs_keep_their_weights() {
+        assert_eq!(
+            qwen35_w4_default_decision(false, false, false, false, sib()),
+            None
+        );
+    }
+
+    #[test]
+    fn no_sibling_snapshot_means_the_given_weights_serve() {
+        assert_eq!(qwen35_w4_default_decision(false, false, false, true, None), None);
+    }
+
+    #[test]
+    fn the_9b_and_27b_shapes_disagree_through_the_geometry_gate() {
+        let raw_9b = r#"{"text_config": {"attn_output_gate": true, "eos_token_id": 248044,
+            "full_attention_interval": 4, "head_dim": 256, "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32, "linear_value_head_dim": 128,
+            "max_position_embeddings": 262144, "num_attention_heads": 16, "num_hidden_layers": 4,
+            "num_key_value_heads": 4, "rms_norm_eps": 1e-06, "vocab_size": 248320,
+            "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25}}}"#;
+        let a = Qwen3_5DenseConfig::from_hf_json_str(raw_9b).expect("9b-shaped config");
+        let raw_27b = raw_9b
+            .replace("\"hidden_size\": 4096", "\"hidden_size\": 5120")
+            .replace("\"intermediate_size\": 12288", "\"intermediate_size\": 17408");
+        let b = Qwen3_5DenseConfig::from_hf_json_str(&raw_27b).expect("27b-shaped config");
+        assert!(qwen35_dense_geometry_matches(&a, &a.clone()));
+        assert!(!qwen35_dense_geometry_matches(&a, &b));
+    }
+
+    #[test]
+    fn the_probe_tensors_name_the_packed_down_proj_and_the_mtp_head() {
+        assert_eq!(
+            QWEN35_W4_PROBE_TENSOR,
+            "model.language_model.layers.0.mlp.down_proj.weight_packed"
+        );
+        assert_eq!(QWEN35_MTP_PROBE_TENSOR, "mtp.pre_fc_norm_embedding.weight");
+        assert!(QWEN35_W4_DEFAULT_SIBLING_HUB_REPO.contains("ig1--Qwen3.5-9B-NVFP4"));
     }
 }

@@ -1,0 +1,180 @@
+{
+  "name": "090-scale-50mp-broadsheet",
+  "family": "090-scale",
+  "description": "50MP broadsheet scan: 0.475x single-pass downscale takes micro print to a 16px em; the acceptance fixture the tiered path must read.",
+  "input": "input.png",
+  "expected_text": "THE MERIDIAN LEDGER\nFounded 1908. Weekend Edition, 14 November 2026.\nTidal Array Delivers First Power to Grid\nThe Stormness tidal array fed 18 megawatts into the northern grid on Thursday, three weeks ahead of\nschedule. Engineers credit the redesigned blade pitch controller, which survived the spring tides that\ndestroyed the 2023 prototype field, and a subsea hub that lets divers isolate one turbine without\ndarkening the whole string.\nTurbine seven remains offline after a seal failure flooded its nacelle in October. Divers recovered the\nunit intact and the operator expects a rebuilt gearbox to spin by January, with the insurance survey\nalready closed out and spares landed at the quayside store.\nShipping Notices\nMV Kittiwake, berth 4, discharging aggregate until Tuesday.\nMV Solan Goose, berth 9, loading 2,400 t of cured timber.\nPilot boarding moves to the eastern anchorage from 06:00.\nTide table, Stormness Sound: high 04:41 and 17:02, low 10:48 and 23:11.\nHeights 3.4 m and 3.1 m. Springs return on the 21st. Chart datum LAT.\nNotice 2026-118: racon on the Skerry buoy unreliable until further notice.\nClassified index: employment 12, marine sales 14, legal notices 15, tenders 17.\nPrinted at Quayside Works on 45 gsm newsprint. ISSN 0140-7723. Price two pounds.\nCouncil Approves Breakwater Levy\nA harbour levy of 40 pence per landed tonne passed by nine votes to three on Wednesday night. Proceeds\nare ring-fenced for the eastern breakwater rebuild, estimated at 6.2 million pounds over four seasons of\nwork, and the first caisson contract goes to tender in February.\nFisheries representatives abstained, calling instead for a berthing rebate for vessels under twelve\nmetres. The council agreed to review the rebate at the March sitting once a season of levy receipts can\nbe set against the dredging account.\nWeather and Sea State\nSaturday: southwest gale eight, easing six by evening. Rain.\nSunday: west five, showers, good visibility between squalls.\nSea area Fair Isle: rough becoming moderate. Icing nil.\nCorrections: last week's edition gave the Kittiwake's tonnage as 4,100; the correct\nfigure is 4,010 gross tonnes. The Ledger regrets the error. Contact corrections@ledger.\nFerry Timetable Consultation Opens\nThe winter timetable consultation runs until 5 December. Proposals cut the Tuesday freight-only sailing\nand add a late Friday passenger run. Responses go to the transport partnership office or any harbour\nmaster's post box before the closing date.\nSchool Boat Prize Returns to Northside\nNorthside Secondary took the inter-school sailing trophy for the third year, finishing four points clear\nover the combined southern crews in a shifting easterly breeze that favoured the lighter boats.",
+  "render": {
+    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "page_px": [
+      5936,
+      8408
+    ],
+    "megapixels": 49.91,
+    "single_pass_downscale_at_default_cap": 0.476
+  },
+  "regions": [
+    {
+      "bbox": [
+        260,
+        332,
+        2360,
+        465
+      ],
+      "tier": "heading",
+      "text": "THE MERIDIAN LEDGER"
+    },
+    {
+      "bbox": [
+        260,
+        651,
+        2410,
+        729
+      ],
+      "tier": "heading",
+      "text": "Founded 1908. Weekend Edition, 14 November 2026."
+    },
+    {
+      "bbox": [
+        260,
+        1007,
+        4319,
+        1560
+      ],
+      "tier": "body",
+      "text": "Tidal Array Delivers First Power to Grid\nThe Stormness tidal array fed 18 megawatts into the northern grid on Thursday, three weeks ahead of\nschedule. Engineers credit the redesigned blade pitch controller, which survived the spring tides that\ndestroyed the 2023 prototype field, and a subsea hub that lets divers isolate one turbine without\ndarkening the whole string."
+    },
+    {
+      "bbox": [
+        260,
+        1852,
+        4245,
+        2171
+      ],
+      "tier": "body",
+      "text": "Turbine seven remains offline after a seal failure flooded its nacelle in October. Divers recovered the\nunit intact and the operator expects a rebuilt gearbox to spin by January, with the insurance survey\nalready closed out and spares landed at the quayside store."
+    },
+    {
+      "bbox": [
+        260,
+        2507,
+        1158,
+        2610
+      ],
+      "tier": "heading",
+      "text": "Shipping Notices"
+    },
+    {
+      "bbox": [
+        260,
+        2750,
+        1587,
+        2926
+      ],
+      "tier": "fine",
+      "text": "MV Kittiwake, berth 4, discharging aggregate until Tuesday.\nMV Solan Goose, berth 9, loading 2,400 t of cured timber.\nPilot boarding moves to the eastern anchorage from 06:00."
+    },
+    {
+      "bbox": [
+        260,
+        3181,
+        1321,
+        3296
+      ],
+      "tier": "micro",
+      "text": "Tide table, Stormness Sound: high 04:41 and 17:02, low 10:48 and 23:11.\nHeights 3.4 m and 3.1 m. Springs return on the 21st. Chart datum LAT.\nNotice 2026-118: racon on the Skerry buoy unreliable until further notice."
+    },
+    {
+      "bbox": [
+        260,
+        3507,
+        1497,
+        3580
+      ],
+      "tier": "micro",
+      "text": "Classified index: employment 12, marine sales 14, legal notices 15, tenders 17.\nPrinted at Quayside Works on 45 gsm newsprint. ISSN 0140-7723. Price two pounds."
+    },
+    {
+      "bbox": [
+        260,
+        3905,
+        2105,
+        4008
+      ],
+      "tier": "heading",
+      "text": "Council Approves Breakwater Levy"
+    },
+    {
+      "bbox": [
+        259,
+        4164,
+        4510,
+        4483
+      ],
+      "tier": "body",
+      "text": "A harbour levy of 40 pence per landed tonne passed by nine votes to three on Wednesday night. Proceeds\nare ring-fenced for the eastern breakwater rebuild, estimated at 6.2 million pounds over four seasons of\nwork, and the first caisson contract goes to tender in February."
+    },
+    {
+      "bbox": [
+        260,
+        4775,
+        4355,
+        5094
+      ],
+      "tier": "body",
+      "text": "Fisheries representatives abstained, calling instead for a berthing rebate for vessels under twelve\nmetres. The council agreed to review the rebate at the March sitting once a season of levy receipts can\nbe set against the dredging account."
+    },
+    {
+      "bbox": [
+        260,
+        5430,
+        1446,
+        5511
+      ],
+      "tier": "heading",
+      "text": "Weather and Sea State"
+    },
+    {
+      "bbox": [
+        260,
+        5672,
+        1600,
+        5849
+      ],
+      "tier": "fine",
+      "text": "Saturday: southwest gale eight, easing six by evening. Rain.\nSunday: west five, showers, good visibility between squalls.\nSea area Fair Isle: rough becoming moderate. Icing nil."
+    },
+    {
+      "bbox": [
+        260,
+        6084,
+        1522,
+        6157
+      ],
+      "tier": "micro",
+      "text": "Corrections: last week's edition gave the Kittiwake's tonnage as 4,100; the correct\nfigure is 4,010 gross tonnes. The Ledger regrets the error. Contact corrections@ledger."
+    },
+    {
+      "bbox": [
+        260,
+        6458,
+        4345,
+        6894
+      ],
+      "tier": "body",
+      "text": "Ferry Timetable Consultation Opens\nThe winter timetable consultation runs until 5 December. Proposals cut the Tuesday freight-only sailing\nand add a late Friday passenger run. Responses go to the transport partnership office or any harbour\nmaster's post box before the closing date."
+    },
+    {
+      "bbox": [
+        260,
+        7166,
+        4217,
+        7485
+      ],
+      "tier": "body",
+      "text": "School Boat Prize Returns to Northside\nNorthside Secondary took the inter-school sailing trophy for the third year, finishing four points clear\nover the combined southern crews in a shifting easterly breeze that favoured the lighter boats."
+    }
+  ],
+  "comparison_strategy": "cer",
+  "skip_when_no_model": true
+}

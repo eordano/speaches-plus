@@ -1,6 +1,7 @@
 #![cfg(feature = "cuda")]
 
 mod common;
+mod ctx_timing_common;
 use common::ctx_tokens_from_env_default_256_8k_168k;
 use candle_core::{DType, Device, Tensor};
 use nv_models::qwen3_5_moe::{Qwen3Moe, Qwen3MoeConfig};
@@ -12,6 +13,23 @@ const PREFILL_CHUNK_512_QWEN3MOE_KV_IS_FLAT_WITH_NO_RING_CAP_ONLY_MAX_SEQ_BOUNDS
     usize = 512;
 const TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN: usize = 64;
 const WARMUP_DECODE_STEPS_8_SO_THE_FIRST_ALLOCS_DONT_COUNT: usize = 8;
+
+fn checkpoint_label_repo_at_short_rev_so_runs_jsonl_rows_carry_their_basis(
+    dir: &std::path::Path,
+) -> String {
+    let snap = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let repo = dir
+        .ancestors()
+        .find_map(|a| {
+            let name = a.file_name()?.to_string_lossy().to_string();
+            name.starts_with("models--").then_some(name)
+        })
+        .unwrap_or_else(|| "unknown-repo".into());
+    format!("{repo}@{}", &snap[..snap.len().min(8)])
+}
 
 #[test]
 #[ignore = "loads the ~22 GB Qwen3.6-35B NVFP4; set NV_QWEN36_CTX_TEST=1 -- decode ms/token vs KV depth (max_pos 262144 fits the full 256/8k/168k ladder), chunked-prefill primed, eager cuda path; timing only, the #95 free-running degeneracy is deliberately not judged; run ONE depth per process via NV_CTX_TOKENS (the #96 residual race)"]
@@ -88,9 +106,30 @@ fn qwen36_cuda_decode_ms_per_token_vs_context_depth_eager_path_chunked_prefill_p
         step_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = step_ms[step_ms.len() / 2];
         eprintln!(
-            "CTX-SCALING qwen36-cuda-eager depth={depth} median_ms_tok={median:.3} tok_s={:.1} prime_s={prime_s:.1} steps={}",
+            "CTX-SCALING qwen36-cuda-eager checkpoint={} depth={depth} median_ms_tok={median:.3} tok_s={:.1} prime_s={prime_s:.1} steps={}",
+            checkpoint_label_repo_at_short_rev_so_runs_jsonl_rows_carry_their_basis(&dir),
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "cuda",
+                device: ctx_timing_common::cuda_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: WARMUP_DECODE_STEPS_8_SO_THE_FIRST_ALLOCS_DONT_COUNT,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_cuda_decode_step_chunked_prefill_primed",
+            },
+            &[
+                ("arm", ctx_timing_common::arm_label_from_the_resolved_value_of_every_gate_accessor_because_a_presence_label_lies_after_a_default_flip(
+                    &ctx_timing_common::Q36_Q38_DECODE_NUMERICS_GATES_EVERY_ONE_APPEARS_RESOLVED_IN_THE_ARM_LABEL,
+                )),
+                ("prime_s", format!("{prime_s:.1}")),
+            ],
         );
     }
 }

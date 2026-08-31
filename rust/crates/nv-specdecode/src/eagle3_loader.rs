@@ -7,8 +7,8 @@ use nv_layers::rope::{Rope, RopeConfig, RopeKind};
 use nv_weights::WeightLoader;
 use std::path::Path;
 
-use crate::util::{load_linear, load_rmsnorm, load_tensor};
 use crate::DraftScorer;
+use nv_layers::weight_load::{load_linear, load_rmsnorm, load_tensor};
 
 #[derive(Clone, Debug)]
 pub struct Eagle3SpeculatorConfig {
@@ -350,6 +350,62 @@ impl DrafterKvCache {
     }
 }
 
+pub const SPECULATOR_SUBDIR: &str = "speculator";
+
+pub const EAGLE3_SPECULATOR_KIND: &str = "eagle3";
+
+pub const SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY:
+    &str = "nv_speculator_kind";
+
+pub const EAGLE3_SPECULATOR_DELTA_TARGETS_EXCLUDE_EMBED_AND_LM_HEAD_BECAUSE_THE_TRAINER_FREEZES_BOTH_AND_EMBED_MAY_BE_TENSOR_SHARED_WITH_THE_TARGET_TRUNK:
+    [&str; 8] = [
+    "fc",
+    "layers.0.mlp.down_proj",
+    "layers.0.mlp.gate_proj",
+    "layers.0.mlp.up_proj",
+    "layers.0.self_attn.k_proj",
+    "layers.0.self_attn.o_proj",
+    "layers.0.self_attn.q_proj",
+    "layers.0.self_attn.v_proj",
+];
+
+pub fn cotrained_eagle3_speculator_dir(adapter_dir: &Path) -> Result<Option<std::path::PathBuf>> {
+    let cfg_path = adapter_dir.join("adapter_config.json");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .with_context(|| format!("read {}", cfg_path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", cfg_path.display()))?;
+    let Some(kind_v) = v
+        .get(SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY)
+    else {
+        return Ok(None);
+    };
+    let Some(kind) = kind_v.as_str() else {
+        bail!(
+            "adapter at {} carries a non-string {} ({kind_v}); reading a malformed kind as \
+             absent would silently serve the base drafter for an artifact that meant to \
+             advertise co-trained deltas",
+            adapter_dir.display(),
+            SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY
+        );
+    };
+    if kind != EAGLE3_SPECULATOR_KIND {
+        return Ok(None);
+    }
+    let sdir = adapter_dir.join(SPECULATOR_SUBDIR);
+    for f in ["adapter_config.json", "adapter_model.safetensors"] {
+        if !sdir.join(f).is_file() {
+            bail!(
+                "adapter at {} advertises an eagle3 co-trained speculator but {} is missing; \
+                 serving the base drafter would silently drop the deltas the artifact promised",
+                adapter_dir.display(),
+                sdir.join(f).display()
+            );
+        }
+    }
+    Ok(Some(sdir))
+}
+
 pub struct LoadedEagle3Scorer {
     cfg: Eagle3SpeculatorConfig,
     device: Device,
@@ -462,6 +518,170 @@ impl LoadedEagle3Scorer {
         Self::load_from_safetensors(&cfg, &st_path, device)
     }
 
+    pub fn try_load_with_speculator_deltas(
+        model_dir: &Path,
+        speculator_dir: Option<&Path>,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut scorer = Self::try_load(model_dir, device)?;
+        if let Some(dir) = speculator_dir {
+            scorer.merge_speculator_deltas(dir)?;
+        }
+        Ok(scorer)
+    }
+
+    pub fn merge_speculator_deltas(&mut self, speculator_dir: &Path) -> Result<()> {
+        let cfg_path = speculator_dir.join("adapter_config.json");
+        let raw = std::fs::read_to_string(&cfg_path)
+            .with_context(|| format!("read {}", cfg_path.display()))?;
+        let cfg_v: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", cfg_path.display()))?;
+        if let Some(kind_v) = cfg_v
+            .get(SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY)
+        {
+            let Some(kind) = kind_v.as_str() else {
+                bail!(
+                    "speculator at {} carries a non-string {} ({kind_v}); a malformed kind is \
+                     refused, never read as the absent-key eagle3 default",
+                    speculator_dir.display(),
+                    SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY
+                );
+            };
+            if kind != EAGLE3_SPECULATOR_KIND {
+                bail!(
+                    "speculator at {} declares kind {kind:?}, not {EAGLE3_SPECULATOR_KIND:?}; \
+                     merging another speculator kind's deltas into the eagle3 drafter would \
+                     serve a drafter nobody trained",
+                    speculator_dir.display()
+                );
+            }
+        }
+        let peft = nv_weights::lora_adapter::PeftConfig::from_json_value(&cfg_v)
+            .with_context(|| format!("speculator config {}", cfg_path.display()))?;
+        let st_path = speculator_dir.join("adapter_model.safetensors");
+        let weights = WeightLoader::open_file(&st_path, &self.device)
+            .with_context(|| format!("open {}", st_path.display()))?;
+        let mut pending: std::collections::BTreeMap<String, (Option<Tensor>, Option<Tensor>)> =
+            std::collections::BTreeMap::new();
+        for name in weights.names() {
+            let (module, is_a, is_embedding) =
+                nv_weights::lora_adapter::parse_fine_tuned_lora_name(&name).with_context(|| {
+                    format!(
+                        "speculator tensor {name} at {} is not a lora_A/lora_B pair member; \
+                         the whole merge is refused, never a skip",
+                        speculator_dir.display()
+                    )
+                })?;
+            if is_embedding
+                || !EAGLE3_SPECULATOR_DELTA_TARGETS_EXCLUDE_EMBED_AND_LM_HEAD_BECAUSE_THE_TRAINER_FREEZES_BOTH_AND_EMBED_MAY_BE_TENSOR_SHARED_WITH_THE_TARGET_TRUNK
+                    .contains(&module.as_str())
+            {
+                bail!(
+                    "speculator at {} names module {module:?}, which is not an eagle3 drafter \
+                     delta target; the whole merge is refused (never a skip) because \
+                     embed_tokens and lm_head are frozen by the drafter recipe, embed_tokens \
+                     may be tensor-shared with the target trunk, and norms and d2t/t2d are not \
+                     LoRA surfaces; allowed targets: {:?}",
+                    speculator_dir.display(),
+                    EAGLE3_SPECULATOR_DELTA_TARGETS_EXCLUDE_EMBED_AND_LM_HEAD_BECAUSE_THE_TRAINER_FREEZES_BOTH_AND_EMBED_MAY_BE_TENSOR_SHARED_WITH_THE_TARGET_TRUNK
+                );
+            }
+            let t = weights.get(&name, DType::F32)?;
+            let slot = pending.entry(module.clone()).or_default();
+            let side = if is_a { &mut slot.0 } else { &mut slot.1 };
+            if side.is_some() {
+                bail!(
+                    "speculator at {} holds two tensors for module {module} lora_{}: a \
+                     prefixed and an unprefixed spelling collide after base_model.model. \
+                     stripping, and silently picking one would drop the other, so the whole \
+                     merge is refused",
+                    speculator_dir.display(),
+                    if is_a { "A" } else { "B" }
+                );
+            }
+            *side = Some(t);
+        }
+        if pending.is_empty() {
+            bail!(
+                "speculator at {} holds no lora_A/lora_B pairs; an empty artifact advertises \
+                 co-trained deltas that were never trained",
+                speculator_dir.display()
+            );
+        }
+        let mut staged: Vec<(String, Linear)> = Vec::with_capacity(pending.len());
+        for (module, (a, b)) in pending {
+            let (Some(a), Some(b)) = (a, b) else {
+                bail!(
+                    "speculator at {} module {module}: lora_A/lora_B pair is incomplete; \
+                     refusing the whole merge",
+                    speculator_dir.display()
+                );
+            };
+            let lin = self.speculator_delta_target(&module)?;
+            let out_f = lin.out_features();
+            let in_f = lin.in_features();
+            let ad = a.dims().to_vec();
+            let bd = b.dims().to_vec();
+            if ad != [peft.r, in_f] || bd != [out_f, peft.r] {
+                bail!(
+                    "speculator at {} module {module}: A {ad:?} B {bd:?} do not match the \
+                     loaded drafter's [{out_f}, {in_f}] at rank {}; the artifact was trained \
+                     against a different drafter, so the whole merge is refused",
+                    speculator_dir.display(),
+                    peft.r
+                );
+            }
+            let mut delta = b.matmul(&a)?;
+            if peft.scaling != 1.0 {
+                delta = (delta * peft.scaling)?;
+            }
+            let w = lin.weight().ok_or_else(|| {
+                anyhow!(
+                    "speculator merge targets the dense drafter weights and must run before \
+                     any load-time quant arm, but {module} has no dense weight tensor"
+                )
+            })?;
+            let merged = w
+                .to_dtype(DType::F32)?
+                .add(&delta)?
+                .to_dtype(self.dtype)?
+                .contiguous()?;
+            staged.push((module, Linear::new(merged, lin.bias().cloned())?));
+        }
+        for (module, lin) in staged {
+            self.replace_speculator_delta_target(&module, lin);
+        }
+        Ok(())
+    }
+
+    fn speculator_delta_target(&self, module: &str) -> Result<&Linear> {
+        Ok(match module {
+            "fc" => &self.fc,
+            "layers.0.self_attn.q_proj" => &self.q_proj,
+            "layers.0.self_attn.k_proj" => &self.k_proj,
+            "layers.0.self_attn.v_proj" => &self.v_proj,
+            "layers.0.self_attn.o_proj" => &self.o_proj,
+            "layers.0.mlp.gate_proj" => &self.gate_proj,
+            "layers.0.mlp.up_proj" => &self.up_proj,
+            "layers.0.mlp.down_proj" => &self.down_proj,
+            _ => bail!("no eagle3 drafter linear named {module}"),
+        })
+    }
+
+    fn replace_speculator_delta_target(&mut self, module: &str, lin: Linear) {
+        match module {
+            "fc" => self.fc = lin,
+            "layers.0.self_attn.q_proj" => self.q_proj = lin,
+            "layers.0.self_attn.k_proj" => self.k_proj = lin,
+            "layers.0.self_attn.v_proj" => self.v_proj = lin,
+            "layers.0.self_attn.o_proj" => self.o_proj = lin,
+            "layers.0.mlp.gate_proj" => self.gate_proj = lin,
+            "layers.0.mlp.up_proj" => self.up_proj = lin,
+            "layers.0.mlp.down_proj" => self.down_proj = lin,
+            _ => unreachable!("staged modules were resolved by speculator_delta_target"),
+        }
+    }
+
     pub fn load_from_safetensors(
         cfg: &Eagle3SpeculatorConfig,
         safetensors_path: &Path,
@@ -470,7 +690,7 @@ impl LoadedEagle3Scorer {
         let weights = WeightLoader::open_file(safetensors_path, device)
             .with_context(|| format!("open {}", safetensors_path.display()))?;
 
-        let dtype = if std::env::var("NV_EAGLE_DRAFT_F32").is_ok() {
+        let dtype = if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE_DRAFT_F32") {
             DType::F32
         } else {
             DType::BF16
@@ -733,8 +953,8 @@ impl LoadedEagle3Scorer {
         };
         #[cfg(not(feature = "cuda"))]
         let attn_out = self.single_query_attn_sdpa(&q_rot, &k_all, &v_all)?;
-        if std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_DEBUG").is_some()
-            && std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_EAGER").is_some()
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_DEBUG")
+            && nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_EAGER")
         {
             let v: Vec<f32> = attn_out
                 .to_dtype(DType::F32)
@@ -782,7 +1002,7 @@ impl LoadedEagle3Scorer {
         v_all: &Tensor,
     ) -> Result<Option<Tensor>> {
         use cudarc::driver::DevicePtrMut;
-        if std::env::var_os("NV_EAGLE3_NO_DEVICE_CHAIN").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_CHAIN") {
             return Ok(None);
         }
         let dev = match &self.device {
@@ -1142,9 +1362,12 @@ impl LoadedEagle3Scorer {
         let mut new_k: Vec<Tensor> = Vec::with_capacity(k);
         let mut new_v: Vec<Tensor> = Vec::with_capacity(k);
 
-        if std::env::var_os("NV_EAGLE3_NO_DEVICE_CHAIN").is_none() {
-            let dbg = std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_DEBUG").is_some()
-                && std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_EAGER").is_some();
+        if !nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_CHAIN") {
+            let dbg =
+                nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_DEBUG")
+                    && nv_config::env_arm_present_at_all_reread_every_call(
+                        "NV_EAGLE3_GRAPH_CHAIN_EAGER",
+                    );
             let dump = |tag: &str, t: &Tensor| {
                 if dbg {
                     let v: Vec<f32> = t
@@ -1252,8 +1475,13 @@ impl LoadedEagle3Scorer {
             _ => bail!("block_seq_appended: k_prev/v_prev must both be set or both absent"),
         };
 
-        let attn_out =
-            self.causal_sdpa_qblocked(&q_rot, &k_all, &v_all, pos_base, encode_attn_score_cap_bytes())?;
+        let attn_out = self.causal_sdpa_qblocked(
+            &q_rot,
+            &k_all,
+            &v_all,
+            pos_base,
+            encode_attn_score_cap_bytes(),
+        )?;
         let attn_out = attn_out
             .squeeze(0)?
             .reshape((m, nh * hd))?
@@ -1368,7 +1596,7 @@ impl LoadedEagle3Scorer {
         m: usize,
     ) -> Result<Option<Tensor>> {
         use cudarc::driver::DevicePtrMut;
-        if std::env::var_os("NV_EAGLE3_NO_DEVICE_KV").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_KV") {
             cache.dev_off = true;
             return Ok(None);
         }
@@ -2218,7 +2446,8 @@ impl LoadedEagle3Scorer {
         kd: usize,
         bonus: u32,
     ) -> Result<Vec<u32>> {
-        let eager_body = std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_EAGER").is_some();
+        let eager_body =
+            nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_EAGER");
         self.chain_draft_cached_shift_graphed_full(
             cache, g, context, aux_proj, 0, kd, bonus, eager_body,
         )
@@ -2235,7 +2464,8 @@ impl LoadedEagle3Scorer {
         kd: usize,
         bonus: u32,
     ) -> Result<Vec<u32>> {
-        let eager_body = std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_EAGER").is_some();
+        let eager_body =
+            nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_EAGER");
         self.chain_draft_cached_shift_graphed_full(
             cache, g, context, aux_proj, aux_base, kd, bonus, eager_body,
         )
@@ -2284,7 +2514,7 @@ impl LoadedEagle3Scorer {
             || kd < 1
             || projected_phys + kd > g.cap
             || ctx_len + kd > self.cfg.max_position_embeddings
-            || std::env::var_os("NV_EAGLE3_NO_DEVICE_CHAIN").is_some()
+            || nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_CHAIN")
         {
             return self.chain_draft_cached_cond_tail(
                 cache,
@@ -2558,7 +2788,10 @@ impl LoadedEagle3Scorer {
                 anyhow::ensure!(rc == 0, "{what} rc={rc}");
                 Ok(())
             };
+            const TOKEN_MAP_U32_READS_D2T_UNBOUNDED_SO_IT_RELIES_ON_ARGMAX_BF16_MATCHING_ARGMAX_CHECKED_INDEX_LT_DV_OR_0_ON_ALL_NONFINITE:
+                () = ();
             let draft_next = |h: u64, slot: usize| -> Result<()> {
+                let () = TOKEN_MAP_U32_READS_D2T_UNBOUNDED_SO_IT_RELIES_ON_ARGMAX_BF16_MATCHING_ARGMAX_CHECKED_INDEX_LT_DV_OR_0_ON_ALL_NONFINITE;
                 rms(h, p_wn, p_normed, eps_n, "chain norm")?;
                 gemv(p_wlm, p_normed, p_logits, dv, hidden, "chain lm_head")?;
                 let rc = unsafe {
@@ -2717,7 +2950,7 @@ impl LoadedEagle3Scorer {
         if eager_body {
             body(&fk)?;
             fk.synchronize().map_err(|e| anyhow!(e))?;
-            if std::env::var_os("NV_EAGLE3_GRAPH_CHAIN_DEBUG").is_some() {
+            if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_DEBUG") {
                 let ns: Vec<i32> = fk.clone_dtoh(&g.n_buf).map_err(|e| anyhow!(e))?;
                 eprintln!("[chain-dbg] ctx={ctx_len} n_buf={ns:?}");
                 if let Some(kt) = cache.k.as_ref() {
@@ -3115,9 +3348,15 @@ mod tests {
         let m = 6usize;
         let sk = 10usize;
         let pos_base = sk - m;
-        let q: Vec<f32> = (0..m * nh * hd).map(|i| ((i as f32) * 0.03).sin()).collect();
-        let kk: Vec<f32> = (0..sk * nkv * hd).map(|i| ((i as f32) * 0.017).cos()).collect();
-        let vv: Vec<f32> = (0..sk * nkv * hd).map(|i| ((i as f32) * 0.021).sin()).collect();
+        let q: Vec<f32> = (0..m * nh * hd)
+            .map(|i| ((i as f32) * 0.03).sin())
+            .collect();
+        let kk: Vec<f32> = (0..sk * nkv * hd)
+            .map(|i| ((i as f32) * 0.017).cos())
+            .collect();
+        let vv: Vec<f32> = (0..sk * nkv * hd)
+            .map(|i| ((i as f32) * 0.021).sin())
+            .collect();
         let dev = &scorer.device;
         let q_rot = Tensor::from_vec(q, (1, m, nh, hd), dev).unwrap();
         let k_all = Tensor::from_vec(kk, (1, sk, nkv, hd), dev).unwrap();
@@ -3499,7 +3738,7 @@ mod tests {
 
     fn require<T>(test: &str, what: &str, found: Option<T>) -> Option<T> {
         if found.is_none() {
-            if std::env::var(ALLOW_SKIP).as_deref() != Ok("1") {
+            if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call(ALLOW_SKIP) {
                 panic!(
                     "{test}: no {what}. This test is #[ignore]d, so it runs only when asked for \
                      by name; reporting a pass without the artifact answers a question that was \

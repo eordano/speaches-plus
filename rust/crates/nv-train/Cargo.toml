@@ -8,13 +8,35 @@ publish.workspace = true
 anyhow = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+nv-config = { workspace = true }
 nv-layers = { workspace = true }
+nv-quant = { workspace = true }
+nv-tokenizer = { workspace = true }
 nv-weights = { workspace = true }
 serde_json = { workspace = true }
 half = { workspace = true }
+tokenizers = { workspace = true }
+
+[features]
+default = []
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "nv-layers/metal",
+]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "nv-layers/cuda",
+    "nv-quant/cuda",
+    "nv-weights/cuda",
+]
 
 [dev-dependencies]
 candle-core = { workspace = true }
+half = { workspace = true }
+safetensors = { workspace = true }
 
 [lints]
 workspace = true

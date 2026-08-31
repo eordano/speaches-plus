@@ -474,6 +474,16 @@ impl AudioSpeech for Qwen3TtsAudioSpeech {
     fn model_id(&self) -> Option<String> {
         Some(self.talker_model_id())
     }
+
+    fn voices(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .talker
+            .as_ref()
+            .map(|t| t.config().spk_id.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        names
+    }
 }
 
 impl Qwen3TtsAudioSpeech {

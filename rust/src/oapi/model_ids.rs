@@ -61,6 +61,25 @@ fn nix_store_model_id(name: &str) -> Option<String> {
     Some(format!("{org}/{model}"))
 }
 
+pub fn chat_model_dirs_from_env() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(d) = std::env::var_os("NV_CHAT_MODEL_DIR") {
+        dirs.push(std::path::PathBuf::from(d));
+    }
+    for var in ["NV_CHAT_MODEL_DIRS", "NV_WGPU_CHAT_MODEL_DIRS"] {
+        if let Some(list) = std::env::var_os(var) {
+            let list = list.to_string_lossy().into_owned();
+            dirs.extend(
+                list.split([',', ':'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(std::path::PathBuf::from),
+            );
+        }
+    }
+    dirs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,23 +136,4 @@ mod tests {
         assert_eq!(canonical_model_id("my-local-gemma"), None);
         assert_eq!(canonical_model_id(""), None);
     }
-}
-
-pub fn chat_model_dirs_from_env() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(d) = std::env::var_os("NV_CHAT_MODEL_DIR") {
-        dirs.push(std::path::PathBuf::from(d));
-    }
-    for var in ["NV_CHAT_MODEL_DIRS", "NV_WGPU_CHAT_MODEL_DIRS"] {
-        if let Some(list) = std::env::var_os(var) {
-            let list = list.to_string_lossy().into_owned();
-            dirs.extend(
-                list.split([',', ':'])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(std::path::PathBuf::from),
-            );
-        }
-    }
-    dirs
 }

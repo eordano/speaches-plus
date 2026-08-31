@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "metal"))]
 
 mod common;
 use common::cer;
@@ -18,6 +18,20 @@ use nv_models::deepseek_ocr::{
 };
 use common::deepseek_ocr_snapshot_dir as snapshot_dir;
 
+const MEAN_CER_CEILING_FOR_ANY_SERVABLE_DSOCR2_PRECISION: f64 = 0.10;
+
+fn serving_device() -> Device {
+    #[cfg(feature = "cuda")]
+    if let Ok(d) = Device::new_cuda(0) {
+        return d;
+    }
+    #[cfg(feature = "metal")]
+    if let Ok(d) = Device::new_metal(0) {
+        return d;
+    }
+    Device::Cpu
+}
+
 #[test]
 #[ignore]
 fn deepseek_markdown_truncation_census_over_070_071_fixtures() {
@@ -34,7 +48,7 @@ fn deepseek_markdown_truncation_census_over_070_071_fixtures() {
         return;
     }
     let dir = snapshot_dir().expect("DeepSeek-OCR-2 snapshot present");
-    let device = Device::new_cuda(0).expect("cuda device 0");
+    let device = serving_device();
     let pipe = DeepSeekOcr2Pipeline::load(&dir, &device, DecoderPrecision::Bf16).expect("load");
     let opts = GenerateOptions {
         max_new_tokens: 4096,
@@ -76,7 +90,7 @@ fn deepseek_markdown_truncation_census_over_070_071_fixtures() {
     }
     raw_counts.sort_unstable();
     eprintln!(
-        "[md-census] SUMMARY basis=deepseek-ai/DeepSeek-OCR-2 device=cuda bf16 mode=Gundam \
+        "[md-census] SUMMARY basis=deepseek-ai/DeepSeek-OCR-2 device={device:?} bf16 mode=Gundam \
          prompt=grounding_markdown max_new_tokens={} images={} capped={:?} \
          raw_tokens median={} max={}",
         opts.max_new_tokens,
@@ -100,10 +114,14 @@ fn deepseek_ocr2_baseline_speed_and_cer_over_070_071_fixtures() {
         return;
     }
     let dir = snapshot_dir().expect("DeepSeek-OCR-2 snapshot present");
-    let device = Device::new_cuda(0).expect("cuda device 0");
+    let device = serving_device();
+    let precision = DecoderPrecision::for_device(&device);
     let load_t0 = Instant::now();
-    let pipe = DeepSeekOcr2Pipeline::load(&dir, &device, DecoderPrecision::Bf16).expect("load");
-    eprintln!("[dsocr-bench] load elapsed {:?}", load_t0.elapsed());
+    let pipe = DeepSeekOcr2Pipeline::load(&dir, &device, precision).expect("load");
+    eprintln!(
+        "[dsocr-bench] load elapsed {:?} precision={precision:?}",
+        load_t0.elapsed()
+    );
 
     let opts = GenerateOptions {
         max_new_tokens: 2048,
@@ -152,13 +170,35 @@ fn deepseek_ocr2_baseline_speed_and_cer_over_070_071_fixtures() {
     let mean_ms_per_image = total_secs * 1e3 / timed_secs.len() as f64;
     let pages_per_sec = timed_secs.len() as f64 / total_secs;
     eprintln!(
-        "[dsocr-bench] SUMMARY basis=deepseek-ai/DeepSeek-OCR-2 snapshot={} device=cuda bf16 mode=Gundam prompt=free_ocr max_new_tokens={} images={n} (1 warmup discarded from timing) \
+        "[dsocr-bench] SUMMARY basis=deepseek-ai/DeepSeek-OCR-2 snapshot={} device={device:?} precision={precision:?} mode=Gundam prompt=free_ocr max_new_tokens={} images={n} (1 warmup discarded from timing) \
          mean_ms_per_image={mean_ms_per_image:.1} pages_per_sec={pages_per_sec:.3} total_tokens={total_tokens} tok_per_s={:.1} mean_CER={mean_cer:.4} mean_WER={mean_wer:.4}",
         dir.display(),
         opts.max_new_tokens,
         total_tokens as f64 / total_secs,
     );
+    let revision = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+    let precision_tag = match precision {
+        DecoderPrecision::Bf16 => "bf16",
+        DecoderPrecision::Nvfp4 => "nvfp4",
+        DecoderPrecision::W4 => "w4",
+        DecoderPrecision::W8 => "w8",
+    };
+    println!(
+        "GEN-ARM dsocr2-070-071-fixtures checkpoint=deepseek-ai/DeepSeek-OCR-2@{revision} \
+         precision={precision_tag} gen={total_tokens} decode_tok_s={:.1} \
+         pages_per_sec={pages_per_sec:.3} mean_cer={mean_cer:.4} mean_wer={mean_wer:.4} images={n}",
+        total_tokens as f64 / total_secs,
+    );
 
     assert_eq!(cers.len(), FIXTURES.len(), "must score every fixture image");
     assert!(total_tokens > 0, "generated zero tokens across the timed set");
+    assert!(
+        mean_cer <= MEAN_CER_CEILING_FOR_ANY_SERVABLE_DSOCR2_PRECISION,
+        "mean CER {mean_cer:.4} over the 070/071 fixtures breaches the servable ceiling \
+         {MEAN_CER_CEILING_FOR_ANY_SERVABLE_DSOCR2_PRECISION}; \
+         if a precision arm did this, it must not be a default"
+    );
 }

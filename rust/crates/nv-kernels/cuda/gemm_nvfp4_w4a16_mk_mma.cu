@@ -11,7 +11,8 @@ constexpr int kMMax = 16;
 constexpr int kXStrideHalves = kKTile + 8;
 constexpr int kWStrideBytes = kKTile / 2 + 16;
 constexpr int kScTilesPerStage = kKTile / 64;
-constexpr int kWarps8NeedsEnoughCtasToCoverAllSms = 132;
+constexpr int kWarps8NeedsThisManyCtasBecauseSub2WaveTailsUnderfillThe188SmBox = 380;
+constexpr int kWarps4KeepsItsBiggerCtasDownToThisGridBecauseHalfSizeCtasDoubleTheXStagingTax = 96;
 #define NV_UE4M3_SUBNORMAL_STEP 0.001953125f
 
 __device__ __forceinline__ void cp_async16(void* dst_smem, const void* src_gmem, int src_bytes) {
@@ -35,6 +36,23 @@ __device__ __forceinline__ float decode_ue4m3_scale(uint8_t b) {
     float mant = (float)(b & 0x07);
     if (biased == 0) return mant * NV_UE4M3_SUBNORMAL_STEP;
     return (1.f + mant / 8.f) * exp2f((float)(biased - 7));
+}
+
+__constant__ __nv_bfloat16 kUe4m3ScaleAsBf16Lut[256];
+
+__device__ __forceinline__ unsigned decode_fp4_pair_bf16x2_direct(uint8_t b) {
+    constexpr unsigned kLoBytes0to3 = 0xC0800000u;
+    constexpr unsigned kLoBytes4to7 = 0xC0804000u;
+    constexpr unsigned kHiBytes0to3 = 0x3F3F3F00u;
+    constexpr unsigned kHiBytes4to7 = 0x40404040u;
+    unsigned m0 = (unsigned)b & 0x07u;
+    unsigned m1 = ((unsigned)b >> 4) & 0x07u;
+    unsigned mag_sel = m0 | (m1 << 4);
+    unsigned lo_pair = __byte_perm(kLoBytes0to3, kLoBytes4to7, mag_sel);
+    unsigned hi_pair = __byte_perm(kHiBytes0to3, kHiBytes4to7, mag_sel);
+    unsigned word = __byte_perm(lo_pair, hi_pair, 0x5140);
+    unsigned signs = (((unsigned)b & 0x08u) << 12) | (((unsigned)b & 0x80u) << 24);
+    return word | signs;
 }
 
 __device__ __forceinline__ unsigned decode_fp4_pair_scaled_bf16x2(uint8_t b, float sf) {
@@ -67,6 +85,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_nvfp4_w4a16_mk_mma_kernel(
     float alpha_b,
     int M,
     int N,
+    int y_stride,
     int K
 ) {
 #if __CUDA_ARCH__ >= 800
@@ -190,11 +209,16 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_nvfp4_w4a16_mk_mma_kernel(
             #pragma unroll
             for (int a = 0; a < kArms; ++a) {
                 const uint8_t* wrow = wrow0 + a * kRows * kWStrideBytes;
-                float sf = decode_ue4m3_scale(
-                    scbuf0[a * kScTilesPerStage * 512 + sc_off]);
-                unsigned b0 = decode_fp4_pair_scaled_bf16x2(wrow[kc / 2 + tg], sf);
-                unsigned b1 =
-                    decode_fp4_pair_scaled_bf16x2(wrow[kc / 2 + tg + 4], sf);
+                __nv_bfloat162 sf2 = __bfloat162bfloat162(
+                    kUe4m3ScaleAsBf16Lut[scbuf0[a * kScTilesPerStage * 512 + sc_off]]);
+                unsigned r0 = decode_fp4_pair_bf16x2_direct(wrow[kc / 2 + tg]);
+                unsigned r1 = decode_fp4_pair_bf16x2_direct(wrow[kc / 2 + tg + 4]);
+                __nv_bfloat162 w0 =
+                    __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&r0), sf2);
+                __nv_bfloat162 w1 =
+                    __hmul2(*reinterpret_cast<const __nv_bfloat162*>(&r1), sf2);
+                unsigned b0 = *reinterpret_cast<const unsigned*>(&w0);
+                unsigned b1 = *reinterpret_cast<const unsigned*>(&w1);
                 asm volatile(
                     "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                     "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -215,14 +239,14 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_nvfp4_w4a16_mk_mma_kernel(
             __nv_bfloat16* y = ys[a];
             float alpha = alphas[a];
             if (gid < M) {
-                y[(size_t)gid * N + ncol] = __float2bfloat16(acc[a][0] * alpha);
-                y[(size_t)gid * N + ncol + 1] =
+                y[(size_t)gid * y_stride + ncol] = __float2bfloat16(acc[a][0] * alpha);
+                y[(size_t)gid * y_stride + ncol + 1] =
                     __float2bfloat16(acc[a][1] * alpha);
             }
             if (!MLE8 && gid + 8 < M) {
-                y[(size_t)(gid + 8) * N + ncol] =
+                y[(size_t)(gid + 8) * y_stride + ncol] =
                     __float2bfloat16(acc[a][2] * alpha);
-                y[(size_t)(gid + 8) * N + ncol + 1] =
+                y[(size_t)(gid + 8) * y_stride + ncol + 1] =
                     __float2bfloat16(acc[a][3] * alpha);
             }
         }
@@ -244,6 +268,7 @@ int launch_mk_mma(
     float alpha_b,
     int M,
     int N,
+    int y_stride,
     int K
 ) {
     int rows = WARPS * 8;
@@ -254,7 +279,7 @@ int launch_mk_mma(
             reinterpret_cast<const __nv_bfloat16*>(x),
             reinterpret_cast<__nv_bfloat16*>(y_a),
             reinterpret_cast<__nv_bfloat16*>(y_b),
-            alpha_a, alpha_b, M, N, K);
+            alpha_a, alpha_b, M, N, y_stride, K);
     return (int)cudaGetLastError();
 }
 
@@ -272,19 +297,41 @@ int launch_mk_mma_pick_warps(
     float alpha_b,
     int M,
     int N,
+    int y_stride,
     int K
 ) {
-    if (N % 64 == 0 && N / 64 >= kWarps8NeedsEnoughCtasToCoverAllSms) {
+    if (N % 64 == 0 && N / 64 >= kWarps8NeedsThisManyCtasBecauseSub2WaveTailsUnderfillThe188SmBox) {
         return launch_mk_mma<8, DUAL, MLE8>(
-            stream, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, K);
+            stream, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
     }
-    if (N % 32 == 0) {
+    if (N % 32 == 0
+        && N / 32 >= kWarps4KeepsItsBiggerCtasDownToThisGridBecauseHalfSizeCtasDoubleTheXStagingTax) {
         return launch_mk_mma<4, DUAL, MLE8>(
-            stream, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, K);
+            stream, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
+    }
+    if (N % 16 == 0) {
+        return launch_mk_mma<2, DUAL, MLE8>(
+            stream, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
     }
     return -1;
 }
 
+}
+
+static int ensure_ue4m3_bf16_lut_uploaded_once() {
+    static int state = 0;
+    if (state != 0) return state > 0 ? 0 : -1;
+    __nv_bfloat16 host[256];
+    for (int b = 0; b < 256; ++b) {
+        int biased = (b >> 3) & 0x0F;
+        float mant = (float)(b & 0x07);
+        float v = (biased == 0) ? mant * NV_UE4M3_SUBNORMAL_STEP
+                                : (1.f + mant / 8.f) * exp2f((float)(biased - 7));
+        host[b] = __float2bfloat16(v);
+    }
+    cudaError_t e = cudaMemcpyToSymbol(kUe4m3ScaleAsBf16Lut, host, sizeof(host));
+    state = (e == cudaSuccess) ? 1 : -1;
+    return state > 0 ? 0 : (int)e;
 }
 
 extern "C" int nv_kernels_gemm_nvfp4_w4a16_mk_dual(
@@ -300,8 +347,11 @@ extern "C" int nv_kernels_gemm_nvfp4_w4a16_mk_dual(
     float alpha_b,
     int M,
     int N,
+    int y_stride,
     int K
 ) {
+    int lrc = ensure_ue4m3_bf16_lut_uploaded_once();
+    if (lrc != 0) return lrc;
     if (M <= 0 || M > kMMax) return -1;
     if (N <= 0 || K <= 0 || (K & 31) != 0) return -1;
     if ((wq_b == nullptr) != (y_b == nullptr)) return -1;
@@ -311,16 +361,16 @@ extern "C" int nv_kernels_gemm_nvfp4_w4a16_mk_dual(
     bool mle8 = M <= 8;
     if (dual && mle8) {
         return launch_mk_mma_pick_warps<true, true>(
-            s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, K);
+            s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
     }
     if (dual) {
         return launch_mk_mma_pick_warps<true, false>(
-            s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, K);
+            s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
     }
     if (mle8) {
         return launch_mk_mma_pick_warps<false, true>(
-            s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, K);
+            s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
     }
     return launch_mk_mma_pick_warps<false, false>(
-        s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, K);
+        s, wq_a, sc_a, wq_b, sc_b, x, y_a, y_b, alpha_a, alpha_b, M, N, y_stride, K);
 }

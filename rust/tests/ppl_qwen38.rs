@@ -1,7 +1,6 @@
 #![cfg(feature = "cuda")]
 
 #[path = "../crates/nv-models/tests/ppl_common/mod.rs"]
-#[allow(dead_code)]
 mod ppl_common;
 
 #[path = "common/qwen38_fixture.rs"]

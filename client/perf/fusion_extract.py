@@ -12,7 +12,7 @@ import csv
 import io
 import sys
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+sys.path.insert(0, "/persist/colmena/projects/speaches-plus/client/perf")
 import numpy as np
 import onnxruntime as ort
 import pyarrow.parquet as pq
@@ -21,8 +21,8 @@ from faster_whisper import WhisperModel
 
 import eot_silence_ab as F
 
-SMART_TURN = "/tmp/models/smart-turn-v3.2-cpu.onnx"
-WHISPER_CT2 = "/tmp/models/faster-whisper-large-v3-turbo-ct2"
+SMART_TURN = "/nix/store/572qm60y75bmrzj74kbshfrkrxrrd62i-hf-model-pipecat-ai-smart-turn-v3-f766f81d3cfdf7737ac64aad813d91bbfd56bf93/smart-turn-v3.2-cpu.onnx"
+WHISPER_CT2 = "/nix/store/3qddnd2yg9zj8ky3alhnhx91zqbdq7kq-hf-model-deepdml-faster-whisper-large-v3-turbo-ct2-4df90f75321148c3a29a9e2351b7ddf8f5b115a8"
 SR = 16000
 
 LANG = {"eng": "en", "spa": "es", "deu": "de", "kor": "ko", "ita": "it", "ukr": "uk",

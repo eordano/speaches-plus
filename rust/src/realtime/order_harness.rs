@@ -1378,199 +1378,220 @@ mod tier1 {
     fn tag(ev: &OutboundEvent) -> &'static str {
         use OutboundEvent::*;
         match ev {
-            SessionCreated { .. } => "SessionCreated",
-            SessionUpdated { .. } => "SessionUpdated",
-            SessionDone { .. } => "SessionDone",
-            SpeechStarted { .. } => "SpeechStarted",
-            SpeechStopped { .. } => "SpeechStopped",
-            BufferCommitted { .. } => "BufferCommitted",
+            SessionCreated(..) => "SessionCreated",
+            SessionUpdated(..) => "SessionUpdated",
+            SessionDone(..) => "SessionDone",
+            SpeechStarted(..) => "SpeechStarted",
+            SpeechStopped(..) => "SpeechStopped",
+            BufferCommitted(..) => "BufferCommitted",
             BufferCleared => "BufferCleared",
-            PartialTranscription { .. } => "PartialTranscription",
-            ItemAdded { .. } => "ItemAdded",
-            ItemDeleted { .. } => "ItemDeleted",
-            ItemTruncatedClientAck { .. } => "ItemTruncatedClientAck",
-            AssistantTruncated { .. } => "AssistantTruncated",
-            TranscriptionCompleted { .. } => "TranscriptionCompleted",
-            TranscriptionDelta { .. } => "TranscriptionDelta",
-            TranscriptionFailed { .. } => "TranscriptionFailed",
-            ItemDone { .. } => "ItemDone",
-            ItemRetrieved { .. } => "ItemRetrieved",
-            ResponseCreated { .. } => "ResponseCreated",
-            ResponseOutputItemAdded { .. } => "ResponseOutputItemAdded",
-            ResponseOutputItemDone { .. } => "ResponseOutputItemDone",
-            ResponseContentPartAdded { .. } => "ResponseContentPartAdded",
-            ResponseContentPartDone { .. } => "ResponseContentPartDone",
-            ResponseOutputAudioTranscriptDelta { .. } => "ResponseOutputAudioTranscriptDelta",
-            ResponseOutputAudioTranscriptDone { .. } => "ResponseOutputAudioTranscriptDone",
-            ResponseOutputAudioDelta { .. } => "ResponseOutputAudioDelta",
-            ResponseOutputAudioDone { .. } => "ResponseOutputAudioDone",
-            ResponseOutputTextDelta { .. } => "ResponseOutputTextDelta",
-            ResponseOutputTextDone { .. } => "ResponseOutputTextDone",
-            ResponseFunctionCallArgumentsDelta { .. } => "ResponseFunctionCallArgumentsDelta",
-            ResponseFunctionCallArgumentsDone { .. } => "ResponseFunctionCallArgumentsDone",
-            ResponseToolProgress { .. } => "ResponseToolProgress",
-            ResponseCancelled { .. } => "ResponseCancelled",
-            ResponseDone { .. } => "ResponseDone",
+            PartialTranscription(..) => "PartialTranscription",
+            ItemAdded(..) => "ItemAdded",
+            ItemDeleted(..) => "ItemDeleted",
+            ItemTruncatedClientAck(..) => "ItemTruncatedClientAck",
+            AssistantTruncated(..) => "AssistantTruncated",
+            TranscriptionCompleted(..) => "TranscriptionCompleted",
+            TranscriptionDelta(..) => "TranscriptionDelta",
+            TranscriptionFailed(..) => "TranscriptionFailed",
+            ItemDone(..) => "ItemDone",
+            ItemRetrieved(..) => "ItemRetrieved",
+            ResponseCreated(..) => "ResponseCreated",
+            ResponseOutputItemAdded(..) => "ResponseOutputItemAdded",
+            ResponseOutputItemDone(..) => "ResponseOutputItemDone",
+            ResponseContentPartAdded(..) => "ResponseContentPartAdded",
+            ResponseContentPartDone(..) => "ResponseContentPartDone",
+            ResponseOutputAudioTranscriptDelta(..) => "ResponseOutputAudioTranscriptDelta",
+            ResponseOutputAudioTranscriptDone(..) => "ResponseOutputAudioTranscriptDone",
+            ResponseOutputAudioDelta(..) => "ResponseOutputAudioDelta",
+            ResponseOutputAudioDone(..) => "ResponseOutputAudioDone",
+            ResponseOutputTextDelta(..) => "ResponseOutputTextDelta",
+            ResponseOutputTextDone(..) => "ResponseOutputTextDone",
+            ResponseFunctionCallArgumentsDelta(..) => "ResponseFunctionCallArgumentsDelta",
+            ResponseFunctionCallArgumentsDone(..) => "ResponseFunctionCallArgumentsDone",
+            ResponseToolProgress(..) => "ResponseToolProgress",
+            ResponseCancelled(..) => "ResponseCancelled",
+            ResponseDone(..) => "ResponseDone",
             OutputAudioBufferCleared => "OutputAudioBufferCleared",
-            OutputAudioBufferStarted { .. } => "OutputAudioBufferStarted",
-            OutputAudioBufferStopped { .. } => "OutputAudioBufferStopped",
-            RateLimitsUpdated { .. } => "RateLimitsUpdated",
-            Error { .. } => "Error",
-            Diarization { .. } => "Diarization",
+            OutputAudioBufferStarted(..) => "OutputAudioBufferStarted",
+            OutputAudioBufferStopped(..) => "OutputAudioBufferStopped",
+            RateLimitsUpdated(..) => "RateLimitsUpdated",
+            Error(..) => "Error",
+            Diarization(..) => "Diarization",
         }
     }
 
     fn all_variants() -> Vec<OutboundEvent> {
+        use super::super::wire::{
+            AssistantTruncatedEvent, BufferCommittedEvent, DiarizationEvent, ErrorEvent,
+            ItemAddedEvent, ItemDeletedEvent, ItemDoneEvent, ItemRetrievedEvent,
+            ItemTruncatedClientAckEvent, OutputAudioBufferStartedEvent,
+            OutputAudioBufferStoppedEvent, PartialTranscriptionEvent, RateLimitsUpdatedEvent,
+            ResponseCancelledEvent, ResponseContentPartAddedEvent, ResponseContentPartDoneEvent,
+            ResponseCreatedEvent, ResponseDoneEvent, ResponseFunctionCallArgumentsDeltaEvent,
+            ResponseFunctionCallArgumentsDoneEvent, ResponseOutputAudioDeltaEvent,
+            ResponseOutputAudioDoneEvent, ResponseOutputAudioTranscriptDeltaEvent,
+            ResponseOutputAudioTranscriptDoneEvent, ResponseOutputItemAddedEvent,
+            ResponseOutputItemDoneEvent, ResponseOutputTextDeltaEvent,
+            ResponseOutputTextDoneEvent, ResponseToolProgressEvent, SessionCreatedEvent,
+            SessionDoneEvent, SessionUpdatedEvent, SpeechStartedEvent, SpeechStoppedEvent,
+            ToolProgressEntry, ToolStatus, TranscriptionCompletedEvent, TranscriptionDeltaEvent,
+            TranscriptionFailedEvent,
+        };
         use OutboundEvent::*;
         let item = || ItemId::new("item_x");
         let resp = || ResponseId::new("resp_x");
         vec![
-            SessionCreated { session: json!({}) },
-            SessionUpdated { session: json!({}) },
-            SessionDone { reason: "x".into() },
-            SpeechStarted {
+            SessionCreated(SessionCreatedEvent { session: json!({}) }),
+            SessionUpdated(SessionUpdatedEvent { session: json!({}) }),
+            SessionDone(SessionDoneEvent { reason: "x".into() }),
+            SpeechStarted(SpeechStartedEvent {
                 item_id: item(),
                 audio_start_ms: 0,
-            },
-            SpeechStopped {
+            }),
+            SpeechStopped(SpeechStoppedEvent {
                 item_id: item(),
                 audio_end_ms: 1,
-            },
-            BufferCommitted { item_id: item() },
+            }),
+            BufferCommitted(BufferCommittedEvent { item_id: item() }),
             BufferCleared,
-            PartialTranscription {
+            PartialTranscription(PartialTranscriptionEvent {
                 item_id: item(),
                 transcript: "t".into(),
                 audio_end_ms: 1,
-            },
-            ItemAdded {
+            }),
+            ItemAdded(ItemAddedEvent {
                 item: json!({"id": "item_x"}),
-            },
-            ItemDeleted { item_id: item() },
-            ItemTruncatedClientAck {
+            }),
+            ItemDeleted(ItemDeletedEvent { item_id: item() }),
+            ItemTruncatedClientAck(ItemTruncatedClientAckEvent {
                 item_id: item(),
                 content_index: 0,
                 audio_end_ms: 0,
-            },
-            AssistantTruncated {
+            }),
+            AssistantTruncated(AssistantTruncatedEvent {
                 event_id: EventId::new("evt_x"),
                 item_id: item(),
                 audio_end_ms: 0,
                 transcript: "t".into(),
-            },
-            TranscriptionCompleted {
+            }),
+            TranscriptionCompleted(TranscriptionCompletedEvent {
                 item_id: item(),
                 content_index: 0,
                 transcript: "t".into(),
-            },
-            TranscriptionDelta {
+            }),
+            TranscriptionDelta(TranscriptionDeltaEvent {
                 item_id: item(),
                 content_index: 0,
                 delta: "d".into(),
-            },
-            TranscriptionFailed {
+            }),
+            TranscriptionFailed(TranscriptionFailedEvent {
                 item_id: item(),
                 content_index: 0,
                 error: json!({}),
-            },
-            ItemDone {
+            }),
+            ItemDone(ItemDoneEvent {
                 item: json!({"id": "item_x"}),
-            },
-            ItemRetrieved {
+            }),
+            ItemRetrieved(ItemRetrievedEvent {
                 item: json!({"id": "item_x"}),
-            },
-            ResponseCreated {
+            }),
+            ResponseCreated(ResponseCreatedEvent {
                 response: json!({"id": "resp_x"}),
-            },
-            ResponseOutputItemAdded {
+            }),
+            ResponseOutputItemAdded(ResponseOutputItemAddedEvent {
                 response_id: resp(),
                 output_index: 0,
                 item: json!({"id": "item_a"}),
-            },
-            ResponseOutputItemDone {
+            }),
+            ResponseOutputItemDone(ResponseOutputItemDoneEvent {
                 response_id: resp(),
                 output_index: 0,
                 item: json!({"id": "item_a"}),
-            },
-            ResponseContentPartAdded {
+            }),
+            ResponseContentPartAdded(ResponseContentPartAddedEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 part: json!({}),
-            },
-            ResponseContentPartDone {
+            }),
+            ResponseContentPartDone(ResponseContentPartDoneEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 part: json!({}),
-            },
-            ResponseOutputAudioTranscriptDelta {
+            }),
+            ResponseOutputAudioTranscriptDelta(ResponseOutputAudioTranscriptDeltaEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 delta: "d".into(),
-            },
-            ResponseOutputAudioTranscriptDone {
+            }),
+            ResponseOutputAudioTranscriptDone(ResponseOutputAudioTranscriptDoneEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 transcript: "t".into(),
-            },
-            ResponseOutputAudioDelta {
+            }),
+            ResponseOutputAudioDelta(ResponseOutputAudioDeltaEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 delta: "d".into(),
-            },
-            ResponseOutputAudioDone {
+            }),
+            ResponseOutputAudioDone(ResponseOutputAudioDoneEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
-            },
-            ResponseOutputTextDelta {
+            }),
+            ResponseOutputTextDelta(ResponseOutputTextDeltaEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 delta: "d".into(),
-            },
-            ResponseOutputTextDone {
+            }),
+            ResponseOutputTextDone(ResponseOutputTextDoneEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 content_index: 0,
                 text: "t".into(),
-            },
-            ResponseFunctionCallArgumentsDelta {
+            }),
+            ResponseFunctionCallArgumentsDelta(ResponseFunctionCallArgumentsDeltaEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 call_id: "c".into(),
                 delta: "d".into(),
-            },
-            ResponseFunctionCallArgumentsDone {
+            }),
+            ResponseFunctionCallArgumentsDone(ResponseFunctionCallArgumentsDoneEvent {
                 response_id: resp(),
                 item_id: item(),
                 output_index: 0,
                 call_id: "c".into(),
                 arguments: "{}".into(),
-            },
-            ResponseToolProgress {
+            }),
+            ResponseToolProgress(ResponseToolProgressEvent {
                 response_id: resp(),
-                item_id: item(),
-                output_index: 0,
-                progress: json!({}),
-            },
-            ResponseCancelled {
+                tools: vec![ToolProgressEntry {
+                    name: "t".into(),
+                    status: ToolStatus::Running,
+                    args: None,
+                    result: None,
+                    error: None,
+                    summary: None,
+                }],
+            }),
+            ResponseCancelled(ResponseCancelledEvent {
                 response_id: resp(),
-            },
-            ResponseDone {
+            }),
+            ResponseDone(ResponseDoneEvent {
                 response: ResponsePayload {
                     id: resp(),
                     status: ResponseStatus::Cancelled,
@@ -1580,26 +1601,26 @@ mod tier1 {
                     }),
                     ..Default::default()
                 },
-            },
+            }),
             OutputAudioBufferCleared,
-            OutputAudioBufferStarted {
+            OutputAudioBufferStarted(OutputAudioBufferStartedEvent {
                 response_id: resp(),
-            },
-            OutputAudioBufferStopped {
+            }),
+            OutputAudioBufferStopped(OutputAudioBufferStoppedEvent {
                 response_id: resp(),
-            },
-            RateLimitsUpdated {
+            }),
+            RateLimitsUpdated(RateLimitsUpdatedEvent {
                 rate_limits: json!([]),
-            },
-            Error {
+            }),
+            Error(ErrorEvent {
                 error: ErrorPayload::for_code("x", "y"),
-            },
-            Diarization {
+            }),
+            Diarization(DiarizationEvent {
                 item_id: item(),
                 audio_end_ms: 0,
                 elapsed_ms: None,
                 segments: vec![],
-            },
+            }),
         ]
     }
 
@@ -1617,6 +1638,13 @@ mod tier1 {
             39,
             "OutboundEvent variant count changed; update the harness table"
         );
+        for ev in &evs {
+            assert_eq!(
+                ev.event_type().wire_name(),
+                ev.type_name(),
+                "typeshared RealtimeServerEventType drifted from the serde wire tag"
+            );
+        }
     }
 
     fn i17_divergences() -> Vec<(&'static str, Topic, Topic)> {
@@ -2978,13 +3006,15 @@ mod client_supplied {
             events::emit_audio_transcript_delta(session, response_id, item_id, SPEAK_TEXT).await;
             for _ in 0..2 {
                 session
-                    .emit(OutboundEvent::ResponseOutputAudioDelta {
-                        response_id: ResponseId::new(response_id),
-                        item_id: ItemId::new(item_id),
-                        output_index: 0,
-                        content_index: 0,
-                        delta: "AAAA".to_string(),
-                    })
+                    .emit(OutboundEvent::ResponseOutputAudioDelta(
+                        super::super::wire::ResponseOutputAudioDeltaEvent {
+                            response_id: ResponseId::new(response_id),
+                            item_id: ItemId::new(item_id),
+                            output_index: 0,
+                            content_index: 0,
+                            delta: "AAAA".to_string(),
+                        },
+                    ))
                     .await;
             }
         }
@@ -3042,7 +3072,7 @@ mod client_supplied {
 
         let bracket: Vec<&str> = trace
             .iter()
-            .map(|e| ty(e))
+            .map(ty)
             .filter(|t| t.starts_with("response.") && *t != AUDIO_DELTA)
             .collect();
         assert_eq!(

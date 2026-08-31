@@ -29,7 +29,8 @@ impl GgufLoader {
         let reader = BufReader::new(
             File::open(&path).with_context(|| format!("open gguf reader {}", path.display()))?,
         );
-        let nvfp4_transcode = std::env::var("NV_GGUF_NVFP4").ok().as_deref() == Some("1");
+        let nvfp4_transcode =
+            nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_GGUF_NVFP4");
         Ok(Self {
             content,
             reader: RefCell::new(reader),

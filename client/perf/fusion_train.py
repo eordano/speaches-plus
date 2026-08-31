@@ -16,8 +16,8 @@ import sys
 
 import numpy as np
 
-FEAT_DIR = "/tmp/eot-scratch/fusion-features"
-OUT = "/tmp/eot-scratch/fusion-weights-new.json"
+FEAT_DIR = "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/fusion-features"
+OUT = "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/fusion-weights-new.json"
 
 CURRENT = np.array([0.866202, 0.283641, 0.018662, 0.560501, 1.195453, 0.258435, 0.003248, 0.081883])
 NAMES = ["bias", "w_p_text", "w_p_audio", "w_audio_log_sec", "w_partial_log_chars",

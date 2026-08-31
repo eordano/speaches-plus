@@ -384,6 +384,18 @@ pub struct Gemma4MmTowers {
     pub vision_graph: Option<nv_models::gemma4_vision_graph::Gemma4VisionGraph>,
 }
 
+pub const VISION_NVFP4_STAYS_OPT_IN_UNTIL_AN_IMAGE_ACCURACY_FIXTURE_EXISTS: &str =
+    "NV_MM_VISION_DTYPE=nvfp4";
+
+pub fn vision_weight_mode_from(raw: Option<&str>) -> (DType, bool) {
+    match raw {
+        Some("int8") => (DType::U8, false),
+        Some("bf16") => (DType::BF16, false),
+        Some("nvfp4") => (DType::BF16, true),
+        _ => (DType::F32, false),
+    }
+}
+
 impl Gemma4MmTowers {
     pub fn new(
         model_id: impl Into<String>,
@@ -424,11 +436,8 @@ impl Gemma4MmTowers {
                 Err(_) => true,
             }
         }
-        let vision_dtype = match std::env::var("NV_MM_VISION_DTYPE").as_deref() {
-            Ok("int8") => DType::U8,
-            Ok("bf16") => DType::BF16,
-            _ => DType::F32,
-        };
+        let (vision_dtype, vision_nvfp4_opt_in) =
+            vision_weight_mode_from(std::env::var("NV_MM_VISION_DTYPE").ok().as_deref());
         let model_id = dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -446,10 +455,18 @@ impl Gemma4MmTowers {
                     .context("parse gemma4 vision_config")?;
                 let loader = WeightLoader::open_dir(dir, device)
                     .with_context(|| format!("open weights in {}", dir.display()))?;
-                Some(
-                    Gemma4VisionTower::load(vcfg, &loader, device, vision_dtype)
-                        .context("load gemma4 vision tower")?,
-                )
+                let mut tower = Gemma4VisionTower::load(vcfg, &loader, device, vision_dtype)
+                    .context("load gemma4 vision tower")?;
+                if vision_nvfp4_opt_in {
+                    let n = tower
+                        .quantize_linears_nvfp4()
+                        .context("NV_MM_VISION_DTYPE=nvfp4: quantize gemma4 vision tower")?;
+                    tracing::info!(
+                        "gemma4 vision tower: {n} projections quantized to nvfp4 \
+                         (NV_MM_VISION_DTYPE=nvfp4 opt-in)"
+                    );
+                }
+                Some(tower)
             }
         };
         let audio = if tower_enabled("audio") {

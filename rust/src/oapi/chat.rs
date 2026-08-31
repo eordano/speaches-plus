@@ -1,16 +1,14 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::oapi::deadline;
@@ -21,9 +19,71 @@ pub mod json_ext;
 
 use self::json_ext::OaiJson;
 
+pub const NV_OAPI_PHASE_WALLS_ENV_OPT_IN_1_WALLS_THE_REQUEST_PATH_ON_STDERR_ONLY_SO_STREAMED_BYTES_NEVER_MOVE:
+    &str = "NV_OAPI_PHASE_WALLS";
+
+pub fn oapi_phase_walls_selected_from_env() -> bool {
+    static SELECTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SELECTED.get_or_init(|| {
+        std::env::var(
+            NV_OAPI_PHASE_WALLS_ENV_OPT_IN_1_WALLS_THE_REQUEST_PATH_ON_STDERR_ONLY_SO_STREAMED_BYTES_NEVER_MOVE,
+        )
+        .ok()
+        .as_deref()
+            == Some("1")
+    })
+}
+
+pub fn oapi_phase_wall(t0: std::time::Instant, phase: &str) {
+    if oapi_phase_walls_selected_from_env() {
+        eprintln!(
+            "OAPI-PHASE phase={phase} at_ms={:.1}",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
 pub const DEFAULT_MAX_TOKENS: usize = 256;
 
+pub const DEFAULT_MAX_TOKENS_ENV_MOVES_THE_OMITTED_MAX_TOKENS_DEFAULT_OF_256: &str =
+    "NV_DEFAULT_MAX_TOKENS";
+
 pub const MAX_MAX_TOKENS: usize = 8192;
+
+pub const MAX_MAX_TOKENS_ENV_LIFTS_THE_8192_CAP_THE_KV_WINDOW_STAYS_THE_REAL_BOUND: &str =
+    "NV_MAX_MAX_TOKENS";
+
+pub fn default_max_tokens_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
+pub fn default_max_tokens() -> usize {
+    default_max_tokens_from(
+        std::env::var(DEFAULT_MAX_TOKENS_ENV_MOVES_THE_OMITTED_MAX_TOKENS_DEFAULT_OF_256)
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub fn max_max_tokens_from(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(MAX_MAX_TOKENS)
+}
+
+pub fn max_max_tokens() -> usize {
+    max_max_tokens_from(
+        std::env::var(MAX_MAX_TOKENS_ENV_LIFTS_THE_8192_CAP_THE_KV_WINDOW_STAYS_THE_REAL_BOUND)
+            .ok()
+            .as_deref(),
+    )
+}
+
+pub fn resolve_max_new_tokens(asked: Option<usize>, omitted_default: usize, cap: usize) -> usize {
+    asked.unwrap_or(omitted_default).clamp(1, cap.max(1))
+}
 
 pub const SPEC_DECODE_HEADER: &str = "x-spec-decode";
 
@@ -1157,6 +1217,22 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
+impl Usage {
+    pub fn totaled(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            prompt_tokens_details: cached_tokens
+                .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct PromptTokensDetails {
@@ -1299,12 +1375,21 @@ pub fn is_busy_shed(msg: &str) -> bool {
     msg.contains(ENGINE_BUSY_PREFIX) || msg.contains(crate::oapi::admission::REJECT_PREFIX)
 }
 
+pub fn is_prompt_overflow(msg: &str) -> bool {
+    msg.contains("KV window") && (msg.contains("does not fit") || msg.contains("no room to generate"))
+}
+
 pub(crate) fn engine_event_error_by_surface(
     msg: String,
     shed_note: &str,
+    invalid: impl FnOnce(String) -> Response,
     unavailable: impl FnOnce(String) -> Response,
     server: impl FnOnce(String) -> Response,
 ) -> Response {
+    if is_prompt_overflow(&msg) {
+        warn!(reason = %msg, "rejecting a chat request: the prompt does not fit the KV window");
+        return invalid(msg);
+    }
     if is_busy_shed(&msg) {
         warn!(reason = %msg, "{}", shed_note);
         return unavailable(msg);
@@ -1329,6 +1414,15 @@ pub(crate) fn engine_event_error_response(msg: String) -> Response {
     engine_event_error_by_surface(
         msg,
         "shed a chat request: capacity ran out before generation started",
+        |m| {
+            openai_error(
+                StatusCode::BAD_REQUEST,
+                m,
+                kind::INVALID_REQUEST,
+                Some("messages"),
+                Some("context_length_exceeded"),
+            )
+        },
         |m| {
             openai_error(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1918,7 +2012,8 @@ pub async fn handle_chat_completions(
 ) -> Response {
     let spec = spec_decode_header_for(&state.registry, req.model.as_deref());
     let client = ClientDeadline::from_request(req.timeout, &headers);
-    let mut resp = chat_completions_impl(state, req, client).await;
+    let traj_meta = crate::oapi::trajectory::TrajMeta::from_headers(&headers);
+    let mut resp = chat_completions_impl(state, req, client, traj_meta).await;
     set_spec_decode_header(&mut resp, spec);
     resp
 }
@@ -1927,7 +2022,9 @@ async fn chat_completions_impl(
     state: ChatAppState,
     mut req: ChatCompletionRequest,
     client: Option<ClientDeadline>,
+    traj_meta: crate::oapi::trajectory::TrajMeta,
 ) -> Response {
+    let t_req = std::time::Instant::now();
     if req.messages.is_empty() {
         return crate::oapi::fastapi_validation_error(vec![crate::oapi::missing_field(&[
             "body", "messages",
@@ -2068,6 +2165,7 @@ async fn chat_completions_impl(
             return missing_template_refusal(message);
         }
     };
+    oapi_phase_wall(t_req, "template_rendered");
     let think = ThinkPostProcess {
         active: engine.thinking_split_supported(),
         opened: prompt.trim_end().ends_with(THINK_OPEN),
@@ -2077,21 +2175,22 @@ async fn chat_completions_impl(
         Some(StopField::Many(v)) => v.clone(),
         None => Vec::new(),
     };
-    let max_new_tokens = req
-        .max_completion_tokens
-        .or(req.max_tokens)
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .clamp(1, MAX_MAX_TOKENS);
+    let max_tokens_cap = max_max_tokens();
+    let max_new_tokens = resolve_max_new_tokens(
+        req.max_completion_tokens.or(req.max_tokens),
+        default_max_tokens(),
+        max_tokens_cap,
+    );
     if let Some(asked) = req
         .max_completion_tokens
         .or(req.max_tokens)
-        .filter(|&asked| asked > MAX_MAX_TOKENS)
+        .filter(|&asked| asked > max_tokens_cap)
     {
         tracing::info!(
             asked,
             effective = max_new_tokens,
-            "max_tokens clamped to MAX_MAX_TOKENS; the response will carry finish_reason=length \
-             if generation reaches it"
+            "max_tokens clamped to the NV_MAX_MAX_TOKENS cap; the response will carry \
+             finish_reason=length if generation reaches it"
         );
     }
 
@@ -2144,11 +2243,13 @@ async fn chat_completions_impl(
             tpp,
             think,
             client,
+            t_req,
+            traj_meta,
         )
         .await
     } else {
         run_non_streaming(
-            engine, gen, n, base_seed, id, model_id, created, tpp, think, client,
+            engine, gen, n, base_seed, id, model_id, created, tpp, think, client, traj_meta,
         )
         .await
     }
@@ -2158,17 +2259,18 @@ async fn first_event(
     rx: &mut mpsc::Receiver<ChatEvent>,
     client: Option<ClientDeadline>,
 ) -> Result<Option<ChatEvent>, Response> {
-    let Some(client) = client else {
-        return Ok(None);
-    };
-    match tokio::time::timeout(client.budget, rx.recv()).await {
-        Ok(ev) => match ev {
-            Some(ChatEvent::Error(msg)) if is_busy_shed(&msg) => {
-                Err(engine_event_error_response(msg))
-            }
-            other => Ok(other),
+    let ev = match client {
+        Some(client) => match tokio::time::timeout(client.budget, rx.recv()).await {
+            Ok(ev) => ev,
+            Err(_) => return Err(deadline_shed_response(client.budget_ms(), client.source)),
         },
-        Err(_) => Err(deadline_shed_response(client.budget_ms(), client.source)),
+        None => rx.recv().await,
+    };
+    match ev {
+        Some(ChatEvent::Error(msg)) if is_busy_shed(&msg) || is_prompt_overflow(&msg) => {
+            Err(engine_event_error_response(msg))
+        }
+        other => Ok(other),
     }
 }
 
@@ -2197,6 +2299,7 @@ async fn run_non_streaming(
     tpp: ToolPostProcess,
     think: ThinkPostProcess,
     client: Option<ClientDeadline>,
+    traj_meta: crate::oapi::trajectory::TrajMeta,
 ) -> Response {
     let mut choices: Vec<ChatChoice> = Vec::with_capacity(n as usize);
     let mut prompt_tokens: u32 = 0;
@@ -2223,6 +2326,8 @@ async fn run_non_streaming(
         let mut engine_reasoning = String::new();
         let mut completion_tokens: u32 = 0;
         let mut finish_reason = String::from("stop");
+        let mut saw_done = false;
+        let mut stopped_by: Option<String> = None;
         let mut lp_entries: Vec<LogprobEntry> = Vec::new();
         #[allow(clippy::while_let_loop)]
         loop {
@@ -2235,7 +2340,7 @@ async fn run_non_streaming(
             match ev {
                 ChatEvent::Started { prompt_tokens: p } => prompt_tokens = p,
                 ChatEvent::PromptCached { cached_tokens: c } => cached_tokens = Some(c),
-                ChatEvent::StoppedBy { .. } => {}
+                ChatEvent::StoppedBy { stop_sequence } => stopped_by = Some(stop_sequence),
                 ChatEvent::TextDelta(s) => text.push_str(&s),
                 ChatEvent::ReasoningDelta(s) => engine_reasoning.push_str(&s),
                 ChatEvent::Logprob(e) => lp_entries.push(e),
@@ -2245,12 +2350,33 @@ async fn run_non_streaming(
                 } => {
                     finish_reason = r;
                     completion_tokens = c;
+                    saw_done = true;
                 }
                 ChatEvent::Error(msg) => return engine_event_error_response(msg),
             }
         }
 
         total_completion_tokens = total_completion_tokens.saturating_add(completion_tokens);
+        if saw_done && crate::oapi::trajectory::enabled() {
+            crate::oapi::trajectory::append(crate::oapi::trajectory::TrajectoryRecord {
+                ts: crate::oapi::trajectory::TrajectoryRecord::now_secs(),
+                endpoint: "chat".into(),
+                id: id.clone(),
+                model: model.clone(),
+                prompt: gen.prompt.clone(),
+                completion: text.clone(),
+                reasoning: (!engine_reasoning.is_empty()).then(|| engine_reasoning.clone()),
+                finish_reason: finish_reason.clone(),
+                stopped_by: stopped_by.clone(),
+                multimodal: gen.mm.is_some(),
+                label: traj_meta.label.clone(),
+                tag: traj_meta.tag.clone(),
+                prompt_tokens,
+                completion_tokens,
+                seed: base_seed.wrapping_add(i as u64),
+                temperature: gen.temperature,
+            });
+        }
         let logprobs = if lp_entries.is_empty() {
             None
         } else {
@@ -2299,13 +2425,7 @@ async fn run_non_streaming(
         system_fingerprint: Some(system_fingerprint(&model)),
         model,
         choices,
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            total_tokens: prompt_tokens + total_completion_tokens,
-            prompt_tokens_details: cached_tokens
-                .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
-        },
+        usage: Usage::totaled(prompt_tokens, total_completion_tokens, cached_tokens),
     };
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -2323,6 +2443,8 @@ async fn run_streaming(
     tpp: ToolPostProcess,
     think: ThinkPostProcess,
     client: Option<ClientDeadline>,
+    t_req: std::time::Instant,
+    traj_meta: crate::oapi::trajectory::TrajMeta,
 ) -> Response {
     let (tx_bytes, rx_bytes) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -2333,11 +2455,13 @@ async fn run_streaming(
         warn!(error = %err, "chat engine.generate failed to start");
         return engine_start_error_response(&err);
     }
+    oapi_phase_wall(t_req, "engine_generate_spawned");
 
     let mut first_ev = match first_event(&mut rx_ev0, client).await {
         Ok(ev) => ev,
         Err(resp) => return resp,
     };
+    oapi_phase_wall(t_req, "first_event_recv");
 
     let id_s = id.clone();
     let model_s = model.clone();
@@ -2347,6 +2471,7 @@ async fn run_streaming(
         let mut cached_tokens: Option<u32> = None;
         let mut total_completion_tokens: u32 = 0;
         let mut rx_first = Some(rx_ev0);
+        let mut first_delta_walled = false;
 
         for i in 0..n {
             let mut pre = first_ev.take();
@@ -2391,6 +2516,12 @@ async fn run_streaming(
 
             let mut buf = String::new();
 
+            let traj_on = crate::oapi::trajectory::enabled();
+            let mut traj = String::new();
+            let mut traj_reasoning = String::new();
+            let mut stopped_by: Option<String> = None;
+            let mut choice_completion_tokens: u32 = 0;
+
             let pair_lp = gen.logprobs && !tpp.active && !think.active;
             let mut pending_content: Option<String> = None;
             let mut splitter = ThinkingStream::new(think.opened);
@@ -2402,15 +2533,26 @@ async fn run_streaming(
                 }) else {
                     break;
                 };
+                if traj_on {
+                    match &ev {
+                        ChatEvent::TextDelta(s) => traj.push_str(s),
+                        ChatEvent::ReasoningDelta(s) => traj_reasoning.push_str(s),
+                        _ => {}
+                    }
+                }
                 match ev {
                     ChatEvent::Started { prompt_tokens: p } => prompt_tokens = p,
                     ChatEvent::PromptCached { cached_tokens: c } => cached_tokens = Some(c),
-                    ChatEvent::StoppedBy { .. } => {}
+                    ChatEvent::StoppedBy { stop_sequence } => stopped_by = Some(stop_sequence),
                     ChatEvent::TextDelta(s) if tpp.active => buf.push_str(&s),
                     ChatEvent::TextDelta(s) if think.active => {
                         let (r, c) = splitter.push(&s);
                         if r.is_empty() && c.is_empty() {
                             continue;
+                        }
+                        if !first_delta_walled {
+                            first_delta_walled = true;
+                            oapi_phase_wall(t_req, "first_delta_enqueued");
                         }
                         let chunk = ChatCompletionChunk {
                             id: id_s.clone(),
@@ -2444,6 +2586,10 @@ async fn run_streaming(
                         });
                     }
                     ChatEvent::ReasoningDelta(s) => {
+                        if !first_delta_walled {
+                            first_delta_walled = true;
+                            oapi_phase_wall(t_req, "first_delta_enqueued");
+                        }
                         let chunk = ChatCompletionChunk {
                             id: id_s.clone(),
                             object: "chat.completion.chunk",
@@ -2466,6 +2612,10 @@ async fn run_streaming(
                         }
                     }
                     ChatEvent::TextDelta(s) => {
+                        if !first_delta_walled {
+                            first_delta_walled = true;
+                            oapi_phase_wall(t_req, "first_delta_enqueued");
+                        }
                         let chunk = ChatCompletionChunk {
                             id: id_s.clone(),
                             object: "chat.completion.chunk",
@@ -2514,6 +2664,7 @@ async fn run_streaming(
                         completion_tokens: c,
                     } => {
                         finish_reason = Some(r);
+                        choice_completion_tokens = c;
                         total_completion_tokens = total_completion_tokens.saturating_add(c);
                     }
                     ChatEvent::Error(msg) => {
@@ -2524,6 +2675,8 @@ async fn run_streaming(
                     }
                 }
             }
+
+            let raw_finish_before_tool_parse = finish_reason.clone();
 
             if let Some(c) = pending_content.take() {
                 let chunk = ChatCompletionChunk {
@@ -2623,6 +2776,30 @@ async fn run_streaming(
                 }
             }
 
+            if traj_on {
+                if let Some(raw_finish) = raw_finish_before_tool_parse {
+                    crate::oapi::trajectory::append(crate::oapi::trajectory::TrajectoryRecord {
+                        ts: crate::oapi::trajectory::TrajectoryRecord::now_secs(),
+                        endpoint: "chat".into(),
+                        id: id_s.clone(),
+                        model: model_s.clone(),
+                        prompt: gen.prompt.clone(),
+                        completion: std::mem::take(&mut traj),
+                        reasoning: (!traj_reasoning.is_empty())
+                            .then(|| std::mem::take(&mut traj_reasoning)),
+                        finish_reason: raw_finish,
+                        stopped_by: stopped_by.clone(),
+                        multimodal: gen.mm.is_some(),
+                        label: traj_meta.label.clone(),
+                        tag: traj_meta.tag.clone(),
+                        prompt_tokens,
+                        completion_tokens: choice_completion_tokens,
+                        seed: base_seed.wrapping_add(i as u64),
+                        temperature: gen.temperature,
+                    });
+                }
+            }
+
             let last = ChatCompletionChunk {
                 id: id_s.clone(),
                 object: "chat.completion.chunk",
@@ -2649,13 +2826,11 @@ async fn run_streaming(
                 created,
                 model: model_s,
                 system_fingerprint: Some(fp),
-                usage: Some(Usage {
+                usage: Some(Usage::totaled(
                     prompt_tokens,
-                    completion_tokens: total_completion_tokens,
-                    total_tokens: prompt_tokens + total_completion_tokens,
-                    prompt_tokens_details: cached_tokens
-                        .map(|cached_tokens| PromptTokensDetails { cached_tokens }),
-                }),
+                    total_completion_tokens,
+                    cached_tokens,
+                )),
                 choices: Vec::new(),
             };
             if send_sse_json(&tx_bytes, &usage_chunk).await.is_err() {
@@ -2666,13 +2841,7 @@ async fn run_streaming(
         let _ = send_sse_raw(&tx_bytes, "[DONE]").await;
     });
 
-    let stream = ReceiverStream::new(rx_bytes);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::oapi::sse_response(rx_bytes)
 }
 
 pub(crate) async fn send_sse_json<T: Serialize>(
@@ -2723,7 +2892,88 @@ pub(crate) fn now_unix_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+
     use super::*;
+
+    #[test]
+    fn max_tokens_resolution_with_envs_unset_is_bit_identical_to_the_old_hard_consts() {
+        for asked in [
+            None,
+            Some(0),
+            Some(1),
+            Some(255),
+            Some(256),
+            Some(8191),
+            Some(8192),
+            Some(8193),
+            Some(32768),
+            Some(usize::MAX),
+        ] {
+            let old = asked.unwrap_or(DEFAULT_MAX_TOKENS).clamp(1, MAX_MAX_TOKENS);
+            let new = resolve_max_new_tokens(
+                asked,
+                default_max_tokens_from(None),
+                max_max_tokens_from(None),
+            );
+            assert_eq!(new, old, "asked={asked:?} must resolve exactly as before");
+        }
+    }
+
+    #[test]
+    fn nv_max_max_tokens_lifts_the_cap_and_nv_default_max_tokens_moves_the_omitted_default() {
+        assert_eq!(max_max_tokens_from(Some("262144")), 262144);
+        assert_eq!(
+            resolve_max_new_tokens(
+                Some(32768),
+                default_max_tokens_from(None),
+                max_max_tokens_from(Some("262144"))
+            ),
+            32768,
+            "a lifted cap must stop clamping a 32768-token ask"
+        );
+        assert_eq!(
+            resolve_max_new_tokens(
+                Some(500_000),
+                default_max_tokens_from(None),
+                max_max_tokens_from(Some("262144"))
+            ),
+            262144,
+            "the lifted cap still clamps above itself; kv_window stays the real bound"
+        );
+        assert_eq!(default_max_tokens_from(Some("2048")), 2048);
+        assert_eq!(
+            resolve_max_new_tokens(
+                None,
+                default_max_tokens_from(Some("2048")),
+                max_max_tokens_from(None)
+            ),
+            2048,
+            "an omitted max_tokens must take the env-moved default"
+        );
+        assert_eq!(
+            resolve_max_new_tokens(
+                None,
+                default_max_tokens_from(Some("32768")),
+                max_max_tokens_from(None)
+            ),
+            MAX_MAX_TOKENS,
+            "a moved omitted-default never escapes the cap"
+        );
+    }
+
+    #[test]
+    fn garbage_or_zero_max_tokens_envs_keep_the_shipped_defaults() {
+        for junk in [None, Some(""), Some(" "), Some("0"), Some("-1"), Some("lots")] {
+            assert_eq!(max_max_tokens_from(junk), MAX_MAX_TOKENS, "junk {junk:?}");
+            assert_eq!(
+                default_max_tokens_from(junk),
+                DEFAULT_MAX_TOKENS,
+                "junk {junk:?}"
+            );
+        }
+        assert_eq!(max_max_tokens_from(Some(" 16384 ")), 16384);
+    }
 
     async fn error_body(resp: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
@@ -2819,11 +3069,45 @@ mod tests {
             Some(ChatEvent::Started { prompt_tokens: 7 })
         ));
 
-        let none = first_event(&mut rx, None)
+        let (tx3, mut rx3) = mpsc::channel::<ChatEvent>(4);
+        tx3.send(ChatEvent::Started { prompt_tokens: 3 })
             .await
-            .expect("no caller deadline means no peek and no shed");
-        assert!(none.is_none());
+            .unwrap();
+        let peeked_no_deadline = first_event(&mut rx3, None)
+            .await
+            .expect("no caller deadline still passes the first event through without shedding");
+        assert!(matches!(
+            peeked_no_deadline,
+            Some(ChatEvent::Started { prompt_tokens: 3 })
+        ));
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_overflow_first_event_is_a_400_before_headers_even_without_a_deadline() {
+        let (tx, mut rx) = mpsc::channel::<ChatEvent>(4);
+        tx.send(ChatEvent::Error(
+            "prompt of 34469 tokens does not fit the 8192-token wgpu KV window (set \
+             NV_WGPU_CHAT_MAX_SEQ)"
+                .into(),
+        ))
+        .await
+        .unwrap();
+        let resp = first_event(&mut rx, None)
+            .await
+            .expect_err("a prompt overflow must abort with a response before headers");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = error_body(resp).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+
+        let no_room = "no room to generate: prompt 8192 tokens fills the 8192-token wgpu KV window";
+        assert!(is_prompt_overflow(no_room));
+        assert_eq!(
+            engine_event_error_response(no_room.to_string()).status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!is_prompt_overflow("engine: some unrelated failure"));
     }
 
     #[tokio::test]

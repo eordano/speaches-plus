@@ -444,9 +444,9 @@
       "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"
     },
     {
-      "id": "T3.14-apple-npu-accelerator",
-      "note": "decode-systems", "paper": "Apple Neural Accelerator (#5)", "note_artifact": null,
-      "claim_text": "vendor throughput figures.", "stated_operating_point": "newest-generation Apple silicon",
+      "id": "T3.14-m5-accelerator",
+      "note": "decode-systems", "paper": "M5 Neural Accelerator (#5)", "note_artifact": null,
+      "claim_text": "vendor throughput figures.", "stated_operating_point": "Apple M5",
       "our_context": {"model": null, "phase": null, "drafter": null, "k": null},
       "lever_class": "cuts_compute", "claimed": {"kind": "ratio", "value": null},
       "check": null, "check_args": null, "reason_code": "DIFFERENT_HARDWARE"

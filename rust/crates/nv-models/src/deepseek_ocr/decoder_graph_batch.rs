@@ -22,9 +22,7 @@ use crate::laguna_fa2::{batch_decode_fwd_bf16, varlen_fwd_bf16, BatchDecodeArgs,
 pub fn attn_batched() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_ATTN_BATCH")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_ATTN_BATCH")
     })
 }
 use nv_kernels::graph::CudaGraphRunner;

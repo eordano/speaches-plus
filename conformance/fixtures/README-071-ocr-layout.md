@@ -19,7 +19,7 @@ Same top-level head as every other family: `name`, `family`, `description`,
 
 `scoring` names the two numbers: `raw` is character edit distance against
 `expected_text` verbatim; `neutral` is the same distance after
-`nv-ocr tests/markup_neutral.rs::markup_neutral` (markup stripped, whitespace
+`nv-ocr tests/e2e_fixtures.rs::markup_neutral` (markup stripped, whitespace
 collapsed). **The neutral number is the gating one.**
 
 `skip_when_no_model: true` covers both backends: classical gates need the
@@ -31,7 +31,7 @@ DeepSeek-OCR weights.
 | fixture | layout | neutral CER gate (model / classical) |
 |---|---|---|
 | 071-ocr-layout-invoice | header blocks, ruled item table, totals column | 0.02 / 0.18 |
-| 071-ocr-layout-newspaper | two columns, masthead, headlines | 0.02 / 0.65 |
+| 071-ocr-layout-newspaper | two columns, masthead, headlines | 0.02 / 0.03 |
 | 071-ocr-layout-report | single-column numbered report, bullet metrics | 0.02 / 0.01 |
 | 071-ocr-layout-letter | address block, salutation, body | 0.02 / 0.01 |
 | 071-ocr-layout-labnotes | heading, data table, observations | 0.02 / 0.02 |
@@ -42,12 +42,16 @@ model that emits markdown scores badly on raw CER while being correct.
 
 ## Consumers
 
-- `rust/crates/nv-ocr/tests/e2e_fixtures.rs::e2e_layout_fixtures_classical_gates`
-  — classical gates.
-- `rust/crates/nv-ocr/tests/markup_neutral.rs` — the neutralizer, plus an
-  `#[ignore]`d dump helper for differential runs.
-- `rust/crates/nv-models/tests/deepseek_ocr_graph*.rs`,
-  `deepseek_ocr_pipeline.rs` — model gates.
+- `rust/crates/nv-ocr/tests/e2e_fixtures.rs` — the classical gates
+  (`e2e_layout_fixtures_classical_gates`), the neutralizer (`markup_neutral`),
+  the gate-shape check that runs with no assets at all
+  (`every_071_fixture_declares_all_four_cer_gates`), and an `#[ignore]`d
+  re-measure table (`report_layout_fixture_cers`).
+- `rust/crates/nv-models/tests/deepseek_ocr_graph_batch.rs`,
+  `dots_ocr_bench.rs`, `got_ocr_real.rs` — these walk the same five-fixture list
+  but assert graphed==eager token identity or measure speed. **`cer_max_model`
+  and `cer_max_model_neutral` have no runner**: nothing scores a generative
+  backend against `expected_text`.
 
 ## Regenerating
 

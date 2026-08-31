@@ -1426,6 +1426,50 @@ fn dense_single_slot_route_ab() {
 }
 
 #[test]
+#[ignore = "GPU rate measurement; run explicitly with --nocapture"]
+fn mrow2_wg256_is_2pct_at_down_and_null_at_gate_up_so_the_shipping_128x2_cfg_stays() {
+    let Some(ctx) = ctx_or_skip("mrow2_cfg_sweep_vs_shipping") else {
+        return;
+    };
+    eprintln!("=== mrow2 wg sweep vs the shipping mrow2_upgrade cfg(128,2) ===");
+    eprintln!(
+        "gate/up ships q3w_gemv_nvfp4_mrow2_2w with mrow2's per-subgroup working set, \
+         so the plain mrow2 cfgs stand proxy for it there"
+    );
+    for (tag, n, k) in [("q38 gate/up", 17408usize, 5120usize), ("q38 down", 5120, 17408)] {
+        route_ab(
+            ctx,
+            tag,
+            n,
+            k,
+            &[
+                RouteArm {
+                    label: "mrow2 wg128 (SHIPPING)",
+                    kind: v2::V2Kernel::MRow2,
+                    cfg: v2::V2Config::new(128, 2),
+                    oracle: Oracle::Pair,
+                    pk: false,
+                },
+                RouteArm {
+                    label: "mrow2 wg64",
+                    kind: v2::V2Kernel::MRow2,
+                    cfg: v2::V2Config::new(64, 2),
+                    oracle: Oracle::Pair,
+                    pk: false,
+                },
+                RouteArm {
+                    label: "mrow2 wg256",
+                    kind: v2::V2Kernel::MRow2,
+                    cfg: v2::V2Config::new(256, 2),
+                    oracle: Oracle::Pair,
+                    pk: false,
+                },
+            ],
+        );
+    }
+}
+
+#[test]
 fn nvfp4_moe_decode_alu_ablation_at_routed_dispatch() {
     let Some(ctx) = ctx_or_skip("nvfp4_moe_decode_alu_ablation_at_routed_dispatch") else {
         return;

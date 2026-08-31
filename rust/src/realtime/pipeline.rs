@@ -195,7 +195,7 @@ pub(super) async fn commit_after_eou(
     audio_ms: u64,
     suppress_response: bool,
 ) {
-    let (predicted_runner, predicted_llm_handle, predicted_id_for_log) = {
+    let (predicted_runner, predicted_llm_handle, predicted_wire_id) = {
         let mut state = session.state.lock().await;
         let already_present = state.conversation.iter().any(|i| i.id == item_id);
         if !already_present {
@@ -206,8 +206,8 @@ pub(super) async fn commit_after_eou(
         if matches!(state.vad, VadPhase::Stopped { .. }) {
             state.vad = VadPhase::Silent;
         }
-        let rid_log = match &state.resp {
-            RespPhase::Predicted { id, .. } => Some(id.as_str().to_string()),
+        let predicted_wire_id = match &state.resp {
+            RespPhase::Predicted { id, .. } => Some(id.clone()),
             _ => None,
         };
         let (predicted_runner, predicted_llm_handle) =
@@ -220,8 +220,9 @@ pub(super) async fn commit_after_eou(
                 (None, None)
             };
         super::session::check_or_react(session, &state);
-        (predicted_runner, predicted_llm_handle, rid_log)
+        (predicted_runner, predicted_llm_handle, predicted_wire_id)
     };
+    let predicted_id_for_log = predicted_wire_id.as_ref().map(|id| id.as_str().to_string());
     {
         let mut last = session.last_eager_dispatch_at.lock().await;
         *last = None;
@@ -277,34 +278,6 @@ pub(super) async fn commit_after_eou(
         }
         None => None,
     };
-    let predicted_llm_text = match (&predicted_llm_text, &predicted_transcript) {
-        (Some(_predicted), Some(final_transcript)) => {
-            let partial_for_llm = predicted_transcript.clone().unwrap_or_default();
-            if super::eou_predicted::transcripts_materially_differ(
-                &partial_for_llm,
-                final_transcript,
-                defaults::eou::EAGER_TRANSCRIPT_MISMATCH_RATIO,
-            ) {
-                let response_id_str = predicted_id_for_log.clone().unwrap_or_default();
-                let chars = predicted_llm_text
-                    .as_ref()
-                    .map(|s| s.chars().count() as u32)
-                    .unwrap_or(0);
-                session
-                    .inspector
-                    .emit(InspectorEvent::EouPredictedRollback {
-                        session_id: session.id.as_str().to_string(),
-                        response_id: response_id_str,
-                        reason: "transcript_mismatch",
-                        llm_chars_thrown: chars,
-                    });
-                None
-            } else {
-                predicted_llm_text.clone()
-            }
-        }
-        _ => predicted_llm_text.clone(),
-    };
     {
         session
             .send_to_client(&json!({
@@ -327,7 +300,11 @@ pub(super) async fn commit_after_eou(
             .await;
     }
     let session_for_task = session.clone();
-    let response_id = session.id_source.response();
+    let response_id = promoted_turn_wire_id(
+        predicted_llm_text.is_some(),
+        predicted_wire_id,
+        session.id_source.response(),
+    );
     let response_id_for_task = response_id.clone();
     let assistant_item_id = session.id_source.item();
     let assistant_item_id_for_task = assistant_item_id.as_str().to_string();
@@ -447,21 +424,26 @@ pub(super) async fn process_utterance(
         cached
     } else {
         let stt_result = match match session.models.whisper() {
-            Ok(w) => run_stt_full(w, crate::types::MonoF32At16k::new(audio)).await,
+            Ok(w) => {
+                run_stt_full(w, crate::types::MonoF32At16k::new(audio), session.stt_language())
+                    .await
+            }
             Err(e) => Err(e),
         } {
             Ok(t) => t,
             Err(err) => {
                 warn!(error = %err, %item_id, "STT failed; emitting transcription.failed");
                 session
-                    .emit(super::wire::OutboundEvent::TranscriptionFailed {
-                        item_id: item_id.clone().into(),
-                        content_index: 0,
-                        error: json!({
-                            "code": errcode::STT_FAILED,
-                            "message": err.to_string(),
-                        }),
-                    })
+                    .emit(super::wire::OutboundEvent::TranscriptionFailed(
+                        super::wire::TranscriptionFailedEvent {
+                            item_id: item_id.clone().into(),
+                            content_index: 0,
+                            error: json!({
+                                "code": errcode::STT_FAILED,
+                                "message": err.to_string(),
+                            }),
+                        },
+                    ))
                     .await;
                 session.mark_user_item_incomplete(&item_id).await;
                 let mut state = session.state.lock().await;
@@ -674,7 +656,7 @@ pub(super) async fn run_response(
             response_id: response_id.to_string(),
             model: model_name,
         });
-        llm::complete_stream_messages(cfg, messages)
+        llm::complete_stream_messages(cfg, messages, Some(response_id.to_string()))
     };
 
     let Some(kokoro) = &session.models.kokoro else {
@@ -739,6 +721,7 @@ pub(super) async fn run_response(
 
     let (sentence_tx, mut sentence_rx) = mpsc::channel::<String>(64);
     let voice = session.query.voice.clone();
+    let tts_speed = session.tts_speed();
     let kokoro_clone = kokoro.clone();
     let audio_store = session.audio_store.clone();
     let tts_inspector = session.inspector.clone();
@@ -761,6 +744,7 @@ pub(super) async fn run_response(
                 &kokoro_clone,
                 &sentence,
                 voice.clone(),
+                tts_speed,
                 pacer.as_mut(),
                 utterance_started,
                 &mut first_audio_logged,
@@ -1205,6 +1189,7 @@ async fn synthesize_and_play(
     kokoro: &crate::tts::KokoroHandle,
     sentence: &str,
     voice: Option<String>,
+    speed: f32,
     pacer: Option<&mut AudioPacer>,
     utterance_started: std::time::Instant,
     first_audio_logged: &mut bool,
@@ -1214,7 +1199,7 @@ async fn synthesize_and_play(
     let synth_text = sentence.to_string();
     let synth_started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        kokoro.synthesize(&synth_text, voice.as_deref(), Some("en-us"), 1.0)
+        kokoro.synthesize(&synth_text, voice.as_deref(), Some("en-us"), speed)
     })
     .await;
     let audio_24k = match result {
@@ -1269,16 +1254,63 @@ async fn synthesize_and_play(
 pub(super) async fn run_stt(
     whisper: &WhisperHandle,
     audio: crate::types::MonoF32At16k,
+    language: Option<String>,
 ) -> anyhow::Result<String> {
-    Ok(run_stt_full(whisper, audio).await?.text)
+    Ok(run_stt_full(whisper, audio, language).await?.text)
 }
 
 pub(super) async fn run_stt_full(
     whisper: &WhisperHandle,
     audio: crate::types::MonoF32At16k,
+    language: Option<String>,
 ) -> anyhow::Result<crate::stt::TranscriptionResult> {
     let whisper = whisper.clone();
     let samples = audio.into_vec();
-    let result = tokio::task::spawn_blocking(move || whisper.transcribe_full(&samples)).await??;
+    let opts = crate::stt::SttRequestOptions {
+        language,
+        initial_prompt: None,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        whisper.transcribe_full_with_opts(&samples, crate::stt::WhisperTask::Transcribe, &opts)
+    })
+    .await??;
     Ok(result)
+}
+
+pub(super) fn promoted_turn_wire_id(
+    promoted: bool,
+    predicted: Option<crate::types::ResponseId>,
+    fresh: crate::types::ResponseId,
+) -> crate::types::ResponseId {
+    match (promoted, predicted) {
+        (true, Some(id)) => id,
+        _ => fresh,
+    }
+}
+
+#[cfg(test)]
+mod wire_id_tests {
+    use super::promoted_turn_wire_id;
+    use crate::types::ResponseId;
+
+    #[test]
+    fn promoted_turn_keeps_the_predicted_wire_id_so_labels_join_the_eager_trajectory_record() {
+        let predicted = ResponseId::new("resp_predicted");
+        let fresh = ResponseId::new("resp_fresh");
+        assert_eq!(
+            promoted_turn_wire_id(true, Some(predicted.clone()), fresh.clone()),
+            predicted,
+        );
+    }
+
+    #[test]
+    fn rolled_back_turn_mints_a_fresh_wire_id_and_its_fallback_llm_call_is_tagged_with_it() {
+        let predicted = ResponseId::new("resp_predicted");
+        let fresh = ResponseId::new("resp_fresh");
+        assert_eq!(
+            promoted_turn_wire_id(false, Some(predicted), fresh.clone()),
+            fresh,
+        );
+        assert_eq!(promoted_turn_wire_id(true, None, fresh.clone()), fresh);
+    }
 }

@@ -43,6 +43,7 @@ impl EventSeq {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +54,7 @@ pub enum ResponseStatus {
     Failed,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum ResponseStatusReason {
@@ -72,6 +74,7 @@ pub enum ResponseStatusReason {
     ClientCancelled,
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct ResponseStatusDetails {
@@ -85,13 +88,16 @@ fn realtime_response_object() -> &'static str {
     "realtime.response"
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct ResponsePayload {
     pub id: ResponseId,
     #[serde(default = "realtime_response_object")]
+    #[typeshare(skip)]
     pub object: &'static str,
     pub status: ResponseStatus,
+    #[typeshare(serialized_as = "U53")]
     pub audio_end_ms: u64,
     pub output: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +118,7 @@ impl Default for ResponsePayload {
     }
 }
 
+#[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct ErrorPayload {
@@ -141,6 +148,528 @@ impl ErrorPayload {
     }
 }
 
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Running,
+    Done,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ToolProgressEntry {
+    pub name: String,
+    pub status: ToolStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub args: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub result: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub error: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub summary: Option<String>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct SessionCreatedEvent {
+    pub session: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct SessionUpdatedEvent {
+    pub session: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct SessionDoneEvent {
+    pub reason: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct SpeechStartedEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub audio_start_ms: u64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct SpeechStoppedEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub audio_end_ms: u64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct BufferCommittedEvent {
+    pub item_id: ItemId,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct PartialTranscriptionEvent {
+    pub item_id: ItemId,
+    pub transcript: String,
+    #[typeshare(serialized_as = "U53")]
+    pub audio_end_ms: u64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ItemAddedEvent {
+    pub item: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ItemDeletedEvent {
+    pub item_id: ItemId,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ItemTruncatedClientAckEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub audio_end_ms: u64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct AssistantTruncatedEvent {
+    pub event_id: EventId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub audio_end_ms: u64,
+    pub transcript: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct TranscriptionCompletedEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub transcript: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct TranscriptionDeltaEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub delta: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct TranscriptionFailedEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub error: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ItemDoneEvent {
+    pub item: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ItemRetrievedEvent {
+    pub item: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseCreatedEvent {
+    pub response: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputItemAddedEvent {
+    pub response_id: ResponseId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    pub item: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputItemDoneEvent {
+    pub response_id: ResponseId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    pub item: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseContentPartAddedEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub part: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseContentPartDoneEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub part: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputAudioTranscriptDeltaEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub delta: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputAudioTranscriptDoneEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub transcript: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputAudioDeltaEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub delta: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputAudioDoneEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputTextDeltaEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub delta: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseOutputTextDoneEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    #[typeshare(serialized_as = "U53")]
+    pub content_index: u64,
+    pub text: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseFunctionCallArgumentsDeltaEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    pub call_id: String,
+    pub delta: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseFunctionCallArgumentsDoneEvent {
+    pub response_id: ResponseId,
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub output_index: u64,
+    pub call_id: String,
+    pub arguments: String,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseToolProgressEvent {
+    pub response_id: ResponseId,
+    pub tools: Vec<ToolProgressEntry>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseCancelledEvent {
+    pub response_id: ResponseId,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ResponseDoneEvent {
+    pub response: ResponsePayload,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct OutputAudioBufferStartedEvent {
+    pub response_id: ResponseId,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct OutputAudioBufferStoppedEvent {
+    pub response_id: ResponseId,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct RateLimitsUpdatedEvent {
+    pub rate_limits: Value,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ErrorEvent {
+    pub error: ErrorPayload,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct DiarizationEvent {
+    pub item_id: ItemId,
+    #[typeshare(serialized_as = "U53")]
+    pub audio_end_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    #[typeshare(serialized_as = "Option<U53>")]
+    pub elapsed_ms: Option<u64>,
+    pub segments: Vec<Value>,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub enum RealtimeServerEventType {
+    #[serde(rename = "session.created")]
+    SessionCreated,
+    #[serde(rename = "session.updated")]
+    SessionUpdated,
+    #[serde(rename = "session.done")]
+    SessionDone,
+    #[serde(rename = "input_audio_buffer.speech_started")]
+    SpeechStarted,
+    #[serde(rename = "input_audio_buffer.speech_stopped")]
+    SpeechStopped,
+    #[serde(rename = "input_audio_buffer.committed")]
+    BufferCommitted,
+    #[serde(rename = "input_audio_buffer.cleared")]
+    BufferCleared,
+    #[serde(rename = "input_audio_buffer.partial_transcription")]
+    PartialTranscription,
+    #[serde(rename = "conversation.item.added")]
+    ItemAdded,
+    #[serde(rename = "conversation.item.deleted")]
+    ItemDeleted,
+    #[serde(rename = "conversation.item.truncated")]
+    ItemTruncatedClientAck,
+    #[serde(rename = "conversation.item.assistant_truncated")]
+    AssistantTruncated,
+    #[serde(rename = "conversation.item.input_audio_transcription.completed")]
+    TranscriptionCompleted,
+    #[serde(rename = "conversation.item.input_audio_transcription.delta")]
+    TranscriptionDelta,
+    #[serde(rename = "conversation.item.input_audio_transcription.failed")]
+    TranscriptionFailed,
+    #[serde(rename = "conversation.item.done")]
+    ItemDone,
+    #[serde(rename = "conversation.item.retrieved")]
+    ItemRetrieved,
+    #[serde(rename = "response.created")]
+    ResponseCreated,
+    #[serde(rename = "response.output_item.added")]
+    ResponseOutputItemAdded,
+    #[serde(rename = "response.output_item.done")]
+    ResponseOutputItemDone,
+    #[serde(rename = "response.content_part.added")]
+    ResponseContentPartAdded,
+    #[serde(rename = "response.content_part.done")]
+    ResponseContentPartDone,
+    #[serde(rename = "response.output_audio_transcript.delta")]
+    ResponseOutputAudioTranscriptDelta,
+    #[serde(rename = "response.output_audio_transcript.done")]
+    ResponseOutputAudioTranscriptDone,
+    #[serde(rename = "response.output_audio.delta")]
+    ResponseOutputAudioDelta,
+    #[serde(rename = "response.output_audio.done")]
+    ResponseOutputAudioDone,
+    #[serde(rename = "response.output_text.delta")]
+    ResponseOutputTextDelta,
+    #[serde(rename = "response.output_text.done")]
+    ResponseOutputTextDone,
+    #[serde(rename = "response.function_call_arguments.delta")]
+    ResponseFunctionCallArgumentsDelta,
+    #[serde(rename = "response.function_call_arguments.done")]
+    ResponseFunctionCallArgumentsDone,
+    #[serde(rename = "response.tool_progress")]
+    ResponseToolProgress,
+    #[serde(rename = "response.cancelled")]
+    ResponseCancelled,
+    #[serde(rename = "response.done")]
+    ResponseDone,
+    #[serde(rename = "output_audio_buffer.cleared")]
+    OutputAudioBufferCleared,
+    #[serde(rename = "output_audio_buffer.started")]
+    OutputAudioBufferStarted,
+    #[serde(rename = "output_audio_buffer.stopped")]
+    OutputAudioBufferStopped,
+    #[serde(rename = "rate_limits.updated")]
+    RateLimitsUpdated,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "conversation.item.diarization")]
+    Diarization,
+}
+
+impl RealtimeServerEventType {
+    pub const ALL: [RealtimeServerEventType; 39] = {
+        use RealtimeServerEventType::*;
+        [
+            SessionCreated,
+            SessionUpdated,
+            SessionDone,
+            SpeechStarted,
+            SpeechStopped,
+            BufferCommitted,
+            BufferCleared,
+            PartialTranscription,
+            ItemAdded,
+            ItemDeleted,
+            ItemTruncatedClientAck,
+            AssistantTruncated,
+            TranscriptionCompleted,
+            TranscriptionDelta,
+            TranscriptionFailed,
+            ItemDone,
+            ItemRetrieved,
+            ResponseCreated,
+            ResponseOutputItemAdded,
+            ResponseOutputItemDone,
+            ResponseContentPartAdded,
+            ResponseContentPartDone,
+            ResponseOutputAudioTranscriptDelta,
+            ResponseOutputAudioTranscriptDone,
+            ResponseOutputAudioDelta,
+            ResponseOutputAudioDone,
+            ResponseOutputTextDelta,
+            ResponseOutputTextDone,
+            ResponseFunctionCallArgumentsDelta,
+            ResponseFunctionCallArgumentsDone,
+            ResponseToolProgress,
+            ResponseCancelled,
+            ResponseDone,
+            OutputAudioBufferCleared,
+            OutputAudioBufferStarted,
+            OutputAudioBufferStopped,
+            RateLimitsUpdated,
+            Error,
+            Diarization,
+        ]
+    };
+
+    pub fn wire_name(&self) -> String {
+        serde_json::to_value(self)
+            .expect("unit enum serializes")
+            .as_str()
+            .expect("unit enum serializes to a string")
+            .to_string()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(
     feature = "ts-bindings",
@@ -150,227 +679,121 @@ impl ErrorPayload {
 #[serde(tag = "type")]
 pub enum OutboundEvent {
     #[serde(rename = "session.created")]
-    SessionCreated { session: Value },
+    SessionCreated(SessionCreatedEvent),
 
     #[serde(rename = "session.updated")]
-    SessionUpdated { session: Value },
+    SessionUpdated(SessionUpdatedEvent),
 
     #[serde(rename = "session.done")]
-    SessionDone { reason: String },
+    SessionDone(SessionDoneEvent),
 
     #[serde(rename = "input_audio_buffer.speech_started")]
-    SpeechStarted {
-        item_id: ItemId,
-        audio_start_ms: u64,
-    },
+    SpeechStarted(SpeechStartedEvent),
 
     #[serde(rename = "input_audio_buffer.speech_stopped")]
-    SpeechStopped { item_id: ItemId, audio_end_ms: u64 },
+    SpeechStopped(SpeechStoppedEvent),
 
     #[serde(rename = "input_audio_buffer.committed")]
-    BufferCommitted { item_id: ItemId },
+    BufferCommitted(BufferCommittedEvent),
 
     #[serde(rename = "input_audio_buffer.cleared")]
     BufferCleared,
 
     #[serde(rename = "input_audio_buffer.partial_transcription")]
-    PartialTranscription {
-        item_id: ItemId,
-        transcript: String,
-        audio_end_ms: u64,
-    },
+    PartialTranscription(PartialTranscriptionEvent),
 
     #[serde(rename = "conversation.item.added")]
-    ItemAdded { item: Value },
+    ItemAdded(ItemAddedEvent),
 
     #[serde(rename = "conversation.item.deleted")]
-    ItemDeleted { item_id: ItemId },
+    ItemDeleted(ItemDeletedEvent),
 
     #[serde(rename = "conversation.item.truncated")]
-    ItemTruncatedClientAck {
-        item_id: ItemId,
-        content_index: u64,
-        audio_end_ms: u64,
-    },
+    ItemTruncatedClientAck(ItemTruncatedClientAckEvent),
 
     #[serde(rename = "conversation.item.assistant_truncated")]
-    AssistantTruncated {
-        event_id: EventId,
-        item_id: ItemId,
-        audio_end_ms: u64,
-        transcript: String,
-    },
+    AssistantTruncated(AssistantTruncatedEvent),
 
     #[serde(rename = "conversation.item.input_audio_transcription.completed")]
-    TranscriptionCompleted {
-        item_id: ItemId,
-        content_index: u64,
-        transcript: String,
-    },
+    TranscriptionCompleted(TranscriptionCompletedEvent),
 
     #[serde(rename = "conversation.item.input_audio_transcription.delta")]
-    TranscriptionDelta {
-        item_id: ItemId,
-        content_index: u64,
-        delta: String,
-    },
+    TranscriptionDelta(TranscriptionDeltaEvent),
 
     #[serde(rename = "conversation.item.input_audio_transcription.failed")]
-    TranscriptionFailed {
-        item_id: ItemId,
-        content_index: u64,
-        error: Value,
-    },
+    TranscriptionFailed(TranscriptionFailedEvent),
 
     #[serde(rename = "conversation.item.done")]
-    ItemDone { item: Value },
+    ItemDone(ItemDoneEvent),
 
     #[serde(rename = "conversation.item.retrieved")]
-    ItemRetrieved { item: Value },
+    ItemRetrieved(ItemRetrievedEvent),
 
     #[serde(rename = "response.created")]
-    ResponseCreated { response: Value },
+    ResponseCreated(ResponseCreatedEvent),
 
     #[serde(rename = "response.output_item.added")]
-    ResponseOutputItemAdded {
-        response_id: ResponseId,
-        output_index: u64,
-        item: Value,
-    },
+    ResponseOutputItemAdded(ResponseOutputItemAddedEvent),
 
     #[serde(rename = "response.output_item.done")]
-    ResponseOutputItemDone {
-        response_id: ResponseId,
-        output_index: u64,
-        item: Value,
-    },
+    ResponseOutputItemDone(ResponseOutputItemDoneEvent),
 
     #[serde(rename = "response.content_part.added")]
-    ResponseContentPartAdded {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        part: Value,
-    },
+    ResponseContentPartAdded(ResponseContentPartAddedEvent),
 
     #[serde(rename = "response.content_part.done")]
-    ResponseContentPartDone {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        part: Value,
-    },
+    ResponseContentPartDone(ResponseContentPartDoneEvent),
 
     #[serde(rename = "response.output_audio_transcript.delta")]
-    ResponseOutputAudioTranscriptDelta {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        delta: String,
-    },
+    ResponseOutputAudioTranscriptDelta(ResponseOutputAudioTranscriptDeltaEvent),
 
     #[serde(rename = "response.output_audio_transcript.done")]
-    ResponseOutputAudioTranscriptDone {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        transcript: String,
-    },
+    ResponseOutputAudioTranscriptDone(ResponseOutputAudioTranscriptDoneEvent),
 
     #[serde(rename = "response.output_audio.delta")]
-    ResponseOutputAudioDelta {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        delta: String,
-    },
+    ResponseOutputAudioDelta(ResponseOutputAudioDeltaEvent),
 
     #[serde(rename = "response.output_audio.done")]
-    ResponseOutputAudioDone {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-    },
+    ResponseOutputAudioDone(ResponseOutputAudioDoneEvent),
 
     #[serde(rename = "response.output_text.delta")]
-    ResponseOutputTextDelta {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        delta: String,
-    },
+    ResponseOutputTextDelta(ResponseOutputTextDeltaEvent),
 
     #[serde(rename = "response.output_text.done")]
-    ResponseOutputTextDone {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        content_index: u64,
-        text: String,
-    },
+    ResponseOutputTextDone(ResponseOutputTextDoneEvent),
 
     #[serde(rename = "response.function_call_arguments.delta")]
-    ResponseFunctionCallArgumentsDelta {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        call_id: String,
-        delta: String,
-    },
+    ResponseFunctionCallArgumentsDelta(ResponseFunctionCallArgumentsDeltaEvent),
 
     #[serde(rename = "response.function_call_arguments.done")]
-    ResponseFunctionCallArgumentsDone {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        call_id: String,
-        arguments: String,
-    },
+    ResponseFunctionCallArgumentsDone(ResponseFunctionCallArgumentsDoneEvent),
 
     #[serde(rename = "response.tool_progress")]
-    ResponseToolProgress {
-        response_id: ResponseId,
-        item_id: ItemId,
-        output_index: u64,
-        progress: Value,
-    },
+    ResponseToolProgress(ResponseToolProgressEvent),
 
     #[serde(rename = "response.cancelled")]
-    ResponseCancelled { response_id: ResponseId },
+    ResponseCancelled(ResponseCancelledEvent),
 
     #[serde(rename = "response.done")]
-    ResponseDone { response: ResponsePayload },
+    ResponseDone(ResponseDoneEvent),
 
     #[serde(rename = "output_audio_buffer.cleared")]
     OutputAudioBufferCleared,
 
     #[serde(rename = "output_audio_buffer.started")]
-    OutputAudioBufferStarted { response_id: ResponseId },
+    OutputAudioBufferStarted(OutputAudioBufferStartedEvent),
 
     #[serde(rename = "output_audio_buffer.stopped")]
-    OutputAudioBufferStopped { response_id: ResponseId },
+    OutputAudioBufferStopped(OutputAudioBufferStoppedEvent),
 
     #[serde(rename = "rate_limits.updated")]
-    RateLimitsUpdated { rate_limits: Value },
+    RateLimitsUpdated(RateLimitsUpdatedEvent),
 
     #[serde(rename = "error")]
-    Error { error: ErrorPayload },
+    Error(ErrorEvent),
 
     #[serde(rename = "conversation.item.diarization")]
-    Diarization {
-        item_id: ItemId,
-        audio_end_ms: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        elapsed_ms: Option<u64>,
-        segments: Vec<Value>,
-    },
+    Diarization(DiarizationEvent),
 }
 
 impl OutboundEvent {
@@ -384,50 +807,103 @@ impl OutboundEvent {
         Ok(value)
     }
 
+    pub fn event_type(&self) -> RealtimeServerEventType {
+        use OutboundEvent::*;
+        match self {
+            SessionCreated(..) => RealtimeServerEventType::SessionCreated,
+            SessionUpdated(..) => RealtimeServerEventType::SessionUpdated,
+            SessionDone(..) => RealtimeServerEventType::SessionDone,
+            SpeechStarted(..) => RealtimeServerEventType::SpeechStarted,
+            SpeechStopped(..) => RealtimeServerEventType::SpeechStopped,
+            BufferCommitted(..) => RealtimeServerEventType::BufferCommitted,
+            BufferCleared => RealtimeServerEventType::BufferCleared,
+            PartialTranscription(..) => RealtimeServerEventType::PartialTranscription,
+            ItemAdded(..) => RealtimeServerEventType::ItemAdded,
+            ItemDeleted(..) => RealtimeServerEventType::ItemDeleted,
+            ItemTruncatedClientAck(..) => RealtimeServerEventType::ItemTruncatedClientAck,
+            AssistantTruncated(..) => RealtimeServerEventType::AssistantTruncated,
+            TranscriptionCompleted(..) => RealtimeServerEventType::TranscriptionCompleted,
+            TranscriptionDelta(..) => RealtimeServerEventType::TranscriptionDelta,
+            TranscriptionFailed(..) => RealtimeServerEventType::TranscriptionFailed,
+            ItemDone(..) => RealtimeServerEventType::ItemDone,
+            ItemRetrieved(..) => RealtimeServerEventType::ItemRetrieved,
+            ResponseCreated(..) => RealtimeServerEventType::ResponseCreated,
+            ResponseOutputItemAdded(..) => RealtimeServerEventType::ResponseOutputItemAdded,
+            ResponseOutputItemDone(..) => RealtimeServerEventType::ResponseOutputItemDone,
+            ResponseContentPartAdded(..) => RealtimeServerEventType::ResponseContentPartAdded,
+            ResponseContentPartDone(..) => RealtimeServerEventType::ResponseContentPartDone,
+            ResponseOutputAudioTranscriptDelta(..) => {
+                RealtimeServerEventType::ResponseOutputAudioTranscriptDelta
+            }
+            ResponseOutputAudioTranscriptDone(..) => {
+                RealtimeServerEventType::ResponseOutputAudioTranscriptDone
+            }
+            ResponseOutputAudioDelta(..) => RealtimeServerEventType::ResponseOutputAudioDelta,
+            ResponseOutputAudioDone(..) => RealtimeServerEventType::ResponseOutputAudioDone,
+            ResponseOutputTextDelta(..) => RealtimeServerEventType::ResponseOutputTextDelta,
+            ResponseOutputTextDone(..) => RealtimeServerEventType::ResponseOutputTextDone,
+            ResponseFunctionCallArgumentsDelta(..) => {
+                RealtimeServerEventType::ResponseFunctionCallArgumentsDelta
+            }
+            ResponseFunctionCallArgumentsDone(..) => {
+                RealtimeServerEventType::ResponseFunctionCallArgumentsDone
+            }
+            ResponseToolProgress(..) => RealtimeServerEventType::ResponseToolProgress,
+            ResponseCancelled(..) => RealtimeServerEventType::ResponseCancelled,
+            ResponseDone(..) => RealtimeServerEventType::ResponseDone,
+            OutputAudioBufferCleared => RealtimeServerEventType::OutputAudioBufferCleared,
+            OutputAudioBufferStarted(..) => RealtimeServerEventType::OutputAudioBufferStarted,
+            OutputAudioBufferStopped(..) => RealtimeServerEventType::OutputAudioBufferStopped,
+            RateLimitsUpdated(..) => RealtimeServerEventType::RateLimitsUpdated,
+            Error(..) => RealtimeServerEventType::Error,
+            Diarization(..) => RealtimeServerEventType::Diarization,
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         use OutboundEvent::*;
         match self {
-            SessionCreated { .. } => "session.created",
-            SessionUpdated { .. } => "session.updated",
-            SessionDone { .. } => "session.done",
-            SpeechStarted { .. } => "input_audio_buffer.speech_started",
-            SpeechStopped { .. } => "input_audio_buffer.speech_stopped",
-            BufferCommitted { .. } => "input_audio_buffer.committed",
+            SessionCreated(..) => "session.created",
+            SessionUpdated(..) => "session.updated",
+            SessionDone(..) => "session.done",
+            SpeechStarted(..) => "input_audio_buffer.speech_started",
+            SpeechStopped(..) => "input_audio_buffer.speech_stopped",
+            BufferCommitted(..) => "input_audio_buffer.committed",
             BufferCleared => "input_audio_buffer.cleared",
-            PartialTranscription { .. } => "input_audio_buffer.partial_transcription",
-            ItemAdded { .. } => "conversation.item.added",
-            ItemDeleted { .. } => "conversation.item.deleted",
-            ItemTruncatedClientAck { .. } => "conversation.item.truncated",
-            AssistantTruncated { .. } => "conversation.item.assistant_truncated",
-            TranscriptionCompleted { .. } => {
+            PartialTranscription(..) => "input_audio_buffer.partial_transcription",
+            ItemAdded(..) => "conversation.item.added",
+            ItemDeleted(..) => "conversation.item.deleted",
+            ItemTruncatedClientAck(..) => "conversation.item.truncated",
+            AssistantTruncated(..) => "conversation.item.assistant_truncated",
+            TranscriptionCompleted(..) => {
                 "conversation.item.input_audio_transcription.completed"
             }
-            TranscriptionDelta { .. } => "conversation.item.input_audio_transcription.delta",
-            TranscriptionFailed { .. } => "conversation.item.input_audio_transcription.failed",
-            ItemDone { .. } => "conversation.item.done",
-            ItemRetrieved { .. } => "conversation.item.retrieved",
-            ResponseCreated { .. } => "response.created",
-            ResponseOutputItemAdded { .. } => "response.output_item.added",
-            ResponseOutputItemDone { .. } => "response.output_item.done",
-            ResponseContentPartAdded { .. } => "response.content_part.added",
-            ResponseContentPartDone { .. } => "response.content_part.done",
-            ResponseOutputAudioTranscriptDelta { .. } => "response.output_audio_transcript.delta",
-            ResponseOutputAudioTranscriptDone { .. } => "response.output_audio_transcript.done",
-            ResponseOutputAudioDelta { .. } => "response.output_audio.delta",
-            ResponseOutputAudioDone { .. } => "response.output_audio.done",
-            ResponseOutputTextDelta { .. } => "response.output_text.delta",
-            ResponseOutputTextDone { .. } => "response.output_text.done",
-            ResponseFunctionCallArgumentsDelta { .. } => "response.function_call_arguments.delta",
-            ResponseFunctionCallArgumentsDone { .. } => "response.function_call_arguments.done",
-            ResponseToolProgress { .. } => "response.tool_progress",
-            ResponseCancelled { .. } => "response.cancelled",
-            ResponseDone { .. } => "response.done",
+            TranscriptionDelta(..) => "conversation.item.input_audio_transcription.delta",
+            TranscriptionFailed(..) => "conversation.item.input_audio_transcription.failed",
+            ItemDone(..) => "conversation.item.done",
+            ItemRetrieved(..) => "conversation.item.retrieved",
+            ResponseCreated(..) => "response.created",
+            ResponseOutputItemAdded(..) => "response.output_item.added",
+            ResponseOutputItemDone(..) => "response.output_item.done",
+            ResponseContentPartAdded(..) => "response.content_part.added",
+            ResponseContentPartDone(..) => "response.content_part.done",
+            ResponseOutputAudioTranscriptDelta(..) => "response.output_audio_transcript.delta",
+            ResponseOutputAudioTranscriptDone(..) => "response.output_audio_transcript.done",
+            ResponseOutputAudioDelta(..) => "response.output_audio.delta",
+            ResponseOutputAudioDone(..) => "response.output_audio.done",
+            ResponseOutputTextDelta(..) => "response.output_text.delta",
+            ResponseOutputTextDone(..) => "response.output_text.done",
+            ResponseFunctionCallArgumentsDelta(..) => "response.function_call_arguments.delta",
+            ResponseFunctionCallArgumentsDone(..) => "response.function_call_arguments.done",
+            ResponseToolProgress(..) => "response.tool_progress",
+            ResponseCancelled(..) => "response.cancelled",
+            ResponseDone(..) => "response.done",
             OutputAudioBufferCleared => "output_audio_buffer.cleared",
-            OutputAudioBufferStarted { .. } => "output_audio_buffer.started",
-            OutputAudioBufferStopped { .. } => "output_audio_buffer.stopped",
-            RateLimitsUpdated { .. } => "rate_limits.updated",
-            Error { .. } => "error",
-            Diarization { .. } => "conversation.item.diarization",
+            OutputAudioBufferStarted(..) => "output_audio_buffer.started",
+            OutputAudioBufferStopped(..) => "output_audio_buffer.stopped",
+            RateLimitsUpdated(..) => "rate_limits.updated",
+            Error(..) => "error",
+            Diarization(..) => "conversation.item.diarization",
         }
     }
 }
@@ -439,12 +915,12 @@ mod tests {
 
     #[test]
     fn type_name_matches_serde_tag() {
-        let ev = OutboundEvent::ResponseOutputAudioDone {
+        let ev = OutboundEvent::ResponseOutputAudioDone(ResponseOutputAudioDoneEvent {
             response_id: "r".into(),
             item_id: "i".into(),
             output_index: 0,
             content_index: 0,
-        };
+        });
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v.get("type").and_then(|t| t.as_str()), Some(ev.type_name()));
     }
@@ -462,20 +938,20 @@ mod tests {
 
     #[test]
     fn topic_classifies_response_variants() {
-        let ev = OutboundEvent::ResponseDone {
+        let ev = OutboundEvent::ResponseDone(ResponseDoneEvent {
             response: sample_response_payload(ResponseStatus::Completed, 0),
-        };
+        });
         assert_eq!(ev.topic(), Topic::Response);
-        let ev2 = OutboundEvent::SessionCreated {
+        let ev2 = OutboundEvent::SessionCreated(SessionCreatedEvent {
             session: json!({"id": "s"}),
-        };
+        });
         assert_eq!(ev2.topic(), Topic::Session);
-        let ev3 = OutboundEvent::AssistantTruncated {
+        let ev3 = OutboundEvent::AssistantTruncated(AssistantTruncatedEvent {
             event_id: "e".into(),
             item_id: "i".into(),
             audio_end_ms: 0,
             transcript: "".into(),
-        };
+        });
         assert_eq!(ev3.topic(), Topic::Item);
     }
 
@@ -487,9 +963,9 @@ mod tests {
             (ResponseStatus::Incomplete, "incomplete"),
             (ResponseStatus::Failed, "failed"),
         ] {
-            let ev = OutboundEvent::ResponseDone {
+            let ev = OutboundEvent::ResponseDone(ResponseDoneEvent {
                 response: sample_response_payload(status, 1234),
-            };
+            });
             let v = serde_json::to_value(&ev).unwrap();
             assert_eq!(v["type"].as_str(), Some("response.done"));
             assert_eq!(
@@ -507,9 +983,9 @@ mod tests {
 
     #[test]
     fn response_done_omits_status_details_when_completed_or_cancelled() {
-        let ev = OutboundEvent::ResponseDone {
+        let ev = OutboundEvent::ResponseDone(ResponseDoneEvent {
             response: sample_response_payload(ResponseStatus::Completed, 0),
-        };
+        });
         let v = serde_json::to_value(&ev).unwrap();
         assert!(v["response"].get("status_details").is_none());
     }
@@ -526,8 +1002,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_progress_carries_response_id_and_per_tool_entries_matching_live_emitters() {
+        let ev = OutboundEvent::ResponseToolProgress(ResponseToolProgressEvent {
+            response_id: ResponseId::new("resp_1"),
+            tools: vec![
+                ToolProgressEntry {
+                    name: "get_current_datetime".into(),
+                    status: ToolStatus::Running,
+                    args: None,
+                    result: None,
+                    error: None,
+                    summary: None,
+                },
+                ToolProgressEntry {
+                    name: "search".into(),
+                    status: ToolStatus::Done,
+                    args: Some(json!({"q": "weather"})),
+                    result: Some("62F".into()),
+                    error: Some(false),
+                    summary: Some("so, 62 and sunny".into()),
+                },
+            ],
+        });
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["type"].as_str(), Some("response.tool_progress"));
+        assert_eq!(v["response_id"].as_str(), Some("resp_1"));
+        let tools = v["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"].as_str(), Some("get_current_datetime"));
+        assert_eq!(tools[0]["status"].as_str(), Some("running"));
+        assert!(
+            tools[0].get("args").is_none() && tools[0].get("result").is_none(),
+            "running entries omit optional fields, matching the mock emitter"
+        );
+        assert_eq!(tools[1]["status"].as_str(), Some("done"));
+        assert_eq!(tools[1]["args"]["q"].as_str(), Some("weather"));
+        assert_eq!(tools[1]["summary"].as_str(), Some("so, 62 and sunny"));
+        assert!(
+            v.get("item_id").is_none() && v.get("output_index").is_none(),
+            "the live wire (mock-speaches-server, Rock RealtimeFrameRouter) has no item_id or \
+             output_index on response.tool_progress"
+        );
+    }
+
+    #[test]
     fn error_payload_serializes_with_code_and_message_required() {
-        let ev = OutboundEvent::Error {
+        let ev = OutboundEvent::Error(ErrorEvent {
             error: ErrorPayload {
                 type_: "invalid_request_error".into(),
                 code: "invalid_request_error".into(),
@@ -535,7 +1055,7 @@ mod tests {
                 event_id: None,
                 param: None,
             },
-        };
+        });
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["type"].as_str(), Some("error"));
         assert_eq!(v["error"]["type"].as_str(), Some("invalid_request_error"));
@@ -555,23 +1075,23 @@ mod tests {
 
     #[test]
     fn typed_ids_serialize_as_strings_in_outbound_events() {
-        let ev = OutboundEvent::ResponseOutputAudioDone {
+        let ev = OutboundEvent::ResponseOutputAudioDone(ResponseOutputAudioDoneEvent {
             response_id: ResponseId::new("resp_1"),
             item_id: ItemId::new("item_a"),
             output_index: 0,
             content_index: 0,
-        };
+        });
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["response_id"].as_str(), Some("resp_1"));
         assert_eq!(v["item_id"].as_str(), Some("item_a"));
         assert_eq!(v["type"].as_str(), Some("response.output_audio.done"));
 
-        let trunc = OutboundEvent::AssistantTruncated {
+        let trunc = OutboundEvent::AssistantTruncated(AssistantTruncatedEvent {
             event_id: EventId::new("evt_1"),
             item_id: ItemId::new("item_a"),
             audio_end_ms: 1234,
             transcript: "partial".into(),
-        };
+        });
         let tv = serde_json::to_value(&trunc).unwrap();
         assert_eq!(tv["event_id"].as_str(), Some("evt_1"));
         assert_eq!(tv["item_id"].as_str(), Some("item_a"));
@@ -592,12 +1112,12 @@ mod tests {
     #[test]
     fn stamp_overwrites_any_caller_supplied_event_id() {
         let seq = EventSeq::new();
-        let ev = OutboundEvent::AssistantTruncated {
+        let ev = OutboundEvent::AssistantTruncated(AssistantTruncatedEvent {
             event_id: EventId::new("evt_caller_supplied"),
             item_id: "i".into(),
             audio_end_ms: 7,
             transcript: "x".into(),
-        };
+        });
         let v = ev.to_wire_value(&seq).expect("wire value");
         assert_eq!(v["event_id"].as_str(), Some("evt_000000000000000000000000"));
         assert_eq!(v["audio_end_ms"].as_u64(), Some(7));
@@ -606,7 +1126,7 @@ mod tests {
     #[test]
     fn stamp_leaves_nested_error_event_id_alone() {
         let seq = EventSeq::new();
-        let ev = OutboundEvent::Error {
+        let ev = OutboundEvent::Error(ErrorEvent {
             error: ErrorPayload {
                 type_: "invalid_request_error".into(),
                 code: "invalid_request_error".into(),
@@ -614,7 +1134,7 @@ mod tests {
                 event_id: Some("evt_from_client".into()),
                 param: None,
             },
-        };
+        });
         let v = ev.to_wire_value(&seq).expect("wire value");
         assert_eq!(v["event_id"].as_str(), Some("evt_000000000000000000000000"));
         assert_eq!(v["error"]["event_id"].as_str(), Some("evt_from_client"));
@@ -624,10 +1144,10 @@ mod tests {
     fn to_wire_value_is_to_value_plus_stamp() {
         for ev in [
             OutboundEvent::BufferCleared,
-            OutboundEvent::SessionDone { reason: "x".into() },
-            OutboundEvent::ResponseCancelled {
+            OutboundEvent::SessionDone(SessionDoneEvent { reason: "x".into() }),
+            OutboundEvent::ResponseCancelled(ResponseCancelledEvent {
                 response_id: "r".into(),
-            },
+            }),
         ] {
             let via_helper = ev.to_wire_value(&EventSeq::new()).expect("wire value");
             let mut via_emit = serde_json::to_value(&ev).expect("serialize");
@@ -645,7 +1165,12 @@ mod tests {
     }
 
     #[test]
-    fn type_name_for_each_variant_unique() {
+    fn typeshared_event_type_enum_matches_type_name_for_every_variant() {
+        let mut seen = std::collections::HashSet::new();
+        for t in RealtimeServerEventType::ALL {
+            assert!(seen.insert(t.wire_name()), "duplicate name {}", t.wire_name());
+        }
+        assert_eq!(seen.len(), 39);
         let names = [
             "session.created",
             "session.updated",
@@ -687,9 +1212,11 @@ mod tests {
             "error",
             "conversation.item.diarization",
         ];
-        let mut seen = std::collections::HashSet::new();
         for n in names {
-            assert!(seen.insert(n), "duplicate name {n}");
+            assert!(
+                seen.contains(n),
+                "type_name vocabulary entry {n} missing from RealtimeServerEventType"
+            );
         }
     }
 }

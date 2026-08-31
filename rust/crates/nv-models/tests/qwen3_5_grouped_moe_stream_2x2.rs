@@ -62,6 +62,7 @@ fn grouped_weights_from(
     let ones = vec![1.0f32; e];
     MoeGroupedWeights {
         num_experts: e,
+        folded_shared: false,
         hidden_size: HIDDEN,
         intermediate_size: INTER,
         gate_w: htod_u8(stream, &gate_p),

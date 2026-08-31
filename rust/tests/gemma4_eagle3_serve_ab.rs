@@ -238,7 +238,7 @@ mod serving {
 
     fn corpus_text() -> String {
         let path = std::env::var("NV_PPL_CORPUS")
-            .unwrap_or_else(|_| "/tmp/nv-corpus/wiki.txt".to_string());
+            .unwrap_or_else(|_| "/home/user/tmp/wf/quant/corpus/wiki.txt".to_string());
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read corpus {path}: {e}"))
     }
@@ -401,6 +401,107 @@ mod serving {
         eprintln!("[g4_eagle3_ab] ladder arm={arm_kind} done");
     }
 
+    async fn decode_ms_per_tok_two_point(
+        engine: &NvEngineChat,
+        label: &str,
+        prompt: &str,
+    ) -> f64 {
+        let short = run_once(engine, prompt, 16).await;
+        let long = run_once(engine, prompt, 272).await;
+        report("k-sweep-short", label, 0, &short);
+        report("k-sweep-long", label, 1, &long);
+        assert!(
+            long.completion >= 200,
+            "{label}: not sustained ({} tokens); a stop this early makes the two-point decode \
+             rate meaningless",
+            long.completion
+        );
+        let dn = long.completion.saturating_sub(short.completion).max(1);
+        1000.0 * (long.elapsed_s - short.elapsed_s) / dn as f64
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn gemma4_eagle3_k_ctx_gate_sweep() {
+        if std::env::var("NV_G4_EAGLE3_TEST").is_err() {
+            panic!(
+                "set NV_G4_EAGLE3_TEST=1 to run this GPU test (it must never silently skip). It \
+                 exists to judge EAGLE3_K_CTX_GATE (the K 4->3 downshift at prompt>=8192) with \
+                 same-session numbers: one eagle3 engine, official chat template prompts at \
+                 NV_G4_DEPTHS (default 8192,32768,98304), NV_EAGLE3_K swept over NV_G4_KS \
+                 (default 3,4) per depth. Decode ms/token is the 16-vs-272-token two-point \
+                 difference so the shared prefill cancels out of the comparison."
+            );
+        }
+        let depths: Vec<usize> = std::env::var("NV_G4_DEPTHS")
+            .unwrap_or_else(|_| "8192,32768,98304".to_string())
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+        let ks: Vec<usize> = std::env::var("NV_G4_KS")
+            .unwrap_or_else(|_| "3,4".to_string())
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect();
+        let reps: usize = std::env::var("NV_G4_K_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(2);
+        assert!(!depths.is_empty() && !ks.is_empty());
+
+        let g4 = g4_snapshot_dir();
+        let dir = eagle3_speculator_dir();
+        std::env::set_var("NV_DRAFTER", "eagle3");
+        std::env::set_var("NV_EAGLE3_DRAFT_DIR", &dir);
+        std::env::set_var("NV_EAGLE3_REQUIRED", "1");
+        std::env::set_var("NV_PROF_CHAT", "1");
+        std::env::remove_var("NV_NO_SPEC");
+        std::env::remove_var("NV_USE_EAGLE3");
+        std::env::remove_var("NV_EAGLE3_K");
+
+        let t0 = Instant::now();
+        let engine = NvEngineChat::try_load(&g4).expect("load gemma4 serving engine");
+        eprintln!(
+            "[g4_eagle3_k_sweep] engine loaded in {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
+        assert_eq!(engine.spec_decode_status(), Some("on"));
+        let tokenizer = tokenizers::Tokenizer::from_file(g4.join("tokenizer.json"))
+            .expect("tokenizer.json in the serving snapshot");
+        let corpus = corpus_text();
+
+        for (name, prompt, max_new) in sustained_cases(&engine).into_iter().take(1) {
+            let warm = run_once(&engine, &prompt, max_new).await;
+            report("warmup", &name, 0, &warm);
+        }
+
+        let mut rows: Vec<String> = Vec::new();
+        for depth in &depths {
+            let (prompt, n_ids) = corpus_prompt_at_depth(&engine, &tokenizer, &corpus, *depth);
+            eprintln!(
+                "[g4_eagle3_k_sweep] depth {depth}: corpus prompt of {n_ids} ids under the \
+                 official template"
+            );
+            for k in &ks {
+                std::env::set_var("NV_EAGLE3_K", k.to_string());
+                for rep in 0..reps {
+                    let label = format!("wiki-{depth}-k{k}-rep{rep}");
+                    let ms = decode_ms_per_tok_two_point(&engine, &label, &prompt).await;
+                    let row = format!(
+                        "depth={depth} prompt_ids={n_ids} k={k} rep={rep} decode_ms_per_tok={ms:.2}"
+                    );
+                    eprintln!("[g4_eagle3_k_sweep] {row}");
+                    rows.push(row);
+                }
+            }
+            std::env::remove_var("NV_EAGLE3_K");
+        }
+        eprintln!("[g4_eagle3_k_sweep] SUMMARY");
+        for row in &rows {
+            eprintln!("[g4_eagle3_k_sweep] {row}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn gemma4_auto_drafter_routes_dflash_short_and_eagle3_past_switch_tokens() {
@@ -491,5 +592,112 @@ mod serving {
              (short={} deep={} prompt tokens)",
             short.prompt_tokens, deep.prompt_tokens
         );
+    }
+
+    const ONE_PROCESS_CAN_ONLY_MEASURE_ONE_ARM_STATE: &str =
+        "the three keys are read through OnceLocks whose first read wins and through a load-time \
+         weight requantization, so a second NvEngineChat::try_load in the same process cannot \
+         answer a different arm state. This rung therefore measures whatever the environment \
+         decides and prints it; the A/B is two processes, one with NV_G4_SERVING_ARM=0 and one \
+         without, and the escape process must reproduce the pre-flip band because the escape is \
+         the absence of the three variables rather than an imitation of it.";
+
+    const THE_ARM_STATE_A_SERVING_PROCESS_ENDS_UP_IN_IS_ALL_THREE_KEYS_OR_NONE: [&str; 3] = [
+        "NV_ATTN_PROJ_QUANT",
+        "NV_NVFP4_M1_GEMV",
+        "NV_G4_LMHEAD_I8",
+    ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn gemma4_serving_default_arm_or_its_escape_measured_through_the_real_chat_engine() {
+        if std::env::var("NV_G4_SERVING_ARM_TEST").is_err() {
+            panic!(
+                "set NV_G4_SERVING_ARM_TEST=1 to run this GPU test (it must never silently skip). \
+                 {ONE_PROCESS_CAN_ONLY_MEASURE_ONE_ARM_STATE}"
+            );
+        }
+        let g4 = g4_snapshot_dir();
+        assert!(g4.join("config.json").is_file(), "missing {}", g4.display());
+        if std::env::var("NV_G4_REFUSAL_EXPECTED").is_ok() {
+            let err = NvEngineChat::try_load(&g4).err().map(|e| format!("{e:#}")).expect(
+                "NV_G4_REFUSAL_EXPECTED=1 asks for the partial-arm refusal, so a loaded engine is \
+                 the failure: this process reached the quantized attention projections without \
+                 the m=1 gemv rescue and served them",
+            );
+            eprintln!("[g4_serving_arm] refused at boot: {err}");
+            assert!(
+                err.contains("NV_NVFP4_M1_GEMV")
+                    && (err.contains("17.056")
+                        || err.contains("armed together or not at all")),
+                "the refusal must carry either the measurement that justifies it or the \
+                 all-or-nothing rule that keeps a subset unreachable, not a bare error: {err}"
+            );
+            return;
+        }
+        for key in THE_ARM_STATE_A_SERVING_PROCESS_ENDS_UP_IN_IS_ALL_THREE_KEYS_OR_NONE {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "{key} is already set in this process, so whatever this rung measures is the \
+                 caller's hand-picked configuration and not the serving default this rung exists \
+                 to measure"
+            );
+        }
+        std::env::set_var("NV_NO_SPEC", "1");
+        std::env::remove_var("NV_USE_EAGLE3");
+        std::env::remove_var("NV_DRAFTER");
+        std::env::remove_var("NV_EAGLE3_DRAFT_DIR");
+        std::env::remove_var("NV_DFLASH_DRAFT_DIR");
+        let escape = std::env::var("NV_G4_SERVING_ARM").ok();
+        let escape_held = matches!(escape.as_deref(), Some("0") | Some("off"));
+
+        let engine = NvEngineChat::try_load(&g4).expect("load gemma4 serving engine");
+        let armed: Vec<(&str, String)> = THE_ARM_STATE_A_SERVING_PROCESS_ENDS_UP_IN_IS_ALL_THREE_KEYS_OR_NONE
+            .iter()
+            .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
+            .collect();
+        if escape_held {
+            assert!(
+                armed.is_empty(),
+                "NV_G4_SERVING_ARM={} must leave every one of the three keys unset -- it armed \
+                 {armed:?}",
+                escape.as_deref().unwrap_or("")
+            );
+        } else {
+            assert_eq!(
+                armed
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>(),
+                vec![
+                    "NV_ATTN_PROJ_QUANT=nvfp4".to_string(),
+                    "NV_NVFP4_M1_GEMV=1".to_string(),
+                    "NV_G4_LMHEAD_I8=1".to_string(),
+                ],
+                "loading an nvfp4 gemma4 checkpoint with no escape must arm all three keys and \
+                 exactly these values; a subset is the configuration the +0.748 ppl measurement \
+                 rejected"
+            );
+        }
+        let arm_label = if escape_held { "escape" } else { "default-arm" };
+        eprintln!(
+            "[g4_serving_arm] {arm_label}: keys={:?} spec=NV_NO_SPEC=1 (non-spec decode path)",
+            armed
+        );
+
+        let cases = sustained_cases(&engine);
+        assert!(!cases.is_empty());
+        for (name, prompt, max_new) in &cases {
+            for run_idx in 1..=2 {
+                let r = run_once(&engine, prompt, *max_new).await;
+                report(arm_label, name, run_idx, &r);
+                assert!(
+                    r.completion >= 32,
+                    "case {name}: not a sustained generation ({} tokens)",
+                    r.completion
+                );
+            }
+        }
+        std::env::remove_var("NV_NO_SPEC");
     }
 }

@@ -88,8 +88,12 @@ fn dtoh_bf16(stream: &Arc<CudaStream>, d: &CudaSlice<bf16>) -> Vec<bf16> {
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- prices the verify-scope dense-mlp GEMM arms (LT pad-128 serving baseline vs LT narrow pads 16/32/64 vs cutlass 128-tile true-m DP/k256/stream-K) at exact q38 shapes so the NV_Q38_VERIFY_MLP_NARROW default can cite a per-layer us table"]
 fn q38_verify_mlp_narrow_kernel_ab() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run the verify mlp narrow bench");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so the verify mlp narrow bench executed nothing. It is \
+             already #[ignore]d, which makes --ignored the opt-in; a second env gate behind that \
+             can only make an --ignored run print `1 passed` for a bench that measured nothing. A \
+             suite whose precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();
@@ -409,6 +413,7 @@ fn q38_verify_mlp_narrow_kernel_ab() {
                             1.0,
                             1.0,
                             mm as i32,
+                            n as i32,
                             n as i32,
                             k as i32,
                         )

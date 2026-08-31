@@ -63,10 +63,21 @@ Python's `python/audio/decode_any.py` tries `soundfile` then shells out to
 `rust/src/stt/mod.rs` defines `enum Backend { Ct2, WhisperCpp, Parakeet }`
 and one `WhisperEngine` wrapping any of them. `Backend::from_env` reads
 `STT_BACKEND`: `ct2` / `ctranslate2` / `faster-whisper` select CTranslate2;
-`parakeet` / `parakeet-tdt` / `tdt` select the Parakeet-TDT ONNX path; `""` /
-`whisper-cpp` / `whisper_cpp` / `cpp` / `ggml` select whisper.cpp. **The Rust
-default is whisper.cpp; the Go default is ct2** (`go/cmd/server/main.go`) — a
-real divergence, not a documented choice.
+`parakeet` / `parakeet-tdt` / `tdt` select the Parakeet-TDT ONNX path;
+`whisper-cpp` / `whisper_cpp` / `cpp` / `ggml` select whisper.cpp. When the
+variable is unset, the Rust server selects parakeet-tdt if — and only if —
+the dylib behind `ORT_DYLIB_PATH` carries `libonnxruntime_providers_cuda.so`
+AND a parakeet checkpoint resolves (`Backend::from_value`, gated by
+`ort_dylib_carries_the_cuda_ep` + `parakeet_checkpoint_present`); otherwise
+the unset default stays whisper.cpp, and `STT_BACKEND=whisper-cpp` pins it
+regardless. The devshell pins a CPU-only onnxruntime, so this GPU default
+engages under `nvk.sh` cuda shells (which repoint `ORT_DYLIB_PATH` at a
+CUDA-capable store lib; `NVK_ORT_CUDA=0` opts out) or wherever the caller
+exports a CUDA-EP dylib; CPU whisper.cpp large-v3-turbo decodes an order of
+magnitude slower than real time, which no live-dictation client survives —
+that is why the unset default prefers the GPU lane. **The Go default is
+ct2** (`go/cmd/server/main.go`) — a real divergence, not a documented
+choice.
 
 **Parakeet-TDT** (`rust/src/stt/parakeet.rs`) is the CPU-fast English lane:
 NVIDIA parakeet-tdt-0.6b-v2 via the istupakov ONNX export (nemo128 mel
@@ -81,10 +92,13 @@ conformer full-attention cost bounded by 60-second decode windows
 `stt_parakeet_real` (gated `NV_PARAKEET_TEST=1`): it transcribes the
 committed espeak clip `rust/tests/data/parakeet_fox_16k.wav` exactly and
 asserts faster-than-realtime CPU decode including the 128-mel frontend, with
-the model's own inverse text normalization ("seventeen" -> "17"). The
-python-side onnx-asr baseline runs far faster on CPU and orders faster on
-CUDA, so the CUDA EP via `ORT_DYLIB_PATH` is the headroom lane when
-English-only STT becomes the bottleneck.
+the model's own inverse text normalization ("seventeen" -> "17"). Its three
+sessions load through the shared EP ladder
+(`crate::diarization::ep::load_session`), so they engage the CUDA EP whenever
+the `ORT_DYLIB_PATH` dylib carries it and honor the same `DIAR_EP` /
+`DIAR_DEVICE_ID` / `DIAR_GPU_MEM_LIMIT_MB` pins as diarization; the chosen
+provider is on the `parakeet-tdt backend loaded` and `Whisper loaded` boot
+lines (`ep=`).
 
 Model resolution is by path convention, not model id: `ct2_model_dir`
 requires `<models>/whisper-ct2/model.bin`; `whisper_cpp_model_path` probes
@@ -428,11 +442,26 @@ deadline wins ties.
 Two speculative extensions sit on top. **Eager** dispatch
 (`realtime/eou_eager.rs`) fires when the score clears `eager_p_threshold`,
 spawning speculative STT and, in conversation mode, a speculative LLM call,
-and moving the response phase to `Predicted`. **Predicted**
+and moving the response phase to `Predicted`. The LLM stream opens only once
+the speculative STT transcript lands and that transcript is the call's user
+message (`spawn_predicted_llm_after_stt`); a failed or empty transcript
+skips the LLM call entirely, so no placeholder prompt ever reaches the model
+or the trajectory log. That same transcript is what the commit path hands
+downstream as the turn's user text, so the prompt the eager LLM consumed and
+the committed transcript are one value and no transcript-mismatch rollback
+exists in the Rust or Python trees; the Go tree keeps a promote-time Jaccard
+compare (`transcriptsMateriallyDiffer`) because its eager prompt is a
+streaming partial that can differ from its commit-time STT, and any change
+that gives Rust or Python a second transcript source — commit-time
+re-transcription, streaming-partial prompts — must reintroduce that compare
+at the promotion seam. **Predicted**
 (`realtime/eou_predicted.rs`) buffers the speculative LLM deltas in a capped
 ring; the entire `response.*` family is refused while the phase is
 `Predicted`, both at the emit site and structurally via `ResponseGate::open`,
-so a wrong speculation rolls back with nothing on the wire.
+so a wrong speculation rolls back with nothing on the wire. A promoted turn
+keeps the predicted `resp_*` id as its wire id (`promoted_turn_wire_id`), so
+a trajectory label on the wire id joins the eager LLM record; a rollback
+mints a fresh id and re-calls the LLM tagged with it.
 
 Configuration comes from `eou/loader.rs::EouConfig::from_env` (`EOU_KIND`,
 `EOU_FUSION_RULE`, `EOU_P_THRESHOLD`, `EOU_AUDIO_WINDOW_MS`,
@@ -1026,8 +1055,6 @@ chapter is not read as a description of live behaviour.
   conversation, so the text head scores only prior turns and the gated-fusion
   text features derive from history rather than the partial. The audio head
   is unaffected.
-- **The predicted-transcript mismatch rollback cannot fire**, because both
-  sides of its comparison derive from the same binding.
 
 Licensing is load-bearing here: per `NOTICE`, the DiariZen segmentation model
 is CC-BY-NC-4.0, so commercial deployments must replace it. Every other

@@ -607,3 +607,206 @@ fn real_weights_mm_greedy_decode_names_the_color_and_text_only_entry_is_unchange
     assert_eq!(seq_a, seq_b, "text-only 24-token greedy sequences differ between the two entries");
     eprintln!("[qwen36-mm] text-only invariance holds over 24 greedy tokens");
 }
+
+const TINY_IMAGE_TOKEN: u32 = 9;
+const TINY_MROPE_SECTION_SUMS_TO_THE_8_HALF_FREQS_OF_ROT16: [usize; 3] = [4, 2, 2];
+
+fn tiny_mm_ids_with_one_2x2_image_run() -> (Vec<u32>, usize) {
+    let mut ids: Vec<u32> = (0..12u32)
+        .map(|i| {
+            let t = ((i * 5 + 2) % 62) + 1;
+            if t == TINY_IMAGE_TOKEN {
+                t + 1
+            } else {
+                t
+            }
+        })
+        .collect();
+    let run_start = 3usize;
+    for slot in ids.iter_mut().skip(run_start).take(4) {
+        *slot = TINY_IMAGE_TOKEN;
+    }
+    (ids, run_start)
+}
+
+#[test]
+fn mrope_rows_install_restore_and_the_installed_rows_are_live_in_the_attention_graph() {
+    let _env = env_lock();
+    if !have_gpu() {
+        std::env::remove_var(PREFILL_M_ENV);
+        std::env::remove_var(MROW_ENV);
+        panic!("needs a wgpu adapter; a skipped mrope proof reads as a passed one");
+    }
+    std::env::set_var(PREFILL_M_ENV, "8");
+    std::env::remove_var(MROW_ENV);
+
+    let cfg = tiny_config();
+    let hidden = cfg.hidden_size;
+    let hw = tiny_weights(&cfg, 0x51ee_dC0F_FEE1 ^ 0x1207);
+    let max_seq = 64usize;
+    let (ids, run_start) = tiny_mm_ids_with_one_2x2_image_run();
+    let splices = splices_from_prompt(&hw, hidden, &ids, &[(run_start, 4)]);
+
+    let mp = nv_models::qwen3_mm_splice::build_mrope_positions_matching_hf_get_rope_index(
+        &ids,
+        TINY_IMAGE_TOKEN,
+        &[(1usize, 2usize, 2usize)],
+    )
+    .expect("mrope positions");
+    assert!(
+        !mp.is_text_degenerate(),
+        "a 2x2 image run must produce non-degenerate mrope positions"
+    );
+    let section = TINY_MROPE_SECTION_SUMS_TO_THE_8_HALF_FREQS_OF_ROT16;
+
+    let mut with_mrope = q3w::Qwen3MoeWgpu::new(cfg.clone(), &hw, max_seq).expect("build a");
+    let attn_layers = cfg
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, LayerType::FullAttention))
+        .count();
+    assert_eq!(
+        with_mrope.attn_rope_layer_count(),
+        attn_layers,
+        "one registered rope cs buffer per full-attention layer"
+    );
+
+    with_mrope
+        .install_mrope_rows_for_prompt_and_shift_continuation_rows_by_delta(&mp, section)
+        .expect("install mrope rows");
+    assert!(with_mrope.mrope_rows_installed());
+
+    let rh = with_mrope.rope_rot_half();
+    let (std_cos, std_sin) =
+        nv_models::qwen3_5_dense_wgpu::rope_tables(2 * rh, cfg.rope_theta, max_seq);
+    let got = with_mrope.read_rope_cs_rows_for_test(0).expect("read cs");
+    let sin_off = max_seq * rh;
+    let n = mp.len();
+    for i in 0..n {
+        for j in 0..rh {
+            let axis = nv_models::qwen3_mm_splice::interleaved_axis_of_half_freq_matching_hf_overwrite_semantics(j, section);
+            let p = match axis {
+                1 => mp.h[i],
+                2 => mp.w[i],
+                _ => mp.t[i],
+            } as usize;
+            assert_eq!(
+                got[i * rh + j].to_bits(),
+                std_cos[p * rh + j].to_bits(),
+                "cos row {i} freq {j} (axis {axis}, pos {p})"
+            );
+            assert_eq!(
+                got[sin_off + i * rh + j].to_bits(),
+                std_sin[p * rh + j].to_bits(),
+                "sin row {i} freq {j} (axis {axis}, pos {p})"
+            );
+        }
+    }
+    let delta = mp.delta_added_to_token_index_for_every_position_after_this_prefill;
+    assert!(delta < 0, "a 2x2 image run over 4 pad slots must shrink positions, got delta {delta}");
+    let cont = n + 2;
+    let shifted = (cont as i64 + delta) as usize;
+    for j in 0..rh {
+        assert_eq!(
+            got[cont * rh + j].to_bits(),
+            std_cos[shifted * rh + j].to_bits(),
+            "continuation row {cont} must carry the std row shifted by delta {delta}"
+        );
+    }
+
+    const LOGITS_ARE_NOT_THE_ROPE_ORACLE_HERE: &str = "in this tiny harness the o_proj input \
+        quantizes through nvfp4 with test-fixture scales, and the sub-bucket attention \
+        differences a rope change produces round to identical 4-bit codes, so final logits stay \
+        bit-identical under wildly different rope tables; the liveness oracle is therefore the \
+        roped q_f32 and the flash output, both read upstream of that quantizer";
+
+    let mut text_rope = q3w::Qwen3MoeWgpu::new(cfg.clone(), &hw, max_seq).expect("build b");
+    let tok_plain = text_rope
+        .prefill_with_splices(&ids, &splices)
+        .expect("mm prefill under text rope");
+    let (qf_plain, at_plain) = text_rope
+        .read_attn_qf32_and_out_for_test(0)
+        .expect("plain probes");
+
+    let tok_mrope = with_mrope
+        .prefill_with_splices(&ids, &splices)
+        .expect("mm prefill under mrope rows");
+    let _ = (tok_plain, tok_mrope);
+    let (qf_mrope, _) = with_mrope
+        .read_attn_qf32_and_out_for_test(0)
+        .expect("mrope probes");
+    assert!(
+        bit_diff(&qf_plain, &qf_mrope) > 0,
+        "installing non-degenerate mrope rows left the roped q identical: the registered cs \
+         buffers are not the ones the attention passes bind, so the install wrote a dead copy \
+         ({LOGITS_ARE_NOT_THE_ROPE_ORACLE_HERE})"
+    );
+
+    let hd = cfg.head_dim;
+    let rope_dims = 2 * rh;
+    let mut zeroed = q3w::Qwen3MoeWgpu::new(cfg.clone(), &hw, max_seq).expect("build zeroed");
+    let zeros = vec![0f32; 2 * max_seq * rh];
+    zeroed.write_rope_cs_rows_for_test(&zeros).expect("zero cs");
+    zeroed
+        .prefill_with_splices(&ids, &splices)
+        .expect("mm prefill under all-zero cs");
+    let (qf_zero, at_zero) = zeroed.read_attn_qf32_and_out_for_test(0).expect("zero probes");
+    for (i, v) in qf_zero.iter().enumerate() {
+        if i % hd < rope_dims {
+            assert_eq!(
+                *v, 0.0,
+                "q_f32[{i}] in the roped dims must be exactly zero under an all-zero cs table; \
+                 a nonzero value means the executed rope pass read some other buffer"
+            );
+        }
+    }
+    assert!(
+        qf_plain
+            .iter()
+            .enumerate()
+            .any(|(i, v)| i % hd < rope_dims && *v != 0.0),
+        "the std-table run must leave nonzero roped dims, or the zero assertion above is vacuous"
+    );
+    assert!(
+        bit_diff(&at_plain, &at_zero) > 0,
+        "zeroing the rope table did not change the flash output; rope is not propagating into \
+         attention ({LOGITS_ARE_NOT_THE_ROPE_ORACLE_HERE})"
+    );
+
+    with_mrope.reset().expect("reset");
+    assert!(
+        !with_mrope.mrope_rows_installed(),
+        "reset must restore text rope rows"
+    );
+    let restored = with_mrope.read_rope_cs_rows_for_test(0).expect("read cs restored");
+    for (k, (g, w)) in restored
+        .iter()
+        .zip(std_cos.iter().chain(std_sin.iter()))
+        .enumerate()
+    {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "restored cs word {k} differs from the std text table"
+        );
+    }
+    text_rope.reset().expect("reset b");
+    let t2 = with_mrope
+        .prefill_with_splices(&ids, &splices)
+        .expect("mm prefill after restore");
+    let (qf2, _) = with_mrope
+        .read_attn_qf32_and_out_for_test(0)
+        .expect("restored probes");
+    let t3 = text_rope
+        .prefill_with_splices(&ids, &splices)
+        .expect("mm prefill fresh");
+    let (qf3, _) = text_rope
+        .read_attn_qf32_and_out_for_test(0)
+        .expect("fresh probes");
+    assert_eq!(t2, t3, "post-restore argmax differs from a never-installed decoder");
+    assert_eq!(
+        bit_diff(&qf2, &qf3),
+        0,
+        "post-restore roped q differs from a never-installed decoder; restore left mrope residue"
+    );
+}

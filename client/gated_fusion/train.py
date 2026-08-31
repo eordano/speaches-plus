@@ -1,10 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "numpy>=2.0",
-# ]
-# ///
 """train -- fit the gated-fusion gate on a feature JSONL produced by
 extract_features.py. Output: trained weights printed as Python, Go and
 Rust literals so a single re-train run can be pasted into all three

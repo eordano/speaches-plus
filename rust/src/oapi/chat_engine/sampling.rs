@@ -974,7 +974,7 @@ mod think_close_tests {
             .build()
             .expect("word-level model");
         let mut tk = tokenizers::Tokenizer::new(model);
-        tk.add_special_tokens(&[
+        tk.add_special_tokens([
             tokenizers::AddedToken::from("<|end|>", true),
             tokenizers::AddedToken::from("<|start|>", true),
             tokenizers::AddedToken::from("<|message|>", true),
@@ -995,7 +995,7 @@ mod think_close_tests {
             .build()
             .expect("word-level model");
         let mut tk = tokenizers::Tokenizer::new(model);
-        tk.add_special_tokens(&[
+        tk.add_special_tokens([
             tokenizers::AddedToken::from("</", true),
             tokenizers::AddedToken::from("think", true),
             tokenizers::AddedToken::from(">", true),
@@ -1103,7 +1103,7 @@ mod think_close_tests {
              close never terminates and the schema is never written"
         );
         assert!(
-            !g.mask_to_defer_token(&mut vec![0.0f32; 8]),
+            !g.mask_to_defer_token(&mut [0.0f32; 8]),
             "there is nothing left to force once the grammar is armed"
         );
     }
@@ -1123,6 +1123,7 @@ mod think_close_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn the_close_marker_cap_cannot_eat_the_room_reserved_for_the_answer() {
         assert!(
             GUIDED_THINK_CLOSE_MAX_TOKENS >= 6,

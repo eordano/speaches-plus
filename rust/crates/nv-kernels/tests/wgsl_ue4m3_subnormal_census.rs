@@ -19,7 +19,7 @@ const KNOWN_DECODERS: [&str; 3] = [
 
 const WGSL_ENTRY_POINT: &str = "@compute";
 
-const SHADER_TEXT_STILL_ASSEMBLED_IN_RUST: [(&str, &str); 14] = [
+const SHADER_TEXT_STILL_ASSEMBLED_IN_RUST: [(&str, &str); 15] = [
     (
         "nv-kernels/src/wgpu_backend/dequant.rs",
         "the gpu_decode_* probes wrap a caller-supplied decode expression in a one-entry map shader",
@@ -70,6 +70,12 @@ const SHADER_TEXT_STILL_ASSEMBLED_IN_RUST: [(&str, &str); 14] = [
     (
         "nv-models/src/gemma4_wgpu.rs",
         "mk_bf16_source and mk_q8_source unroll per token count over the extracted g4w_mk_params.wgsl",
+    ),
+    (
+        "nv-models/src/gpt_oss_wgpu.rs",
+        "the fused-step arm (0c1070924 default flip) declares its rope+kv-write entry \
+         inline over per-model head-dim constants; fixed prologue extraction is the \
+         standing cleanup",
     ),
     (
         "nv-models/src/qwen3_5_dense_wgpu.rs",

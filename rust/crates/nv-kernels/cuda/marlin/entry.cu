@@ -537,6 +537,193 @@ static int gptq_marlin_repack_w4_raw(uint32_t const* b_q_weight_ptr,
   return 0;
 }
 
+template <int const num_threads>
+__global__ void gptq_marlin_repack_w4a8_kernel(
+    uint32_t const* __restrict__ b_q_weight_ptr,
+    uint32_t* __restrict__ out_ptr, int size_k, int size_n) {
+  constexpr int num_bits = 4;
+  constexpr int pack_factor = 32 / num_bits;
+
+  constexpr int target_tile_n_size = tile_n_size / 2;
+  constexpr int target_tile_k_size = tile_k_size * 2;
+  int k_tiles = size_k / target_tile_k_size;
+  int n_tiles = size_n / target_tile_n_size;
+  int block_k_tiles = div_ceil(k_tiles, gridDim.x);
+
+  auto start_k_tile = blockIdx.x * block_k_tiles;
+  if (start_k_tile >= k_tiles) {
+    return;
+  }
+
+  int finish_k_tile = min(start_k_tile + block_k_tiles, k_tiles);
+
+  auto wait_for_stage = [&]() {
+    cp_async_wait<repack_stages - 2>();
+    __syncthreads();
+  };
+
+  extern __shared__ int4 sh[];
+
+  int4* sh_pipe_ptr = sh;
+
+  constexpr int tile_ints = target_tile_k_size / pack_factor;
+
+  constexpr int stage_n_threads = target_tile_n_size / 4;
+  constexpr int stage_k_threads = tile_ints;
+  constexpr int stage_size = stage_k_threads * stage_n_threads;
+
+  auto fetch_to_shared = [&](int pipe, int k_tile_id, int n_tile_id) {
+    if (n_tile_id >= n_tiles) {
+      cp_async_fence();
+      return;
+    }
+
+    int first_n = n_tile_id * target_tile_n_size;
+
+    int4* sh_ptr = sh_pipe_ptr + stage_size * pipe;
+
+    if (threadIdx.x < stage_size) {
+      auto k_id = threadIdx.x / stage_n_threads;
+      auto n_id = threadIdx.x % stage_n_threads;
+
+      int first_k = k_tile_id * target_tile_k_size;
+      int first_k_packed = first_k / pack_factor;
+
+      cp_async4(&sh_ptr[k_id * stage_n_threads + n_id],
+                reinterpret_cast<int4 const*>(
+                    &(b_q_weight_ptr[(first_k_packed + k_id) * size_n +
+                                     first_n + (n_id * 4)])));
+    }
+
+    cp_async_fence();
+  };
+
+  auto repack_tile = [&](int pipe, int k_tile_id, int n_tile_id) {
+    if (n_tile_id >= n_tiles) {
+      return;
+    }
+
+    auto warp_id = threadIdx.x / 32;
+    auto th_id = threadIdx.x % 32;
+
+    if (warp_id >= 4) {
+      return;
+    }
+
+    int tc_col = th_id / 4;
+    int tc_row = (th_id % 4) * 4;
+
+    int cur_n = (warp_id / 2) * 16 + tc_col;
+
+    constexpr int sh_stride = target_tile_n_size;
+    constexpr uint32_t mask = (1 << num_bits) - 1;
+
+    int4* sh_stage_ptr = sh_pipe_ptr + stage_size * pipe;
+    uint32_t* sh_stage_int_ptr = reinterpret_cast<uint32_t*>(sh_stage_ptr);
+
+    uint32_t vals[8];
+
+    uint32_t b1_vals[tile_ints];
+
+#pragma unroll
+    for (int i = 0; i < tile_ints; i++) {
+      b1_vals[i] = sh_stage_int_ptr[cur_n + sh_stride * i + (warp_id % 2) * 8];
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int cur_elem = tc_row + i;
+      int cur_int = cur_elem / pack_factor;
+      int cur_pos = cur_elem % pack_factor;
+
+      vals[i] = (b1_vals[cur_int] >> (cur_pos * num_bits)) & mask;
+      vals[4 + i] =
+          (b1_vals[cur_int + tile_ints / 2] >> (cur_pos * num_bits)) & mask;
+    }
+
+    constexpr int rtile_size =
+        target_tile_k_size * target_tile_n_size / pack_factor;
+    int out_offset = (k_tile_id * n_tiles + n_tile_id) * rtile_size;
+
+    int pack_idx[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    uint32_t res = 0;
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+      res |= vals[pack_idx[i]] << (i * 4);
+    }
+
+    out_ptr[out_offset + th_id * 4 + warp_id] = res;
+  };
+
+  auto start_pipes = [&](int k_tile_id, int n_tile_id) {
+#pragma unroll
+    for (int pipe = 0; pipe < repack_stages - 1; pipe++) {
+      fetch_to_shared(pipe, k_tile_id, n_tile_id + pipe);
+    }
+
+    wait_for_stage();
+  };
+#pragma unroll
+  for (int k_tile_id = start_k_tile; k_tile_id < finish_k_tile; k_tile_id++) {
+    int n_tile_id = 0;
+
+    start_pipes(k_tile_id, n_tile_id);
+
+    while (n_tile_id < n_tiles) {
+#pragma unroll
+      for (int pipe = 0; pipe < repack_stages; pipe++) {
+        fetch_to_shared((pipe + repack_stages - 1) % repack_stages, k_tile_id,
+                        n_tile_id + pipe + repack_stages - 1);
+        repack_tile(pipe, k_tile_id, n_tile_id + pipe);
+        wait_for_stage();
+      }
+      n_tile_id += repack_stages;
+    }
+  }
+}
+
+static int gptq_marlin_repack_w4a8_raw(uint32_t const* b_q_weight_ptr,
+                                       uint32_t* out_ptr, int size_k,
+                                       int size_n, int dev,
+                                       cudaStream_t stream) {
+  if (!(size_k % (tile_k_size * 2) == 0)) return -1;
+  if (!(size_n % tile_n_size == 0)) return -1;
+
+  int blocks;
+  cudaDeviceGetAttribute(&blocks, cudaDevAttrMultiProcessorCount, dev);
+
+  int max_shared_mem = 0;
+  cudaDeviceGetAttribute(&max_shared_mem,
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (!(max_shared_mem > 0)) return -1;
+
+  cudaFuncSetAttribute(gptq_marlin_repack_w4a8_kernel<repack_threads>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       max_shared_mem);
+  gptq_marlin_repack_w4a8_kernel<repack_threads>
+      <<<blocks, repack_threads, max_shared_mem, stream>>>(b_q_weight_ptr,
+                                                           out_ptr, size_k,
+                                                           size_n);
+  return 0;
+}
+
+__global__ void marlin_int4_fp8_preprocess_u4b8_kernel(
+    const int32_t* __restrict__ qweight, int32_t* __restrict__ output) {
+  int32_t val = qweight[blockIdx.x * 32 + threadIdx.x];
+  int32_t new_val = 0;
+
+#pragma unroll
+  for (int32_t i = 0; i < 8; i++) {
+    int32_t single_val = val & 0xF;
+    single_val = single_val >= 8 ? single_val - 8 : 15 - single_val;
+    new_val |= single_val << (i * 4);
+    val >>= 4;
+  }
+
+  output[blockIdx.x * 32 + threadIdx.x] = new_val;
+}
+
 }
 
 extern "C" {
@@ -705,6 +892,101 @@ extern "C" int nv_kernels_marlin_gemm_w4a16_ex(
       false, num_groups, group_size, dev, cu_stream,
       -1, -1, sms,
       use_atomic_add != 0, use_fp32_reduce != 0, false);
+
+  if (rc == 0) {
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) rc = -3;
+  }
+  return rc;
+}
+
+extern "C" int nv_kernels_marlin_int4_fp8_preprocess(void* stream,
+                                                     const void* qweight,
+                                                     void* out,
+                                                     long long numel_i32) {
+  if (qweight == nullptr || out == nullptr) return -1;
+  if (numel_i32 <= 0 || numel_i32 % 32 != 0) return -1;
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+  long long blocks = numel_i32 / 32;
+  marlin::marlin_int4_fp8_preprocess_u4b8_kernel<<<(unsigned)blocks, 32, 0,
+                                                   cu_stream>>>(
+      reinterpret_cast<const int32_t*>(qweight),
+      reinterpret_cast<int32_t*>(out));
+  cudaError_t e = cudaGetLastError();
+  return e == cudaSuccess ? 0 : -3;
+}
+
+extern "C" int nv_kernels_marlin_repack_w4a8(void* stream,
+                                             const void* b_q_packed,
+                                             void* b_q_marlin_out, int k,
+                                             int n, int num_bits) {
+  if (b_q_packed == nullptr || b_q_marlin_out == nullptr) return -1;
+  if (num_bits != 4) return -1;
+  if (k <= 0 || n <= 0) return -1;
+  if (k % (marlin::tile_k_size * 2) != 0) return -1;
+  if (n % marlin::tile_n_size != 0) return -1;
+
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return -2;
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+
+  int rc = marlin::gptq_marlin_repack_w4a8_raw(
+      reinterpret_cast<uint32_t const*>(b_q_packed),
+      reinterpret_cast<uint32_t*>(b_q_marlin_out), k, n, dev, cu_stream);
+
+  if (rc == 0) {
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) rc = -3;
+  }
+  return rc;
+}
+
+extern "C" int nv_kernels_marlin_gemm_w4a8_fp8(
+    void* stream, const void* a_fp8, const void* a_scales_f32,
+    const void* b_q_marlin, const void* b_scales_bf16, void* c_out_bf16,
+    void* workspace, int m, int n, int k, int group_size, int c_prezeroed) {
+  if (m == 0) return 0;
+  if (a_fp8 == nullptr || a_scales_f32 == nullptr || b_q_marlin == nullptr ||
+      b_scales_bf16 == nullptr || c_out_bf16 == nullptr ||
+      workspace == nullptr)
+    return -1;
+  if (m < 0 || n <= 0 || k <= 0) return -1;
+
+  if (k % marlin::tile_size != 0) return -1;
+  if (k % 16 != 0) return -1;
+  if (n % marlin::min_thread_n != 0) return -1;
+  if (group_size != -1) {
+    if (group_size < 32 || k % group_size != 0) return -1;
+  }
+
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return -2;
+  int sms = 0;
+  if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) !=
+      cudaSuccess)
+    return -2;
+
+  vllm::ScalarType a_type = vllm::kFE4M3fn;
+  vllm::ScalarType b_type = vllm::kU4B8;
+  vllm::ScalarType c_type = vllm::kBFloat16;
+  vllm::ScalarType s_type = vllm::kBFloat16;
+
+  int num_groups = (group_size == -1) ? 1 : (k / group_size);
+
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+
+  size_t c_bytes = (size_t)m * (size_t)n * 2;
+  if (!c_prezeroed) cudaMemsetAsync(c_out_bf16, 0, c_bytes, cu_stream);
+
+  int rc = marlin::marlin_mm_raw(
+      a_fp8, b_q_marlin, c_out_bf16, nullptr,
+      nullptr, (void*)a_scales_f32, (void*)b_scales_bf16,
+      nullptr, nullptr, nullptr, nullptr,
+      nullptr, m, n, k, k, workspace, a_type, b_type, c_type,
+      s_type, false, false, true,
+      false, num_groups, group_size, dev, cu_stream,
+      -1, -1, sms, true,
+      false, false);
 
   if (rc == 0) {
     cudaError_t e = cudaGetLastError();

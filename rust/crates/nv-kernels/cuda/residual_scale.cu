@@ -178,3 +178,59 @@ extern "C" int nv_kernels_tanh_softcap_bf16_to_f32(
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : static_cast<int>(e);
 }
+
+__global__ void attn_gate_sigmoid_mul_bf16_kernel(
+    const __nv_bfloat16* __restrict__ attn,
+    const __nv_bfloat16* __restrict__ q_raw_value_gate_interleaved_per_head,
+    __nv_bfloat16* __restrict__ out,
+    size_t rows,
+    size_t n_heads,
+    size_t head_dim
+) {
+    NVK_PDL_PROLOG();
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = rows * n_heads * head_dim;
+    if (idx < total) {
+        size_t d = idx % head_dim;
+        size_t h = (idx / head_dim) % n_heads;
+        size_t row = idx / (head_dim * n_heads);
+        size_t gate_at = (row * n_heads + h) * (2 * head_dim) + head_dim + d;
+        float g = __bfloat162float(q_raw_value_gate_interleaved_per_head[gate_at]);
+        __nv_bfloat16 sig = __float2bfloat16(1.0f / (1.0f + expf(-g)));
+        out[idx] = __float2bfloat16(
+            __bfloat162float(attn[idx]) * __bfloat162float(sig));
+    }
+    NVK_PDL_EPILOG();
+}
+
+extern "C" int nv_kernels_attn_gate_sigmoid_mul_bf16(
+    void* stream,
+    const uint16_t* attn,
+    const uint16_t* q_raw,
+    uint16_t* out,
+    size_t rows,
+    size_t n_heads,
+    size_t head_dim
+) {
+    cudaStream_t s = (cudaStream_t)stream;
+    size_t total = rows * n_heads * head_dim;
+    if (total == 0) return -2;
+    int block = 256;
+    int grid = (int)((total + block - 1) / block);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, dim3(grid), dim3(block), 0, s);
+        cudaLaunchKernelEx(
+            &cfg, attn_gate_sigmoid_mul_bf16_kernel,
+            reinterpret_cast<const __nv_bfloat16*>(attn),
+            reinterpret_cast<const __nv_bfloat16*>(q_raw),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            rows, n_heads, head_dim);
+    } else {
+        attn_gate_sigmoid_mul_bf16_kernel<<<grid, block, 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(attn),
+            reinterpret_cast<const __nv_bfloat16*>(q_raw),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            rows, n_heads, head_dim);
+    }
+    return (int)cudaGetLastError();
+}

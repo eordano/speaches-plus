@@ -1,8 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["httpx>=0.28"]
-# ///
 """HTTP shape-parity test for `/v1/audio/transcriptions?response_format=diarized_json`.
 
 Both the Rust and Go servers expose this endpoint and are expected to agree

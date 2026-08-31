@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::linear::Linear;
 use crate::mlp::Mlp;
+use crate::weight_load::load_linear;
 
 #[derive(Clone, Copy, Debug)]
 pub struct MoeConfig {
@@ -362,17 +363,49 @@ impl MoeBlock {
             }
         }
 
+        let mut rows_concat: Vec<u32> = Vec::with_capacity(n_tokens * k);
+        let mut w_concat: Vec<f32> = Vec::with_capacity(n_tokens * k);
+        let mut offsets: Vec<usize> = Vec::with_capacity(self.cfg.num_experts);
+        for e in 0..self.cfg.num_experts {
+            offsets.push(rows_concat.len());
+            rows_concat.extend_from_slice(&expert_rows[e]);
+            w_concat.extend_from_slice(&expert_w[e]);
+        }
+        let total = rows_concat.len();
+        let (rows_all_t, w_all_t) = if total > 0 {
+            (
+                Some(Tensor::from_vec(rows_concat, total, &device)?),
+                Some(Tensor::from_vec(w_concat, total, &device)?),
+            )
+        } else {
+            (None, None)
+        };
+
         let mut acc = Tensor::zeros((n_tokens, self.cfg.hidden_size), DType::F32, &device)?;
         for e in 0..self.cfg.num_experts {
-            let rows = &expert_rows[e];
-            if rows.is_empty() {
+            let m = expert_rows[e].len();
+            if m == 0 {
                 continue;
             }
-            let m = rows.len();
-            let idx_t = Tensor::from_vec(rows.clone(), m, &device)?;
+            let idx_t = rows_all_t.as_ref().unwrap().narrow(0, offsets[e], m)?;
             let gathered = x_flat.index_select(&idx_t, 0)?.contiguous()?;
             let y_e = self.experts[e].forward(&gathered)?.to_dtype(DType::F32)?;
-            let w_t = Tensor::from_vec(expert_w[e].clone(), (m, 1), &device)?;
+            if std::env::var("NV_DEBUG_NAN_SCAN").as_deref() == Ok("1") {
+                let v: Vec<f32> = y_e.flatten_all()?.to_vec1()?;
+                let bad = v.iter().filter(|x| !x.is_finite()).count();
+                if bad > 0 {
+                    anyhow::bail!(
+                        "NV_DEBUG_NAN_SCAN eager-expert first non-finite: expert {e} m={m} \
+                         bad={bad}/{} (n_tokens={n_tokens})",
+                        v.len()
+                    );
+                }
+            }
+            let w_t = w_all_t
+                .as_ref()
+                .unwrap()
+                .narrow(0, offsets[e], m)?
+                .reshape((m, 1))?;
             let weighted = y_e.broadcast_mul(&w_t)?;
             acc = acc.index_add(&idx_t, &weighted, 0)?;
         }
@@ -547,28 +580,6 @@ fn grouped_enabled() -> bool {
         Some("1") | Some("true") | Some("on") => true,
         _ => false,
     }
-}
-
-fn load_linear(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    out_features: usize,
-    in_features: usize,
-    dtype: DType,
-) -> Result<Linear> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
-            "linear {name}: expected [{}, {}], got {:?}",
-            out_features,
-            in_features,
-            d
-        );
-    }
-    Linear::new(w, None)
 }
 
 #[cfg(feature = "cuda")]
@@ -966,7 +977,7 @@ fn dequantize_nvfp4_to_bf16(
     let gscale = weights.get(&gscale_name, DType::F32)?;
     let gvec = gscale.flatten_all()?.to_vec1::<f32>()?;
     let stored_global = *gvec.first().unwrap_or(&1.0f32);
-    let inv_global = if stored_global == 0.0 {
+    let inv_global = if stored_global == 0.0 || !stored_global.is_finite() {
         1.0
     } else {
         1.0 / stored_global

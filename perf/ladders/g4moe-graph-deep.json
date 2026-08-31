@@ -1,0 +1,34 @@
+{
+ "ladder": "g4moe-graph-deep",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "g4moe cuda serving-deep",
+  "model": "gemma4-26b-a4b",
+  "backend": "cuda",
+  "pkg": "nv-models",
+  "features": "cuda",
+  "suite": "g4moe_serving_ctx",
+  "exact": "g4moe_cuda_serving_decode_ms_per_token_vs_context_depth_synthetic_cache_fill_eager_bf16_ring_kv_the_serving_decode_builds_no_graph",
+  "parse": "ctx-scaling",
+  "timeout": "3600"
+ },
+ "base_env": {
+  "NV_G4MOE_SERVING_TEST": "1"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  256,
+  8192,
+  196608
+ ],
+ "depths_per_run": false,
+ "notes": "#246 CUDA depth instrument fill: gemma4-26B-A4B has cuda depth rows only at 256 (g4moe_cuda_decode_ms_per_token_at_depth_256_expert_residency_ab reads 38.5 bare / 24.0 nvfp4-experts), so the family's rival comparison has been read off wgpu columns; this ladder lands the cuda serving shape at the wgpu-comparable rungs, 196608 matching the g4moe-26b wgpu depth-stack rows",
+ "rationale": "The serving decode for this family is the eager run_sampling_gemma4_moe loop (chat_engine/build.rs: 'Gemma4Moe and Qwen3 build no graph'), so the eager forward_with_cache step over the bf16 sliding-ring Gemma4KvCache IS the serving shape and the bare arm times exactly what a default deployment runs. run_sampling_gemma4_moe arms nothing beyond defaults -- NV_G4MOE_CUDA_NVFP4 and NV_G4MOE_EXPERT_BT_GEMM are opt-in, so there is no default-on decode-fix equivalent and the spec stays single-arm. Coverage fill, not an adjudication: rows land as labeled facts about the unarmed path and no margin is quoted from this spec. The rival re-comparison itself needs the g4 GGUF re-fetch, tracked elsewhere.",
+ "baseline_arm": "bare-defaults",
+ "arms": [
+  {
+   "name": "bare-defaults",
+   "env": {}
+  }
+ ]
+}

@@ -280,6 +280,7 @@ fn gdn_decode_chunk_matches_sequential() {
                         d_v as i32,
                         1e-6f32,
                         t as i32,
+                        n_v as i32,
                     )
                 }
             };
@@ -483,6 +484,7 @@ fn gdn_chunk_wrappers_reject_bad_shapes() {
                 d_v_arg,
                 1e-6f32,
                 t,
+                n_v_arg,
             )
         }
     };
@@ -539,8 +541,13 @@ const Q38_GDN_LAYERS_48_IS_WHAT_A_VERIFY_ROUND_PAYS_THE_PER_LAYER_COST_TIMES: us
 #[ignore]
 fn q38_verify_gdn_chunk_ab_at_serving_shapes() {
     if !bench_gated() {
-        eprintln!("q38_verify_gdn_chunk_ab_at_serving_shapes: SKIP set NV_GDN_CHUNK_BENCH=1");
-        return;
+        panic!(
+            "NV_GDN_CHUNK_BENCH is not 1, so q38_verify_gdn_chunk_ab_at_serving_shapes executed \
+             nothing. It is already #[ignore]d, which makes --ignored the opt-in; a second env \
+             gate behind that can only make an --ignored run print `1 passed` for an A/B that \
+             compared nothing. A suite whose precondition is absent must fail or be ignored, \
+             never return green."
+        );
     }
     let stream = match CudaContext::new(0) {
         Ok(c) => c.default_stream(),
@@ -697,6 +704,7 @@ fn q38_verify_gdn_chunk_ab_at_serving_shapes() {
                     d_v as i32,
                     1e-6f32,
                     m as i32,
+                    n_v as i32,
                 )
             };
             assert_eq!(rc, 0, "gdn_decode_chunk_split_bf16 rc={rc}");
@@ -782,8 +790,12 @@ fn q38_verify_gdn_chunk_ab_at_serving_shapes() {
 #[ignore]
 fn gdn_chunk_microbench() {
     if !bench_gated() {
-        eprintln!("gdn_chunk_microbench: SKIP set NV_GDN_CHUNK_BENCH=1 to run");
-        return;
+        panic!(
+            "NV_GDN_CHUNK_BENCH is not 1, so gdn_chunk_microbench executed nothing. It is already \
+             #[ignore]d, which makes --ignored the opt-in; a second env gate behind that can only \
+             make an --ignored run print `1 passed` for a bench that measured nothing. A suite \
+             whose precondition is absent must fail or be ignored, never return green."
+        );
     }
     let stream = match CudaContext::new(0) {
         Ok(c) => c.default_stream(),
@@ -850,6 +862,7 @@ fn gdn_chunk_microbench() {
                     d_v as i32,
                     1e-6f32,
                     t as i32,
+                    n_v as i32,
                 )
             };
             assert_eq!(rc, 0);

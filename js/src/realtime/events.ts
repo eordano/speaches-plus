@@ -54,6 +54,20 @@ export interface RealtimeResponsePayload {
   status_details?: RealtimeResponseStatusDetails;
 }
 
+export type RealtimeToolStatus = "running" | "done";
+
+// Mirror of wire.rs ToolProgressEntry -- the per-tool entry carried by both
+// the SSE `tool_progress` chunk and the realtime `response.tool_progress`
+// event's `tools` array.
+export interface RealtimeToolProgressEntry {
+  name: string;
+  status: RealtimeToolStatus;
+  args?: JsonValue;
+  result?: string;
+  error?: boolean;
+  summary?: string;
+}
+
 export interface RealtimeContentPart {
   type?: string;
   text?: string;
@@ -131,7 +145,7 @@ export type RealtimeServerEvent =
   | (Stamped & { type: "response.output_text.done"; response_id: ResponseId; item_id: ItemId; output_index: number; content_index: number; text: string })
   | (Stamped & { type: "response.function_call_arguments.delta"; response_id: ResponseId; item_id: ItemId; output_index: number; call_id: string; delta: string })
   | (Stamped & { type: "response.function_call_arguments.done"; response_id: ResponseId; item_id: ItemId; output_index: number; call_id: string; arguments: string })
-  | (Stamped & { type: "response.tool_progress"; response_id: ResponseId; item_id: ItemId; output_index: number; progress: JsonValue })
+  | (Stamped & { type: "response.tool_progress"; response_id: ResponseId; tools: RealtimeToolProgressEntry[] })
   | (Stamped & { type: "response.cancelled"; response_id: ResponseId })
   | (Stamped & { type: "response.done"; response: RealtimeResponsePayload })
   | (Stamped & { type: "output_audio_buffer.cleared" })

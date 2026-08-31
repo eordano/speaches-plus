@@ -13,8 +13,15 @@ use crate::gemma4_wgpu_shared::{
     bf16_bits, err, rope_tables, FLASH2_PK_ENTRY, FLASH2_PK_WGSL, GEMV_PK3_ENTRY, GEMV_PK_ENTRY,
     GEMV_PK_WGSL, ROPE_F32_ENTRY, ROPE_F32_WGSL,
 };
+use crate::wgpu_lora::{
+    bind_bytes, build_lora_pipelines, build_lora_site, emit_lora_site_pk, upload_lora_site,
+    LoraPipelines, LoraSite, LoraSiteGpu, Pass,
+};
 
 pub const FLASH_SPLITS: u32 = 16;
+
+pub const FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES:
+    u32 = 1;
 
 pub const MAX_TABLE_CHUNKS: usize = 8;
 
@@ -40,136 +47,6 @@ fn flash2_pk_wgsl() -> String {
     [FLASH2_PK_WGSL, FLASH2_PK_MK_WGSL].concat()
 }
 
-pub fn flash1_e4b_source(hd_max: u32, sg: bool) -> String {
-    assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max <= 512,
-        "flash1 hd_max {hd_max} must be a positive multiple of 32 up to 512"
-    );
-    let accs = hd_max / 32;
-    let t = flash1_e4b_tag(hd_max, sg);
-    let entry = flash1_e4b_entry(hd_max, sg);
-    let mut b = String::with_capacity(8192);
-    use std::fmt::Write;
-
-    writeln!(b, "var<workgroup> f1{t}_qsh: array<f32, {hd_max}>;").unwrap();
-    writeln!(b, "var<workgroup> f1{t}_sacc: array<f32, {}>;", hd_max * 8).unwrap();
-    writeln!(b, "var<workgroup> f1{t}_sm: array<f32, 8>;").unwrap();
-    writeln!(b, "var<workgroup> f1{t}_sl: array<f32, 8>;").unwrap();
-    if sg {
-        writeln!(
-            b,
-            "\nfn f1{t}_reduce(lid: u32, x: f32) -> f32 {{\n    var a = x;\n    a = a + \
-             subgroupShuffleXor(a, 16u);\n    a = a + subgroupShuffleXor(a, 8u);\n    a = a + \
-             subgroupShuffleXor(a, 4u);\n    a = a + subgroupShuffleXor(a, 2u);\n    a = a + \
-             subgroupShuffleXor(a, 1u);\n    return a;\n}}"
-        )
-        .unwrap();
-    } else {
-        writeln!(b, "var<workgroup> f1{t}_red: array<f32, 256>;").unwrap();
-        writeln!(
-            b,
-            "\nfn f1{t}_reduce(lid: u32, x: f32) -> f32 {{\n    f1{t}_red[lid] = x;\n    \
-             workgroupBarrier();\n    for (var o = 16u; o > 0u; o = o >> 1u) {{\n        let \
-             other = f1{t}_red[lid ^ o];\n        workgroupBarrier();\n        f1{t}_red[lid] = \
-             f1{t}_red[lid] + other;\n        workgroupBarrier();\n    }}\n    return \
-             f1{t}_red[lid];\n}}"
-        )
-        .unwrap();
-    }
-
-    writeln!(
-        b,
-        "\nfn f1{t}_epilogue(lid: u32, lane: u32, warp: u32, hd: u32, slot: u32, m: f32, l: f32) \
-         {{\n    if (lane == 0u) {{\n        f1{t}_sm[warp] = m;\n        f1{t}_sl[warp] = l;\n    \
-         }}\n    workgroupBarrier();\n    if (warp == 0u) {{\n        var m_blk = \
-         fd_neg_inf();\n        for (var w = 0u; w < FD_WARPS; w = w + 1u) {{\n            m_blk = \
-         max(m_blk, f1{t}_sm[w]);\n        }}\n        var l_blk = 0.0;\n        for (var w = 0u; \
-         w < FD_WARPS; w = w + 1u) {{\n            if (f1{t}_sm[w] > fd_neg_inf()) {{\n           \
-         l_blk = l_blk + fd_round(f1{t}_sl[w] * fd_exp(f1{t}_sm[w] - m_blk));\n            }}\n    \
-         }}\n        if (lane == 0u) {{\n            fd_scratch[slot] = m_blk;\n            \
-         fd_scratch[slot + 1u] = l_blk;\n        }}\n    }}\n    var m_blk = fd_neg_inf();\n    \
-         for (var w = 0u; w < FD_WARPS; w = w + 1u) {{\n        m_blk = max(m_blk, \
-         f1{t}_sm[w]);\n    }}\n    for (var d = lid; d < hd; d = d + FD_BLOCK) {{\n        var a \
-         = 0.0;\n        for (var w = 0u; w < FD_WARPS; w = w + 1u) {{\n            if \
-         (f1{t}_sm[w] > fd_neg_inf()) {{\n                a = a + fd_round(f1{t}_sacc[w * \
-         {hd_max}u + d] * fd_exp(f1{t}_sm[w] - m_blk));\n            }}\n        }}\n        \
-         fd_scratch[slot + 2u + d] = a;\n    }}\n}}"
-    )
-    .unwrap();
-
-    writeln!(b, "\n@compute @workgroup_size(256)").unwrap();
-    writeln!(
-        b,
-        "fn {entry}(\n    @builtin(workgroup_id) wg: vec3<u32>,\n    \
-         @builtin(local_invocation_id) tid: vec3<u32>\n) {{"
-    )
-    .unwrap();
-    writeln!(
-        b,
-        "    let h = wg.x;\n    let split = wg.y;\n    if (h >= fd_params.n_heads) {{\n        \
-         return;\n    }}\n    let hd = fd_params.head_dim;\n    let nkv = fd_params.n_kv;\n    let \
-         group = fd_params.n_heads / nkv;\n    let kvh = h / group;\n    let lid = tid.x;\n    let \
-         lane = lid & 31u;\n    let warp = lid >> 5u;\n\n    for (var d = lid; d < hd; d = d + \
-         FD_BLOCK) {{\n        f1{t}_qsh[d] = fd_q[h * hd + d];\n    }}\n    workgroupBarrier();\n"
-    )
-    .unwrap();
-    for i in 0..accs {
-        writeln!(b, "    var acc{i} = 0.0;").unwrap();
-    }
-    writeln!(
-        b,
-        "    var m = fd_neg_inf();\n    var l = 0.0;\n\n    let total = fd_params.total;\n    let \
-         base = fd_params.start + split * FD_WARPS;\n    let stride = fd_params.splits * \
-         FD_WARPS;\n    var rounds = 0u;\n    if (total > base) {{\n        rounds = (total - base \
-         + stride - 1u) / stride;\n    }}\n    let use_vec4 = (hd & 3u) == 0u;\n\n    for (var r = \
-         0u; r < rounds; r = r + 1u) {{\n        let p = base + warp + r * stride;\n        let \
-         live = p < total;\n        var sp = p;\n        if (fd_params.ring > 0u) {{\n            \
-         sp = p % fd_params.ring;\n        }}\n        var partial = 0.0;\n        var ks = 0.0;\n \
-         if (live) {{\n            let kbase = (sp * nkv + kvh) * hd;\n            ks = \
-         fd_k_scales[sp * nkv + kvh];\n            if (use_vec4) {{\n                let n4 = hd >> \
-         2u;\n                for (var j = lane; j < n4; j = j + FD_LANES) {{\n                    \
-         let qb = j * 4u;\n                    let kb = kbase + qb;\n                    let f0 = \
-         fd_k_fp8(kb);\n                    let f1 = fd_k_fp8(kb + 1u);\n                    let \
-         f2 = fd_k_fp8(kb + 2u);\n                    let f3 = fd_k_fp8(kb + 3u);\n                \
-         var t = f1{t}_qsh[qb + 1u] * f1;\n                    t = fma(f1{t}_qsh[qb], f0, t);\n    \
-         t = fma(f1{t}_qsh[qb + 2u], f2, t);\n                    t = fma(f1{t}_qsh[qb + 3u], f3, \
-         t);\n                    partial = partial + t;\n                }}\n            }} else \
-         {{\n                for (var d = lane; d < hd; d = d + FD_LANES) {{\n                    \
-         partial = fma(f1{t}_qsh[d], fd_k_fp8(kbase + d), partial);\n                }}\n          \
-         }}\n        }}\n        let score = (f1{t}_reduce(lid, partial) * ks) * \
-         fd_params.scaling;\n        if (live) {{\n            let m_new = max(m, score);\n        \
-         let corr = fd_exp(m - m_new);\n            let w = fd_exp(score - m_new);\n            l = \
-         fma(l, corr, w);\n            let vbase = (sp * nkv + kvh) * hd;\n            let w_v = w \
-         * fd_v_scales[sp * nkv + kvh];"
-    )
-    .unwrap();
-    for i in 0..accs {
-        writeln!(
-            b,
-            "            {{\n                let d = lane + {i}u * FD_LANES;\n                if \
-             (d < hd) {{\n                    acc{i} = fma(w_v, fd_v_fp8(vbase + d), acc{i} * \
-             corr);\n                }}\n            }}"
-        )
-        .unwrap();
-    }
-    writeln!(b, "            m = m_new;\n        }}\n    }}\n").unwrap();
-    for i in 0..accs {
-        writeln!(
-            b,
-            "    {{\n        let d = lane + {i}u * FD_LANES;\n        if (d < hd) {{\n            \
-             f1{t}_sacc[warp * {hd_max}u + d] = acc{i};\n        }}\n    }}"
-        )
-        .unwrap();
-    }
-    writeln!(
-        b,
-        "    let slot = (h * fd_params.splits + split) * (hd + 2u);\n    f1{t}_epilogue(lid, lane, \
-         warp, hd, slot, m, l);\n}}"
-    )
-    .unwrap();
-    b
-}
-
 fn flash1_pick(
     built: &[(u32, Arc<wgpu::ComputePipeline>)],
     hd: usize,
@@ -190,21 +67,13 @@ fn flash1_for(pl: &Pipelines, hd: usize) -> Arc<wgpu::ComputePipeline> {
     flash1_pick(&pl.flash1, hd)
 }
 
-fn flash1_e4b_tag(hd_max: u32, sg: bool) -> String {
-    format!("{}{}", hd_max, if sg { "sg" } else { "wb" })
-}
-
-pub fn flash1_e4b_entry(hd_max: u32, sg: bool) -> String {
-    format!("e4b_flash1_{}_fp8", flash1_e4b_tag(hd_max, sg))
-}
-
 pub const FLASH_SD_ENV: &str = "NV_E4B_FLASH_SD";
 
 pub const FLASH_SD_DEFAULT_ON_SHIFT_DECODE_WINS_AT_DEPTH_AND_HOLDS_PPL_PER_PERF_RUNS_JSONL: bool =
     true;
 
 pub fn flash_sd_enabled() -> bool {
-    if std::env::var(FLASH_SD_ENV).ok().as_deref() == Some("0") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(FLASH_SD_ENV) {
         return false;
     }
     FLASH_SD_DEFAULT_ON_SHIFT_DECODE_WINS_AT_DEPTH_AND_HOLDS_PPL_PER_PERF_RUNS_JSONL
@@ -262,19 +131,6 @@ fn flash_sd_rewrite(base: &str, entry: &str, k_anchor: &str, v_anchor: &str) -> 
     sd
 }
 
-pub fn flash1_e4b_entry_sd(hd_max: u32, sg: bool) -> String {
-    format!("{}_sd", flash1_e4b_entry(hd_max, sg))
-}
-
-pub fn flash1_e4b_source_sd(hd_max: u32, sg: bool) -> String {
-    flash_sd_rewrite(
-        &flash1_e4b_source(hd_max, sg),
-        &flash1_e4b_entry(hd_max, sg),
-        E4B_SD_K_SCALE_ANCHOR,
-        E4B_SD_W_V_SCALE_ANCHOR,
-    )
-}
-
 pub const FLASH_ROWS_STAGE1_ENTRY: &str = "g4w_flash_rows_stage1_fp8";
 
 pub const FLASH_ROWS_STAGE1_ENTRY_SD: &str = "g4w_flash_rows_stage1_fp8_sd";
@@ -327,7 +183,7 @@ pub const E4B_DEEP_SPLITS_ENV: &str = "NV_E4B_DEEP_SPLITS";
 pub const E4B_DEEP_FULL_ONLY_ENV: &str = "NV_E4B_DEEP_FULL_ONLY";
 
 pub fn deep_full_only() -> bool {
-    std::env::var(E4B_DEEP_FULL_ONLY_ENV).ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(E4B_DEEP_FULL_ONLY_ENV)
 }
 
 pub const E4B_DEEP_FOLD_ENV: &str = "NV_E4B_DEEP_FOLD";
@@ -357,11 +213,14 @@ pub const DEEP_STAGE2_RULE: &str = "the shared g4w_flash_splitk_stage2_pk body i
      any-splits stage2 the deep arm dispatches instead, and NV_E4B_DEEP_STAGE2_LEGACY16=1 \
      restores the truncating fold for measurement. Cost of the fix at deep splits 64: within \
      run variance (12.70 vs 13.03 ms/tok at depth 122880, same-harness repeats). Numbers \
-     published from the truncating path: the DEEP_SPLIT_ARM_RULE ladder cells and the \
-     RECORD-BAR gemma4-E4B deep row (63.4 ms/tok at 122880)";
+     published from the truncating path: the DEEP_SPLIT_ARM_RULE ladder cells are the only \
+     ones left. The RECORD-BAR gemma4-E4B deep row this rule used to cite (63.4 ms/tok at \
+     122880) was WITHDRAWN by the ledger audit as an off-arm measurement, so the truncating \
+     path no longer backs any published cell -- do not restore that citation, and if a deep \
+     E4B number is needed, measure it on the arm that ships rather than reviving a retired one";
 
 pub fn deep_stage2_legacy16() -> bool {
-    std::env::var(E4B_DEEP_STAGE2_LEGACY16_ENV).ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(E4B_DEEP_STAGE2_LEGACY16_ENV)
 }
 
 pub const FLASH2_DEEP_ENTRY: &str = "e4b_flash2_pk_deep_rt";
@@ -436,6 +295,70 @@ fn {FLASH2_DEEP_ENTRY}(
     }}
 }}
 "#
+    )
+}
+
+pub fn e4b_flash2_deep_module_source(splits: u32) -> String {
+    format!(
+        "{}\n{}\n{}",
+        compose(wk::flash_decode::WGSL),
+        flash2_pk_wgsl(),
+        e4b_flash2_deep_source(splits)
+    )
+}
+
+pub const FLASH2_PK_SPLIT_ANCHOR: &str = "let splits = 16u;";
+
+pub const SHALLOW_STAGE2_RULE: &str = "the shallow decode stage2 is the SAME hand-unrolled \
+     g4w_flash_splitk_stage2_pk body as the deep arm's legacy path, so the same truncation applies \
+     to it: `let splits` only moves the per-head base and the running-max scan, while ssc0..ssc15 \
+     and sixteen fma terms per output pair are fixed text. Folding it to N>16 merges the first 16 \
+     of N partials; folding it to N<16 reads the NEXT head's partials with this head's max. \
+     Measured on the truncating fold, NV_WGPU_FLASH_SPLITS moved gemma4-E4B from ppl 8.165 / top-1 \
+     0.6309 at the built-in 16 to 58.204-8815.866 / 0.076-0.305 at 1,2,4,8,32,64,128 -- an accuracy \
+     collapse a reduction order cannot produce. The shallow stage2 therefore takes \
+     e4b_flash2_deep_source, the generated any-splits merge, at every split count except the \
+     shipped 16, where the hand-unrolled body is kept bit-identical so no shipped number moves. \
+     NV_E4B_DEEP_STAGE2_LEGACY16=1 restores the truncating fold on every arm for measurement. The \
+     only published numbers taken on the truncating shallow fold are the defect ladder itself \
+     (/home/user/tmp/wf/comparator/RESULTS.md section 3.1); every shipped e4b number is at 16, which \
+     this change leaves untouched";
+
+pub fn e4b_flash2_pk_folded_truncating_to_splits(prelude: &str, splits: u32) -> String {
+    let folded = prelude.replacen(
+        FLASH2_PK_SPLIT_ANCHOR,
+        &format!("let splits = {splits}u;"),
+        1,
+    );
+    assert!(
+        splits == FLASH_SPLITS || folded != prelude,
+        "flash2 split-count anchor `{FLASH2_PK_SPLIT_ANCHOR}` missing from g4shared_flash2_pk; \
+         the folded stage2 would silently merge the wrong number of partials. {SHALLOW_STAGE2_RULE}"
+    );
+    folded
+}
+
+pub fn e4b_flash2_stage2_source_and_entry(prelude: &str, splits: u32) -> (String, &'static str) {
+    if splits == FLASH_SPLITS || deep_stage2_legacy16() {
+        return (
+            e4b_flash2_pk_folded_truncating_to_splits(prelude, splits),
+            FLASH2_PK_ENTRY,
+        );
+    }
+    (
+        format!("{prelude}\n{}", e4b_flash2_deep_source(splits)),
+        FLASH2_DEEP_ENTRY,
+    )
+}
+
+pub fn e4b_flash2_stage2_module_source_and_entry(splits: u32) -> (String, &'static str) {
+    e4b_flash2_stage2_source_and_entry(
+        &format!(
+            "{}\n{}",
+            compose(wk::flash_decode::WGSL),
+            flash2_pk_wgsl()
+        ),
+        splits,
     )
 }
 
@@ -709,9 +632,111 @@ pub fn deep_split_arm() -> Option<(u32, u32)> {
     Some((depth, deep_splits()))
 }
 
+pub const E4B_DEEP_DEPTHGATE_ENV: &str = "NV_E4B_DEEP_DEPTHGATE";
+
+pub const E4B_DEEP2_SPLITS_ENV: &str = "NV_E4B_DEEP2_SPLITS";
+
+pub const E4B_DEEP2_KNEE_ENV: &str = "NV_E4B_DEEP2_KNEE";
+
+const DEEP2_SPLITS_94_IS_376_WORKGROUPS_TWO_PER_SM_ON_188_SMS_AND_110_128_141_ALL_LOSE_ABOVE_IT: u32 =
+    94;
+
+const DEEP2_KNEE_TOKENS_4096_IS_THE_FIRST_DEPTH_WHERE_94_BEATS_64_IN_BOTH_REPS_AND_64_WINS_EVERY_DEPTH_BELOW:
+    u32 = 4096;
+
+pub const DEEP2_BAND_RULE: &str = "the shipped deep band of 64 splits is 256 workgroups = 1.36 \
+     per SM on 188 SMs and it starves the decode grid past 4096 kv positions; the measured ladder \
+     at 4/94/376 workgroups makes 94 splits = 376 workgroups = exactly two per SM the winner at \
+     every depth from 4096 up (122880: 10.03 vs 11.45 ms/tok) while 110, 128 and 141 all LOSE to \
+     it non-monotonically -- this kernel's residency ceiling is two workgroups per SM, past which \
+     a partial third wave costs more than the extra parallelism buys. The same gate keys the \
+     sliding layers on min(total, window): a 512-position window never reaches the 2048 deep knee, \
+     so splitting it 64 or 94 ways leaves 5-8 positions per split, and pinning the sliding layers \
+     to the shallow band is worth -1.2% to -6.2% on its own (NV_E4B_DEEP_FULL_ONLY measures that \
+     half alone). Both halves are one arm behind NV_E4B_DEEP_DEPTHGATE, default off";
+
+pub fn deep_depthgate() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(E4B_DEEP_DEPTHGATE_ENV)
+}
+
+pub fn deep2_splits() -> u32 {
+    deep_env_u32(E4B_DEEP2_SPLITS_ENV)
+        .unwrap_or(DEEP2_SPLITS_94_IS_376_WORKGROUPS_TWO_PER_SM_ON_188_SMS_AND_110_128_141_ALL_LOSE_ABOVE_IT)
+        .clamp(1, wk::flash_decode::MAX_SPLITS as u32)
+}
+
+pub fn deep2_knee() -> u32 {
+    deep_env_u32(E4B_DEEP2_KNEE_ENV).unwrap_or(
+        DEEP2_KNEE_TOKENS_4096_IS_THE_FIRST_DEPTH_WHERE_94_BEATS_64_IN_BOTH_REPS_AND_64_WINS_EVERY_DEPTH_BELOW,
+    )
+}
+
+pub fn deep2_split_arm() -> Option<(u32, u32)> {
+    if !deep_depthgate() {
+        return None;
+    }
+    let (knee1, band1) = deep_split_arm()?;
+    let band2 = deep2_splits();
+    if band2 == band1 || band2 == decode_splits() {
+        return None;
+    }
+    Some((deep2_knee().max(knee1), band2))
+}
+
+pub fn sliding_splits_cap_a_sliding_layer_scans_at_most_its_window_so_its_band_saturates_there(
+    window: usize,
+) -> Option<u32> {
+    if deep_full_only() {
+        return Some(decode_splits());
+    }
+    if !deep_depthgate() || window == 0 {
+        return None;
+    }
+    Some(deep_band_splits_for_context_tokens(
+        window as u32,
+        decode_splits(),
+        deep_split_arm(),
+        deep2_split_arm(),
+    ))
+}
+
+pub fn deep_band_splits_for_context_tokens(
+    tokens: u32,
+    shallow: u32,
+    band1: Option<(u32, u32)>,
+    band2: Option<(u32, u32)>,
+) -> u32 {
+    if let Some((knee, splits)) = band2 {
+        if tokens > knee {
+            return splits;
+        }
+    }
+    if let Some((knee, splits)) = band1 {
+        if tokens > knee {
+            return splits;
+        }
+    }
+    shallow
+}
+
 pub fn scratch_splits() -> u32 {
     let deep = deep_split_arm().map(|(_, s)| s).unwrap_or(0);
-    decode_splits().max(deep).max(FLASH_SPLITS)
+    let deep2 = deep2_split_arm().map(|(_, s)| s).unwrap_or(0);
+    decode_splits().max(deep).max(deep2).max(FLASH_SPLITS)
+}
+
+pub fn synthetic_kv_bytes_0x30_to_0x3e_finite_small_under_e4m3_and_f32_views_so_no_nan_and_no_zero_scale(
+    len: usize,
+) -> Vec<u8> {
+    let mut state = 0x9e3779b97f4a7c15u64;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            0x30u8 + ((state >> 41) % 15) as u8
+        })
+        .collect()
 }
 
 pub const PREFILL_QTILE_ENV: &str = "NV_E4B_WGPU_PREFILL_QTILE";
@@ -970,14 +995,14 @@ pub fn flash1_sg_supported(ctx: &WgpuContext) -> bool {
 }
 
 fn flash1_sg_enabled(ctx: &WgpuContext) -> bool {
-    if std::env::var("NV_E4B_WGPU_FLASH1_SG").ok().as_deref() == Some("0") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FLASH1_SG") {
         return false;
     }
     flash1_sg_supported(ctx)
 }
 
 fn flash1_hd_specialize_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_FLASH1_HD").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FLASH1_HD")
 }
 
 const LMHEAD_I8_WGSL: &str = include_str!("../../nv-kernels/wgsl/e4b_lmhead_i8.wgsl");
@@ -1020,11 +1045,38 @@ struct GmParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GmFoldParams {
+    pli_word_off: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct PkOffParams {
     dst_word_off: u32,
     pad0: u32,
     pad1: u32,
     pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct E4bFncFoldParams {
+    hidden: u32,
+    words: u32,
+    eps: f32,
+    scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct FacMergeParams {
+    n_q: u32,
+    n_kv: u32,
+    pad0: u32,
+    pad1: u32,
 }
 
 #[repr(C)]
@@ -1258,30 +1310,11 @@ pub fn plan_chunks(rows: usize, row_bytes: usize, limit: u64) -> Result<ChunkPla
     })
 }
 
-#[derive(Clone)]
-struct Pass {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
-    grid: (u32, u32, u32),
-
-    bound_bytes: u64,
-    widest_bytes: u64,
-}
-
-fn bind_bytes<'a>(bufs: impl Iterator<Item = &'a wgpu::Buffer>) -> (u64, u64) {
-    let mut sum = 0u64;
-    let mut widest = 0u64;
-    for b in bufs {
-        sum += b.size();
-        widest = widest.max(b.size());
-    }
-    (sum, widest)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SplitArm {
     Shallow,
     Deep,
+    Deep2,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1507,6 +1540,7 @@ struct Pipelines {
     flash1_entry: String,
     flash2_pk: Arc<wgpu::ComputePipeline>,
     flash2_pk_deep: Option<Arc<wgpu::ComputePipeline>>,
+    flash2_pk_deep2: Option<Arc<wgpu::ComputePipeline>>,
     gemv_pk: Arc<wgpu::ComputePipeline>,
     gemv_pk3: Arc<wgpu::ComputePipeline>,
     gemv_w4_pk: Arc<wgpu::ComputePipeline>,
@@ -1514,9 +1548,26 @@ struct Pipelines {
     gemv_w4_v4_pk: Arc<wgpu::ComputePipeline>,
     gemv_w4_v4_pk3: Arc<wgpu::ComputePipeline>,
     gemv_w4_sg_pk: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_pk_u2: Option<Arc<wgpu::ComputePipeline>>,
     gemv_w4_sg_pk3: Option<Arc<wgpu::ComputePipeline>>,
     gemv_w4_sg_pkm: Option<Arc<wgpu::ComputePipeline>>,
     gemv_w4_sg_pkm3: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_pk_rs: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_pk3_rs: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_gelu_rs: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_kpre: Vec<(usize, Arc<wgpu::ComputePipeline>)>,
+    gemv_w4_sg_kpre3: Vec<(usize, Arc<wgpu::ComputePipeline>)>,
+    gemv_w4_sg_gelu_kpre: Vec<(usize, Arc<wgpu::ComputePipeline>)>,
+    gemv_w4_sg_gm: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_gelu: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_fnca: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_fncb: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_tail_fnca: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_tail_fncc: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_tail_gate: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_fncc_pk: Option<Arc<wgpu::ComputePipeline>>,
+    gemv_w4_sg_fncc_pk3: Option<Arc<wgpu::ComputePipeline>>,
+    gelu_inter: Option<Arc<wgpu::ComputePipeline>>,
     gemv_i8_pk: Option<Arc<wgpu::ComputePipeline>>,
     gemv_i8_pk3: Option<Arc<wgpu::ComputePipeline>>,
     gemv_i8g_pk: Option<Arc<wgpu::ComputePipeline>>,
@@ -1546,6 +1597,7 @@ struct FacPipelines {
     q: Arc<wgpu::ComputePipeline>,
     k: Arc<wgpu::ComputePipeline>,
     v: Arc<wgpu::ComputePipeline>,
+    qkv: Option<Arc<wgpu::ComputePipeline>>,
 }
 
 struct MkPipelines {
@@ -1570,7 +1622,7 @@ struct MkPipelines {
 }
 
 fn sg16_enabled(ctx: &WgpuContext) -> bool {
-    if std::env::var("NV_E4B_WGPU_W4_SG").ok().as_deref() == Some("0") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_W4_SG") {
         return false;
     }
     wk::gemv_w4a16::sg_pk_supported(ctx.subgroup_width())
@@ -1589,11 +1641,266 @@ fn w4_mr() -> u32 {
 }
 
 fn w4_route_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_W4_ROUTE").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_W4_ROUTE")
+}
+
+const SG_ROWSPLIT_ENV: &str = "NV_E4B_WGPU_SG_ROWSPLIT";
+
+fn sg_rowsplit_rows_per_wg() -> Option<u32> {
+    match std::env::var(SG_ROWSPLIT_ENV).ok()?.parse::<u32>().ok()? {
+        0 => None,
+        r => {
+            assert!(
+                matches!(r, 4 | 8),
+                "{SG_ROWSPLIT_ENV} spreads the unchanged 16-lane row dots over more \
+                 workgroups; rows per workgroup must be 4 (wg 64) or 8 (wg 128) so the \
+                 pair and quad output packing stays inside one workgroup, got {r}"
+            );
+            Some(r)
+        }
+    }
+}
+
+fn sg_rowsplit_grid_1d(n: usize, rows: u32, ctx: &WgpuContext) -> (u32, u32, u32) {
+    let groups = (n as u32).div_ceil(rows);
+    assert!(
+        groups <= ctx.caps.max_compute_workgroups_per_dimension,
+        "rowsplit grid {groups} exceeds the 1-D dispatch limit; the rowsplit entries \
+         index rows by wid.x alone"
+    );
+    (groups, 1, 1)
+}
+
+const E4B_SG_PK_RS_ENTRY: &str = "e4b_sg_pk_rowsplit";
+const E4B_SG_PK3_RS_ENTRY: &str = "e4b_sg_pk3_rowsplit";
+const E4B_SG_GELU_RS_ENTRY: &str = "e4b_sg_pk_gelu_fold_rowsplit";
+
+fn sg_pk_rowsplit_entry_header_same_row_dot_fewer_rows_per_wg(entry: &str, rows: u32) -> String {
+    assert_eq!(
+        (wk::gemv_w4a16::SG_PK_LANES, wk::gemv_w4a16::SG_PK_WG),
+        (16, 256),
+        "the rowsplit entries hardcode the 16-lane sg_pk row geometry"
+    );
+    let wg = rows * 16;
+    format!(
+        "@compute @workgroup_size({wg})\n\
+         fn {entry}(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    \
+         @builtin(subgroup_id) sgid: u32,\n    @builtin(subgroup_size) sgsz: u32,\n    \
+         @builtin(subgroup_invocation_id) slane: u32\n) {{\n    \
+         let vt = sgid * sgsz + slane;\n    let slot = vt / 16u;\n    \
+         let vlane = slane & 15u;\n    let row = wid.x * {rows}u + slot;\n    \
+         let live = row < sgp_params.n_rows;\n    \
+         let acc = sgp_row_acc(row, live, vlane);\n    \
+         if (vlane == 0u) {{\n        sgp_row_tot[slot] = acc;\n    }}\n    \
+         workgroupBarrier();\n"
+    )
+}
+
+const SG_PK_RS_PAIR_WORD: &str = "    if (vlane == 0u && live && (slot & 1u) == 0u) {\n        let lo = bf16_encode(acc) & 0xffffu;\n        let hi_live = row + 1u < sgp_params.n_rows;\n        let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;\n        let word = lo | (select(0u, hi, hi_live) << 16u);\n";
+
+fn sg_pk_rowsplit_entry_sources_same_16_lane_dot_same_output_words(rows: u32) -> String {
+    let mut s = String::new();
+    s.push_str(&sg_pk_rowsplit_entry_header_same_row_dot_fewer_rows_per_wg(
+        E4B_SG_PK_RS_ENTRY,
+        rows,
+    ));
+    s.push_str(SG_PK_RS_PAIR_WORD);
+    s.push_str("        sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;\n    }\n}\n\n");
+    s.push_str(&sg_pk_rowsplit_entry_header_same_row_dot_fewer_rows_per_wg(
+        E4B_SG_PK3_RS_ENTRY,
+        rows,
+    ));
+    s.push_str(SG_PK_RS_PAIR_WORD);
+    s.push_str(
+        "        if (row < sgp_split.q_rows) {\n            sgp_y_q[row >> 1u] = word;\n        } else {\n            let kr = row - sgp_split.q_rows;\n            if (kr < sgp_split.kv_rows) {\n                sgp_y_k[kr >> 1u] = word;\n            }\n            if (row >= sgp_split.v_off) {\n                let vr = row - sgp_split.v_off;\n                if (vr < sgp_split.kv_rows) {\n                    sgp_y_v[vr >> 1u] = word;\n                }\n            }\n        }\n    }\n}\n\n",
+    );
+    s
+}
+
+const W4_KPRE_ENV: &str = "NV_E4B_WGPU_W4_KPRE";
+
+fn w4_kpre_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(W4_KPRE_ENV)
+}
+
+fn sg_pk_kpre_acc_fn_name(k: usize) -> String {
+    format!("sgp_row_acc_kpre{k}")
+}
+
+fn sg_pk_kpre_row_acc_source_issuing_every_w_and_scale_load_before_the_fma_chain(
+    k: usize,
+    grain: wk::gemv_w4a16::ScaleGrain,
+) -> String {
+    use std::fmt::Write as _;
+    assert!(
+        k.is_multiple_of(32) && k >= 32,
+        "sg_pk covers k % 32 == 0, got {k}"
+    );
+    assert!(
+        !matches!(grain, wk::gemv_w4a16::ScaleGrain::G16),
+        "the kpre arm replicates the Ge32-grain scale loads; e4b w4a16-qat checkpoints \
+         carry gs >= 32, G16 was never routed here"
+    );
+    let kv = (k / 32) as u32;
+    let n_full = kv / 16;
+    let rem = kv % 16;
+    let sgo = |v_expr: &str| -> String {
+        match grain {
+            wk::gemv_w4a16::ScaleGrain::Ge32 => format!("((({v_expr}) << 5u) / sgp_params.gs)"),
+            wk::gemv_w4a16::ScaleGrain::Ge32Fixed(0) => format!("({v_expr})"),
+            wk::gemv_w4a16::ScaleGrain::Ge32Fixed(s) => format!("(({v_expr}) >> {s}u)"),
+            wk::gemv_w4a16::ScaleGrain::G16 => unreachable!("asserted above"),
+        }
+    };
+    let mut b = String::new();
+    writeln!(
+        b,
+        "fn {}(row: u32, live: bool, vlane: u32) -> f32 {{",
+        sg_pk_kpre_acc_fn_name(k)
+    )
+    .unwrap();
+    b.push_str("    var acc = 0.0;\n    if (live) {\n");
+    b.push_str("        let wbase4 = row * (sgp_params.w_row_words >> 2u);\n");
+    b.push_str("        let sbase = row * sgp_params.scale_row_stride;\n");
+    for i in 0..n_full {
+        let v = format!("(vlane + {}u)", 16 * i);
+        writeln!(b, "        let wv{i} = sgp_packed4[wbase4 + {v}];").unwrap();
+        writeln!(
+            b,
+            "        let ssw{i} = sgp_scale[(sbase + {}) >> 1u];",
+            sgo(&v)
+        )
+        .unwrap();
+    }
+    if rem > 0 {
+        let v = format!("(vlane + {}u)", 16 * n_full);
+        b.push_str("        var wvr: vec4<u32>;\n        var sswr: u32;\n");
+        writeln!(b, "        if (vlane < {rem}u) {{").unwrap();
+        writeln!(b, "            wvr = sgp_packed4[wbase4 + {v}];").unwrap();
+        writeln!(
+            b,
+            "            sswr = sgp_scale[(sbase + {}) >> 1u];",
+            sgo(&v)
+        )
+        .unwrap();
+        b.push_str("        }\n");
+    }
+    for i in 0..n_full {
+        let v = format!("(vlane + {}u)", 16 * i);
+        writeln!(b, "        let sgi{i} = sbase + {};", sgo(&v)).unwrap();
+        writeln!(
+            b,
+            "        let sc{i} = select(bf16_lo(ssw{i}), bf16_hi(ssw{i}), (sgi{i} & 1u) == 1u);"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "        acc = fma(sc{i}, sgp_dot32(wv{i}, ({v} << 2u)), acc);"
+        )
+        .unwrap();
+    }
+    if rem > 0 {
+        let v = format!("(vlane + {}u)", 16 * n_full);
+        writeln!(b, "        if (vlane < {rem}u) {{").unwrap();
+        writeln!(b, "            let sgir = sbase + {};", sgo(&v)).unwrap();
+        b.push_str(
+            "            let scr = select(bf16_lo(sswr), bf16_hi(sswr), (sgir & 1u) == 1u);\n",
+        );
+        writeln!(
+            b,
+            "            acc = fma(scr, sgp_dot32(wvr, ({v} << 2u)), acc);"
+        )
+        .unwrap();
+        b.push_str("        }\n");
+    }
+    b.push_str("    }\n");
+    let mut s = wk::gemv_w4a16::SG_PK_LANES / 2;
+    while s >= 1 {
+        writeln!(b, "    acc = acc + subgroupShuffleXor(acc, {s}u);").unwrap();
+        if s == 1 {
+            break;
+        }
+        s /= 2;
+    }
+    b.push_str("    return acc;\n}\n\n");
+    b
+}
+
+fn sg_pk_kpre_entry_names(k: usize) -> (String, String, String) {
+    (
+        format!("e4b_sg_pk_kpre_{k}"),
+        format!("e4b_sg_pk3_kpre_{k}"),
+        format!("e4b_sg_pk_gelu_fold_kpre_{k}"),
+    )
+}
+
+fn sg_pk_kpre_plain_and_pk3_sources_same_output_words(
+    k: usize,
+    grain: wk::gemv_w4a16::ScaleGrain,
+    rows: u32,
+) -> String {
+    let (plain, pk3, _) = sg_pk_kpre_entry_names(k);
+    let acc = sg_pk_kpre_acc_fn_name(k);
+    let mut s = sg_pk_kpre_row_acc_source_issuing_every_w_and_scale_load_before_the_fma_chain(
+        k, grain,
+    );
+    for (entry, tail) in [
+        (
+            plain,
+            "        sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;\n    }\n}\n\n".to_string(),
+        ),
+        (
+            pk3,
+            "        if (row < sgp_split.q_rows) {\n            sgp_y_q[row >> 1u] = word;\n        } else {\n            let kr = row - sgp_split.q_rows;\n            if (kr < sgp_split.kv_rows) {\n                sgp_y_k[kr >> 1u] = word;\n            }\n            if (row >= sgp_split.v_off) {\n                let vr = row - sgp_split.v_off;\n                if (vr < sgp_split.kv_rows) {\n                    sgp_y_v[vr >> 1u] = word;\n                }\n            }\n        }\n    }\n}\n\n"
+                .to_string(),
+        ),
+    ] {
+        s.push_str(
+            &sg_pk_rowsplit_entry_header_same_row_dot_fewer_rows_per_wg(&entry, rows)
+                .replace("sgp_row_acc(", &format!("{acc}(")),
+        );
+        s.push_str(SG_PK_RS_PAIR_WORD);
+        s.push_str(&tail);
+    }
+    s
+}
+
+fn sg_pk_kpre_gelu_fold_source_same_quad_words(
+    k: usize,
+    grain: wk::gemv_w4a16::ScaleGrain,
+    rows: u32,
+) -> String {
+    let (_, _, gelu) = sg_pk_kpre_entry_names(k);
+    let acc = sg_pk_kpre_acc_fn_name(k);
+    format!(
+        "{acc_src}{E4B_GELU_SCALAR_WGSL_REPLICATES_GELU_TANH_MUL_SCALAR}\n{header}    if (vlane == 0u && live && (slot & 3u) == 0u) {{\n        let w1 = (bf16_encode(sgp_row_tot[slot]) & 0xffffu)\n            | ((bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu) << 16u);\n        let w2 = (bf16_encode(sgp_row_tot[slot + 2u]) & 0xffffu)\n            | ((bf16_encode(sgp_row_tot[slot + 3u]) & 0xffffu) << 16u);\n        sgp_y[sgp_off.dst_word_off + (row >> 2u)] = bf16_pack(gf_word(w1), gf_word(w2));\n    }}\n}}\n",
+        acc_src =
+            sg_pk_kpre_row_acc_source_issuing_every_w_and_scale_load_before_the_fma_chain(k, grain),
+        header = sg_pk_rowsplit_entry_header_same_row_dot_fewer_rows_per_wg(&gelu, rows)
+            .replace("sgp_row_acc(", &format!("{acc}(")),
+    )
+}
+
+const KPRE_MIN_K_512_EXCLUDES_THE_LATENCY_FLOOR_PL_GATE_WHERE_PRELOAD_MEASURED_SLOWER: usize = 512;
+
+const GELU_KPRE_ROWS_4_KEEPS_THE_MEASURED_ROWSPLIT_WIN_ON_THE_GATE_UP_FOLD: u32 = 4;
+
+fn sg_pk_kpre_plain_rows_16_measured_faster_than_any_rowsplit_on_the_preloaded_down_gemv() -> u32 {
+    wk::gemv_w4a16::SG_PK_ROWS
+}
+
+fn sg_pk_gelu_fold_rowsplit_source_same_quad_words(rows: u32) -> String {
+    format!(
+        "{E4B_GELU_SCALAR_WGSL_REPLICATES_GELU_TANH_MUL_SCALAR}\n{header}    if (vlane == 0u && live && (slot & 3u) == 0u) {{\n        let w1 = (bf16_encode(sgp_row_tot[slot]) & 0xffffu)\n            | ((bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu) << 16u);\n        let w2 = (bf16_encode(sgp_row_tot[slot + 2u]) & 0xffffu)\n            | ((bf16_encode(sgp_row_tot[slot + 3u]) & 0xffffu) << 16u);\n        sgp_y[sgp_off.dst_word_off + (row >> 2u)] = bf16_pack(gf_word(w1), gf_word(w2));\n    }}\n}}\n",
+        header = sg_pk_rowsplit_entry_header_same_row_dot_fewer_rows_per_wg(
+            E4B_SG_GELU_RS_ENTRY,
+            rows
+        ),
+    )
 }
 
 fn w4_grain_enabled() -> bool {
-    std::env::var("NV_E4B_W4_GRAIN").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_W4_GRAIN")
 }
 
 fn st_elems(l: &nv_weights::WeightLoader, name: &str) -> Option<usize> {
@@ -1688,7 +1995,7 @@ fn checkpoint_w4_grain(
 }
 
 fn na_route_enabled() -> bool {
-    std::env::var("NV_WGPU_NA").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_WGPU_NA")
 }
 
 fn na_route_note(reason: &str) {
@@ -1699,7 +2006,7 @@ fn na_route_note(reason: &str) {
 }
 
 fn na_attn_enabled() -> bool {
-    std::env::var("NV_WGPU_NA_ATTN").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_WGPU_NA_ATTN")
 }
 
 fn na_attn_note(reason: &str) {
@@ -1719,6 +2026,999 @@ fn lmhead_i8_enabled() -> bool {
     std::env::var("NV_E4B_LMHEAD_INT8").ok().as_deref() == Some("1")
 }
 
+fn fuse_plgate_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FUSE_PLGATE")
+}
+
+fn fuse_gelu_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FUSE_GELU")
+}
+
+fn fuse_qkv_rope_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FUSE_QKV")
+}
+
+fn fold_fnca_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FOLD_FNCA")
+}
+
+fn fold_fncb_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FOLD_FNCB")
+}
+
+fn fold_fncc_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FOLD_FNCC")
+}
+
+fn tail_fnca_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_TAIL_FNCA")
+}
+
+fn tail_fncc_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_TAIL_FNCC")
+}
+
+fn tail_gate_only_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_TAIL_GATE_ONLY")
+}
+
+fn interleave_gate_up_rows_when_gelu_fold_on(l: &HostLin) -> Option<HostLin> {
+    if !fuse_gelu_enabled() {
+        return None;
+    }
+    let q = l.q.as_ref()?;
+    assert!(
+        l.n.is_multiple_of(4),
+        "gelu fold packs four interleaved rows per act word; gate_up n {} % 4 != 0",
+        l.n
+    );
+    let inter = l.n / 2;
+    let row_words = l.k / 8;
+    let srow = l.k / q.gs;
+    let mut packed = vec![0u32; q.packed.len()];
+    let mut scales = vec![0u16; q.scales.len()];
+    for j in 0..inter {
+        for (dst, src) in [(2 * j, j), (2 * j + 1, inter + j)] {
+            packed[dst * row_words..(dst + 1) * row_words]
+                .copy_from_slice(&q.packed[src * row_words..(src + 1) * row_words]);
+            scales[dst * srow..(dst + 1) * srow]
+                .copy_from_slice(&q.scales[src * srow..(src + 1) * srow]);
+        }
+    }
+    Some(HostLin::new_w4(packed, scales, q.gs, l.n, l.k))
+}
+
+const E4B_SG_GELU_ENTRY: &str = "e4b_sg_pk_gelu_fold";
+
+const E4B_GELU_INTERLEAVED_ENTRY: &str = "e4b_gelu_interleaved";
+
+const E4B_GELU_SCALAR_WGSL_REPLICATES_GELU_TANH_MUL_SCALAR: &str = r#"
+const GF_SQRT2_OVER_PI: f32 = 0.7978845608028654;
+const GF_CUBIC_COEFF: f32 = 0.044715;
+const GF_TANH_CLAMP: f32 = 10.0;
+
+fn gf_scalar(gate: f32, up: f32) -> f32 {
+    let g3 = gate * gate * gate;
+    let inner = GF_SQRT2_OVER_PI * (gate + GF_CUBIC_COEFF * g3);
+    let clamped = clamp(inner, -GF_TANH_CLAMP, GF_TANH_CLAMP);
+    let t = select(nv_tanhf(clamped), inner, inner != inner);
+    let mag = 0.5 * abs(gate) * (1.0 + t) * abs(up);
+    let sgn = (bitcast<u32>(gate) ^ bitcast<u32>(up)) & 0x80000000u;
+    return bitcast<f32>((bitcast<u32>(mag) & 0x7fffffffu) | sgn);
+}
+
+fn gf_word(w: u32) -> f32 {
+    return gf_scalar(bf16_lo(w), bf16_hi(w));
+}
+"#;
+
+fn sg_pk_gelu_fold_source_packing_four_interleaved_rows_into_one_act_word() -> String {
+    assert_eq!(
+        (wk::gemv_w4a16::SG_PK_LANES, wk::gemv_w4a16::SG_PK_WG),
+        (16, 256),
+        "the fold entry hardcodes the 16-lane 256-thread sg_pk geometry"
+    );
+    format!(
+        r#"
+{E4B_GELU_SCALAR_WGSL_REPLICATES_GELU_TANH_MUL_SCALAR}
+
+@compute @workgroup_size(256)
+fn e4b_sg_pk_gelu_fold(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / 16u;
+    let vlane = slane & 15u;
+    let row = (wid.x + wid.y * sgp_params.groups_x) * 16u + slot;
+    let live = row < sgp_params.n_rows;
+    let acc = sgp_row_acc(row, live, vlane);
+    if (vlane == 0u) {{
+        sgp_row_tot[slot] = acc;
+    }}
+    workgroupBarrier();
+    if (vlane == 0u && live && (slot & 3u) == 0u) {{
+        let w1 = (bf16_encode(sgp_row_tot[slot]) & 0xffffu)
+            | ((bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu) << 16u);
+        let w2 = (bf16_encode(sgp_row_tot[slot + 2u]) & 0xffffu)
+            | ((bf16_encode(sgp_row_tot[slot + 3u]) & 0xffffu) << 16u);
+        sgp_y[sgp_off.dst_word_off + (row >> 2u)] = bf16_pack(gf_word(w1), gf_word(w2));
+    }}
+}}
+"#
+    )
+}
+
+fn gelu_interleaved_source_reading_gate_up_row_pairs_in_one_word() -> String {
+    format!(
+        r#"
+struct GeluParams {{
+    inter: u32,
+    inter_words: u32,
+    rows: u32,
+    tot_pairs: u32,
+}};
+
+@group(0) @binding(3) var<storage, read> gfi_src: array<u32>;
+@group(0) @binding(4) var<storage, read_write> gfi_y: array<u32>;
+@group(0) @binding(5) var<uniform> gfi_params: GeluParams;
+
+{E4B_GELU_SCALAR_WGSL_REPLICATES_GELU_TANH_MUL_SCALAR}
+
+@compute @workgroup_size(256)
+fn e4b_gelu_interleaved(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) ng: vec3<u32>
+) {{
+    let iw = gfi_params.inter_words;
+    let stride_x = ng.x * 256u;
+    for (var bs = gid.y; bs < gfi_params.rows; bs = bs + ng.y) {{
+        let src_base = bs * gfi_params.inter;
+        let out_base = bs * iw;
+        for (var j = gid.x; j < iw; j = j + stride_x) {{
+            gfi_y[out_base + j] = bf16_pack(
+                gf_word(gfi_src[src_base + 2u * j]),
+                gf_word(gfi_src[src_base + 2u * j + 1u])
+            );
+        }}
+    }}
+}}
+"#
+    )
+}
+
+const E4B_SG_GM_ENTRY: &str = "e4b_sg_pk_gatemul_fold";
+
+fn sg_pk_gatemul_fold_source_replicating_gate_gemv_word_then_gatemul_body() -> String {
+    assert_eq!(
+        (wk::gemv_w4a16::SG_PK_LANES, wk::gemv_w4a16::SG_PK_WG),
+        (16, 256),
+        "the fold entry hardcodes the 16-lane 256-thread sg_pk geometry"
+    );
+    r#"
+struct GmFoldParams {
+    pli_word_off: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+
+@group(0) @binding(9) var<storage, read> gmf_pli: array<u32>;
+@group(0) @binding(10) var<uniform> gmf_params: GmFoldParams;
+
+const GMF_SQRT2_OVER_PI: f32 = 0.7978845608028654;
+const GMF_CUBIC: f32 = 0.044715;
+const GMF_CLAMP: f32 = 10.0;
+
+fn gmf_gelu(x: f32) -> f32 {
+    let x3 = x * x * x;
+    let inner = GMF_SQRT2_OVER_PI * (x + GMF_CUBIC * x3);
+    let clamped = clamp(inner, -GMF_CLAMP, GMF_CLAMP);
+    let t = select(tanh(clamped), inner, inner != inner);
+    return 0.5 * x * (1.0 + t);
+}
+
+@compute @workgroup_size(256)
+fn e4b_sg_pk_gatemul_fold(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {
+    let vt = sgid * sgsz + slane;
+    let slot = vt / 16u;
+    let vlane = slane & 15u;
+    let row = (wid.x + wid.y * sgp_params.groups_x) * 16u + slot;
+    let live = row < sgp_params.n_rows;
+    let acc = sgp_row_acc(row, live, vlane);
+    if (vlane == 0u) {
+        sgp_row_tot[slot] = acc;
+    }
+    workgroupBarrier();
+    if (vlane == 0u && live && (slot & 1u) == 0u) {
+        let lo = bf16_encode(acc) & 0xffffu;
+        let hi_live = row + 1u < sgp_params.n_rows;
+        let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;
+        let word = lo | (select(0u, hi, hi_live) << 16u);
+        let wi = row >> 1u;
+        let pw = gmf_pli[gmf_params.pli_word_off + wi];
+        sgp_y[sgp_off.dst_word_off + wi] = bf16_pack(
+            gmf_gelu(bf16_lo(word)) * bf16_lo(pw),
+            gmf_gelu(bf16_hi(word)) * bf16_hi(pw)
+        );
+    }
+}
+"#
+    .to_string()
+}
+
+const E4B_FAC_QKV_ENTRY: &str = "e4b_attn_qkv_fused";
+
+fn fac_merged_qkv_source_one_dispatch_replicating_q_k_v_row_arithmetic() -> String {
+    r#"
+struct FacMergeParams {
+    n_q: u32,
+    n_kv: u32,
+    pad0: u32,
+    pad1: u32,
+};
+
+@group(0) @binding(10) var<storage, read> facm_ksrc: array<u32>;
+@group(0) @binding(11) var<storage, read> facm_kw: array<u32>;
+@group(0) @binding(12) var<storage, read> facm_vsrc: array<u32>;
+@group(0) @binding(13) var<storage, read> facm_vw: array<u32>;
+@group(0) @binding(14) var<storage, read_write> facm_vfp8: array<u32>;
+@group(0) @binding(15) var<storage, read_write> facm_vscales: array<f32>;
+@group(0) @binding(16) var<uniform> facm_p: FacMergeParams;
+
+fn facm_norm_stage(lid: u32, base: u32, role: u32) {
+    let hd = fac_params.head_dim;
+    let words = hd >> 1u;
+
+    var local = 0.0;
+    for (var i = lid; i < hd; i = i + FAC_BLOCK) {
+        var word: u32;
+        if (role == 0u) {
+            word = fac_src[base + (i >> 1u)];
+        } else if (role == 1u) {
+            word = facm_ksrc[base + (i >> 1u)];
+        } else {
+            word = facm_vsrc[base + (i >> 1u)];
+        }
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local = fma(v, v, local);
+    }
+    let rms = fac_rms_reduce(lid, local);
+
+    for (var i = lid; i < words; i = i + FAC_BLOCK) {
+        var xw: u32;
+        var ww: u32;
+        if (role == 0u) {
+            xw = fac_src[base + i];
+            ww = fac_w[i];
+        } else if (role == 1u) {
+            xw = facm_ksrc[base + i];
+            ww = facm_kw[i];
+        } else {
+            xw = facm_vsrc[base + i];
+            ww = facm_vw[i];
+        }
+        let lo = bf16_lo(xw) * rms * bf16_lo(ww);
+        let hi = bf16_hi(xw) * rms * bf16_hi(ww);
+        fac_stage[i] = bf16_pack(lo, hi);
+    }
+    workgroupBarrier();
+}
+
+fn facm_quant_stage2(lid: u32, row: u32, is_v: bool) {
+    let n_kv = fac_params.n_heads;
+    let hd = fac_params.head_dim;
+    let token = row / n_kv;
+    let kv_head = row % n_kv;
+
+    var slot = u32(max(fac_start[0], 0)) + token;
+    if (fac_params.ring > 0u) {
+        slot = slot % fac_params.ring;
+    }
+    let base_dst = (slot * n_kv + kv_head) * hd;
+
+    var local = 0.0;
+    for (var d = lid; d < hd; d = d + FAC_BLOCK) {
+        let a = abs(fac_stage2_at(d));
+        if (a > local) {
+            local = a;
+        }
+    }
+    let amax = fac_kv_reduce_max(lid, local);
+    let positive = amax > 0.0;
+    let scale = select(1.0, kv_div_rn(amax, KV_FP8_E4M3_MAX), positive);
+    let inv_scale = select(1.0, kv_div_rn(KV_FP8_E4M3_MAX, amax), positive);
+
+    if (lid == 0u) {
+        if (is_v) {
+            facm_vscales[slot * n_kv + kv_head] = scale;
+        } else {
+            fac_scales[slot * n_kv + kv_head] = scale;
+        }
+    }
+
+    let out_words = hd >> 2u;
+    for (var w = lid; w < out_words; w = w + FAC_BLOCK) {
+        let d0 = w * 4u;
+        var packed = 0u;
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let v = fac_stage2_at(d0 + j);
+            packed = packed | (kv_encode_e4m3(v * inv_scale) << (8u * j));
+        }
+        if (is_v) {
+            facm_vfp8[(base_dst >> 2u) + w] = packed;
+        } else {
+            fac_fp8[(base_dst >> 2u) + w] = packed;
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn e4b_attn_qkv_fused(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) tid: vec3<u32>
+) {
+    let wgid = wg.x;
+    let lid = tid.x;
+    let half = fac_params.half_dim;
+    let pos = u32(fac_pos[0]);
+    let row_base = pos * half;
+    if (wgid < facm_p.n_q) {
+        let row = wgid;
+        let base = row * half;
+        facm_norm_stage(lid, base, 0u);
+        for (var w = lid; w < half; w = w + FAC_BLOCK) {
+            let elem = w * 2u;
+            let lo = fac_rotate(row_base, elem);
+            let hi = fac_rotate(row_base, elem + 1u);
+            let word = bf16_pack(lo, hi);
+            let idx = base + w;
+            fac_qf32[idx * 2u] = bf16_lo(word);
+            fac_qf32[idx * 2u + 1u] = bf16_hi(word);
+        }
+        return;
+    }
+    if (wgid < facm_p.n_q + facm_p.n_kv) {
+        let row = wgid - facm_p.n_q;
+        let base = row * half;
+        facm_norm_stage(lid, base, 1u);
+        for (var w = lid; w < half; w = w + FAC_BLOCK) {
+            let elem = w * 2u;
+            let lo = fac_rotate(row_base, elem);
+            let hi = fac_rotate(row_base, elem + 1u);
+            fac_stage2[w] = bf16_pack(lo, hi);
+        }
+        workgroupBarrier();
+        facm_quant_stage2(lid, row, false);
+        return;
+    }
+    let row = wgid - facm_p.n_q - facm_p.n_kv;
+    let base = row * half;
+    facm_norm_stage(lid, base, 2u);
+    for (var w = lid; w < half; w = w + FAC_BLOCK) {
+        fac_stage2[w] = fac_stage[w];
+    }
+    workgroupBarrier();
+    facm_quant_stage2(lid, row, true);
+}
+"#
+    .to_string()
+}
+
+const E4B_FNCA_ENTRY: &str = "e4b_sg_pk_fnca_gelu_fold";
+const E4B_FNCB_ENTRY: &str = "e4b_sg_pk_fncb_gatemul_fold";
+const E4B_FNCC_PK_ENTRY: &str = "e4b_sg_pk_fncc_pk";
+const E4B_FNCC_PK3_ENTRY: &str = "e4b_sg_pk_fncc_pk3";
+
+fn e4f_scale_acc_step_replicating_sg_pk_inner_loop(
+    grain: wk::gemv_w4a16::ScaleGrain,
+) -> String {
+    use wk::gemv_w4a16::ScaleGrain;
+    match grain {
+        ScaleGrain::Ge32 => concat!(
+            "        let sgi = sbase + ((v << 5u) / sgp_params.gs);\n",
+            "        let ssw = sgp_scale[sgi >> 1u];\n",
+            "        let sc = select(bf16_lo(ssw), bf16_hi(ssw), (sgi & 1u) == 1u);\n",
+            "        let wv = sgp_packed4[wbase4 + v];\n",
+            "        acc = fma(sc, e4f_dot32(wv, (v << 2u)), acc);\n",
+        )
+        .to_string(),
+        ScaleGrain::Ge32Fixed(shift) => {
+            let idx = if shift == 0 {
+                "v".to_string()
+            } else {
+                format!("(v >> {shift}u)")
+            };
+            format!(
+                "        let sgi = sbase + {idx};\n        \
+                 let ssw = sgp_scale[sgi >> 1u];\n        \
+                 let sc = select(bf16_lo(ssw), bf16_hi(ssw), (sgi & 1u) == 1u);\n        \
+                 let wv = sgp_packed4[wbase4 + v];\n        \
+                 acc = fma(sc, e4f_dot32(wv, (v << 2u)), acc);\n"
+            )
+        }
+        ScaleGrain::G16 => concat!(
+            "        let sgi = sbase + (v << 1u);\n",
+            "        let ssw = sgp_scale[sgi >> 1u];\n",
+            "        let sc_lo = bf16_lo(ssw);\n",
+            "        let sc_hi = bf16_hi(ssw);\n",
+            "        let wv = sgp_packed4[wbase4 + v];\n",
+            "        let xb_acc = (v << 2u);\n",
+            "        var a0_acc = 0.0;\n",
+            "        a0_acc = sgp_dot8(wv.x, e4f_x4(xb_acc), a0_acc);\n",
+            "        a0_acc = sgp_dot8(wv.y, e4f_x4(xb_acc + 1u), a0_acc);\n",
+            "        var a1_acc = 0.0;\n",
+            "        a1_acc = sgp_dot8(wv.z, e4f_x4(xb_acc + 2u), a1_acc);\n",
+            "        a1_acc = sgp_dot8(wv.w, e4f_x4(xb_acc + 3u), a1_acc);\n",
+            "        acc = fma(sc_lo, a0_acc, acc);\n",
+            "        acc = fma(sc_hi, a1_acc, acc);\n",
+        )
+        .to_string(),
+    }
+}
+
+fn sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
+    grain: wk::gemv_w4a16::ScaleGrain,
+    hidden: usize,
+) -> String {
+    use std::fmt::Write as _;
+    assert_eq!(
+        (wk::gemv_w4a16::SG_PK_LANES, wk::gemv_w4a16::SG_PK_WG),
+        (16, 256),
+        "the fnc fold entries hardcode the 16-lane 256-thread sg_pk geometry"
+    );
+    assert!(
+        hidden.is_multiple_of(512),
+        "fnc fold prologue assumes hidden % 512 == 0; got {hidden}"
+    );
+    let words = hidden / 2;
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "\nstruct E4bFncFoldParams {{\n    hidden: u32,\n    words: u32,\n    eps: f32,\n    scale: f32,\n}};\n\
+         struct E4ffGmParams {{\n    pli_word_off: u32,\n    pad0: u32,\n    pad1: u32,\n    pad2: u32,\n}};\n\
+         @group(0) @binding(9) var<storage, read> e4ff_pli: array<u32>;\n\
+         @group(0) @binding(10) var<uniform> e4ff_gmp: E4ffGmParams;\n\
+         @group(0) @binding(40) var<uniform> e4f_p: E4bFncFoldParams;\n\
+         @group(0) @binding(41) var<storage, read> e4f_in: array<u32>;\n\
+         @group(0) @binding(42) var<storage, read> e4f_res: array<u32>;\n\
+         @group(0) @binding(43) var<storage, read> e4f_w1: array<u32>;\n\
+         @group(0) @binding(44) var<storage, read> e4f_w2: array<u32>;\n\
+         @group(0) @binding(45) var<storage, read_write> e4f_out: array<u32>;\n\
+         @group(0) @binding(46) var<storage, read_write> e4f_out2: array<u32>;\n\
+         var<workgroup> e4f_xs: array<u32, {words}>;\n\
+         var<workgroup> e4f_scratch: array<f32, 256>;\n\
+         var<workgroup> e4f_shared: f32;"
+    );
+    s.push_str(
+        r#"
+const E4FF_SQRT2_OVER_PI: f32 = 0.7978845608028654;
+const E4FF_CUBIC: f32 = 0.044715;
+const E4FF_CLAMP: f32 = 10.0;
+
+fn e4ff_gelu(x: f32) -> f32 {
+    let x3 = x * x * x;
+    let inner = E4FF_SQRT2_OVER_PI * (x + E4FF_CUBIC * x3);
+    let clamped = clamp(inner, -E4FF_CLAMP, E4FF_CLAMP);
+    let t = select(tanh(clamped), inner, inner != inner);
+    return 0.5 * x * (1.0 + t);
+}
+
+fn e4f_x4(i: u32) -> vec4<u32> {
+    let j = i << 2u;
+    return vec4<u32>(e4f_xs[j], e4f_xs[j + 1u], e4f_xs[j + 2u], e4f_xs[j + 3u]);
+}
+
+fn e4f_dot32(wv: vec4<u32>, xb: u32) -> f32 {
+    var a = 0.0;
+    a = sgp_dot8(wv.x, e4f_x4(xb), a);
+    a = sgp_dot8(wv.y, e4f_x4(xb + 1u), a);
+    a = sgp_dot8(wv.z, e4f_x4(xb + 2u), a);
+    a = sgp_dot8(wv.w, e4f_x4(xb + 3u), a);
+    return a;
+}
+
+fn e4f_div_rn(a: f32, b: f32) -> f32 {
+    let r0 = 1.0 / b;
+    let r = fma(fma(-b, r0, 1.0), r0, r0);
+    let q0 = a * r;
+    let e = fma(-b, q0, a);
+    return fma(e, r, q0);
+}
+
+fn e4f_rms_reduce(lid: u32, local: f32) -> f32 {
+    e4f_scratch[lid] = local;
+    workgroupBarrier();
+
+    for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
+        if ((lid & 31u) < stride) {
+            e4f_scratch[lid] = e4f_scratch[lid] + e4f_scratch[lid + stride];
+        }
+        workgroupBarrier();
+    }
+
+    if (lid == 0u) {
+        let a = (e4f_scratch[0u] + e4f_scratch[128u]) + (e4f_scratch[64u] + e4f_scratch[192u]);
+        let b = (e4f_scratch[32u] + e4f_scratch[160u]) + (e4f_scratch[96u] + e4f_scratch[224u]);
+        let sum = a + b;
+        let mean = e4f_div_rn(sum, f32(e4f_p.hidden));
+        e4f_shared = inverseSqrt(e4f_p.eps + mean);
+    }
+    workgroupBarrier();
+    return e4f_shared;
+}
+
+fn e4f_prologue_b(lid: u32, wg0: bool) {
+    var local = 0.0;
+    for (var i = lid; i < e4f_p.hidden; i = i + 256u) {
+        let word = e4f_in[i >> 1u];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local = fma(v, v, local);
+    }
+    let rms1 = e4f_rms_reduce(lid, local);
+    let scale = e4f_p.scale;
+    for (var i = lid; i < e4f_p.words; i = i + 256u) {
+        let xw = e4f_in[i];
+        let w1w = e4f_w1[i];
+        let tlo = bf16_lo(xw) * rms1 * bf16_lo(w1w);
+        let thi = bf16_hi(xw) * rms1 * bf16_hi(w1w);
+        let tw = bf16_pack(tlo, thi);
+        let rw = e4f_res[i];
+        let lo = (bf16_lo(rw) + bf16_lo(tw)) * scale;
+        let hi = (bf16_hi(rw) + bf16_hi(tw)) * scale;
+        let sw = bf16_pack(lo, hi);
+        e4f_xs[i] = sw;
+        if (wg0) {
+            e4f_out[i] = sw;
+        }
+    }
+    workgroupBarrier();
+}
+
+fn e4f_res_reduce(lid: u32, local: f32) -> f32 {
+    e4f_scratch[lid] = local;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if (lid < stride) {
+            e4f_scratch[lid] = e4f_scratch[lid] + e4f_scratch[lid + stride];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        e4f_shared = inverseSqrt(e4f_scratch[0] / f32(e4f_p.hidden) + e4f_p.eps);
+    }
+    workgroupBarrier();
+    return e4f_shared;
+}
+
+fn e4f_prologue_a(lid: u32, wg0: bool) {
+    var local = 0.0;
+    for (var i = lid; i < e4f_p.hidden; i = i + 256u) {
+        let word = e4f_in[i >> 1u];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local = fma(v, v, local);
+    }
+    let rms1 = e4f_rms_reduce(lid, local);
+    var local2 = 0.0;
+    for (var i = lid; i < e4f_p.words; i = i + 256u) {
+        let xw = e4f_in[i];
+        let w1w = e4f_w1[i];
+        let tlo = bf16_lo(xw) * rms1 * bf16_lo(w1w);
+        let thi = bf16_hi(xw) * rms1 * bf16_hi(w1w);
+        let tw = bf16_pack(tlo, thi);
+        let rw = e4f_res[i];
+        let lo = bf16_lo(tw) + bf16_lo(rw);
+        let hi = bf16_hi(tw) + bf16_hi(rw);
+        let sw = bf16_pack(lo, hi);
+        e4f_xs[i] = sw;
+        if (wg0) {
+            e4f_out[i] = sw;
+        }
+        local2 = local2 + lo * lo + hi * hi;
+    }
+    let rms2 = e4f_res_reduce(lid, local2);
+    for (var i = lid; i < e4f_p.words; i = i + 256u) {
+        let sw = e4f_xs[i];
+        let ww = e4f_w2[i];
+        let lo = bf16_lo(sw) * rms2 * bf16_lo(ww);
+        let hi = bf16_hi(sw) * rms2 * bf16_hi(ww);
+        e4f_xs[i] = bf16_pack(lo, hi);
+    }
+    workgroupBarrier();
+}
+
+fn e4f_prologue_c(lid: u32, wg0: bool) {
+    var local = 0.0;
+    for (var i = lid; i < e4f_p.hidden; i = i + 256u) {
+        let word = e4f_in[i >> 1u];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local = fma(v, v, local);
+    }
+    let rms1 = e4f_rms_reduce(lid, local);
+    let scale = e4f_p.scale;
+    for (var i = lid; i < e4f_p.words; i = i + 256u) {
+        let xw = e4f_in[i];
+        let w1w = e4f_w1[i];
+        let tlo = bf16_lo(xw) * rms1 * bf16_lo(w1w);
+        let thi = bf16_hi(xw) * rms1 * bf16_hi(w1w);
+        let tw = bf16_pack(tlo, thi);
+        let rw = e4f_res[i];
+        let lo = (bf16_lo(rw) + bf16_lo(tw)) * scale;
+        let hi = (bf16_hi(rw) + bf16_hi(tw)) * scale;
+        let sw = bf16_pack(lo, hi);
+        e4f_xs[i] = sw;
+        if (wg0) {
+            e4f_out[i] = sw;
+        }
+    }
+    workgroupBarrier();
+    var local2 = 0.0;
+    for (var i = lid; i < e4f_p.hidden; i = i + 256u) {
+        let word = e4f_xs[i >> 1u];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local2 = fma(v, v, local2);
+    }
+    let rms2 = e4f_rms_reduce(lid, local2);
+    for (var i = lid; i < e4f_p.words; i = i + 256u) {
+        let sw = e4f_xs[i];
+        let ww = e4f_w2[i];
+        let lo = bf16_lo(sw) * rms2 * bf16_lo(ww);
+        let hi = bf16_hi(sw) * rms2 * bf16_hi(ww);
+        let nw = bf16_pack(lo, hi);
+        e4f_xs[i] = nw;
+        if (wg0) {
+            e4f_out2[i] = nw;
+        }
+    }
+    workgroupBarrier();
+}
+"#,
+    );
+    let _ = writeln!(
+        s,
+        "fn e4f_row_acc(row: u32, live: bool, vlane: u32) -> f32 {{\n    \
+         let kv = select(0u, sgp_params.k_elems >> 5u, live);\n    \
+         let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);\n    \
+         let sbase = select(0u, row * sgp_params.scale_row_stride, live);\n    \
+         var acc = 0.0;\n    \
+         for (var v = vlane; v < kv; v = v + 16u) {{\n{}    }}\n    \
+         acc = acc + subgroupShuffleXor(acc, 8u);\n    \
+         acc = acc + subgroupShuffleXor(acc, 4u);\n    \
+         acc = acc + subgroupShuffleXor(acc, 2u);\n    \
+         acc = acc + subgroupShuffleXor(acc, 1u);\n    \
+         return acc;\n}}\n",
+        e4f_scale_acc_step_replicating_sg_pk_inner_loop(grain)
+    );
+    let header = |s: &mut String, entry: &str, prologue: &str| {
+        let _ = writeln!(
+            s,
+            "@compute @workgroup_size(256)\nfn {entry}(\n    \
+             @builtin(workgroup_id) wid: vec3<u32>,\n    \
+             @builtin(local_invocation_id) tid: vec3<u32>,\n    \
+             @builtin(subgroup_id) sgid: u32,\n    \
+             @builtin(subgroup_size) sgsz: u32,\n    \
+             @builtin(subgroup_invocation_id) slane: u32\n) {{\n    \
+             let lid = tid.x;\n    \
+             {prologue}(lid, wid.x == 0u && wid.y == 0u);\n    \
+             let vt = sgid * sgsz + slane;\n    \
+             let slot = vt / 16u;\n    \
+             let vlane = slane & 15u;\n    \
+             let row = (wid.x + wid.y * sgp_params.groups_x) * 16u + slot;\n    \
+             let live = row < sgp_params.n_rows;\n    \
+             let acc = e4f_row_acc(row, live, vlane);\n    \
+             if (vlane == 0u) {{\n        sgp_row_tot[slot] = acc;\n    }}\n    \
+             workgroupBarrier();\n    \
+             if (vlane == 0u && live && (slot & 1u) == 0u) {{\n        \
+             let lo = bf16_encode(acc) & 0xffffu;\n        \
+             let hi_live = row + 1u < sgp_params.n_rows;\n        \
+             let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;\n        \
+             let word = lo | (select(0u, hi, hi_live) << 16u);"
+        );
+    };
+    header(&mut s, E4B_FNCB_ENTRY, "e4f_prologue_b");
+    s.push_str(
+        "        let wi = row >> 1u;\n        \
+         let pw = e4ff_pli[e4ff_gmp.pli_word_off + wi];\n        \
+         sgp_y[sgp_off.dst_word_off + wi] = bf16_pack(\n            \
+         e4ff_gelu(bf16_lo(word)) * bf16_lo(pw),\n            \
+         e4ff_gelu(bf16_hi(word)) * bf16_hi(pw)\n        );\n    }\n}\n\n",
+    );
+    header(&mut s, E4B_FNCC_PK_ENTRY, "e4f_prologue_c");
+    s.push_str("        sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;\n    }\n}\n\n");
+    header(&mut s, E4B_FNCC_PK3_ENTRY, "e4f_prologue_c");
+    s.push_str(
+        "        if (row < sgp_split.q_rows) {\n            \
+         sgp_y_q[row >> 1u] = word;\n        } else {\n            \
+         let kr = row - sgp_split.q_rows;\n            \
+         if (kr < sgp_split.kv_rows) {\n                \
+         sgp_y_k[kr >> 1u] = word;\n            }\n            \
+         if (row >= sgp_split.v_off) {\n                \
+         let vr = row - sgp_split.v_off;\n                \
+         if (vr < sgp_split.kv_rows) {\n                    \
+         sgp_y_v[vr >> 1u] = word;\n                }\n            }\n        }\n    }\n}\n",
+    );
+    s.push_str(E4B_GELU_SCALAR_WGSL_REPLICATES_GELU_TANH_MUL_SCALAR);
+    let _ = writeln!(
+        s,
+        "@compute @workgroup_size(256)\nfn {E4B_FNCA_ENTRY}(\n    \
+         @builtin(workgroup_id) wid: vec3<u32>,\n    \
+         @builtin(local_invocation_id) tid: vec3<u32>,\n    \
+         @builtin(subgroup_id) sgid: u32,\n    \
+         @builtin(subgroup_size) sgsz: u32,\n    \
+         @builtin(subgroup_invocation_id) slane: u32\n) {{\n    \
+         let lid = tid.x;\n    \
+         e4f_prologue_a(lid, wid.x == 0u && wid.y == 0u);\n    \
+         let vt = sgid * sgsz + slane;\n    \
+         let slot = vt / 16u;\n    \
+         let vlane = slane & 15u;\n    \
+         let row = (wid.x + wid.y * sgp_params.groups_x) * 16u + slot;\n    \
+         let live = row < sgp_params.n_rows;\n    \
+         let acc = e4f_row_acc(row, live, vlane);\n    \
+         if (vlane == 0u) {{\n        sgp_row_tot[slot] = acc;\n    }}\n    \
+         workgroupBarrier();\n    \
+         if (vlane == 0u && live && (slot & 3u) == 0u) {{\n        \
+         let w1 = (bf16_encode(sgp_row_tot[slot]) & 0xffffu)\n            \
+         | ((bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu) << 16u);\n        \
+         let w2 = (bf16_encode(sgp_row_tot[slot + 2u]) & 0xffffu)\n            \
+         | ((bf16_encode(sgp_row_tot[slot + 3u]) & 0xffffu) << 16u);\n        \
+         sgp_y[sgp_off.dst_word_off + (row >> 2u)] = bf16_pack(gf_word(w1), gf_word(w2));\n    }}\n}}"
+    );
+    s
+}
+
+const E4B_TAIL_FNCA_ENTRY: &str = "e4b_sg_pk_tail_fnca";
+const E4B_TAIL_FNCC_ENTRY: &str = "e4b_sg_pk_tail_fncc";
+
+const E4B_TAIL_GATE_ENTRY: &str = "e4b_sg_pk_tail_gate_only";
+
+const TAIL_GATE_ONLY_IS_THE_NULL_PROBE_THAT_PRICES_THE_DEVICE_FENCE_WITHOUT_FOLDING_ANYTHING: &str =
+    "e4b_sg_pk_tail_gate_only runs the arrival fence, the device atomic and the uniform-load branch \
+     but folds NO work and removes NO dispatch, so its A/B against the default is the cost of the \
+     last-workgroup MACHINERY alone, separated from the cost of carrying the folded body in every \
+     workgroup";
+
+const TAIL_FOLD_IS_A_BACKWARD_FOLD_PAID_ONCE_NOT_ONCE_PER_CONSUMER_WORKGROUP: &str =
+    "the fnc tail entries run the norm in the LAST sg_pk workgroup to reach the atomic, so the \
+     folded reduction executes exactly once per dispatch instead of once per consumer workgroup \
+     the way the forward FOLD_FNC* prologues do";
+
+fn sg_pk_tail_fold_source_running_fused_norm_chain_in_the_last_workgroup_to_arrive() -> String {
+    assert_eq!(
+        (wk::gemv_w4a16::SG_PK_LANES, wk::gemv_w4a16::SG_PK_WG),
+        (16, 256),
+        "the fnc tail entries hardcode the 16-lane 256-thread sg_pk geometry"
+    );
+    let mut s = String::from(
+        r#"
+struct E4bTailFoldParams {
+    hidden: u32,
+    words: u32,
+    eps: f32,
+    scale: f32,
+};
+@group(0) @binding(40) var<uniform> e4t_p: E4bTailFoldParams;
+@group(0) @binding(42) var<storage, read_write> e4t_res: array<u32>;
+@group(0) @binding(43) var<storage, read> e4t_w1: array<u32>;
+@group(0) @binding(44) var<storage, read> e4t_w2: array<u32>;
+@group(0) @binding(45) var<storage, read_write> e4t_out: array<u32>;
+@group(0) @binding(46) var<storage, read_write> e4t_out2: array<u32>;
+@group(0) @binding(47) var<storage, read_write> e4t_ctr: array<atomic<u32>>;
+
+var<workgroup> e4t_scratch: array<f32, 256>;
+var<workgroup> e4t_shared: f32;
+var<workgroup> e4t_last: u32;
+
+fn e4t_div_rn(a: f32, b: f32) -> f32 {
+    let r0 = 1.0 / b;
+    let r = fma(fma(-b, r0, 1.0), r0, r0);
+    let q0 = a * r;
+    let e = fma(-b, q0, a);
+    return fma(e, r, q0);
+}
+
+fn e4t_rms_reduce(lid: u32, local: f32) -> f32 {
+    e4t_scratch[lid] = local;
+    workgroupBarrier();
+
+    for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
+        if ((lid & 31u) < stride) {
+            e4t_scratch[lid] = e4t_scratch[lid] + e4t_scratch[lid + stride];
+        }
+        workgroupBarrier();
+    }
+
+    if (lid == 0u) {
+        let a = (e4t_scratch[0u] + e4t_scratch[128u]) + (e4t_scratch[64u] + e4t_scratch[192u]);
+        let b = (e4t_scratch[32u] + e4t_scratch[160u]) + (e4t_scratch[96u] + e4t_scratch[224u]);
+        let sum = a + b;
+        let mean = e4t_div_rn(sum, f32(e4t_p.hidden));
+        e4t_shared = inverseSqrt(e4t_p.eps + mean);
+    }
+    workgroupBarrier();
+    return e4t_shared;
+}
+
+fn e4t_res_reduce(lid: u32, local: f32) -> f32 {
+    e4t_scratch[lid] = local;
+    workgroupBarrier();
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if (lid < stride) {
+            e4t_scratch[lid] = e4t_scratch[lid] + e4t_scratch[lid + stride];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        e4t_shared = inverseSqrt(e4t_scratch[0] / f32(e4t_p.hidden) + e4t_p.eps);
+    }
+    workgroupBarrier();
+    return e4t_shared;
+}
+
+fn e4t_last_workgroup_to_arrive(lid: u32, nwg: vec3<u32>) -> bool {
+    storageBarrier();
+    if (lid == 0u) {
+        let prev = atomicAdd(&e4t_ctr[0], 1u);
+        e4t_last = select(0u, 1u, prev + 1u == nwg.x * nwg.y * nwg.z);
+    }
+    return workgroupUniformLoad(&e4t_last) == 1u;
+}
+
+fn e4t_body_none(lid: u32) {
+    let unused_by_the_null_probe = lid;
+}
+
+fn e4t_body_fnca(lid: u32) {
+    let hidden = e4t_p.hidden;
+    let words = e4t_p.words;
+    let base = sgp_off.dst_word_off;
+    var local = 0.0;
+    for (var i = lid; i < hidden; i = i + 256u) {
+        let word = sgp_y[base + (i >> 1u)];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local = fma(v, v, local);
+    }
+    let rms1 = e4t_rms_reduce(lid, local);
+
+    var local2 = 0.0;
+    for (var i = lid; i < words; i = i + 256u) {
+        let xw = sgp_y[base + i];
+        let w1w = e4t_w1[i];
+        let tlo = bf16_lo(xw) * rms1 * bf16_lo(w1w);
+        let thi = bf16_hi(xw) * rms1 * bf16_hi(w1w);
+        let tw = bf16_pack(tlo, thi);
+        let rw = e4t_res[i];
+        let lo = bf16_lo(tw) + bf16_lo(rw);
+        let hi = bf16_hi(tw) + bf16_hi(rw);
+        e4t_res[i] = bf16_pack(lo, hi);
+        local2 = local2 + lo * lo + hi * hi;
+    }
+    let rms2 = e4t_res_reduce(lid, local2);
+
+    for (var i = lid; i < words; i = i + 256u) {
+        let sw = e4t_res[i];
+        let ww = e4t_w2[i];
+        let lo = bf16_lo(sw) * rms2 * bf16_lo(ww);
+        let hi = bf16_hi(sw) * rms2 * bf16_hi(ww);
+        e4t_out[i] = bf16_pack(lo, hi);
+    }
+}
+
+fn e4t_body_fncc(lid: u32) {
+    let hidden = e4t_p.hidden;
+    let words = e4t_p.words;
+    let base = sgp_off.dst_word_off;
+    var local = 0.0;
+    for (var i = lid; i < hidden; i = i + 256u) {
+        let word = sgp_y[base + (i >> 1u)];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local = fma(v, v, local);
+    }
+    let rms1 = e4t_rms_reduce(lid, local);
+
+    let scale = e4t_p.scale;
+    for (var i = lid; i < words; i = i + 256u) {
+        let xw = sgp_y[base + i];
+        let w1w = e4t_w1[i];
+        let tlo = bf16_lo(xw) * rms1 * bf16_lo(w1w);
+        let thi = bf16_hi(xw) * rms1 * bf16_hi(w1w);
+        let tw = bf16_pack(tlo, thi);
+        let rw = e4t_res[i];
+        let lo = (bf16_lo(rw) + bf16_lo(tw)) * scale;
+        let hi = (bf16_hi(rw) + bf16_hi(tw)) * scale;
+        e4t_out[i] = bf16_pack(lo, hi);
+    }
+    storageBarrier();
+
+    var local2 = 0.0;
+    for (var i = lid; i < hidden; i = i + 256u) {
+        let word = e4t_out[i >> 1u];
+        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
+        local2 = fma(v, v, local2);
+    }
+    let rms2 = e4t_rms_reduce(lid, local2);
+
+    for (var i = lid; i < words; i = i + 256u) {
+        let sw = e4t_out[i];
+        let ww = e4t_w2[i];
+        let lo = bf16_lo(sw) * rms2 * bf16_lo(ww);
+        let hi = bf16_hi(sw) * rms2 * bf16_hi(ww);
+        e4t_out2[i] = bf16_pack(lo, hi);
+    }
+}
+"#,
+    );
+    let entry = |s: &mut String, name: &str, body: &str| {
+        use std::fmt::Write as _;
+        let _ = write!(
+            s,
+            r#"
+@compute @workgroup_size(256)
+fn {name}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+    @builtin(local_invocation_id) tid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let lid = tid.x;
+    let vt = sgid * sgsz + slane;
+    let slot = vt / 16u;
+    let vlane = slane & 15u;
+    let row = (wid.x + wid.y * sgp_params.groups_x) * 16u + slot;
+    let live = row < sgp_params.n_rows;
+    let acc = sgp_row_acc(row, live, vlane);
+    if (vlane == 0u) {{
+        sgp_row_tot[slot] = acc;
+    }}
+    workgroupBarrier();
+    if (vlane == 0u && live && (slot & 1u) == 0u) {{
+        let lo = bf16_encode(acc) & 0xffffu;
+        let hi_live = row + 1u < sgp_params.n_rows;
+        let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;
+        let word = lo | (select(0u, hi, hi_live) << 16u);
+        sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;
+    }}
+    if (e4t_last_workgroup_to_arrive(lid, nwg)) {{
+        {body}(lid);
+        if (lid == 0u) {{
+            atomicStore(&e4t_ctr[0], 0u);
+        }}
+    }}
+}}
+"#
+        );
+    };
+    entry(&mut s, E4B_TAIL_FNCA_ENTRY, "e4t_body_fnca");
+    entry(&mut s, E4B_TAIL_FNCC_ENTRY, "e4t_body_fncc");
+    entry(&mut s, E4B_TAIL_GATE_ENTRY, "e4t_body_none");
+    s
+}
+
+fn tail_fold_projection_takes_the_plain_sg_pk_row_map(proj: &GpuProj, pl: &Pipelines) -> bool {
+    match proj {
+        GpuProj::W4 {
+            variant: W4Variant::Sg16,
+            k,
+            ..
+        } => {
+            !pl.gemv_w4_sg_kpre.iter().any(|(kk, _)| kk == k)
+                && pl.gemv_w4_sg_pk_rs.is_none()
+                && !(pl.gemv_w4_sg_pk_u2.is_some() && *k >= E4B_SG_PK_U2_MIN_K)
+                && pl.gemv_w4_sg_pkm.is_none()
+                && pl.gemv_w4_sg_pk.is_some()
+        }
+        _ => false,
+    }
+}
+
 fn lmhead_sg_enabled(ctx: &WgpuContext) -> bool {
     std::env::var("NV_E4B_LMHEAD_SG").ok().as_deref() == Some("1") && wk::gemv_bf16::sg32_ok(ctx)
 }
@@ -1732,12 +3032,12 @@ fn lmhead_sg_wg() -> u32 {
 
 fn flash_nozi_enabled() -> bool {
     dispatch::nozi_env_enabled()
-        && std::env::var("NV_E4B_WGPU_FLASH_NOZI").ok().as_deref() != Some("0")
+        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FLASH_NOZI")
 }
 
 fn nozi_all_enabled() -> bool {
     dispatch::nozi_env_enabled()
-        && std::env::var("NV_E4B_WGPU_NOZI_ALL").ok().as_deref() != Some("0")
+        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_NOZI_ALL")
 }
 
 fn raw_nozi_pipeline(
@@ -1747,12 +3047,7 @@ fn raw_nozi_pipeline(
     entry: &str,
 ) -> Result<Arc<wgpu::ComputePipeline>> {
     let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let module = ctx
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
+    let module = dispatch::create_module_honoring_unchecked_optin(ctx, label, source);
     let pipeline = ctx
         .device
         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1786,7 +3081,7 @@ fn nozi_all_pipeline(
 }
 
 fn fuse_norms_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_FUSE_NORMS").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FUSE_NORMS")
 }
 
 pub const FNCU_ENTRY_A: &str = "e4b_fncu_a";
@@ -1941,19 +3236,410 @@ pub fn fnc_unrolled_source(hidden: usize) -> Option<String> {
     Some(s)
 }
 
+fn norm_lat_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_NORM_LAT")
+}
+
+pub const FNCL_ENTRY_A: &str = "e4b_fncl_a";
+pub const FNCL_ENTRY_C: &str = "e4b_fncl_c";
+
+const FNCL_RMS_REDUCE_SUBGROUP_EXACT_SCRATCH_TREE_ORDER: &str = r#"
+fn fncl_rms_reduce(lid: u32, local: f32) -> f32 {
+    var acc = local;
+    acc = acc + subgroupShuffleXor(acc, 16u);
+    acc = acc + subgroupShuffleXor(acc, 8u);
+    acc = acc + subgroupShuffleXor(acc, 4u);
+    acc = acc + subgroupShuffleXor(acc, 2u);
+    acc = acc + subgroupShuffleXor(acc, 1u);
+    if ((lid & 31u) == 0u) {
+        fncu_scratch[lid] = acc;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        let a = (fncu_scratch[0u] + fncu_scratch[128u]) + (fncu_scratch[64u] + fncu_scratch[192u]);
+        let b = (fncu_scratch[32u] + fncu_scratch[160u]) + (fncu_scratch[96u] + fncu_scratch[224u]);
+        let sum = a + b;
+        let mean = fncu_div_rn(sum, f32(fncu_params.hidden));
+        fncu_shared = inverseSqrt(fncu_params.eps + mean);
+    }
+    workgroupBarrier();
+    return fncu_shared;
+}
+
+fn fncl_res_reduce(lid: u32, local: f32) -> f32 {
+    fncu_scratch[lid] = local;
+    workgroupBarrier();
+    for (var stride = 128u; stride >= 32u; stride = stride >> 1u) {
+        if (lid < stride) {
+            fncu_scratch[lid] = fncu_scratch[lid] + fncu_scratch[lid + stride];
+        }
+        workgroupBarrier();
+    }
+    var acc = 0.0;
+    if (lid < 32u) {
+        acc = fncu_scratch[lid];
+    }
+    acc = acc + subgroupShuffleXor(acc, 16u);
+    acc = acc + subgroupShuffleXor(acc, 8u);
+    acc = acc + subgroupShuffleXor(acc, 4u);
+    acc = acc + subgroupShuffleXor(acc, 2u);
+    acc = acc + subgroupShuffleXor(acc, 1u);
+    if (lid == 0u) {
+        fncu_shared = inverseSqrt(acc / f32(fncu_params.hidden) + fncu_params.eps);
+    }
+    workgroupBarrier();
+    return fncu_shared;
+}
+"#;
+
+pub fn fnc_norm_lat_source_subgroup_tree_register_tail_shared_stash(
+    hidden: usize,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    if hidden == 0 || !hidden.is_multiple_of(2 * FNCU_BLOCK) {
+        return None;
+    }
+    let words = hidden / 2;
+    let it1 = hidden / FNCU_BLOCK;
+    let it2 = words / FNCU_BLOCK;
+    let half = FNCU_BLOCK / 2;
+
+    let mut s = String::from(FNCU_PRELUDE);
+    s.push_str(FNCL_RMS_REDUCE_SUBGROUP_EXACT_SCRATCH_TREE_ORDER);
+    let _ = writeln!(s, "var<workgroup> fncl_sw: array<u32, {words}>;");
+
+    let head = |s: &mut String, name: &str| {
+        let _ = writeln!(
+            s,
+            "\n@compute @workgroup_size(256)\nfn {name}(\n    \
+             @builtin(workgroup_id) wg: vec3<u32>,\n    \
+             @builtin(num_workgroups) nwg: vec3<u32>,\n    \
+             @builtin(local_invocation_id) tid: vec3<u32>\n) {{\n    \
+             let row = wg.x + wg.y * nwg.x;\n    \
+             if (row >= fncu_params.batch) {{ return; }}\n    \
+             let lid = tid.x;\n    \
+             let base = row * {words}u;\n    \
+             let hw = base + (lid >> 1u);\n    \
+             let odd = (lid & 1u) == 1u;"
+        );
+    };
+    let pass1 = |s: &mut String| {
+        for k in 0..it1 {
+            let _ = writeln!(s, "    let a{k} = fncu_in[hw + {}u];", k * half);
+        }
+        let _ = writeln!(s, "    var acc = 0.0;");
+        for k in 0..it1 {
+            let _ = writeln!(
+                s,
+                "    let v{k} = select(bf16_lo(a{k}), bf16_hi(a{k}), odd);\n    \
+                 acc = fma(v{k}, v{k}, acc);"
+            );
+        }
+        let _ = writeln!(s, "    let rms1 = fncl_rms_reduce(lid, acc);");
+    };
+    let load_xgr_and_hoisted_w2 = |s: &mut String| {
+        for k in 0..it2 {
+            let off = k * FNCU_BLOCK;
+            let _ = writeln!(s, "    let x{k} = fncu_in[base + lid + {off}u];");
+            let _ = writeln!(s, "    let g{k} = fncu_w1[lid + {off}u];");
+            let _ = writeln!(s, "    let r{k} = fncu_res[base + lid + {off}u];");
+            let _ = writeln!(s, "    let ww{k} = fncu_w2[lid + {off}u];");
+        }
+    };
+    let register_tail = |s: &mut String, dst: &str| {
+        for k in 0..it2 {
+            let off = k * FNCU_BLOCK;
+            let _ = writeln!(
+                s,
+                "    {dst}[base + lid + {off}u] = bf16_pack(\n        \
+                 bf16_lo(sw{k}) * rms2 * bf16_lo(ww{k}),\n        \
+                 bf16_hi(sw{k}) * rms2 * bf16_hi(ww{k})\n    );"
+            );
+        }
+    };
+
+    head(&mut s, FNCL_ENTRY_A);
+    pass1(&mut s);
+    load_xgr_and_hoisted_w2(&mut s);
+    let _ = writeln!(&mut s, "    var acc2 = 0.0;");
+    for k in 0..it2 {
+        let off = k * FNCU_BLOCK;
+        let _ = writeln!(
+            &mut s,
+            "    let tlo{k} = bf16_lo(x{k}) * rms1 * bf16_lo(g{k});\n    \
+             let thi{k} = bf16_hi(x{k}) * rms1 * bf16_hi(g{k});\n    \
+             let tw{k} = bf16_pack(tlo{k}, thi{k});\n    \
+             let lo{k} = bf16_lo(tw{k}) + bf16_lo(r{k});\n    \
+             let hi{k} = bf16_hi(tw{k}) + bf16_hi(r{k});\n    \
+             let sw{k} = bf16_pack(lo{k}, hi{k});\n    \
+             fncu_res[base + lid + {off}u] = sw{k};\n    \
+             acc2 = acc2 + lo{k} * lo{k} + hi{k} * hi{k};"
+        );
+    }
+    let _ = writeln!(&mut s, "    let rms2 = fncl_res_reduce(lid, acc2);");
+    register_tail(&mut s, "fncu_out");
+    let _ = writeln!(&mut s, "}}");
+
+    head(&mut s, FNCL_ENTRY_C);
+    pass1(&mut s);
+    load_xgr_and_hoisted_w2(&mut s);
+    let _ = writeln!(&mut s, "    let scale = fncu_params.scale;");
+    for k in 0..it2 {
+        let off = k * FNCU_BLOCK;
+        let _ = writeln!(
+            &mut s,
+            "    let tlo{k} = bf16_lo(x{k}) * rms1 * bf16_lo(g{k});\n    \
+             let thi{k} = bf16_hi(x{k}) * rms1 * bf16_hi(g{k});\n    \
+             let tw{k} = bf16_pack(tlo{k}, thi{k});\n    \
+             let lo{k} = (bf16_lo(r{k}) + bf16_lo(tw{k})) * scale;\n    \
+             let hi{k} = (bf16_hi(r{k}) + bf16_hi(tw{k})) * scale;\n    \
+             let sw{k} = bf16_pack(lo{k}, hi{k});\n    \
+             fncu_out[base + lid + {off}u] = sw{k};\n    \
+             fncl_sw[lid + {off}u] = sw{k};"
+        );
+    }
+    let _ = writeln!(&mut s, "    workgroupBarrier();");
+    for k in 0..it1 {
+        let _ = writeln!(
+            &mut s,
+            "    let d{k} = fncl_sw[(lid >> 1u) + {}u];",
+            k * half
+        );
+    }
+    let _ = writeln!(&mut s, "    var acc3 = 0.0;");
+    for k in 0..it1 {
+        let _ = writeln!(
+            &mut s,
+            "    let u{k} = select(bf16_lo(d{k}), bf16_hi(d{k}), odd);\n    \
+             acc3 = fma(u{k}, u{k}, acc3);"
+        );
+    }
+    let _ = writeln!(&mut s, "    let rms2 = fncl_rms_reduce(lid, acc3);");
+    register_tail(&mut s, "fncu_out2");
+    let _ = writeln!(&mut s, "}}");
+    Some(s)
+}
+
+fn sg_pk_fnc_fold_source_norm_lat_subgroup_reduce_and_unrolled_stashing_prologue_b(
+    grain: wk::gemv_w4a16::ScaleGrain,
+    hidden: usize,
+) -> String {
+    use std::fmt::Write as _;
+    let base = sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(grain, hidden);
+    let words = hidden / 2;
+    let it1 = hidden / FNCU_BLOCK;
+    let it2 = words / FNCU_BLOCK;
+    let half = FNCU_BLOCK / 2;
+
+    let pb_start = base
+        .find("fn e4f_prologue_b(")
+        .expect("fold source lost the e4f_prologue_b definition");
+    let pb_end = base[pb_start..]
+        .find("\nfn e4f_res_reduce(")
+        .expect("e4f_res_reduce no longer follows e4f_prologue_b")
+        + pb_start;
+    let mut pb = String::from("fn e4f_prologue_b(lid: u32, wg0: bool) {\n");
+    let _ = writeln!(pb, "    let hw = lid >> 1u;");
+    let _ = writeln!(pb, "    let odd = (lid & 1u) == 1u;");
+    for k in 0..it1 {
+        let _ = writeln!(pb, "    let a{k} = e4f_in[hw + {}u];", k * half);
+    }
+    let _ = writeln!(pb, "    var local = 0.0;");
+    for k in 0..it1 {
+        let _ = writeln!(
+            pb,
+            "    let v{k} = select(bf16_lo(a{k}), bf16_hi(a{k}), odd);\n    \
+             local = fma(v{k}, v{k}, local);"
+        );
+    }
+    let _ = writeln!(pb, "    if (!odd) {{");
+    for k in 0..it1 {
+        let _ = writeln!(pb, "        e4f_xs[hw + {}u] = a{k};", k * half);
+    }
+    let _ = writeln!(pb, "    }}");
+    let _ = writeln!(pb, "    let rms1 = e4f_rms_reduce(lid, local);");
+    let _ = writeln!(pb, "    let scale = e4f_p.scale;");
+    for k in 0..it2 {
+        let off = k * FNCU_BLOCK;
+        let _ = writeln!(pb, "    let w1w{k} = e4f_w1[lid + {off}u];");
+        let _ = writeln!(pb, "    let rw{k} = e4f_res[lid + {off}u];");
+        let _ = writeln!(pb, "    let xw{k} = e4f_xs[lid + {off}u];");
+    }
+    for k in 0..it2 {
+        let off = k * FNCU_BLOCK;
+        let _ = writeln!(
+            pb,
+            "    let tlo{k} = bf16_lo(xw{k}) * rms1 * bf16_lo(w1w{k});\n    \
+             let thi{k} = bf16_hi(xw{k}) * rms1 * bf16_hi(w1w{k});\n    \
+             let tw{k} = bf16_pack(tlo{k}, thi{k});\n    \
+             let lo{k} = (bf16_lo(rw{k}) + bf16_lo(tw{k})) * scale;\n    \
+             let hi{k} = (bf16_hi(rw{k}) + bf16_hi(tw{k})) * scale;\n    \
+             let sw{k} = bf16_pack(lo{k}, hi{k});\n    \
+             e4f_xs[lid + {off}u] = sw{k};\n    \
+             if (wg0) {{\n        e4f_out[lid + {off}u] = sw{k};\n    }}"
+        );
+    }
+    let _ = writeln!(pb, "    workgroupBarrier();");
+    let _ = writeln!(pb, "}}");
+    let mut out = String::with_capacity(base.len() + pb.len());
+    out.push_str(&base[..pb_start]);
+    out.push_str(&pb);
+    out.push_str(&base[pb_end..]);
+
+    let rms_start = out
+        .find("fn e4f_rms_reduce(")
+        .expect("fold source lost the e4f_rms_reduce definition");
+    let rms_end = out[rms_start..]
+        .find("\nfn e4f_prologue_b(")
+        .expect("e4f_prologue_b no longer follows e4f_rms_reduce")
+        + rms_start;
+    let rms = r#"fn e4f_rms_reduce(lid: u32, local: f32) -> f32 {
+    var acc = local;
+    acc = acc + subgroupShuffleXor(acc, 16u);
+    acc = acc + subgroupShuffleXor(acc, 8u);
+    acc = acc + subgroupShuffleXor(acc, 4u);
+    acc = acc + subgroupShuffleXor(acc, 2u);
+    acc = acc + subgroupShuffleXor(acc, 1u);
+    if ((lid & 31u) == 0u) {
+        e4f_scratch[lid] = acc;
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        let a = (e4f_scratch[0u] + e4f_scratch[128u]) + (e4f_scratch[64u] + e4f_scratch[192u]);
+        let b = (e4f_scratch[32u] + e4f_scratch[160u]) + (e4f_scratch[96u] + e4f_scratch[224u]);
+        let sum = a + b;
+        let mean = e4f_div_rn(sum, f32(e4f_p.hidden));
+        e4f_shared = inverseSqrt(e4f_p.eps + mean);
+    }
+    workgroupBarrier();
+    return e4f_shared;
+}
+"#;
+    let mut swapped = String::with_capacity(out.len());
+    swapped.push_str(&out[..rms_start]);
+    swapped.push_str(rms);
+    swapped.push_str(&out[rms_end..]);
+    swapped
+}
+
+const E4B_SG_PK_U2_ENTRY: &str = "e4b_sg_pk_deep_k_unroll2";
+const E4B_SG_PK_U2_MIN_K: usize = 8192;
+
+fn w4_deep_k_unroll2_enabled() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_W4_U2")
+}
+
+fn sgpu2_scale_acc_step_exact_sg_pk_iteration_order(
+    grain: wk::gemv_w4a16::ScaleGrain,
+    t: &str,
+    v: &str,
+) -> String {
+    use wk::gemv_w4a16::ScaleGrain;
+    match grain {
+        ScaleGrain::Ge32 => format!(
+            "        let sgi{t} = sbase + (({v} << 5u) / sgp_params.gs);\n        \
+             let ssw{t} = sgp_scale[sgi{t} >> 1u];\n        \
+             let sc{t} = select(bf16_lo(ssw{t}), bf16_hi(ssw{t}), (sgi{t} & 1u) == 1u);\n        \
+             let wv{t} = sgp_packed4[wbase4 + {v}];\n        \
+             acc = fma(sc{t}, sgp_dot32(wv{t}, ({v} << 2u)), acc);\n"
+        ),
+        ScaleGrain::Ge32Fixed(shift) => {
+            let idx = if shift == 0 {
+                v.to_string()
+            } else {
+                format!("({v} >> {shift}u)")
+            };
+            format!(
+                "        let sgi{t} = sbase + {idx};\n        \
+                 let ssw{t} = sgp_scale[sgi{t} >> 1u];\n        \
+                 let sc{t} = select(bf16_lo(ssw{t}), bf16_hi(ssw{t}), (sgi{t} & 1u) == 1u);\n        \
+                 let wv{t} = sgp_packed4[wbase4 + {v}];\n        \
+                 acc = fma(sc{t}, sgp_dot32(wv{t}, ({v} << 2u)), acc);\n"
+            )
+        }
+        ScaleGrain::G16 => format!(
+            "        let sgi{t} = sbase + ({v} << 1u);\n        \
+             let ssw{t} = sgp_scale[sgi{t} >> 1u];\n        \
+             let sc_lo{t} = bf16_lo(ssw{t});\n        \
+             let sc_hi{t} = bf16_hi(ssw{t});\n        \
+             let wv{t} = sgp_packed4[wbase4 + {v}];\n        \
+             let xb{t} = ({v} << 2u);\n        \
+             var a0{t} = 0.0;\n        \
+             a0{t} = sgp_dot8(wv{t}.x, sgp_x4[xb{t}], a0{t});\n        \
+             a0{t} = sgp_dot8(wv{t}.y, sgp_x4[xb{t} + 1u], a0{t});\n        \
+             var a1{t} = 0.0;\n        \
+             a1{t} = sgp_dot8(wv{t}.z, sgp_x4[xb{t} + 2u], a1{t});\n        \
+             a1{t} = sgp_dot8(wv{t}.w, sgp_x4[xb{t} + 3u], a1{t});\n        \
+             acc = fma(sc_lo{t}, a0{t}, acc);\n        \
+             acc = fma(sc_hi{t}, a1{t}, acc);\n"
+        ),
+    }
+}
+
+fn sg_pk_deep_k_unroll2_entry_source_pairing_loads_exact_fma_order(
+    grain: wk::gemv_w4a16::ScaleGrain,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    s.push_str("fn sgpu2_row_acc(row: u32, live: bool, vlane: u32) -> f32 {\n");
+    s.push_str("    let kv = select(0u, sgp_params.k_elems >> 5u, live);\n");
+    s.push_str("    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);\n");
+    s.push_str("    let sbase = select(0u, row * sgp_params.scale_row_stride, live);\n");
+    s.push_str("    var acc = 0.0;\n");
+    s.push_str("    var v = vlane;\n");
+    s.push_str("    loop {\n");
+    s.push_str("        if (v + 16u >= kv) { break; }\n");
+    s.push_str("        let vb = v + 16u;\n");
+    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(grain, "a", "v"));
+    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(grain, "b", "vb"));
+    s.push_str("        v = v + 32u;\n");
+    s.push_str("    }\n");
+    s.push_str("    if (v < kv) {\n");
+    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(grain, "c", "v"));
+    s.push_str("    }\n");
+    s.push_str("    acc = acc + subgroupShuffleXor(acc, 8u);\n");
+    s.push_str("    acc = acc + subgroupShuffleXor(acc, 4u);\n");
+    s.push_str("    acc = acc + subgroupShuffleXor(acc, 2u);\n");
+    s.push_str("    acc = acc + subgroupShuffleXor(acc, 1u);\n");
+    s.push_str("    return acc;\n}\n\n");
+    let _ = writeln!(
+        s,
+        "@compute @workgroup_size(256)\nfn {E4B_SG_PK_U2_ENTRY}(\n    \
+         @builtin(workgroup_id) wid: vec3<u32>,\n    \
+         @builtin(subgroup_id) sgid: u32,\n    \
+         @builtin(subgroup_size) sgsz: u32,\n    \
+         @builtin(subgroup_invocation_id) slane: u32\n) {{\n    \
+         let vt = sgid * sgsz + slane;\n    \
+         let slot = vt / 16u;\n    \
+         let vlane = slane & 15u;\n    \
+         let row = (wid.x + wid.y * sgp_params.groups_x) * 16u + slot;\n    \
+         let live = row < sgp_params.n_rows;\n    \
+         let acc = sgpu2_row_acc(row, live, vlane);\n    \
+         if (vlane == 0u) {{\n        sgp_row_tot[slot] = acc;\n    }}\n    \
+         workgroupBarrier();\n    \
+         if (vlane == 0u && live && (slot & 1u) == 0u) {{\n        \
+         let lo = bf16_encode(acc) & 0xffffu;\n        \
+         let hi_live = row + 1u < sgp_params.n_rows;\n        \
+         let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;\n        \
+         let word = lo | (select(0u, hi, hi_live) << 16u);\n        \
+         sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;\n    }}\n}}"
+    );
+    s
+}
+
 fn fuse_attn_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_FUSE_ATTN").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FUSE_ATTN")
 }
 
 fn fuse_head_argmax_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_FUSE_HEAD").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_FUSE_HEAD")
 }
 
 pub const PREFILL_M_MAX: usize = 128;
 const PREFILL_SLAB: usize = wk::gemv_w4a16::SG_MK_MAX as usize;
 
 fn prefill_m_from_env() -> usize {
-    if std::env::var("NV_E4B_WGPU_PREFILL").ok().as_deref() == Some("0") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_PREFILL") {
         return 0;
     }
     std::env::var("NV_WGPU_PREFILL_M")
@@ -1965,7 +3651,7 @@ fn prefill_m_from_env() -> usize {
 }
 
 fn prefill_tail_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_PREFILL_TAIL").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_PREFILL_TAIL")
 }
 
 fn verify_m_from_env() -> Option<usize> {
@@ -1984,11 +3670,11 @@ fn mk_widen(src: &str, mk_max: usize) -> String {
 }
 
 fn mk_unroll_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_MK_UNROLL").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_MK_UNROLL")
 }
 
 fn w8_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_W8").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_W8")
 }
 
 fn w8_group() -> usize {
@@ -2608,6 +4294,7 @@ fn build_pipelines(
     hidden: usize,
     flash1_hds: &[u32],
     gqa_group: usize,
+    kpre_ks: &[usize],
 ) -> Result<Pipelines> {
     let raw_nozi =
         |label: &str, source: &str, entry: &str| raw_nozi_pipeline(ctx, label, source, entry);
@@ -2624,20 +4311,10 @@ fn build_pipelines(
     let src_rope = format!("{}\n{}", compose(wk::rope_bf16::WGSL), ROPE_F32_WGSL);
     let src_kv = compose(wk::kv_fp8::WGSL);
     let src_flash = format!("{}\n{}", compose(wk::flash_decode::WGSL), flash2_pk_wgsl());
-    let fold_flash2 = |splits: u32| -> Result<String> {
-        let folded = src_flash.replacen(
-            "let splits = 16u;",
-            &format!("let splits = {splits}u;"),
-            1,
-        );
-        anyhow::ensure!(
-            splits == 16 || folded != src_flash,
-            "flash2 split-count anchor `let splits = 16u;` missing from g4shared_flash2_pk; \
-             the folded stage2 would silently merge the wrong number of partials"
-        );
-        Ok(folded)
+    let stage2_for_splits = |label: &str, splits: u32| -> Result<Arc<wgpu::ComputePipeline>> {
+        let (src, entry) = e4b_flash2_stage2_source_and_entry(&src_flash, splits);
+        mk(label, &src, entry)
     };
-    let src_flash2_folded = fold_flash2(decode_splits())?;
     let src_gemvb = format!("{}\n{}", compose(wk::gemv_bf16::WGSL), gemv_pk_wgsl());
     let src_gemvw4 = format!("{}\n{}", compose(wk::gemv_w4a16::WGSL), GEMV_W4_PK_WGSL);
     let src_gd = compose(wk::graph_decode::WGSL);
@@ -2662,6 +4339,63 @@ fn build_pipelines(
     } else {
         (None, None)
     };
+    let gemv_w4_sg_pk_u2 = if sg16 && w4_deep_k_unroll2_enabled() {
+        let src_u2 = format!(
+            "{}\n{}",
+            wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+            sg_pk_deep_k_unroll2_entry_source_pairing_loads_exact_fma_order(w4_grain)
+        );
+        Some(mk("e4bw-gemv-w4-sg-pk-u2", &src_u2, E4B_SG_PK_U2_ENTRY)?)
+    } else {
+        None
+    };
+    let (gemv_w4_sg_pk_rs, gemv_w4_sg_pk3_rs) = match sg_rowsplit_rows_per_wg().filter(|_| sg16) {
+        Some(rows) => {
+            let src_rs = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_rowsplit_entry_sources_same_16_lane_dot_same_output_words(rows)
+            );
+            (
+                Some(mk("e4bw-gemv-w4-sg-pk-rs", &src_rs, E4B_SG_PK_RS_ENTRY)?),
+                Some(mk("e4bw-gemv-w4-sg-pk3-rs", &src_rs, E4B_SG_PK3_RS_ENTRY)?),
+            )
+        }
+        None => (None, None),
+    };
+    let mut gemv_w4_sg_kpre = Vec::new();
+    let mut gemv_w4_sg_kpre3 = Vec::new();
+    let mut gemv_w4_sg_gelu_kpre = Vec::new();
+    if sg16 && w4_mr() == 1 && w4_kpre_enabled() {
+        let rows = sg_pk_kpre_plain_rows_16_measured_faster_than_any_rowsplit_on_the_preloaded_down_gemv();
+        for &k in kpre_ks {
+            if k < KPRE_MIN_K_512_EXCLUDES_THE_LATENCY_FLOOR_PL_GATE_WHERE_PRELOAD_MEASURED_SLOWER {
+                continue;
+            }
+            let (plain, pk3, gelu) = sg_pk_kpre_entry_names(k);
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_kpre_plain_and_pk3_sources_same_output_words(k, w4_grain, rows)
+            );
+            gemv_w4_sg_kpre.push((k, mk(&plain, &src, &plain)?));
+            if k == hidden {
+                gemv_w4_sg_kpre3.push((k, mk(&pk3, &src, &pk3)?));
+            }
+            if k == hidden && fuse_gelu_enabled() {
+                let src_g = format!(
+                    "{}\n{}",
+                    wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                    sg_pk_kpre_gelu_fold_source_same_quad_words(
+                        k,
+                        w4_grain,
+                        GELU_KPRE_ROWS_4_KEEPS_THE_MEASURED_ROWSPLIT_WIN_ON_THE_GATE_UP_FOLD
+                    )
+                );
+                gemv_w4_sg_gelu_kpre.push((k, mk(&gelu, &src_g, &gelu)?));
+            }
+        }
+    }
     let (gemv_w4_sg_pkm, gemv_w4_sg_pkm3) = if sg16 && w4_mr() > 1 {
         let src_sgm = wk::gemv_w4a16::sg_pk_mr_source_grain(w4_mr(), w4_grain);
         (
@@ -2696,7 +4430,7 @@ fn build_pipelines(
                 None => mk(rolled_entry, &src_fnc, rolled_entry),
             }
         };
-        Some(FncPipelines {
+        let mut pipes = FncPipelines {
             a: one(0, wk::fused_norm_chain::ENTRY_RMS_RES_RMS, FNCU_ENTRY_A)?,
             b: one(1, wk::fused_norm_chain::ENTRY_RES_OF_RMS, FNCU_ENTRY_B)?,
             c: one(
@@ -2705,16 +4439,37 @@ fn build_pipelines(
                 FNCU_ENTRY_C,
             )?,
             unrolled: if fast.is_some() { want } else { [false; 3] },
-        })
+        };
+        let lat_src = (norm_lat_enabled() && ctx.subgroup_width() == Some(32))
+            .then(|| fnc_norm_lat_source_subgroup_tree_register_tail_shared_stash(hidden))
+            .flatten();
+        if let Some(body) = lat_src {
+            let src = compose(&body);
+            pipes.a = mk(FNCL_ENTRY_A, &src, FNCL_ENTRY_A)?;
+            pipes.c = mk(FNCL_ENTRY_C, &src, FNCL_ENTRY_C)?;
+        }
+        Some(pipes)
     } else {
         None
     };
     let fac = if fuse_attn {
-        let src_fac = compose(wk::fused_attn_chain::WGSL);
+        let src_fac = compose(
+            &wk::fused_attn_chain::wgsl_with_kv_fp8_e4m3_encode_helpers_because_the_k_v_quant_stages_call_them(),
+        );
         Some(FacPipelines {
             q: mk("e4bw-fac-q", &src_fac, wk::fused_attn_chain::ENTRY_Q)?,
             k: mk("e4bw-fac-k", &src_fac, wk::fused_attn_chain::ENTRY_K)?,
             v: mk("e4bw-fac-v", &src_fac, wk::fused_attn_chain::ENTRY_V)?,
+            qkv: if fuse_qkv_rope_enabled() {
+                let src = format!(
+                    "{}\n{}",
+                    src_fac,
+                    fac_merged_qkv_source_one_dispatch_replicating_q_k_v_row_arithmetic()
+                );
+                Some(mk("e4bw-fac-qkv", &src, E4B_FAC_QKV_ENTRY)?)
+            } else {
+                None
+            },
         })
     } else {
         None
@@ -2906,19 +4661,25 @@ fn build_pipelines(
     }
     let mut flash1: Vec<(u32, Arc<wgpu::ComputePipeline>)> = Vec::with_capacity(hds.len());
     for hd in hds {
-        let (entry, gen) = if sd {
-            (flash1_e4b_entry_sd(hd, sg), flash1_e4b_source_sd(hd, sg))
+        let (entry, generated_wgsl) = if sd {
+            (
+                wk::flash_decode::fold_stage1_entry_sd(hd, sg, FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES),
+                wk::flash_decode::fold_stage1_source_sd(hd, sg, FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES),
+            )
         } else {
-            (flash1_e4b_entry(hd, sg), flash1_e4b_source(hd, sg))
+            (
+                wk::flash_decode::fold_stage1_entry(hd, sg, FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES),
+                wk::flash_decode::fold_stage1_source(hd, sg, FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES),
+            )
         };
-        let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), gen);
+        let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), generated_wgsl);
         flash1.push((hd, mk_nozi(&format!("e4bw-flash1-{hd}"), &src, &entry)?));
     }
     let gqa_fold = wk::flash_decode::gqa_fold_env(gqa_group) as u32;
     let mut flash1_fold: Vec<(u32, Arc<wgpu::ComputePipeline>)> = Vec::new();
     if gqa_fold > 1 {
         for (hd, _) in &flash1 {
-            let (entry, gen) = if sd {
+            let (entry, generated_wgsl) = if sd {
                 (
                     wk::flash_decode::fold_stage1_entry_sd(*hd, sg, gqa_fold),
                     wk::flash_decode::fold_stage1_source_sd(*hd, sg, gqa_fold),
@@ -2929,7 +4690,7 @@ fn build_pipelines(
                     wk::flash_decode::fold_stage1_source(*hd, sg, gqa_fold),
                 )
             };
-            let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), gen);
+            let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), generated_wgsl);
             flash1_fold.push((
                 *hd,
                 mk_nozi(&format!("e4bw-flash1-fold{gqa_fold}-{hd}"), &src, &entry)?,
@@ -2949,7 +4710,7 @@ fn build_pipelines(
              fold reduce is wired for the deep split arm"
         );
         for (hd, _) in &flash1 {
-            let (entry, gen) = if tpw > 1 {
+            let (entry, generated_wgsl) = if tpw > 1 {
                 (
                     deep_tpw_entry(*hd, deep_fold.max(1), tpw, sd),
                     deep_tpw_source(*hd, deep_fold.max(1), tpw, sd),
@@ -2965,7 +4726,7 @@ fn build_pipelines(
                     wk::flash_decode::fold_stage1_source(*hd, sg, deep_fold),
                 )
             };
-            let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), gen);
+            let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), generated_wgsl);
             flash1_fold_deep.push((
                 *hd,
                 mk_nozi(&format!("e4bw-flash1-dfold{deep_fold}t{tpw}-{hd}"), &src, &entry)?,
@@ -2982,9 +4743,9 @@ fn build_pipelines(
         0
     };
     let flash1_entry = if sd {
-        flash1_e4b_entry_sd(widest, sg)
+        wk::flash_decode::fold_stage1_entry_sd(widest, sg, FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES)
     } else {
-        flash1_e4b_entry(widest, sg)
+        wk::flash_decode::fold_stage1_entry(widest, sg, FLASH1_UNFOLDED_IS_THE_SHARED_FOLD_STAGE1_AT_FOLD_1_BIT_IDENTICAL_ON_STAGE1_SCRATCH_80_SHAPE_ARM_CASES)
     };
     eprintln!(
         "[gemma4_e4b_wgpu] flash stage1: {} pipeline(s) at head_dim {:?}, reduce {}, gqa fold {}, \
@@ -3017,20 +4778,13 @@ fn build_pipelines(
         gqa_fold,
         deep_fold,
         flash1_entry,
-        flash2_pk: mk("e4bw-flash2-pk", &src_flash2_folded, FLASH2_PK_ENTRY)?,
-        flash2_pk_deep: match deep_split_arm() {
-            Some((_, splits)) if deep_stage2_legacy16() => Some(mk(
-                "e4bw-flash2-pk-deep",
-                &fold_flash2(splits)?,
-                FLASH2_PK_ENTRY,
-            )?),
-            Some((_, splits)) => Some(mk(
-                "e4bw-flash2-pk-deep",
-                &format!("{src_flash}\n{}", e4b_flash2_deep_source(splits)),
-                FLASH2_DEEP_ENTRY,
-            )?),
-            None => None,
-        },
+        flash2_pk: stage2_for_splits("e4bw-flash2-pk", decode_splits())?,
+        flash2_pk_deep: deep_split_arm()
+            .map(|(_, splits)| stage2_for_splits("e4bw-flash2-pk-deep", splits))
+            .transpose()?,
+        flash2_pk_deep2: deep2_split_arm()
+            .map(|(_, splits)| stage2_for_splits("e4bw-flash2-pk-deep2", splits))
+            .transpose()?,
         gemv_i8_pk: if w8_enabled() {
             let src_i8 = format!("{}\n{}", compose(wk::gemv_bf16::WGSL), gemv_i8_pk_source());
             Some(mk("e4bw-gemv-i8-pk", &src_i8, "g4w_gemv_i8_pk")?)
@@ -3062,9 +4816,145 @@ fn build_pipelines(
         gemv_w4_v4_pk: mk("e4bw-gemv-w4-v4-pk", &src_gemvw4, "g4w_gemv_w4a16_v4_pk")?,
         gemv_w4_v4_pk3: mk("e4bw-gemv-w4-v4-pk3", &src_gemvw4, "g4w_gemv_w4a16_v4_pk3")?,
         gemv_w4_sg_pk,
+        gemv_w4_sg_pk_u2,
         gemv_w4_sg_pk3,
         gemv_w4_sg_pkm,
         gemv_w4_sg_pkm3,
+        gemv_w4_sg_kpre,
+        gemv_w4_sg_kpre3,
+        gemv_w4_sg_gelu_kpre,
+        gemv_w4_sg_pk_rs,
+        gemv_w4_sg_pk3_rs,
+        gemv_w4_sg_gelu_rs: match sg_rowsplit_rows_per_wg()
+            .filter(|_| sg16 && w4_mr() == 1 && fuse_gelu_enabled())
+        {
+            Some(rows) => {
+                let src = format!(
+                    "{}\n{}",
+                    wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                    sg_pk_gelu_fold_rowsplit_source_same_quad_words(rows)
+                );
+                Some(mk("e4bw-gemv-w4-sg-gelu-rs", &src, E4B_SG_GELU_RS_ENTRY)?)
+            }
+            None => None,
+        },
+        gemv_w4_sg_gm: if sg16 && w4_mr() == 1 && fuse_plgate_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_gatemul_fold_source_replicating_gate_gemv_word_then_gatemul_body()
+            );
+            Some(mk("e4bw-gemv-w4-sg-gm", &src, E4B_SG_GM_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_fnca: if sg16 && w4_mr() == 1 && fuse_gelu_enabled() && fold_fnca_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
+                    w4_grain, hidden
+                )
+            );
+            Some(mk("e4bw-gemv-w4-sg-fnca", &src, E4B_FNCA_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_fncb: if sg16 && w4_mr() == 1 && fuse_plgate_enabled() && fold_fncb_enabled() {
+            let fold_src = if norm_lat_enabled()
+                && ctx.subgroup_width() == Some(32)
+                && hidden.is_multiple_of(2 * FNCU_BLOCK)
+            {
+                sg_pk_fnc_fold_source_norm_lat_subgroup_reduce_and_unrolled_stashing_prologue_b(
+                    w4_grain, hidden,
+                )
+            } else {
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
+                    w4_grain, hidden,
+                )
+            };
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                fold_src
+            );
+            Some(mk("e4bw-gemv-w4-sg-fncb", &src, E4B_FNCB_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_tail_fnca: if sg16 && w4_mr() == 1 && tail_fnca_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_tail_fold_source_running_fused_norm_chain_in_the_last_workgroup_to_arrive()
+            );
+            Some(mk("e4bw-gemv-w4-sg-tail-fnca", &src, E4B_TAIL_FNCA_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_tail_fncc: if sg16 && w4_mr() == 1 && tail_fncc_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_tail_fold_source_running_fused_norm_chain_in_the_last_workgroup_to_arrive()
+            );
+            Some(mk("e4bw-gemv-w4-sg-tail-fncc", &src, E4B_TAIL_FNCC_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_tail_gate: if sg16 && w4_mr() == 1 && tail_gate_only_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_tail_fold_source_running_fused_norm_chain_in_the_last_workgroup_to_arrive()
+            );
+            Some(mk("e4bw-gemv-w4-sg-tail-gate", &src, E4B_TAIL_GATE_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_fncc_pk: if sg16 && w4_mr() == 1 && fold_fncc_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
+                    w4_grain, hidden
+                )
+            );
+            Some(mk("e4bw-gemv-w4-sg-fncc-pk", &src, E4B_FNCC_PK_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_fncc_pk3: if sg16 && w4_mr() == 1 && fold_fncc_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
+                    w4_grain, hidden
+                )
+            );
+            Some(mk("e4bw-gemv-w4-sg-fncc-pk3", &src, E4B_FNCC_PK3_ENTRY)?)
+        } else {
+            None
+        },
+        gemv_w4_sg_gelu: if sg16 && w4_mr() == 1 && fuse_gelu_enabled() {
+            let src = format!(
+                "{}\n{}",
+                wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
+                sg_pk_gelu_fold_source_packing_four_interleaved_rows_into_one_act_word()
+            );
+            Some(mk("e4bw-gemv-w4-sg-gelu", &src, E4B_SG_GELU_ENTRY)?)
+        } else {
+            None
+        },
+        gelu_inter: if fuse_gelu_enabled() {
+            Some(mk(
+                "e4bw-gelu-il",
+                &compose(&gelu_interleaved_source_reading_gate_up_row_pairs_in_one_word()),
+                E4B_GELU_INTERLEAVED_ENTRY,
+            )?)
+        } else {
+            None
+        },
         lmhead_sg: lmhead_sg_pl,
         lmhead_i8: lmhead_i8_pl,
         gelu_even: mk("e4bw-gelu", &src_gelu, wk::gelu_tanh_mul::ENTRY_FUSED_EVEN)?,
@@ -3110,15 +5000,22 @@ enum GemvDstMk<'b> {
     },
 }
 
+struct DeferredFncC {
+    ln_pli: wgpu::Buffer,
+    ln_next: wgpu::Buffer,
+    scale: f32,
+}
+
 struct Builder<'a> {
     ctx: &'static WgpuContext,
     pl: &'a Pipelines,
+    deferred_fnc_c: Option<DeferredFncC>,
     passes: Vec<Pass>,
     prefill_passes: Vec<Pass>,
     verify_prefill_passes: Vec<Pass>,
     to_prefill: bool,
     to_verify: bool,
-    keep: Vec<Box<dyn std::any::Any>>,
+    keep: Vec<Box<dyn std::any::Any + Send>>,
     weight_bytes: u64,
     sg16: bool,
 
@@ -3127,6 +5024,10 @@ struct Builder<'a> {
     mk_prefill_unis: Vec<(wgpu::Buffer, MkParams, usize)>,
     mk_verify_unis: Vec<(wgpu::Buffer, MkParams, usize)>,
     deep_attn: Vec<(usize, Pass)>,
+    deep2_attn: Vec<(usize, Pass)>,
+    deep_flash1_full_indices: Vec<usize>,
+    deep_flash1_sliding_indices: Vec<usize>,
+    sliding_splits_cap: Option<u32>,
 }
 
 impl Builder<'_> {
@@ -3154,6 +5055,42 @@ impl Builder<'_> {
         }
     }
 
+    fn deep_band_twin(
+        &self,
+        i1: usize,
+        s1_binds: &[(u32, &wgpu::Buffer)],
+        s2_binds: &[(u32, &wgpu::Buffer)],
+        n_q: u32,
+        hd: usize,
+        full_attn: bool,
+        splits: u32,
+        stage2: Arc<wgpu::ComputePipeline>,
+    ) -> (Pass, Pass) {
+        let mut s1 = self.passes[i1].clone();
+        assert_eq!(
+            s1.grid.1,
+            decode_splits(),
+            "deep twin must shadow the decode flash stage1 dispatch; {DEEP_SPLIT_ARM_RULE}"
+        );
+        s1.grid.1 = splits;
+        if full_attn && !self.pl.flash1_fold_deep.is_empty() {
+            let fpl = flash1_pick(&self.pl.flash1_fold_deep, hd);
+            s1.bind = dispatch::bind_group(self.ctx, &fpl, s1_binds);
+            s1.pipeline = fpl;
+            s1.grid.0 = n_q / self.pl.deep_fold.max(1);
+        }
+        let bind = dispatch::bind_group(self.ctx, &stage2, s2_binds);
+        let (bound_bytes, widest_bytes) = bind_bytes(s2_binds.iter().map(|(_, b)| *b));
+        let s2 = Pass {
+            pipeline: stage2,
+            bind,
+            grid: (n_q, 1, 1),
+            bound_bytes,
+            widest_bytes,
+        };
+        (s1, s2)
+    }
+
     fn push_deep_decode_attn(
         &mut self,
         s1_binds: &[(u32, &wgpu::Buffer)],
@@ -3174,35 +5111,55 @@ impl Builder<'_> {
         );
         let i2 = self.passes.len() - 1;
         let i1 = i2 - 1;
-        if !full_attn && deep_full_only() {
-            self.deep_attn.push((i1, self.passes[i1].clone()));
-            self.deep_attn.push((i2, self.passes[i2].clone()));
-            return;
+        let band2 = self.pl.flash2_pk_deep2.clone().zip(deep2_split_arm());
+        if full_attn {
+            self.deep_flash1_full_indices.push(i1);
+        } else {
+            self.deep_flash1_sliding_indices.push(i1);
         }
-        let mut s1 = self.passes[i1].clone();
-        assert_eq!(
-            s1.grid.1,
-            decode_splits(),
-            "deep twin must shadow the decode flash stage1 dispatch; {DEEP_SPLIT_ARM_RULE}"
-        );
-        s1.grid.1 = deep;
-        if full_attn && !self.pl.flash1_fold_deep.is_empty() {
-            let fpl = flash1_pick(&self.pl.flash1_fold_deep, hd);
-            s1.bind = dispatch::bind_group(self.ctx, &fpl, s1_binds);
-            s1.pipeline = fpl;
-            s1.grid.0 = n_q / self.pl.deep_fold.max(1);
-        }
-        let bind = dispatch::bind_group(self.ctx, &deep_pl, s2_binds);
-        let (bound_bytes, widest_bytes) = bind_bytes(s2_binds.iter().map(|(_, b)| *b));
-        let s2 = Pass {
-            pipeline: deep_pl,
-            bind,
-            grid: (n_q, 1, 1),
-            bound_bytes,
-            widest_bytes,
+        let cap = if full_attn {
+            None
+        } else {
+            self.sliding_splits_cap
         };
+        let (s1, s2) = self.deep_band_pass_pair(
+            i1, i2, s1_binds, s2_binds, n_q, hd, full_attn, deep, &deep_pl, &band2, cap,
+        );
         self.deep_attn.push((i1, s1));
         self.deep_attn.push((i2, s2));
+        if let Some((_, (_, splits2))) = band2.clone() {
+            let (t1, t2) = self.deep_band_pass_pair(
+                i1, i2, s1_binds, s2_binds, n_q, hd, full_attn, splits2, &deep_pl, &band2, cap,
+            );
+            self.deep2_attn.push((i1, t1));
+            self.deep2_attn.push((i2, t2));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deep_band_pass_pair(
+        &self,
+        i1: usize,
+        i2: usize,
+        s1_binds: &[(u32, &wgpu::Buffer)],
+        s2_binds: &[(u32, &wgpu::Buffer)],
+        n_q: u32,
+        hd: usize,
+        full_attn: bool,
+        splits: u32,
+        deep_pl: &Arc<wgpu::ComputePipeline>,
+        band2: &Option<(Arc<wgpu::ComputePipeline>, (u32, u32))>,
+        cap: Option<u32>,
+    ) -> (Pass, Pass) {
+        let eff = cap.map_or(splits, |c| splits.min(c));
+        if eff == decode_splits() {
+            return (self.passes[i1].clone(), self.passes[i2].clone());
+        }
+        let pl = match band2 {
+            Some((p2, (_, s2))) if eff == *s2 => p2.clone(),
+            _ => deep_pl.clone(),
+        };
+        self.deep_band_twin(i1, s1_binds, s2_binds, n_q, hd, full_attn, eff, pl)
     }
 
     fn push_off(
@@ -3229,7 +5186,7 @@ impl Builder<'_> {
         }
     }
 
-    fn uni<T: bytemuck::Pod + 'static>(&mut self, label: &str, value: T) -> wgpu::Buffer {
+    fn uni<T: bytemuck::Pod + Send + 'static>(&mut self, label: &str, value: T) -> wgpu::Buffer {
         let u = GpuUniform::new(self.ctx, label, &value);
         let raw = u.raw().clone();
         self.keep.push(Box::new(u));
@@ -3279,6 +5236,104 @@ impl Builder<'_> {
                 ..Default::default()
             },
         )
+    }
+
+    fn gemv_tail_gate_only_null_probe(
+        &mut self,
+        pipeline: Arc<wgpu::ComputePipeline>,
+        proj: &GpuProj,
+        x_packed: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        ctr: &wgpu::Buffer,
+    ) {
+        let GpuProj::W4 {
+            packed,
+            scales,
+            params,
+            grid,
+            ..
+        } = proj
+        else {
+            unreachable!(
+                "{TAIL_GATE_ONLY_IS_THE_NULL_PROBE_THAT_PRICES_THE_DEVICE_FENCE_WITHOUT_FOLDING_ANYTHING}"
+            )
+        };
+        let grid = *grid;
+        let off = self.uni("e4bw-tailgate-off", PkOffParams::default());
+        self.push(
+            pipeline,
+            &[
+                (1, scales.raw()),
+                (3, y),
+                (4, params.raw()),
+                (6, packed.raw()),
+                (7, x_packed),
+                (30, &off),
+                (47, ctr),
+            ],
+            grid,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_tail_fnc(
+        &mut self,
+        pipeline: Arc<wgpu::ComputePipeline>,
+        proj: &GpuProj,
+        x_packed: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        res: &wgpu::Buffer,
+        w1: &wgpu::Buffer,
+        w2: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        out2: Option<&wgpu::Buffer>,
+        ctr: &wgpu::Buffer,
+        hidden: usize,
+        eps: f32,
+        scale: f32,
+    ) {
+        let GpuProj::W4 {
+            packed,
+            scales,
+            params,
+            grid,
+            ..
+        } = proj
+        else {
+            unreachable!(
+                "the tail fnc fold only accepts a w4 sg16 projection; \
+                 {TAIL_FOLD_IS_A_BACKWARD_FOLD_PAID_ONCE_NOT_ONCE_PER_CONSUMER_WORKGROUP}"
+            )
+        };
+        let grid = *grid;
+        let off = self.uni("e4bw-tail-off", PkOffParams::default());
+        let fp = self.uni(
+            "e4bw-tail-p",
+            E4bFncFoldParams {
+                hidden: hidden as u32,
+                words: (hidden / 2) as u32,
+                eps,
+                scale,
+            },
+        );
+        let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+            (1, scales.raw()),
+            (3, y),
+            (4, params.raw()),
+            (6, packed.raw()),
+            (7, x_packed),
+            (30, &off),
+            (40, &fp),
+            (42, res),
+            (43, w1),
+            (44, w2),
+            (45, out),
+            (47, ctr),
+        ];
+        if let Some(o2) = out2 {
+            binds.push((46, o2));
+        }
+        self.push(pipeline, &binds, grid);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3382,7 +5437,6 @@ impl Builder<'_> {
     fn lora_site(
         &mut self,
         pl: &LoraPipelines,
-        scratch: &wgpu::Buffer,
         m: usize,
         site: &LoraSiteGpu,
         x: &wgpu::Buffer,
@@ -3396,7 +5450,7 @@ impl Builder<'_> {
         } else {
             &mut self.passes
         };
-        emit_lora_site(ctx, out, &mut self.keep, pl, scratch, m, site, x, segs);
+        emit_lora_site_pk(ctx, out, &mut self.keep, pl, m, site, x, segs);
     }
 
     fn gemv(&mut self, proj: &GpuProj, x_packed: &wgpu::Buffer, dst: GemvDst) {
@@ -3466,16 +5520,44 @@ impl Builder<'_> {
                         params,
                         grid,
                         variant,
+                        n,
+                        k,
                         ..
                     } => match variant {
                         W4Variant::Sg16 => {
-                            let pipeline = self
+                            let kpre = self
                                 .pl
-                                .gemv_w4_sg_pkm
-                                .as_ref()
-                                .or(self.pl.gemv_w4_sg_pk.as_ref())
-                                .expect("sg16 routing without sg pipeline")
-                                .clone();
+                                .gemv_w4_sg_kpre
+                                .iter()
+                                .find(|(kk, _)| kk == k)
+                                .map(|(_, p)| p.clone());
+                            let (pipeline, sg_grid) = if let Some(p) = kpre {
+                                (
+                                    p,
+                                    sg_rowsplit_grid_1d(
+                                        *n,
+                                        sg_pk_kpre_plain_rows_16_measured_faster_than_any_rowsplit_on_the_preloaded_down_gemv(),
+                                        self.ctx,
+                                    ),
+                                )
+                            } else if let Some(rs) = self.pl.gemv_w4_sg_pk_rs.clone() {
+                                let rows = sg_rowsplit_rows_per_wg().expect(
+                                    "rowsplit pipelines exist only while the env resolves",
+                                );
+                                (rs, sg_rowsplit_grid_1d(*n, rows, self.ctx))
+                            } else {
+                                (
+                                    self.pl
+                                        .gemv_w4_sg_pk_u2
+                                        .as_ref()
+                                        .filter(|_| *k >= E4B_SG_PK_U2_MIN_K)
+                                        .or(self.pl.gemv_w4_sg_pkm.as_ref())
+                                        .or(self.pl.gemv_w4_sg_pk.as_ref())
+                                        .expect("sg16 routing without sg pipeline")
+                                        .clone(),
+                                    *grid,
+                                )
+                            };
                             self.push(
                                 pipeline,
                                 &[
@@ -3486,7 +5568,7 @@ impl Builder<'_> {
                                     (7, x_packed),
                                     (30, &off),
                                 ],
-                                *grid,
+                                sg_grid,
                             );
                         }
                         W4Variant::V4 => {
@@ -3600,16 +5682,42 @@ impl Builder<'_> {
                         params,
                         grid,
                         variant,
+                        n,
+                        k: k_dim,
                         ..
                     } => match variant {
                         W4Variant::Sg16 => {
-                            let pipeline = self
+                            let kpre = self
                                 .pl
-                                .gemv_w4_sg_pkm3
-                                .as_ref()
-                                .or(self.pl.gemv_w4_sg_pk3.as_ref())
-                                .expect("sg16 routing without sg pipeline")
-                                .clone();
+                                .gemv_w4_sg_kpre3
+                                .iter()
+                                .find(|(kk, _)| kk == k_dim)
+                                .map(|(_, p)| p.clone());
+                            let (pipeline, sg_grid) = if let Some(p) = kpre {
+                                (
+                                    p,
+                                    sg_rowsplit_grid_1d(
+                                        *n,
+                                        sg_pk_kpre_plain_rows_16_measured_faster_than_any_rowsplit_on_the_preloaded_down_gemv(),
+                                        self.ctx,
+                                    ),
+                                )
+                            } else if let Some(rs) = self.pl.gemv_w4_sg_pk3_rs.clone() {
+                                let rows = sg_rowsplit_rows_per_wg().expect(
+                                    "rowsplit pipelines exist only while the env resolves",
+                                );
+                                (rs, sg_rowsplit_grid_1d(*n, rows, self.ctx))
+                            } else {
+                                (
+                                    self.pl
+                                        .gemv_w4_sg_pkm3
+                                        .as_ref()
+                                        .or(self.pl.gemv_w4_sg_pk3.as_ref())
+                                        .expect("sg16 routing without sg pipeline")
+                                        .clone(),
+                                    *grid,
+                                )
+                            };
                             self.push(
                                 pipeline,
                                 &[
@@ -3622,7 +5730,7 @@ impl Builder<'_> {
                                     (33, v),
                                     (34, &sp),
                                 ],
-                                *grid,
+                                sg_grid,
                             );
                         }
                         W4Variant::V4 => {
@@ -4146,7 +6254,7 @@ fn upload_proj(ctx: &WgpuContext, b: &mut Builder, label: &str, l: &HostLin) -> 
             q.gs
         );
         let packed = GpuTensor::upload(ctx, label, &q.packed);
-        let force_block = std::env::var("NV_E4B_WGPU_W4_BLOCK").ok().as_deref() == Some("1");
+        let force_block = nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_W4_BLOCK");
         let grain = b.pl.w4_grain;
         let sg_ok =
             b.sg16 && grain.accepts(q.gs) && !(w4_route_enabled() && w4_prefer_v4(l.n, l.k));
@@ -4303,7 +6411,10 @@ struct Bufs {
     gu_pack: GpuTensor<u32>,
     act_pack: GpuTensor<u32>,
     scratch: GpuTensor<f32>,
+    tail_ctr: GpuTensor<u32>,
 }
+
+const TAIL_CTR_SELF_RESETS_SO_NO_CLEAR_DISPATCH_IS_NEEDED: usize = 4;
 
 fn alloc_bufs(
     ctx: &WgpuContext,
@@ -4342,6 +6453,11 @@ fn alloc_bufs(
             ctx,
             "e4bw-flash-scratch",
             cfg.n_q * m * scratch_splits() as usize * (hd_max + 2),
+        ),
+        tail_ctr: GpuTensor::zeroed(
+            ctx,
+            "e4bw-tail-ctr",
+            TAIL_CTR_SELF_RESETS_SO_NO_CLEAR_DISPATCH_IS_NEEDED,
         ),
     }
 }
@@ -4492,13 +6608,12 @@ struct LayerEmit<'x> {
     kv_start: &'x wgpu::Buffer,
     lora: Option<&'x LayerLoraGpu>,
     lora_pl: Option<&'x LoraPipelines>,
-    lora_scratch: Option<&'x wgpu::Buffer>,
 }
 
 impl LayerEmit<'_> {
-    fn lora_parts(&self) -> Option<(&LoraPipelines, &wgpu::Buffer, &LayerLoraGpu)> {
-        match (self.lora_pl, self.lora_scratch, self.lora) {
-            (Some(pl), Some(s), Some(l)) => Some((pl, s, l)),
+    fn lora_parts(&self) -> Option<(&LoraPipelines, &LayerLoraGpu)> {
+        match (self.lora_pl, self.lora) {
+            (Some(pl), Some(l)) => Some((pl, l)),
             _ => None,
         }
     }
@@ -4561,71 +6676,198 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
     if !fuse || a.li == 0 {
         b.rms(x_in, a.ln_in, bufs.t0.raw(), m, hidden, eps);
     }
-    match a.shared {
-        Some(_) => {
-            if m == 1 {
-                b.gemv(
-                    a.qkv,
-                    bufs.t0.raw(),
-                    GemvDst::Packed {
-                        y: bufs.qa.raw(),
-                        word_off: 0,
+    let decode_list = !b.to_prefill && !b.to_verify;
+    let deferred = if decode_list {
+        b.deferred_fnc_c.take()
+    } else {
+        None
+    };
+    let lora_qkv = a.lora_parts().is_some_and(|(_, ll)| ll.qkv.is_some());
+    let fncc_fold = deferred.is_some()
+        && m == 1
+        && !lora_qkv
+        && matches!(
+            a.qkv,
+            GpuProj::W4 {
+                variant: W4Variant::Sg16,
+                ..
+            }
+        )
+        && match a.shared {
+            Some(_) => b.pl.gemv_w4_sg_fncc_pk.is_some(),
+            None => b.pl.gemv_w4_sg_fncc_pk3.is_some(),
+        };
+    if let Some(d) = &deferred {
+        if !fncc_fold {
+            b.fnc_c(
+                bufs.t1.raw(),
+                bufs.mid.raw(),
+                &d.ln_pli,
+                &d.ln_next,
+                x_in,
+                bufs.t0.raw(),
+                m,
+                hidden,
+                eps,
+                d.scale,
+            );
+        }
+    }
+    if fncc_fold {
+        let d = deferred
+            .as_ref()
+            .expect("fncc_fold requires a deferred fnc_c");
+        let GpuProj::W4 {
+            packed,
+            scales,
+            params,
+            grid,
+            ..
+        } = a.qkv
+        else {
+            unreachable!("fncc_fold checked the qkv variant")
+        };
+        let fp = b.uni(
+            "e4bw-fncc-p",
+            E4bFncFoldParams {
+                hidden: hidden as u32,
+                words: (hidden / 2) as u32,
+                eps,
+                scale: d.scale,
+            },
+        );
+        match a.shared {
+            Some(_) => {
+                let off = b.uni("e4bw-fncc-off", PkOffParams::default());
+                let pl = b
+                    .pl
+                    .gemv_w4_sg_fncc_pk
+                    .clone()
+                    .expect("fncc_fold checked the pk pipeline");
+                b.push(
+                    pl,
+                    &[
+                        (1, scales.raw()),
+                        (3, bufs.qa.raw()),
+                        (4, params.raw()),
+                        (6, packed.raw()),
+                        (30, &off),
+                        (40, &fp),
+                        (41, bufs.t1.raw()),
+                        (42, bufs.mid.raw()),
+                        (43, &d.ln_pli),
+                        (44, &d.ln_next),
+                        (45, x_in),
+                        (46, bufs.t0.raw()),
+                    ],
+                    *grid,
+                );
+            }
+            None => {
+                let v_off = if a.has_v { a.q_dim + a.kv_dim } else { a.q_dim };
+                let sp = b.uni(
+                    "e4bw-fncc-split-p",
+                    SplitParams {
+                        q_rows: a.q_dim as u32,
+                        kv_rows: a.kv_dim as u32,
+                        v_off: v_off as u32,
+                        pad0: 0,
                     },
                 );
-            } else {
-                b.gemv_mk(
-                    a.qkv,
-                    bufs.t0.raw(),
-                    m,
-                    hidden / 2,
-                    GemvDstMk::Packed {
-                        y: bufs.qa.raw(),
-                        word_off: 0,
-                        y_stride_words: a.q_dim / 2,
-                    },
+                let pl = b
+                    .pl
+                    .gemv_w4_sg_fncc_pk3
+                    .clone()
+                    .expect("fncc_fold checked the pk3 pipeline");
+                b.push(
+                    pl,
+                    &[
+                        (1, scales.raw()),
+                        (4, params.raw()),
+                        (6, packed.raw()),
+                        (31, bufs.qa.raw()),
+                        (32, bufs.ka.raw()),
+                        (33, bufs.va.raw()),
+                        (34, &sp),
+                        (40, &fp),
+                        (41, bufs.t1.raw()),
+                        (42, bufs.mid.raw()),
+                        (43, &d.ln_pli),
+                        (44, &d.ln_next),
+                        (45, x_in),
+                        (46, bufs.t0.raw()),
+                    ],
+                    *grid,
                 );
             }
         }
-        None => {
-            let v_off = if a.has_v { a.q_dim + a.kv_dim } else { a.q_dim };
-            if m == 1 {
-                b.gemv(
-                    a.qkv,
-                    bufs.t0.raw(),
-                    GemvDst::SplitQkv {
-                        q: bufs.qa.raw(),
-                        k: bufs.ka.raw(),
-                        v: bufs.va.raw(),
-                        q_rows: a.q_dim,
-                        kv_rows: a.kv_dim,
-                        v_off,
-                    },
-                );
-            } else {
-                b.gemv_mk(
-                    a.qkv,
-                    bufs.t0.raw(),
-                    m,
-                    hidden / 2,
-                    GemvDstMk::SplitQkv {
-                        q: bufs.qa.raw(),
-                        k: bufs.ka.raw(),
-                        v: bufs.va.raw(),
-                        q_rows: a.q_dim,
-                        kv_rows: a.kv_dim,
-                        v_off,
-                    },
-                );
+    } else {
+        match a.shared {
+            Some(_) => {
+                if m == 1 {
+                    b.gemv(
+                        a.qkv,
+                        bufs.t0.raw(),
+                        GemvDst::Packed {
+                            y: bufs.qa.raw(),
+                            word_off: 0,
+                        },
+                    );
+                } else {
+                    b.gemv_mk(
+                        a.qkv,
+                        bufs.t0.raw(),
+                        m,
+                        hidden / 2,
+                        GemvDstMk::Packed {
+                            y: bufs.qa.raw(),
+                            word_off: 0,
+                            y_stride_words: a.q_dim / 2,
+                        },
+                    );
+                }
+            }
+            None => {
+                let v_off = if a.has_v { a.q_dim + a.kv_dim } else { a.q_dim };
+                if m == 1 {
+                    b.gemv(
+                        a.qkv,
+                        bufs.t0.raw(),
+                        GemvDst::SplitQkv {
+                            q: bufs.qa.raw(),
+                            k: bufs.ka.raw(),
+                            v: bufs.va.raw(),
+                            q_rows: a.q_dim,
+                            kv_rows: a.kv_dim,
+                            v_off,
+                        },
+                    );
+                } else {
+                    b.gemv_mk(
+                        a.qkv,
+                        bufs.t0.raw(),
+                        m,
+                        hidden / 2,
+                        GemvDstMk::SplitQkv {
+                            q: bufs.qa.raw(),
+                            k: bufs.ka.raw(),
+                            v: bufs.va.raw(),
+                            q_rows: a.q_dim,
+                            kv_rows: a.kv_dim,
+                            v_off,
+                        },
+                    );
+                }
             }
         }
     }
-    if let Some((pl, scratch, ll)) = a.lora_parts() {
+    if let Some((pl, ll)) = a.lora_parts() {
         if let Some(site) = &ll.qkv {
             let segs: Vec<&wgpu::Buffer> = match a.shared {
                 Some(_) => vec![bufs.qa.raw()],
                 None => vec![bufs.qa.raw(), bufs.ka.raw(), bufs.va.raw()],
             };
-            b.lora_site(pl, scratch, m, site, bufs.t0.raw(), &segs);
+            b.lora_site(pl, m, site, bufs.t0.raw(), &segs);
         }
     }
     let half = a.hd / 2;
@@ -4633,7 +6875,62 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         && b.pl.fac.is_some()
         && a.hd.is_multiple_of(4)
         && a.hd <= wk::fused_attn_chain::MAX_HEAD_DIM;
-    if fuse_attn {
+    let fac_merged = fuse_attn
+        && a.shared.is_none()
+        && b.pl.fac.as_ref().is_some_and(|f| f.qkv.is_some());
+    if fac_merged {
+        let fac_p = b.uni(
+            "e4bw-fac-p",
+            wk::fused_attn_chain::FacParams {
+                n_heads: a.nkv as u32,
+                head_dim: a.hd as u32,
+                half_dim: half as u32,
+                eps,
+                rows: (n_q + 2 * a.nkv) as u32,
+                ring: 0,
+                pad0: 0,
+                pad1: 0,
+            },
+        );
+        let fm = b.uni(
+            "e4bw-facm-p",
+            FacMergeParams {
+                n_q: n_q as u32,
+                n_kv: a.nkv as u32,
+                pad0: 0,
+                pad1: 0,
+            },
+        );
+        let pl = b
+            .pl
+            .fac
+            .as_ref()
+            .and_then(|f| f.qkv.clone())
+            .expect("fac_merged checked the qkv pipeline");
+        b.push(
+            pl,
+            &[
+                (0, bufs.qa.raw()),
+                (1, a.qn),
+                (2, a.cos),
+                (3, a.sin),
+                (4, a.rope_pos),
+                (5, a.kv_start),
+                (6, bufs.q_f32.raw()),
+                (7, a.kv.k_fp8.raw()),
+                (8, a.kv.k_scales.raw()),
+                (9, &fac_p),
+                (10, bufs.ka.raw()),
+                (11, a.kn),
+                (12, bufs.va.raw()),
+                (13, a.vn),
+                (14, a.kv.v_fp8.raw()),
+                (15, a.kv.v_scales.raw()),
+                (16, &fm),
+            ],
+            ((n_q + 2 * a.nkv) as u32, 1, 1),
+        );
+    } else if fuse_attn {
         let mk_fac = |b: &mut Builder, heads: usize| {
             b.uni(
                 "e4bw-fac-p",
@@ -4848,7 +7145,53 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         );
     }
 
-    if m == 1 {
+    let tail_fnca = fuse
+        && m == 1
+        && tail_fnca_enabled()
+        && !fold_fnca_enabled()
+        && b.pl.gemv_w4_sg_tail_fnca.is_some()
+        && b.pl.gemv_w4_sg_pk_rs.is_none()
+        && a.lora_parts().is_none_or(|(_, ll)| ll.o.is_none())
+        && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.o, b.pl);
+    if tail_fnca {
+        let pl = b
+            .pl
+            .gemv_w4_sg_tail_fnca
+            .clone()
+            .expect("tail_fnca checked the pipeline");
+        b.gemv_tail_fnc(
+            pl,
+            a.o,
+            bufs.attn_pack.raw(),
+            bufs.t1.raw(),
+            x_in,
+            a.ln_pa,
+            a.ln_pf,
+            bufs.t2.raw(),
+            None,
+            bufs.tail_ctr.raw(),
+            hidden,
+            eps,
+            1.0,
+        );
+    } else if tail_gate_only_enabled()
+        && m == 1
+        && b.pl.gemv_w4_sg_tail_gate.is_some()
+        && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.o, b.pl)
+    {
+        let pl = b
+            .pl
+            .gemv_w4_sg_tail_gate
+            .clone()
+            .expect("the null probe checked the pipeline");
+        b.gemv_tail_gate_only_null_probe(
+            pl,
+            a.o,
+            bufs.attn_pack.raw(),
+            bufs.t1.raw(),
+            bufs.tail_ctr.raw(),
+        );
+    } else if m == 1 {
         b.gemv(
             a.o,
             bufs.attn_pack.raw(),
@@ -4870,12 +7213,25 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
             },
         );
     }
-    if let Some((pl, scratch, ll)) = a.lora_parts() {
+    if let Some((pl, ll)) = a.lora_parts() {
         if let Some(site) = &ll.o {
-            b.lora_site(pl, scratch, m, site, bufs.attn_pack.raw(), &[bufs.t1.raw()]);
+            b.lora_site(pl, m, site, bufs.attn_pack.raw(), &[bufs.t1.raw()]);
         }
     }
-    let mlp_in = if fuse {
+    let fnca_fold = fuse
+        && m == 1
+        && fuse_gelu_enabled()
+        && b.pl.gemv_w4_sg_fnca.is_some()
+        && matches!(
+            a.gate_up,
+            GpuProj::W4 {
+                variant: W4Variant::Sg16,
+                ..
+            }
+        );
+    let mlp_in = if tail_fnca || fnca_fold {
+        bufs.t2.raw()
+    } else if fuse {
         b.fnc_a(
             bufs.t1.raw(),
             x_in,
@@ -4914,53 +7270,172 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         bufs.t1.raw()
     };
 
-    if m == 1 {
-        b.gemv(
-            a.gate_up,
-            mlp_in,
-            GemvDst::Packed {
-                y: bufs.gu_pack.raw(),
-                word_off: 0,
-            },
-        );
-    } else {
-        b.gemv_mk(
-            a.gate_up,
-            mlp_in,
-            m,
-            hidden / 2,
-            GemvDstMk::Packed {
-                y: bufs.gu_pack.raw(),
-                word_off: 0,
-                y_stride_words: inter,
-            },
-        );
-    }
-    if let Some((pl, scratch, ll)) = a.lora_parts() {
-        if let Some(site) = &ll.gate_up {
-            b.lora_site(pl, scratch, m, site, mlp_in, &[bufs.gu_pack.raw()]);
+    let gelu_interleaved = fuse_gelu_enabled() && matches!(a.gate_up, GpuProj::W4 { .. });
+    if gelu_interleaved {
+        if let Some((_, ll)) = a.lora_parts() {
+            assert!(
+                ll.gate_up.is_none(),
+                "NV_E4B_WGPU_FUSE_GELU=1 interleaves gate_up rows; a gate_up LoRA site targets the checkpoint layout"
+            );
         }
     }
-    let gelu_p = b.uni(
-        "e4bw-gelu-p",
-        GeluParams {
-            inter: inter as u32,
-            inter_words: (inter / 2) as u32,
-            rows: m as u32,
-            tot_pairs: (m * inter) as u32,
-        },
-    );
-    let ggrid = b.grid_1d((inter / 2) as u64, 256);
-    let gelu_pl = b.pl.gelu_even.clone();
-    b.push(
-        gelu_pl,
-        &[
-            (3, bufs.gu_pack.raw()),
-            (4, bufs.act_pack.raw()),
-            (5, &gelu_p),
-        ],
-        (ggrid.0, m as u32, 1),
-    );
+    let gelu_fold_pl = if m == 1 && gelu_interleaved {
+        b.pl.gemv_w4_sg_gelu.clone()
+    } else {
+        None
+    };
+    if fnca_fold {
+        let GpuProj::W4 {
+            packed,
+            scales,
+            params,
+            grid,
+            ..
+        } = a.gate_up
+        else {
+            unreachable!("fnca_fold checked the gate_up variant")
+        };
+        let off = b.uni("e4bw-fnca-off", PkOffParams::default());
+        let fp = b.uni(
+            "e4bw-fnca-p",
+            E4bFncFoldParams {
+                hidden: hidden as u32,
+                words: (hidden / 2) as u32,
+                eps,
+                scale: 1.0,
+            },
+        );
+        let pl = b
+            .pl
+            .gemv_w4_sg_fnca
+            .clone()
+            .expect("fnca_fold checked the pipeline");
+        b.push(
+            pl,
+            &[
+                (1, scales.raw()),
+                (3, bufs.act_pack.raw()),
+                (4, params.raw()),
+                (6, packed.raw()),
+                (30, &off),
+                (40, &fp),
+                (41, bufs.t1.raw()),
+                (42, x_in),
+                (43, a.ln_pa),
+                (44, a.ln_pf),
+                (45, bufs.t2.raw()),
+            ],
+            *grid,
+        );
+    } else {
+    match (gelu_fold_pl, a.gate_up) {
+        (
+            Some(pl),
+            GpuProj::W4 {
+                packed,
+                scales,
+                params,
+                grid,
+                variant: W4Variant::Sg16,
+                n,
+                k,
+                ..
+            },
+        ) => {
+            let off = b.uni("e4bw-gelu-fold-off", PkOffParams::default());
+            let kpre = b
+                .pl
+                .gemv_w4_sg_gelu_kpre
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, p)| p.clone());
+            let (pl, fold_grid) = if let Some(p) = kpre {
+                (
+                    p,
+                    sg_rowsplit_grid_1d(
+                        *n,
+                        GELU_KPRE_ROWS_4_KEEPS_THE_MEASURED_ROWSPLIT_WIN_ON_THE_GATE_UP_FOLD,
+                        b.ctx,
+                    ),
+                )
+            } else if let Some(rs) = b.pl.gemv_w4_sg_gelu_rs.clone() {
+                let rows = sg_rowsplit_rows_per_wg()
+                    .expect("rowsplit pipelines exist only while the env resolves");
+                (rs, sg_rowsplit_grid_1d(*n, rows, b.ctx))
+            } else {
+                (pl, *grid)
+            };
+            b.push(
+                pl,
+                &[
+                    (1, scales.raw()),
+                    (3, bufs.act_pack.raw()),
+                    (4, params.raw()),
+                    (6, packed.raw()),
+                    (7, mlp_in),
+                    (30, &off),
+                ],
+                fold_grid,
+            );
+        }
+        _ => {
+            if m == 1 {
+                b.gemv(
+                    a.gate_up,
+                    mlp_in,
+                    GemvDst::Packed {
+                        y: bufs.gu_pack.raw(),
+                        word_off: 0,
+                    },
+                );
+            } else {
+                b.gemv_mk(
+                    a.gate_up,
+                    mlp_in,
+                    m,
+                    hidden / 2,
+                    GemvDstMk::Packed {
+                        y: bufs.gu_pack.raw(),
+                        word_off: 0,
+                        y_stride_words: inter,
+                    },
+                );
+            }
+            if let Some((pl, ll)) = a.lora_parts() {
+                if let Some(site) = &ll.gate_up {
+                    b.lora_site(pl, m, site, mlp_in, &[bufs.gu_pack.raw()]);
+                }
+            }
+            let gelu_p = b.uni(
+                "e4bw-gelu-p",
+                GeluParams {
+                    inter: inter as u32,
+                    inter_words: (inter / 2) as u32,
+                    rows: m as u32,
+                    tot_pairs: (m * inter) as u32,
+                },
+            );
+            let ggrid = b.grid_1d((inter / 2) as u64, 256);
+            let gelu_pl = if gelu_interleaved {
+                b.pl
+                    .gelu_inter
+                    .clone()
+                    .expect("interleaved gate_up rows without the interleaved gelu pipeline")
+            } else {
+                b.pl.gelu_even.clone()
+            };
+            b.push(
+                gelu_pl,
+                &[
+                    (3, bufs.gu_pack.raw()),
+                    (4, bufs.act_pack.raw()),
+                    (5, &gelu_p),
+                ],
+                (ggrid.0, m as u32, 1),
+            );
+        }
+    }
+    }
     if m == 1 {
         b.gemv(
             a.down,
@@ -4983,15 +7458,78 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
             },
         );
     }
-    if let Some((pl, scratch, ll)) = a.lora_parts() {
+    if let Some((pl, ll)) = a.lora_parts() {
         if let Some(site) = &ll.down {
-            b.lora_site(pl, scratch, m, site, bufs.act_pack.raw(), &[bufs.t0.raw()]);
+            b.lora_site(pl, m, site, bufs.act_pack.raw(), &[bufs.t0.raw()]);
         }
     }
+    let mlp_res = if fnca_fold { bufs.t2.raw() } else { x_in };
+    let fncb_fold = fuse
+        && m == 1
+        && b.pl.gemv_w4_sg_fncb.is_some()
+        && matches!(
+            a.pl_gate_proj,
+            GpuProj::W4 {
+                variant: W4Variant::Sg16,
+                ..
+            }
+        );
+    if fncb_fold {
+        let GpuProj::W4 {
+            packed,
+            scales,
+            params,
+            grid,
+            ..
+        } = a.pl_gate_proj
+        else {
+            unreachable!("fncb_fold checked the pl_gate variant")
+        };
+        let off = b.uni("e4bw-fncb-off", PkOffParams::default());
+        let gmf = b.uni(
+            "e4bw-fncb-gm-p",
+            GmFoldParams {
+                pli_word_off: (a.li * hpl / 2) as u32,
+                ..Default::default()
+            },
+        );
+        let fp = b.uni(
+            "e4bw-fncb-p",
+            E4bFncFoldParams {
+                hidden: hidden as u32,
+                words: (hidden / 2) as u32,
+                eps,
+                scale: 1.0,
+            },
+        );
+        let pl = b
+            .pl
+            .gemv_w4_sg_fncb
+            .clone()
+            .expect("fncb_fold checked the pipeline");
+        b.push(
+            pl,
+            &[
+                (1, scales.raw()),
+                (3, bufs.pl_gated.raw()),
+                (4, params.raw()),
+                (6, packed.raw()),
+                (30, &off),
+                (9, bufs.pli.raw()),
+                (10, &gmf),
+                (40, &fp),
+                (41, bufs.t0.raw()),
+                (42, mlp_res),
+                (43, a.ln_po),
+                (45, bufs.mid.raw()),
+            ],
+            *grid,
+        );
+    } else {
     if fuse {
         b.fnc_b(
             bufs.t0.raw(),
-            x_in,
+            mlp_res,
             a.ln_po,
             bufs.mid.raw(),
             m,
@@ -5004,58 +7542,147 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         b.resadd(x_in, bufs.t1.raw(), bufs.mid.raw(), m * hidden, 1.0);
     }
 
-    if m == 1 {
-        b.gemv(
-            a.pl_gate_proj,
-            bufs.mid.raw(),
-            GemvDst::Packed {
-                y: bufs.pl_gate.raw(),
-                word_off: 0,
-            },
-        );
+    let plgate_fold_pl = if m == 1 {
+        b.pl.gemv_w4_sg_gm.clone()
     } else {
-        b.gemv_mk(
-            a.pl_gate_proj,
-            bufs.mid.raw(),
-            m,
-            hidden / 2,
-            GemvDstMk::Packed {
-                y: bufs.pl_gate.raw(),
-                word_off: 0,
-                y_stride_words: hpl / 2,
-            },
-        );
-    }
-    let gm_p = b.uni(
-        "e4bw-gm-p",
-        GmParams {
-            n_words: (m * hpl / 2) as u32,
-            pli_word_off: (a.li * hpl / 2) as u32,
-            tok_words: (hpl / 2) as u32,
-            pli_stride: (cfg.ple_row / 2) as u32,
-        },
-    );
-    let gmgrid = b.grid_1d((m * hpl / 2) as u64, 256);
-    let gm_pl = if m == 1 {
-        b.pl.gatemul.clone()
-    } else {
-        b.pl.mk
-            .as_ref()
-            .expect("prefill gatemul pipeline")
-            .gatemul
-            .clone()
+        None
     };
-    b.push(
-        gm_pl,
-        &[
-            (0, bufs.pl_gate.raw()),
-            (1, bufs.pli.raw()),
-            (2, bufs.pl_gated.raw()),
-            (3, &gm_p),
-        ],
-        gmgrid,
-    );
-    if m == 1 {
+    match (plgate_fold_pl, a.pl_gate_proj) {
+        (
+            Some(pl),
+            GpuProj::W4 {
+                packed,
+                scales,
+                params,
+                grid,
+                variant: W4Variant::Sg16,
+                ..
+            },
+        ) => {
+            let off = b.uni("e4bw-gm-fold-off", PkOffParams::default());
+            let gmf = b.uni(
+                "e4bw-gm-fold-p",
+                GmFoldParams {
+                    pli_word_off: (a.li * hpl / 2) as u32,
+                    ..Default::default()
+                },
+            );
+            let fold_grid = *grid;
+            b.push(
+                pl,
+                &[
+                    (1, scales.raw()),
+                    (3, bufs.pl_gated.raw()),
+                    (4, params.raw()),
+                    (6, packed.raw()),
+                    (7, bufs.mid.raw()),
+                    (30, &off),
+                    (9, bufs.pli.raw()),
+                    (10, &gmf),
+                ],
+                fold_grid,
+            );
+        }
+        _ => {
+            if m == 1 {
+                b.gemv(
+                    a.pl_gate_proj,
+                    bufs.mid.raw(),
+                    GemvDst::Packed {
+                        y: bufs.pl_gate.raw(),
+                        word_off: 0,
+                    },
+                );
+            } else {
+                b.gemv_mk(
+                    a.pl_gate_proj,
+                    bufs.mid.raw(),
+                    m,
+                    hidden / 2,
+                    GemvDstMk::Packed {
+                        y: bufs.pl_gate.raw(),
+                        word_off: 0,
+                        y_stride_words: hpl / 2,
+                    },
+                );
+            }
+            let gm_p = b.uni(
+                "e4bw-gm-p",
+                GmParams {
+                    n_words: (m * hpl / 2) as u32,
+                    pli_word_off: (a.li * hpl / 2) as u32,
+                    tok_words: (hpl / 2) as u32,
+                    pli_stride: (cfg.ple_row / 2) as u32,
+                },
+            );
+            let gmgrid = b.grid_1d((m * hpl / 2) as u64, 256);
+            let gm_pl = if m == 1 {
+                b.pl.gatemul.clone()
+            } else {
+                b.pl.mk
+                    .as_ref()
+                    .expect("prefill gatemul pipeline")
+                    .gatemul
+                    .clone()
+            };
+            b.push(
+                gm_pl,
+                &[
+                    (0, bufs.pl_gate.raw()),
+                    (1, bufs.pli.raw()),
+                    (2, bufs.pl_gated.raw()),
+                    (3, &gm_p),
+                ],
+                gmgrid,
+            );
+        }
+    }
+    }
+    let tail_fncc = fuse
+        && m == 1
+        && tail_fncc_enabled()
+        && !fold_fncc_enabled()
+        && b.pl.gemv_w4_sg_tail_fncc.is_some()
+        && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.pl_proj, b.pl);
+    if tail_fncc {
+        let pl = b
+            .pl
+            .gemv_w4_sg_tail_fncc
+            .clone()
+            .expect("tail_fncc checked the pipeline");
+        b.gemv_tail_fnc(
+            pl,
+            a.pl_proj,
+            bufs.pl_gated.raw(),
+            bufs.t1.raw(),
+            bufs.mid.raw(),
+            a.ln_pli,
+            a.ln_next,
+            x_out,
+            Some(bufs.t0.raw()),
+            bufs.tail_ctr.raw(),
+            hidden,
+            eps,
+            a.layer_scalar,
+        );
+    } else if tail_gate_only_enabled()
+        && m == 1
+        && b.pl.gemv_w4_sg_tail_gate.is_some()
+        && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.pl_proj, b.pl)
+    {
+        let pl = b
+            .pl
+            .gemv_w4_sg_tail_gate
+            .clone()
+            .expect("the null probe checked the pipeline");
+        b.gemv_tail_gate_only_null_probe(
+            pl,
+            a.pl_proj,
+            bufs.pl_gated.raw(),
+            bufs.t1.raw(),
+            bufs.tail_ctr.raw(),
+        );
+    } else if m == 1 {
         b.gemv(
             a.pl_proj,
             bufs.pl_gated.raw(),
@@ -5077,19 +7704,32 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
             },
         );
     }
-    if fuse {
-        b.fnc_c(
-            bufs.t1.raw(),
-            bufs.mid.raw(),
-            a.ln_pli,
-            a.ln_next,
-            x_out,
-            bufs.t0.raw(),
-            m,
-            hidden,
-            eps,
-            a.layer_scalar,
-        );
+    if tail_fncc {
+    } else if fuse {
+        let defer_c = decode_list
+            && fold_fncc_enabled()
+            && b.pl.gemv_w4_sg_fncc_pk.is_some()
+            && a.li + 1 < cfg.n_layers;
+        if defer_c {
+            b.deferred_fnc_c = Some(DeferredFncC {
+                ln_pli: a.ln_pli.clone(),
+                ln_next: a.ln_next.clone(),
+                scale: a.layer_scalar,
+            });
+        } else {
+            b.fnc_c(
+                bufs.t1.raw(),
+                bufs.mid.raw(),
+                a.ln_pli,
+                a.ln_next,
+                x_out,
+                bufs.t0.raw(),
+                m,
+                hidden,
+                eps,
+                a.layer_scalar,
+            );
+        }
     } else {
         b.rms(bufs.t1.raw(), a.ln_pli, bufs.t2.raw(), m, hidden, eps);
         b.resadd(
@@ -5276,6 +7916,9 @@ fn pipeline_name(pl: &Pipelines, p: &Arc<wgpu::ComputePipeline>) -> &'static str
     if opt(&pl.gemv_w4_sg_pk) {
         return "gemv_w4_sg16";
     }
+    if opt(&pl.gemv_w4_sg_pk_u2) {
+        return "gemv_w4_sg16_u2";
+    }
     if opt(&pl.gemv_w4_sg_pk3) {
         return "gemv_w4_sg16_qkv";
     }
@@ -5299,6 +7942,51 @@ fn pipeline_name(pl: &Pipelines, p: &Arc<wgpu::ComputePipeline>) -> &'static str
     }
     if eq(&pl.gatemul) {
         return "gatemul";
+    }
+    if opt(&pl.gemv_w4_sg_gm) {
+        return "gemv_w4_sg16_gatemul_fold";
+    }
+    if opt(&pl.gemv_w4_sg_fnca) {
+        return "gemv_w4_sg16_fnca_gelu_fold";
+    }
+    if opt(&pl.gemv_w4_sg_fncb) {
+        return "gemv_w4_sg16_fncb_gm_fold";
+    }
+    if opt(&pl.gemv_w4_sg_tail_fnca) {
+        return "gemv_w4_sg16_tail_fnca";
+    }
+    if opt(&pl.gemv_w4_sg_tail_fncc) {
+        return "gemv_w4_sg16_tail_fncc";
+    }
+    if opt(&pl.gemv_w4_sg_tail_gate) {
+        return "gemv_w4_sg16_tail_gate_null_probe";
+    }
+    if opt(&pl.gemv_w4_sg_fncc_pk) || opt(&pl.gemv_w4_sg_fncc_pk3) {
+        return "gemv_w4_sg16_fncc_fold";
+    }
+    if opt(&pl.gemv_w4_sg_gelu) {
+        return "gemv_w4_sg16_gelu_fold";
+    }
+    if opt(&pl.gemv_w4_sg_pk_rs) {
+        return "gemv_w4_sg16_rowsplit";
+    }
+    if opt(&pl.gemv_w4_sg_pk3_rs) {
+        return "gemv_w4_sg16_qkv_rowsplit";
+    }
+    if opt(&pl.gemv_w4_sg_gelu_rs) {
+        return "gemv_w4_sg16_gelu_fold_rowsplit";
+    }
+    if pl.gemv_w4_sg_kpre.iter().any(|(_, p2)| eq(p2)) {
+        return "gemv_w4_sg16_kpre";
+    }
+    if pl.gemv_w4_sg_kpre3.iter().any(|(_, p2)| eq(p2)) {
+        return "gemv_w4_sg16_qkv_kpre";
+    }
+    if pl.gemv_w4_sg_gelu_kpre.iter().any(|(_, p2)| eq(p2)) {
+        return "gemv_w4_sg16_gelu_fold_kpre";
+    }
+    if opt(&pl.gelu_inter) {
+        return "gelu_mul_interleaved";
     }
     if eq(&pl.am1) {
         return "argmax_stage1";
@@ -5326,6 +8014,9 @@ fn pipeline_name(pl: &Pipelines, p: &Arc<wgpu::ComputePipeline>) -> &'static str
         }
         if eq(&f.v) {
             return "fused_attn_v";
+        }
+        if opt(&f.qkv) {
+            return "fused_attn_qkv";
         }
     }
     for mk in [pl.mk.as_ref(), pl.mk_verify.as_ref()]
@@ -5423,11 +8114,11 @@ fn encode_passes_staged(
 const TOK_STAGE_BYTES: u64 = 64;
 
 fn staged_read_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_STAGED_READ").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_STAGED_READ")
 }
 
 fn spin_read_enabled() -> bool {
-    std::env::var("NV_E4B_WGPU_SPIN_READ").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_SPIN_READ")
 }
 
 const SPIN_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
@@ -5478,6 +8169,12 @@ pub struct Gemma4E4bWgpu {
     deep_split_depth: u32,
     deep_splits_baked: u32,
     deep_overlay: Vec<Option<Pass>>,
+    deep2_split_depth: u32,
+    deep2_splits_baked: u32,
+    deep2_overlay: Vec<Option<Pass>>,
+    sliding_splits_cap: Option<u32>,
+    deep_flash1_full_indices: Vec<usize>,
+    deep_flash1_sliding_indices: Vec<usize>,
 
     base_passes: usize,
     prof: ProfMode,
@@ -5489,7 +8186,7 @@ pub struct Gemma4E4bWgpu {
     fnc_unrolled: Option<[bool; 3]>,
     flash1_entry: String,
     flash1_hds: Vec<(u32, usize)>,
-    _keep: Vec<Box<dyn std::any::Any>>,
+    _keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 pub enum WeightSource<'a> {
@@ -5667,6 +8364,19 @@ impl Gemma4E4bWgpu {
             }
         }
         let verify_m = verify_m_from_env();
+        let kpre_ks = {
+            let mut ks = vec![
+                config.hidden_size,
+                config.intermediate_size,
+                config.num_attention_heads * config.head_dim_for(LayerType::SlidingAttention),
+                config.num_attention_heads * config.head_dim_for(LayerType::FullAttention),
+                config.hidden_size_per_layer_input,
+            ];
+            ks.sort_unstable();
+            ks.dedup();
+            ks.retain(|k| k.is_multiple_of(32) && *k >= 32);
+            ks
+        };
         let pl = build_pipelines(
             ctx,
             sg16,
@@ -5680,6 +8390,7 @@ impl Gemma4E4bWgpu {
             config.hidden_size,
             &flash1_head_dims(&config),
             gqa_group_of(&config),
+            &kpre_ks,
         )?;
         let fnc_unrolled = pl.fnc.as_ref().map(|f| f.unrolled);
         eprintln!(
@@ -5721,6 +8432,7 @@ impl Gemma4E4bWgpu {
         let mut b = Builder {
             ctx,
             pl: &pl,
+            deferred_fnc_c: None,
             passes: Vec::new(),
             prefill_passes: Vec::new(),
             verify_prefill_passes: Vec::new(),
@@ -5733,6 +8445,13 @@ impl Gemma4E4bWgpu {
             mk_prefill_unis: Vec::new(),
             mk_verify_unis: Vec::new(),
             deep_attn: Vec::new(),
+            deep2_attn: Vec::new(),
+            deep_flash1_full_indices: Vec::new(),
+            deep_flash1_sliding_indices: Vec::new(),
+            sliding_splits_cap:
+                sliding_splits_cap_a_sliding_layer_scans_at_most_its_window_so_its_band_saturates_there(
+                    config.sliding_window,
+                ),
         };
 
         let hidden = config.hidden_size;
@@ -5840,28 +8559,6 @@ impl Gemma4E4bWgpu {
             ))
         } else {
             None
-        };
-        let lora_scratch = lora.map(|l| {
-            let w = l.max_row_width().max(2);
-            (
-                GpuTensor::<u32>::zeroed(ctx, "e4bw-lora-scratch", w),
-                prefill_m.max(1).saturating_mul(w),
-            )
-        });
-        let (lora_scratch, pf_lora_scratch) = match lora_scratch {
-            Some((decode, pf_len)) => {
-                let pf = if prefill_m > 0 {
-                    Some(GpuTensor::<u32>::zeroed(
-                        ctx,
-                        "e4bw-lora-scratch-pf",
-                        pf_len,
-                    ))
-                } else {
-                    None
-                };
-                (Some(decode), pf)
-            }
-            None => (None, None),
         };
         let logits_pk = GpuTensor::<u32>::zeroed(ctx, "e4bw-logits-pk", vocab / 2);
         let logits_f32 = GpuTensor::<f32>::zeroed(ctx, "e4bw-logits-f32", vocab);
@@ -6064,7 +8761,10 @@ impl Gemma4E4bWgpu {
 
             let qkv = upload_proj(ctx, &mut b, "e4bw-qkv", &hl.qkv)?;
             let o = upload_proj(ctx, &mut b, "e4bw-o", &hl.o)?;
-            let gate_up = upload_proj(ctx, &mut b, "e4bw-gate-up", &hl.gate_up)?;
+            let gate_up = match interleave_gate_up_rows_when_gelu_fold_on(&hl.gate_up) {
+                Some(il) => upload_proj(ctx, &mut b, "e4bw-gate-up", &il)?,
+                None => upload_proj(ctx, &mut b, "e4bw-gate-up", &hl.gate_up)?,
+            };
             let down = upload_proj(ctx, &mut b, "e4bw-down", &hl.down)?;
             let pl_gate_proj = upload_proj(ctx, &mut b, "e4bw-plig", &hl.per_layer_input_gate)?;
             let pl_proj = upload_proj(ctx, &mut b, "e4bw-plp", &hl.per_layer_projection)?;
@@ -6142,7 +8842,6 @@ impl Gemma4E4bWgpu {
                 kv_start: kv_start.raw(),
                 lora: None,
                 lora_pl: lora_pl.as_ref(),
-                lora_scratch: lora_scratch.as_ref().map(|t| t.raw()),
             };
             let layer_lora = match lora {
                 Some(l) => Some(upload_lora_layer(ctx, &l.layers[li])?),
@@ -6157,7 +8856,6 @@ impl Gemma4E4bWgpu {
                     LayerType::SlidingAttention => pf_s.raw(),
                     LayerType::FullAttention => pf_f.raw(),
                 };
-                le.lora_scratch = pf_lora_scratch.as_ref().map(|t| t.raw());
                 b.to_prefill = true;
                 emit_layer(&mut b, &le);
                 if b.wants_verify_list() {
@@ -6532,8 +9230,7 @@ impl Gemma4E4bWgpu {
             _ => None,
         };
 
-        b.keep
-            .push(Box::new((lora_scratch, pf_lora_scratch, lora_pl)));
+        b.keep.push(Box::new(lora_pl));
         b.keep.push(Box::new(ple_tab));
         b.keep.push(Box::new((final_norm, plp_norm, plmp)));
         b.keep.push(Box::new(ln_in_all));
@@ -6552,9 +9249,13 @@ impl Gemma4E4bWgpu {
             mk_prefill_unis,
             mk_verify_unis,
             deep_attn,
+            deep2_attn,
+            deep_flash1_full_indices,
+            deep_flash1_sliding_indices,
             ..
         } = b;
         let deep_arm = deep_split_arm();
+        let deep2_arm = deep2_split_arm();
         if deep_arm.is_some() {
             assert_eq!(
                 deep_attn.len(),
@@ -6569,18 +9270,44 @@ impl Gemma4E4bWgpu {
                 "deep twins recorded while the deep split arm is disabled"
             );
         }
-        let mut deep_overlay: Vec<Option<Pass>> = vec![None; passes.len()];
-        for (i, p) in deep_attn {
+        if deep2_arm.is_some() {
+            assert_eq!(
+                deep2_attn.len(),
+                2 * config.num_hidden_layers,
+                "the second deep band must shadow exactly stage1+stage2 in each of {} decode \
+                 layers; {DEEP2_BAND_RULE}",
+                config.num_hidden_layers
+            );
+        } else {
             assert!(
-                deep_overlay[i].replace(p).is_none(),
-                "deep split-arm overlay would shadow decode pass {i} twice"
+                deep2_attn.is_empty(),
+                "second-band twins recorded while {E4B_DEEP_DEPTHGATE_ENV} is off"
             );
         }
+        let overlay = |twins: Vec<(usize, Pass)>| -> Vec<Option<Pass>> {
+            let mut o: Vec<Option<Pass>> = vec![None; passes.len()];
+            for (i, p) in twins {
+                assert!(
+                    o[i].replace(p).is_none(),
+                    "deep split-arm overlay would shadow decode pass {i} twice"
+                );
+            }
+            o
+        };
+        let deep_overlay = overlay(deep_attn);
+        let deep2_overlay = overlay(deep2_attn);
         if let Some((depth, splits)) = deep_arm {
             eprintln!(
                 "[gemma4_e4b_wgpu] decode split-k arms: shallow {} / deep {splits} past total \
                  {depth}",
                 decode_splits()
+            );
+        }
+        if let Some((knee, splits)) = deep2_arm {
+            eprintln!(
+                "[gemma4_e4b_wgpu] decode split-k band 2: {splits} past total {knee}, sliding \
+                 layers keyed on min(total, window {})",
+                config.sliding_window
             );
         }
         eprintln!(
@@ -6638,6 +9365,10 @@ impl Gemma4E4bWgpu {
             rows_live_verify: prefill_m,
             live_rows_enabled: verify_live_rows_enabled(),
         });
+        let sliding_splits_cap =
+            sliding_splits_cap_a_sliding_layer_scans_at_most_its_window_so_its_band_saturates_there(
+                config.sliding_window,
+            );
         Ok(Self {
             ctx,
             config,
@@ -6672,15 +9403,21 @@ impl Gemma4E4bWgpu {
             decode_hid,
             decode_hid_row_words: hidden / 2,
             vocab,
-            enc_stats: std::env::var("NV_E4B_WGPU_ENCODE_STATS").ok().as_deref() == Some("1"),
+            enc_stats: nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_ENCODE_STATS"),
             enc_us_sum: 0.0,
             enc_us_min: f64::INFINITY,
             enc_steps: 0,
-            preenc: std::env::var("NV_E4B_WGPU_PREENC").ok().as_deref() != Some("0"),
+            preenc: nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_PREENC"),
             pending_cb: None,
             deep_split_depth: deep_arm.map(|(d, _)| d).unwrap_or(0),
             deep_splits_baked: deep_arm.map(|(_, s)| s).unwrap_or_else(decode_splits),
             deep_overlay,
+            deep2_split_depth: deep2_arm.map(|(d, _)| d).unwrap_or(0),
+            deep2_splits_baked: deep2_arm.map(|(_, s)| s).unwrap_or_else(decode_splits),
+            deep2_overlay,
+            sliding_splits_cap,
+            deep_flash1_full_indices,
+            deep_flash1_sliding_indices,
             base_passes: labels.len(),
             pass_labels: labels,
             prof: if dispatch::profile::enabled() && ctx.caps.timestamp_query {
@@ -6701,10 +9438,20 @@ impl Gemma4E4bWgpu {
     }
 
     fn arm_for_total(&self, total: usize) -> SplitArm {
-        if self.deep_split_depth > 0 && total > self.deep_split_depth as usize {
+        if self.deep2_split_depth > 0 && total > self.deep2_split_depth as usize {
+            SplitArm::Deep2
+        } else if self.deep_split_depth > 0 && total > self.deep_split_depth as usize {
             SplitArm::Deep
         } else {
             SplitArm::Shallow
+        }
+    }
+
+    fn sliding_splits_for_total(&self, total: usize) -> u32 {
+        let arm = self.arm_splits(self.arm_for_total(total));
+        match self.sliding_splits_cap {
+            Some(c) => arm.min(c),
+            None => arm,
         }
     }
 
@@ -6716,16 +9463,43 @@ impl Gemma4E4bWgpu {
         match arm {
             SplitArm::Shallow => self.fd_full_base.splits,
             SplitArm::Deep => self.deep_splits_baked,
+            SplitArm::Deep2 => self.deep2_splits_baked,
         }
     }
 
     fn arm_pass(&self, i: usize, arm: SplitArm) -> &Pass {
-        if arm == SplitArm::Deep {
-            if let Some(Some(p)) = self.deep_overlay.get(i) {
-                return p;
-            }
+        let overlay = match arm {
+            SplitArm::Shallow => None,
+            SplitArm::Deep => self.deep_overlay.get(i),
+            SplitArm::Deep2 => self.deep2_overlay.get(i),
+        };
+        if let Some(Some(p)) = overlay {
+            return p;
         }
         &self.passes[i]
+    }
+
+    pub fn flash1_grid_y_as_encoded_for_total(&self, total: usize) -> (Vec<u32>, Vec<u32>) {
+        let arm = self.arm_for_total(total);
+        (
+            self.deep_flash1_full_indices
+                .iter()
+                .map(|&i| self.arm_pass(i, arm).grid.1)
+                .collect(),
+            self.deep_flash1_sliding_indices
+                .iter()
+                .map(|&i| self.arm_pass(i, arm).grid.1)
+                .collect(),
+        )
+    }
+
+    pub fn split_bands_shallow_deep_deep2(&self) -> (u32, Option<(u32, u32)>, Option<(u32, u32)>) {
+        (
+            self.fd_full_base.splits,
+            (self.deep_split_depth > 0).then_some((self.deep_split_depth, self.deep_splits_baked)),
+            (self.deep2_split_depth > 0)
+                .then_some((self.deep2_split_depth, self.deep2_splits_baked)),
+        )
     }
 
     fn take_arm_cb(
@@ -7078,7 +9852,33 @@ impl Gemma4E4bWgpu {
         });
         let arm = self.active_arm();
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        if per_dispatch {
+        let inpass_low_distortion = dispatch::profile_inpass_low_distortion_requested()
+            && self.ctx.ts_inside_passes;
+        static PROF_SHAPE_BANNER_ONCE: std::sync::Once = std::sync::Once::new();
+        PROF_SHAPE_BANNER_ONCE.call_once(|| {
+            eprintln!(
+                "[e4bw-prof] shape={} ts_inside_passes={}",
+                if inpass_low_distortion {
+                    "inpass-low-distortion"
+                } else if per_dispatch {
+                    "pass-per-dispatch"
+                } else {
+                    "whole-pass"
+                },
+                self.ctx.ts_inside_passes
+            );
+        });
+        if per_dispatch && inpass_low_distortion {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            for i in 0..n {
+                let p = self.arm_pass(i, arm);
+                pass.write_timestamp(&qs, (i * 2) as u32);
+                pass.set_pipeline(&p.pipeline);
+                pass.set_bind_group(0, &p.bind, &[]);
+                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                pass.write_timestamp(&qs, (i * 2 + 1) as u32);
+            }
+        } else if per_dispatch {
             for i in 0..n {
                 let p = self.arm_pass(i, arm);
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -7221,6 +10021,50 @@ impl Gemma4E4bWgpu {
         self.kv_epoch += 1;
     }
 
+    pub fn fill_kv_cache_with_finite_synthetic_bytes_and_set_pos_for_depth_timing_decode_reads_kv_size_not_values(
+        &mut self,
+        pos: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            pos <= self.max_seq,
+            "synthetic fill pos {pos} past max_seq {}; e4b keeps one flat fp8 slot array per kv \
+             layer with no ring, so the sliding window start and every flash split boundary are \
+             pure functions of pos and pos alone is the cache-depth state",
+            self.max_seq
+        );
+        let _ = self.decode_pipe_abort();
+        let words = self
+            .kv_layers
+            .iter()
+            .flatten()
+            .map(|kv| kv.k_fp8.len().max(kv.v_fp8.len()))
+            .max()
+            .unwrap_or(0);
+        let scales = self
+            .kv_layers
+            .iter()
+            .flatten()
+            .map(|kv| kv.k_scales.len().max(kv.v_scales.len()))
+            .max()
+            .unwrap_or(0);
+        let pattern = synthetic_kv_bytes_0x30_to_0x3e_finite_small_under_e4m3_and_f32_views_so_no_nan_and_no_zero_scale(
+            (words * 4).max(scales * 4),
+        );
+        for kv in self.kv_layers.iter().flatten() {
+            for (buf, bytes) in [
+                (kv.k_fp8.raw(), kv.k_fp8.len() * 4),
+                (kv.v_fp8.raw(), kv.v_fp8.len() * 4),
+                (kv.k_scales.raw(), kv.k_scales.len() * 4),
+                (kv.v_scales.raw(), kv.v_scales.len() * 4),
+            ] {
+                self.ctx.queue.write_buffer(buf, 0, &pattern[..bytes]);
+            }
+        }
+        self.pos = pos;
+        self.kv_epoch += 1;
+        Ok(())
+    }
+
     pub fn kv_cache_snapshot(&self, li: usize) -> Result<Option<KvCacheSnapshot>> {
         anyhow::ensure!(
             self.pipe_inflight == 0,
@@ -7359,11 +10203,7 @@ impl Gemma4E4bWgpu {
         let mut fd_s = self.fd_sliding_base;
         fd_s.total = total as u32;
         fd_s.start = Self::window_start(total, self.config.sliding_window) as u32;
-        fd_s.splits = if deep_full_only() {
-            self.fd_full_base.splits
-        } else {
-            splits
-        };
+        fd_s.splits = self.sliding_splits_for_total(total);
         self.fd_sliding.write(self.ctx, &fd_s);
         let mut fd_f = self.fd_full_base;
         fd_f.total = total as u32;
@@ -8248,391 +11088,12 @@ pub fn e4b_host_weights_from_loader(
     })
 }
 
-const LORA_CVT_WGSL: &str = include_str!("../../nv-kernels/wgsl/e4b_lora_cvt.wgsl");
-
-const LORA_WIDEN_ENTRY: &str = "e4b_lora_widen";
-const LORA_REPACK_ENTRY: &str = "e4b_lora_repack";
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct LoraCvtParams {
-    m: u32,
-    width: u32,
-    pk_row_words: u32,
-    wide_row_elems: u32,
-    wide_col_off: u32,
-    total: u32,
-    pad0: u32,
-    pad1: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct LoraFusedParams {
-    m: u32,
-    rank: u32,
-    k: u32,
-    a_slice_stride: u32,
-    a_d0_stride: u32,
-    y_row_stride: u32,
-    win_off: u32,
-    win_len: u32,
-    scale: f32,
-    off_counts: u32,
-    off_start: u32,
-    off_active: u32,
-    off_slice_n: u32,
-    off_slice_start: u32,
-    off_b_off: u32,
-    off_b_d0: u32,
-}
-
-struct LoraMetaLayout {
-    data: Vec<i32>,
-    off_counts: u32,
-    off_start: u32,
-    off_active: u32,
-    off_slice_n: u32,
-    off_slice_start: u32,
-    off_b_off: u32,
-    off_b_d0: u32,
-}
-
-fn build_lora_meta(meta: &wk::lora::LoraMeta, widths: &[usize], rank: usize) -> LoraMetaLayout {
-    let mut data: Vec<i32> = Vec::new();
-    data.extend_from_slice(&meta.token_indices_sorted);
-    let off_counts = data.len() as u32;
-    data.extend_from_slice(&meta.num_tokens_per_lora);
-    let off_start = data.len() as u32;
-    data.extend_from_slice(&meta.lora_token_start_loc);
-    let off_active = data.len() as u32;
-    data.extend_from_slice(&meta.active_lora_ids);
-    let off_slice_n = data.len() as u32;
-    for &w in widths {
-        data.push(w as i32);
-    }
-    let off_slice_start = data.len() as u32;
-    let mut acc = 0usize;
-    for &w in widths {
-        data.push(acc as i32);
-        acc += w;
-    }
-    let off_b_off = data.len() as u32;
-    let mut b_acc = 0usize;
-    for &w in widths {
-        data.push(b_acc as i32);
-        b_acc += meta.max_loras * w * rank;
-    }
-    let off_b_d0 = data.len() as u32;
-    for &w in widths {
-        data.push((w * rank) as i32);
-    }
-    LoraMetaLayout {
-        data,
-        off_counts,
-        off_start,
-        off_active,
-        off_slice_n,
-        off_slice_start,
-        off_b_off,
-        off_b_d0,
-    }
-}
-
-struct LoraPipelines {
-    fused: Arc<wgpu::ComputePipeline>,
-    widen: Arc<wgpu::ComputePipeline>,
-    repack: Arc<wgpu::ComputePipeline>,
-}
-
-fn build_lora_pipelines(ctx: &WgpuContext) -> Result<LoraPipelines> {
-    let mk = |label: &str, source: &str, entry: &str| {
-        dispatch::cached_compute_pipeline(ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}: {e}"))
-    };
-    let src_fused = compose(wk::lora::FUSED_WGSL);
-    let src_cvt = compose(LORA_CVT_WGSL);
-    Ok(LoraPipelines {
-        fused: mk("e4bw-lora-fused", &src_fused, wk::lora::FUSED_ENTRY)?,
-        widen: mk("e4bw-lora-widen", &src_cvt, LORA_WIDEN_ENTRY)?,
-        repack: mk("e4bw-lora-repack", &src_cvt, LORA_REPACK_ENTRY)?,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_lora_site(
-    ctx: &WgpuContext,
-    out: &mut Vec<Pass>,
-    keep: &mut Vec<Box<dyn std::any::Any>>,
-    pl: &LoraPipelines,
-    scratch: &wgpu::Buffer,
-    m: usize,
-    site: &LoraSiteGpu,
-    x: &wgpu::Buffer,
-    segs: &[&wgpu::Buffer],
-) {
-    assert_eq!(
-        segs.len(),
-        site.segs.len(),
-        "lora site: {} destination buffers for {} segments",
-        segs.len(),
-        site.segs.len()
-    );
-    let total_w: usize = site.segs.iter().sum();
-    fn cvt(
-        ctx: &WgpuContext,
-        out: &mut Vec<Pass>,
-        keep: &mut Vec<Box<dyn std::any::Any>>,
-        pipeline: &Arc<wgpu::ComputePipeline>,
-        scratch: &wgpu::Buffer,
-        m: usize,
-        total_w: usize,
-        seg_widths: &[usize],
-        segs: &[&wgpu::Buffer],
-        widen: bool,
-    ) {
-        let mut off = 0usize;
-        for (buf, w) in segs.iter().zip(seg_widths.iter()) {
-            let total = if widen { m * w } else { m * w / 2 };
-            let p = GpuUniform::new(
-                ctx,
-                "e4bw-lora-cvt-p",
-                &LoraCvtParams {
-                    m: m as u32,
-                    width: *w as u32,
-                    pk_row_words: (w / 2) as u32,
-                    wide_row_elems: total_w as u32,
-                    wide_col_off: off as u32,
-                    total: total as u32,
-                    ..Default::default()
-                },
-            );
-            let grid = dispatch::workgroup_count_1d(ctx, total as u64, 256);
-            let binds: [(u32, &wgpu::Buffer); 3] = [(0, buf), (1, scratch), (2, p.raw())];
-            let bind = dispatch::bind_group(ctx, pipeline, &binds);
-            let (bound_bytes, widest_bytes) = bind_bytes(binds.iter().map(|(_, b)| *b));
-            out.push(Pass {
-                pipeline: pipeline.clone(),
-                bind,
-                grid,
-                bound_bytes,
-                widest_bytes,
-            });
-            keep.push(Box::new(p));
-            off += w;
-        }
-    }
-    cvt(
-        ctx, out, keep, &pl.widen, scratch, m, total_w, &site.segs, segs, true,
-    );
-
-    let meta = wk::lora::LoraMeta::prepare(&vec![0i32; m], 1);
-    let ml = build_lora_meta(&meta, &site.widths, site.rank);
-    let meta_buf = GpuTensor::<i32>::upload(ctx, "e4bw-lora-meta", &ml.data);
-    let params = GpuUniform::new(
-        ctx,
-        "e4bw-lora-fused-p",
-        &LoraFusedParams {
-            m: m as u32,
-            rank: site.rank as u32,
-            k: site.k as u32,
-            a_slice_stride: (site.rank * site.k) as u32,
-            a_d0_stride: (site.rank * site.k) as u32,
-            y_row_stride: total_w as u32,
-            win_off: 0,
-            win_len: total_w as u32,
-            scale: 1.0,
-            off_counts: ml.off_counts,
-            off_start: ml.off_start,
-            off_active: ml.off_active,
-            off_slice_n: ml.off_slice_n,
-            off_slice_start: ml.off_slice_start,
-            off_b_off: ml.off_b_off,
-            off_b_d0: ml.off_b_d0,
-        },
-    );
-    let max_n = *site.widths.iter().max().expect("lora site has slices");
-    let grid = (
-        (m * max_n.div_ceil(wk::lora::FUSED_N_CHUNK as usize)) as u32,
-        site.widths.len() as u32,
-        meta.grid_loras() as u32,
-    );
-    let limit = ctx.caps.max_compute_workgroups_per_dimension;
-    assert!(
-        grid.0 <= limit && grid.1 <= limit && grid.2 <= limit,
-        "lora fused grid {grid:?} exceeds device limit {limit}"
-    );
-    let binds: [(u32, &wgpu::Buffer); 6] = [
-        (0, x),
-        (1, site.a.raw()),
-        (2, site.b.raw()),
-        (3, scratch),
-        (4, meta_buf.raw()),
-        (5, params.raw()),
-    ];
-    let bind = dispatch::bind_group(ctx, &pl.fused, &binds);
-    let (bound_bytes, widest_bytes) = bind_bytes(binds.iter().map(|(_, b)| *b));
-    out.push(Pass {
-        pipeline: pl.fused.clone(),
-        bind,
-        grid,
-        bound_bytes,
-        widest_bytes,
-    });
-    keep.push(Box::new(meta_buf));
-    keep.push(Box::new(params));
-
-    cvt(
-        ctx, out, keep, &pl.repack, scratch, m, total_w, &site.segs, segs, false,
-    );
-}
-
-#[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
-pub fn lora_site_probe(
-    x_bf16: &[u16],
-    a_bf16: &[u16],
-    b_bf16: &[u16],
-    y_segments: &mut [Vec<u16>],
-    widths: &[usize],
-    segs: &[usize],
-    m: usize,
-    rank: usize,
-    k: usize,
-) -> Result<()> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
-    let pl = build_lora_pipelines(ctx)?;
-    let host = E4bLoraSite {
-        a: a_bf16.to_vec(),
-        b: b_bf16.to_vec(),
-        widths: widths.to_vec(),
-        segs: segs.to_vec(),
-        k,
-        rank,
-    };
-    let site = upload_lora_site(ctx, "e4bw-lora-probe", &host)?;
-    anyhow::ensure!(
-        x_bf16.len() == m * k,
-        "lora probe x is {} elements, want {}",
-        x_bf16.len(),
-        m * k
-    );
-    anyhow::ensure!(y_segments.len() == segs.len(), "lora probe segment count");
-    let x = GpuTensor::upload(ctx, "e4bw-lora-probe-x", &pack_pairs(x_bf16));
-    let total_w: usize = segs.iter().sum();
-    let scratch = GpuTensor::<u32>::zeroed(ctx, "e4bw-lora-probe-scratch", m * total_w);
-    let mut ys = Vec::with_capacity(segs.len());
-    for (i, w) in segs.iter().enumerate() {
-        anyhow::ensure!(
-            y_segments[i].len() == m * w,
-            "lora probe segment {i} is {} elements, want {}",
-            y_segments[i].len(),
-            m * w
-        );
-        ys.push(GpuTensor::upload(
-            ctx,
-            "e4bw-lora-probe-y",
-            &pack_pairs(&y_segments[i]),
-        ));
-    }
-    let mut passes: Vec<Pass> = Vec::new();
-    let mut keep: Vec<Box<dyn std::any::Any>> = Vec::new();
-    let seg_refs: Vec<&wgpu::Buffer> = ys.iter().map(|t| t.raw()).collect();
-    emit_lora_site(
-        ctx,
-        &mut passes,
-        &mut keep,
-        &pl,
-        scratch.raw(),
-        m,
-        &site,
-        x.raw(),
-        &seg_refs,
-    );
-    let refs: Vec<dispatch::PassRef<'_>> = passes
-        .iter()
-        .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
-        .collect();
-    dispatch::submit_pass_list(ctx, refs);
-    ctx.poll_blocking().map_err(err)?;
-    for (i, w) in segs.iter().enumerate() {
-        let words = ys[i].download(ctx).map_err(err)?;
-        for j in 0..(m * w) {
-            let word = words[j / 2];
-            y_segments[i][j] = if j.is_multiple_of(2) {
-                (word & 0xffff) as u16
-            } else {
-                (word >> 16) as u16
-            };
-        }
-    }
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-pub struct E4bLoraSite {
-    pub a: Vec<u16>,
-    pub b: Vec<u16>,
-    pub widths: Vec<usize>,
-    pub segs: Vec<usize>,
-    pub k: usize,
-    pub rank: usize,
-}
-
-impl E4bLoraSite {
-    fn validate(&self, label: &str) -> Result<()> {
-        anyhow::ensure!(!self.widths.is_empty(), "{label}: no lora slices");
-        anyhow::ensure!(!self.segs.is_empty(), "{label}: no lora segments");
-        anyhow::ensure!(
-            self.segs.iter().sum::<usize>() == self.widths.iter().sum::<usize>(),
-            "{label}: segment widths {:?} do not cover slice widths {:?}",
-            self.segs,
-            self.widths
-        );
-        anyhow::ensure!(self.rank > 0 && self.k > 0, "{label}: zero lora rank/k");
-        anyhow::ensure!(
-            self.rank <= wk::lora::FUSED_MAX_RANK,
-            "{label}: rank {} exceeds kernel limit {}",
-            self.rank,
-            wk::lora::FUSED_MAX_RANK
-        );
-        anyhow::ensure!(
-            self.a.len() == self.widths.len() * self.rank * self.k,
-            "{label}: lora_a is {} elements, want {}",
-            self.a.len(),
-            self.widths.len() * self.rank * self.k
-        );
-        let want_b: usize = self.widths.iter().map(|w| w * self.rank).sum();
-        anyhow::ensure!(
-            self.b.len() == want_b,
-            "{label}: lora_b is {} elements, want {want_b}",
-            self.b.len()
-        );
-        anyhow::ensure!(self.k.is_multiple_of(2), "{label}: lora k must be even");
-        for w in self.widths.iter().chain(self.segs.iter()) {
-            anyhow::ensure!(
-                w.is_multiple_of(2),
-                "{label}: lora slice width must be even"
-            );
-        }
-        Ok(())
-    }
-
-    fn total_width(&self) -> usize {
-        self.widths.iter().sum()
-    }
-
-    fn pass_count(&self) -> usize {
-        1 + 2 * self.segs.len()
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 struct E4bLoraLayer {
-    qkv: Option<E4bLoraSite>,
-    o: Option<E4bLoraSite>,
-    gate_up: Option<E4bLoraSite>,
-    down: Option<E4bLoraSite>,
+    qkv: Option<LoraSite>,
+    o: Option<LoraSite>,
+    gate_up: Option<LoraSite>,
+    down: Option<LoraSite>,
 }
 
 pub struct E4bLora {
@@ -8789,23 +11250,12 @@ impl E4bLora {
         self.layers.len()
     }
 
-    fn max_row_width(&self) -> usize {
-        let mut m = 0usize;
-        for l in &self.layers {
-            for s in [&l.qkv, &l.o, &l.gate_up, &l.down].into_iter().flatten() {
-                m = m.max(s.total_width());
-            }
-        }
-        m
-    }
-
     pub fn layer_pass_count(&self, layer: usize) -> usize {
         let l = &self.layers[layer];
-        let mut n = 0usize;
-        for s in [&l.qkv, &l.o, &l.gate_up, &l.down].into_iter().flatten() {
-            n += s.pass_count();
-        }
-        n
+        2 * [&l.qkv, &l.o, &l.gate_up, &l.down]
+            .into_iter()
+            .flatten()
+            .count()
     }
 
     pub fn total_pass_count(&self) -> usize {
@@ -8815,84 +11265,12 @@ impl E4bLora {
     }
 }
 
-fn build_lora_site(
-    adapter: &nv_weights::lora_adapter::LoraAdapter,
-    rank: usize,
-    k: usize,
-    slices: &[(&str, usize)],
-    segs: &[usize],
-) -> Result<(Option<E4bLoraSite>, usize)> {
-    use candle_core::{DType, Device};
-    use nv_layers::lora_slots::LoraSlotStack;
-
-    let mut matched = 0usize;
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    let mut widths = Vec::with_capacity(slices.len());
-    for (name, width) in slices {
-        let stack = LoraSlotStack::new(1, rank, k, *width, DType::BF16, &Device::Cpu)
-            .map_err(|e| anyhow::anyhow!("lora slot stack for {name}: {e}"))?;
-        if let Some(w) = adapter.loras.get(*name) {
-            anyhow::ensure!(
-                !w.is_embedding,
-                "{name}: embedding lora is not supported by the wgpu graph"
-            );
-            stack
-                .set_lora(0, &w.lora_a, &w.lora_b)
-                .map_err(|e| anyhow::anyhow!("set lora for {name}: {e}"))?;
-            matched += 1;
-        }
-        a.extend_from_slice(&bf16_bits_of_tensor(stack.lora_a_stacked())?);
-        b.extend_from_slice(&bf16_bits_of_tensor(stack.lora_b_stacked())?);
-        widths.push(*width);
-    }
-    if matched == 0 {
-        return Ok((None, 0));
-    }
-    let site = E4bLoraSite {
-        a,
-        b,
-        widths,
-        segs: segs.to_vec(),
-        k,
-        rank,
-    };
-    site.validate("lora site")?;
-    Ok((Some(site), matched))
-}
-
-fn bf16_bits_of_tensor(t: &candle_core::Tensor) -> Result<Vec<u16>> {
-    let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
-    Ok(v.into_iter().map(|x| x.to_bits()).collect())
-}
-
-struct LoraSiteGpu {
-    a: GpuTensor<u32>,
-    b: GpuTensor<u32>,
-    widths: Vec<usize>,
-    segs: Vec<usize>,
-    k: usize,
-    rank: usize,
-}
-
 #[derive(Default)]
 struct LayerLoraGpu {
     qkv: Option<LoraSiteGpu>,
     o: Option<LoraSiteGpu>,
     gate_up: Option<LoraSiteGpu>,
     down: Option<LoraSiteGpu>,
-}
-
-fn upload_lora_site(ctx: &WgpuContext, label: &str, site: &E4bLoraSite) -> Result<LoraSiteGpu> {
-    site.validate(label)?;
-    Ok(LoraSiteGpu {
-        a: GpuTensor::upload(ctx, label, &pack_pairs(&site.a)),
-        b: GpuTensor::upload(ctx, label, &pack_pairs(&site.b)),
-        widths: site.widths.clone(),
-        segs: site.segs.clone(),
-        k: site.k,
-        rank: site.rank,
-    })
 }
 
 fn upload_lora_layer(ctx: &WgpuContext, l: &E4bLoraLayer) -> Result<LayerLoraGpu> {

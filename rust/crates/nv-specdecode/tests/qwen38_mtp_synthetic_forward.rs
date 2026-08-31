@@ -502,6 +502,186 @@ fn clairvoyant_oracle_rounds_commit_full_and_partial_accepts_losslessly() {
     );
 }
 
+fn host_f32(t: &Tensor) -> Vec<f32> {
+    t.to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap()
+}
+
+fn greedy_decode_logits(
+    rig: &Rig,
+    cache: &mut nv_models::qwen3_5_moe::Qwen3MoeKvCache,
+    first_logits: &Tensor,
+    steps: usize,
+) -> Vec<Vec<f32>> {
+    let mut rows = vec![host_f32(first_logits)];
+    for _ in 0..steps {
+        let last = rows.last().unwrap();
+        let tok = last
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0 as u32;
+        let pos = cache.current_len() as i32;
+        let t = Tensor::from_vec(vec![tok], (1usize, 1usize), &rig.device).unwrap();
+        let p = Tensor::from_vec(vec![pos], 1usize, &rig.device).unwrap();
+        let lg = rig
+            .base
+            .forward_with_cache_dispatched_rows(&t, &p, cache, None, Some(1))
+            .expect("greedy decode step");
+        rows.push(host_f32(&lg));
+    }
+    rows
+}
+
+const CHUNKS_UNDER_TEST_19_DIVIDES_57_AND_23_LEAVES_AN_11_TAIL_BOTH_ABOVE_THE_8_ROW_MK_VERIFY_ROUTE:
+    [usize; 2] = [19, 23];
+
+#[test]
+fn chunked_trunk_prefill_bitwise_equals_one_shot_and_the_decode_reading_its_kv_agrees() {
+    let Some(rig) = build_rig(SEED) else { return };
+    let vocab = TINY_INTER_192_VOCAB_64_MAX_POS_64.1 as u32;
+    let prompt: Vec<u32> = (0..57u32).map(|i| (i * 37 + 11) % vocab).collect();
+    const DECODE_STEPS: usize = 4;
+
+    let mut cache_a = rig.base.new_kv_cache(64).expect("one-shot cache");
+    let toks =
+        Tensor::from_vec(prompt.clone(), (1usize, prompt.len()), &rig.device).expect("toks");
+    let pos = Tensor::from_vec(
+        (0..prompt.len() as i32).collect::<Vec<i32>>(),
+        prompt.len(),
+        &rig.device,
+    )
+    .expect("pos");
+    let logits_a = rig
+        .base
+        .forward_with_cache_dispatched_rows(&toks, &pos, &mut cache_a, None, Some(1))
+        .expect("one-shot prefill");
+    let rows_a = greedy_decode_logits(&rig, &mut cache_a, &logits_a, DECODE_STEPS);
+
+    for chunk in CHUNKS_UNDER_TEST_19_DIVIDES_57_AND_23_LEAVES_AN_11_TAIL_BOTH_ABOVE_THE_8_ROW_MK_VERIFY_ROUTE
+    {
+        let mut cache_b = rig.base.new_kv_cache(64).expect("chunked cache");
+        let logits_b = rig
+            .base
+            .prefill_chunks_dispatched_serving_last_row_logits_bounding_transients_to_one_chunk(
+                &prompt,
+                chunk,
+                &mut cache_b,
+                None,
+            )
+            .expect("chunked prefill");
+        assert_eq!(cache_b.current_len(), prompt.len());
+        let rows_b = greedy_decode_logits(&rig, &mut cache_b, &logits_b, DECODE_STEPS);
+        assert_eq!(
+            rows_a, rows_b,
+            "chunk={chunk}: chunked prefill must reproduce the one-shot last-row logits and \
+             every decode row read from its KV/GDN state bitwise; the GDN scan is token-\
+             sequential and full attention reads the same fp8-dequant rows either way, so a \
+             mismatch is a state hand-off bug, not reassociation"
+        );
+    }
+}
+
+#[test]
+fn per_chunk_drafter_catch_up_with_a_carry_row_bitwise_equals_the_one_shot_shifted_prefill() {
+    let Some(rig) = build_rig(SEED) else { return };
+    let vocab = TINY_INTER_192_VOCAB_64_MAX_POS_64.1 as u32;
+    let prompt: Vec<u32> = (0..57u32).map(|i| (i * 29 + 5) % vocab).collect();
+    let seq = prompt.len();
+    let chunk = 19usize;
+
+    let hidden_full = trunk_hidden_rows(&rig, &prompt);
+    let normed_full = rig
+        .mtp
+        .trunk_hidden_rows_as_drafter_anchor_input(&hidden_full)
+        .expect("anchor-normed hidden");
+    let mut kv_a = rig.mtp.new_kv_cache(64, &rig.device).expect("one-shot kv");
+    rig.mtp
+        .prefill_prompt_kv_shifted_by_one_with_position_zero_on_a_zero_hidden(
+            &rig.base,
+            &prompt,
+            &normed_full,
+            &mut kv_a,
+        )
+        .expect("one-shot drafter prefill");
+    let base_hidden_a = normed_full.narrow(1, seq - 1, 1).unwrap();
+
+    let mut trunk_cache = rig.base.new_kv_cache(64).expect("chunked trunk cache");
+    let mut kv_b = rig.mtp.new_kv_cache(64, &rig.device).expect("chunked kv");
+    let mut carry: Option<Tensor> = None;
+    let mut fed = 0usize;
+    while fed < seq {
+        let n = chunk.min(seq - fed);
+        let toks =
+            Tensor::from_vec(prompt[fed..fed + n].to_vec(), (1usize, n), &rig.device).unwrap();
+        let pos = Tensor::from_vec(
+            (fed as i32..(fed + n) as i32).collect::<Vec<i32>>(),
+            n,
+            &rig.device,
+        )
+        .unwrap();
+        let (_lg, hd) = rig
+            .base
+            .forward_with_cache_dispatched_hidden_rows(&toks, &pos, &mut trunk_cache, None, Some(1))
+            .expect("chunk trunk forward");
+        let normed = rig
+            .mtp
+            .trunk_hidden_rows_as_drafter_anchor_input(&hd)
+            .expect("chunk normed");
+        let first = match carry.take() {
+            Some(prev) => prev,
+            None => Tensor::zeros(
+                (1usize, 1usize, normed.dim(2).unwrap()),
+                normed.dtype(),
+                normed.device(),
+            )
+            .unwrap(),
+        };
+        let shifted = if n == 1 {
+            first
+        } else {
+            Tensor::cat(&[&first, &normed.narrow(1, 0, n - 1).unwrap()], 1)
+                .unwrap()
+                .contiguous()
+                .unwrap()
+        };
+        rig.mtp
+            .catch_up_kv_recomputing_and_discarding_q_which_v1_prices_over_a_kv_only_projection(
+                &rig.base,
+                &prompt[fed..fed + n],
+                &shifted,
+                &mut kv_b,
+            )
+            .expect("chunk drafter catch-up");
+        carry = Some(normed.narrow(1, n - 1, 1).unwrap().contiguous().unwrap());
+        fed += n;
+    }
+
+    assert_eq!(kv_a.len(), seq);
+    assert_eq!(kv_b.len(), seq);
+    assert_eq!(
+        kv_a.k_rows_host_f32().unwrap(),
+        kv_b.k_rows_host_f32().unwrap(),
+        "per-chunk catch-up with a carried last-hidden row must write, bitwise, the K rows the \
+         one-shot shifted prefill writes; a mismatch is an off-by-one in the carry hand-off"
+    );
+    assert_eq!(
+        kv_a.v_rows_host_f32().unwrap(),
+        kv_b.v_rows_host_f32().unwrap(),
+        "same invariant for V rows"
+    );
+    assert_eq!(
+        host_f32(&base_hidden_a),
+        host_f32(&carry.expect("carry row")),
+        "the carry row left by the chunk loop must be the one-shot base_hidden row bitwise"
+    );
+}
+
 #[test]
 fn spec_stream_equals_the_greedy_reference_on_synthetic_weights() {
     let Some(rig) = build_rig(SEED) else { return };

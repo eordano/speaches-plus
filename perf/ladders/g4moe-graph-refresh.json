@@ -1,0 +1,33 @@
+{
+  "ladder": "g4moe-graph-refresh",
+  "mode": "ours",
+  "base_args": {
+    "build-name": "g4moe graph-refresh",
+    "model": "gemma4-26b-a4b",
+    "backend": "wgpu-vulkan",
+    "pkg": "nv-models",
+    "features": "cuda,wgpu",
+    "suite": "wgpu_ctx_scaling",
+    "exact": "g4moe_wgpu_decode_ms_per_token_vs_context_depth_chunked_prefill_primed",
+    "parse": "ctx-scaling",
+    "timeout": "3600"
+  },
+  "base_env": {
+    "NV_G4MOE_CTX_CHUNKED_TEST": "1",
+    "NV_G4MOE_KV_RING": "1"
+  },
+  "depth_env": "NV_CTX_TOKENS",
+  "depths": [
+    8192,
+    120000
+  ],
+  "depths_per_run": false,
+  "notes": "post-flip depth fill: the champion-stack default (commit 801ce16e5) landed 103.7 at 8192 (was 81.6 pre-flip, +27%); the 120k rung has NEVER landed on recent defaults -- the btgemm-era 83.4/81.8 cells this note once cited as a deep basis were actually 256/8192 cells from runs whose deep rung timed out, and the paired-invocation attempt here hit exit-124 at 3600s too; the standing deep attempt is a solo-depth run at 7200s; comparator ref at 120000 is llama.cpp-Vulkan b10675 157.2",
+  "baseline_arm": "bare-defaults",
+  "arms": [
+    {
+      "name": "bare-defaults",
+      "env": {}
+    }
+  ]
+}

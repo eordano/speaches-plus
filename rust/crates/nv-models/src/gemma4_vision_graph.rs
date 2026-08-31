@@ -63,7 +63,7 @@ pub const THE_CAPTURED_BODY_ALLOWS_ONLY_LAYOUT_INFO_FREE_OPS: &str =
      stay in the eager path.";
 
 pub fn vision_graph_enabled() -> bool {
-    std::env::var("NV_VISION_GRAPH").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_VISION_GRAPH")
 }
 
 struct CaptureAids {
@@ -136,7 +136,8 @@ fn capture_supported_for(tower: &Gemma4VisionTower) -> Result<()> {
     anyhow::ensure!(
         tower.patch_embedder.input_proj.dense_weight().is_some()
             && tower.embedding_projection.dense_weight().is_some(),
-        "vision graph capture needs dense weights; the int8 vision mode dequantizes per call"
+        "vision graph capture needs dense weights; int8/nvfp4 vision modes route through \
+         non-capturable per-call kernels"
     );
     for layer in &tower.layers {
         for lin in [
@@ -150,8 +151,8 @@ fn capture_supported_for(tower: &Gemma4VisionTower) -> Result<()> {
         ] {
             anyhow::ensure!(
                 lin.dense_weight().is_some(),
-                "vision graph capture needs dense weights; the int8 vision mode dequantizes per \
-                 call"
+                "vision graph capture needs dense weights; int8/nvfp4 vision modes route \
+                 through non-capturable per-call kernels"
             );
         }
     }

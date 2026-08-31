@@ -21,6 +21,96 @@ fn tail_fuse_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn normgate_fuse_enabled() -> bool {
+    std::env::var("NV_LAGUNA_MOE_NORMGATE_FUSE")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+fn normgate_fuse_applies_only_with_the_shared_expert_folded_and_m_1_because_the_unfolded_branch_consumes_the_normed_tensor_and_the_router_path_is_a_gemv(
+    ctx: &GroupedDecodeContext,
+) -> bool {
+    normgate_fuse_enabled() && ctx.folds_shared() && ctx.n_tokens() == 1
+}
+
+fn normgate_fused_rstd_normx_gemv(
+    s: &Arc<CudaStream>,
+    moe: &LagunaMoe,
+    norm: &RmsNorm,
+    ctx: &mut GroupedDecodeContext,
+    hidden: usize,
+    e: usize,
+) -> Result<()> {
+    let wn = crate::laguna_step_graph::bf16_ptr(norm.weight_bf16(), s, hidden)?;
+    let gate_w = moe
+        .gate
+        .weight()
+        .ok_or_else(|| anyhow::anyhow!("normgate fuse: router gate has no dense weight"))?;
+    let gw = crate::laguna_step_graph::bf16_ptr(gate_w, s, e * hidden)?;
+    let mut rstd: CudaSlice<f32> = unsafe { s.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
+    let mut logits_bf16: CudaSlice<bf16> =
+        unsafe { s.alloc::<bf16>(e).map_err(|e| anyhow::anyhow!(e))? };
+    let (xp, _g0) = ctx.resid_in.device_ptr(s);
+    {
+        let (rp, _g1) = rstd.device_ptr_mut(s);
+        let rc = unsafe {
+            nv_kernels::cuda::laguna_rstd256_bf16(
+                s.cu_stream() as *mut c_void,
+                xp as *const u16,
+                rp as *mut f32,
+                hidden as i32,
+                norm.eps() as f32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "normgate rstd rc={rc}");
+    }
+    let (rp, _g2) = rstd.device_ptr(s);
+    {
+        let (np, _g3) = ctx.x_in.device_ptr_mut(s);
+        let rc = unsafe {
+            nv_kernels::cuda::normx_mk(
+                s.cu_stream() as *mut c_void,
+                xp as *const u16,
+                wn as *const u16,
+                rp as *const f32,
+                np as *mut u16,
+                hidden as i32,
+                1,
+            )
+        };
+        anyhow::ensure!(rc == 0, "normgate normx rc={rc}");
+    }
+    {
+        let (lp, _g4) = logits_bf16.device_ptr_mut(s);
+        let rc = unsafe {
+            nv_kernels::cuda::gemv_bf16_normed(
+                s.cu_stream() as *mut c_void,
+                gw as *const u16,
+                xp as *const u16,
+                wn as *const u16,
+                rp as *const f32,
+                lp as *mut u16,
+                e as i32,
+                hidden as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "normgate router gemv rc={rc}");
+    }
+    let (lp, _g5) = logits_bf16.device_ptr(s);
+    let (dp, _g6) = ctx.logits_f32.device_ptr_mut(s);
+    let rc = unsafe {
+        nv_kernels::cuda::tanh_softcap_bf16_to_f32(
+            s.cu_stream() as *mut c_void,
+            lp as *const u16,
+            dp as *mut f32,
+            0.0,
+            e,
+        )
+    };
+    anyhow::ensure!(rc == 0, "normgate logits cast rc={rc}");
+    Ok(())
+}
+
 pub fn graph_enabled() -> bool {
     std::env::var("NV_LAGUNA_GRAPH")
         .map(|v| {
@@ -239,6 +329,10 @@ pub(crate) fn moe_block_body(
     let hidden = w.hidden_size;
     let e = w.num_experts;
     let n = ctx.n_tokens();
+    let x_t: Option<Tensor> = if normgate_fuse_applies_only_with_the_shared_expert_folded_and_m_1_because_the_unfolded_branch_consumes_the_normed_tensor_and_the_router_path_is_a_gemv(ctx) {
+        normgate_fused_rstd_normx_gemv(s, moe, norm, ctx, hidden, e)?;
+        None
+    } else {
     let mut resid_copy: CudaSlice<bf16> = unsafe {
         s.alloc::<bf16>(n * hidden)
             .map_err(|e| anyhow::anyhow!(e))?
@@ -306,6 +400,8 @@ pub(crate) fn moe_block_body(
         };
         anyhow::ensure!(rc == 0, "logits cast rc={rc}");
     }
+    Some(x_t)
+    };
     if let Some((p, li)) = prof {
         p.record(ProfPoint::MoeNormGate(li), s)?;
     }
@@ -338,8 +434,11 @@ pub(crate) fn moe_block_body(
         if let Some((p, li)) = prof {
             p.record(ProfPoint::SharedStart(li), aux_shared)?;
         }
+        let x_t = x_t
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("unfolded shared expert needs the normed tensor"))?;
         nv_layers::cuda_stream::with_stream(aux_shared.clone(), || -> Result<()> {
-        let shared_t = moe.shared_expert.forward_fused_cuda(&x_t)?;
+        let shared_t = moe.shared_expert.forward_fused_cuda(x_t)?;
         anyhow::ensure!(
             shared_t.dtype() == DType::BF16 && shared_t.elem_count() == n * hidden,
             "graph moe: unexpected shared expert output {:?} {:?}",

@@ -3,7 +3,7 @@
 mod nozi_graph_common;
 use nozi_graph_common::*;
 
-const AUDITED_ENTRIES: usize = 68;
+const AUDITED_ENTRIES: usize = 71;
 
 const AUDITED_GRAPH_ENTRIES: usize = 41;
 
@@ -86,7 +86,7 @@ const PREFIX_WRITE_SITES: &[(&str, &str, &str, &str, &[&str])] = &[
 
 const COVERING_WRITE_CLASSES: (usize, usize, usize, usize) = (59, 8, 15, 15);
 
-const ROPE_HALVING_SITES: usize = 15;
+const ROPE_HALVING_SITES: usize = 18;
 
 const EXTENT_GATES: &[(&str, &str, &str, &str)] = &[
     ("g4m:attn", "gd_qs", "gemma4_moe_wgpu", "MAX_HEAD_DIM"),

@@ -138,7 +138,7 @@ pub fn gc_response_store(dir: &std::path::Path) {
     if snaps.len() <= RESPONSE_STORE_KEEPS_NEWEST {
         return;
     }
-    snaps.sort_by(|a, b| b.0.cmp(&a.0));
+    snaps.sort_by_key(|s| std::cmp::Reverse(s.0));
     for (_, p) in snaps.split_off(RESPONSE_STORE_KEEPS_NEWEST) {
         let _ = std::fs::remove_file(p.with_extension("json"));
         let _ = std::fs::remove_file(p);
@@ -207,6 +207,18 @@ pub struct Meta {
     pub kind: String,
     pub adapter: Option<String>,
     pub max_seq: usize,
+}
+
+pub fn adapter_tag_that_changes_when_the_weights_change(dir: &std::path::Path) -> String {
+    let weights = dir.join(crate::oapi::lora::ADAPTER_WEIGHTS_FILE);
+    match std::fs::read(&weights) {
+        Ok(bytes) => {
+            let mut h = Xxh3::new();
+            h.update(&bytes);
+            format!("{}@{}:{:016x}", dir.display(), bytes.len(), h.digest())
+        }
+        Err(_) => dir.display().to_string(),
+    }
 }
 
 pub struct Session {

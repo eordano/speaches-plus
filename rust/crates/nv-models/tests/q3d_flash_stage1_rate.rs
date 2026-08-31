@@ -341,6 +341,41 @@ fn q3d_fold_variants_match_the_shipping_fold_sd() {
 }
 
 #[test]
+fn q3d_tp_out_is_invariant_across_the_splits_ladder() {
+    let ctx = ctx();
+    let arms = arms(ctx);
+    let tp = &arms[2];
+    assert!(
+        tp.k_side == KSide::Transposed,
+        "arm 2 must be the tp arm or this oracle grades the wrong kernel"
+    );
+    let s2 = stage2_pipeline(ctx);
+    for total in [1u32, 513, 2600] {
+        for seed in 0..2u64 {
+            let mk = |splits: u32| Shape {
+                slots: 4096,
+                total,
+                splits,
+            };
+            let seed = 0x517c_c1b7_2722_0a95u64.wrapping_mul(seed + 1);
+            let (s16, s64) = (mk(16), mk(64));
+            let out16 = out_of(ctx, tp, &s2, &make_bufs_seed(ctx, &s16, 1, seed), &s16);
+            let out64 = out_of(ctx, tp, &s2, &make_bufs_seed(ctx, &s64, 1, seed), &s64);
+            assert!(
+                out16.iter().any(|w| *w != 0),
+                "total={total}: an all-zero out would make splits-invariance vacuous"
+            );
+            assert_close_bf16(
+                tp.name,
+                &format!("splits 16-vs-64 total={total} seed={seed:x}"),
+                &out64,
+                &out16,
+            );
+        }
+    }
+}
+
+#[test]
 fn kv_fp8_kt_writer_is_a_bit_exact_permutation_of_the_position_major_writer() {
     let ctx = ctx();
     let n_tokens = 13usize;

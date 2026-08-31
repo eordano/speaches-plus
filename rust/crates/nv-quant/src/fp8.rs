@@ -123,6 +123,36 @@ pub fn dequantize_e4m3_per_row(
     Ok(out)
 }
 
+pub fn amax_e4m3_per_row(bytes: &[u8], rows: usize, cols: usize, scales: &[f32]) -> Result<f32> {
+    use float8::F8E4M3;
+    if rows.checked_mul(cols) != Some(bytes.len()) {
+        bail!(
+            "amax_e4m3_per_row: {} bytes do not form a {rows}x{cols} matrix",
+            bytes.len()
+        );
+    }
+    if scales.len() != rows {
+        bail!("amax_e4m3_per_row: {} scales for {rows} rows", scales.len());
+    }
+    let mut lut = [0f32; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        let d = f32::from(F8E4M3::from_bits(i as u8)).abs();
+        *v = if d.is_finite() { d } else { 0.0 };
+    }
+    let mut amax = 0f32;
+    for (r, scale) in scales.iter().enumerate() {
+        let mut m = 0f32;
+        for &b in &bytes[r * cols..(r + 1) * cols] {
+            m = m.max(lut[b as usize]);
+        }
+        let v = m * scale.abs();
+        if v.is_finite() && v > amax {
+            amax = v;
+        }
+    }
+    Ok(amax)
+}
+
 pub fn cpu_e4m3_matmul_row_scaled(
     a: &[u8],
     b_weight: &[u8],
@@ -228,12 +258,49 @@ mod cuda {
             a_scale: &CudaSlice<f32>,
             b_scale: &CudaSlice<f32>,
         ) -> Result<()> {
+            self.matmul_e4m3_weight_row_span(a, b_weight, d, 0, m, n, k, a_scale, b_scale)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul_e4m3_weight_row_span(
+            &mut self,
+            a: &CudaSlice<u8>,
+            b_weight: &CudaSlice<u8>,
+            d: &mut CudaSlice<bf16>,
+            row_start: u64,
+            rows: u64,
+            n: u64,
+            k: u64,
+            a_scale: &CudaSlice<f32>,
+            b_scale: &CudaSlice<f32>,
+        ) -> Result<()> {
+            self.matmul_e4m3_weight_row_span_with_plan_rows(
+                a, b_weight, d, row_start, rows, rows, n, k, a_scale, b_scale,
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul_e4m3_weight_row_span_with_plan_rows(
+            &mut self,
+            a: &CudaSlice<u8>,
+            b_weight: &CudaSlice<u8>,
+            d: &mut CudaSlice<bf16>,
+            row_start: u64,
+            rows: u64,
+            plan_rows: u64,
+            n: u64,
+            k: u64,
+            a_scale: &CudaSlice<f32>,
+            b_scale: &CudaSlice<f32>,
+        ) -> Result<()> {
             unsafe {
                 self.matmul_e4m3_unchecked(
                     a,
                     b_weight,
                     d,
-                    m,
+                    row_start,
+                    rows,
+                    plan_rows,
                     n,
                     k,
                     a_scale,
@@ -271,6 +338,8 @@ mod cuda {
                     a,
                     b_weight,
                     d,
+                    0,
+                    m,
                     m,
                     n,
                     k,
@@ -287,13 +356,26 @@ mod cuda {
             a: &CudaSlice<u8>,
             b_weight: &CudaSlice<u8>,
             d: &mut CudaSlice<bf16>,
+            row_start: u64,
             m: u64,
+            plan_rows: u64,
             n: u64,
             k: u64,
             a_scale: &CudaSlice<f32>,
             b_scale: &CudaSlice<f32>,
             scale_mode: Fp8ScaleMode,
         ) -> Result<()> {
+            if std::env::var("NV_DEBUG_FP8_LT_SHAPES").as_deref() == Ok("1") {
+                static SEEN: std::sync::Mutex<
+                    std::collections::BTreeSet<(u64, u64, u64, u64)>,
+                > = std::sync::Mutex::new(std::collections::BTreeSet::new());
+                if SEEN.lock().unwrap().insert((m, plan_rows, n, k)) {
+                    eprintln!(
+                        "[fp8-lt-shape] m={m} plan_rows={plan_rows} n={n} k={k} \
+                         scale_mode={scale_mode:?}"
+                    );
+                }
+            }
             let handle = self.handle;
             let stream = self.stream.cu_stream();
 
@@ -362,9 +444,56 @@ mod cuda {
                 mem::size_of::<usize>(),
             )?;
 
-            let heur = cublaslt::get_matmul_algo_heuristic(
-                handle, desc, a_layout, b_layout, d_layout, d_layout, pref,
-            )
+            let plan_layouts = if plan_rows == m {
+                None
+            } else {
+                Some((
+                    cublaslt::create_matrix_layout(dtype_fp8, k, plan_rows, k as i64)?,
+                    cublaslt::create_matrix_layout(dtype_bf16, n, plan_rows, n as i64)?,
+                ))
+            };
+            let (heur_b_layout, heur_d_layout) = match plan_layouts {
+                Some((pb, pd)) => (pb, pd),
+                None => (b_layout, d_layout),
+            };
+            let nows_pin_because_the_default_splitk_pick_reads_1212_vs_1415_gbs_on_this_shape =
+                m <= 8
+                    && n == 12288
+                    && k == 5120
+                    && std::env::var("NV_FP8_LT_NOWS_12288").as_deref() == Ok("1");
+            let heur = if nows_pin_because_the_default_splitk_pick_reads_1212_vs_1415_gbs_on_this_shape
+            {
+                let mut cands: [sys::cublasLtMatmulHeuristicResult_t; 8] = mem::zeroed();
+                let mut count: i32 = 0;
+                let rc = sys::cublasLtMatmulAlgoGetHeuristic(
+                    handle,
+                    desc,
+                    a_layout,
+                    heur_b_layout,
+                    heur_d_layout,
+                    heur_d_layout,
+                    pref,
+                    8,
+                    cands.as_mut_ptr(),
+                    &mut count,
+                );
+                anyhow::ensure!(
+                    rc == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS && count > 0,
+                    "cublasLt fp8 heuristic (nows pin) for {m}x{n}x{k}: rc={rc:?} count={count}"
+                );
+                Ok(cands[..count as usize]
+                    .iter()
+                    .find(|c| {
+                        c.state == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+                            && c.workspaceSize == 0
+                    })
+                    .copied()
+                    .unwrap_or(cands[0]))
+            } else {
+                cublaslt::get_matmul_algo_heuristic(
+                    handle, desc, a_layout, heur_b_layout, heur_d_layout, heur_d_layout, pref,
+                )
+            }
             .map_err(|e| {
                 if scale_mode == Fp8ScaleMode::PerOuterRow {
                     anyhow::anyhow!(
@@ -381,9 +510,11 @@ mod cuda {
 
             let alpha = 1.0f32;
             let beta = 0.0f32;
-            let (a_ptr, _ga) = a.device_ptr(&self.stream);
+            let (a_base, _ga) = a.device_ptr(&self.stream);
+            let a_ptr = a_base + row_start * k;
             let (b_ptr, _gb) = b_weight.device_ptr(&self.stream);
-            let (d_ptr, _gd) = d.device_ptr_mut(&self.stream);
+            let (d_base, _gd) = d.device_ptr_mut(&self.stream);
+            let d_ptr = d_base + row_start * n * 2;
             let (ws_ptr, _gw) = self.workspace.device_ptr_mut(&self.stream);
 
             let rc = cublaslt::matmul(
@@ -410,6 +541,10 @@ mod cuda {
             cublaslt::destroy_matrix_layout(a_layout)?;
             cublaslt::destroy_matrix_layout(b_layout)?;
             cublaslt::destroy_matrix_layout(d_layout)?;
+            if let Some((pb, pd)) = plan_layouts {
+                cublaslt::destroy_matrix_layout(pb)?;
+                cublaslt::destroy_matrix_layout(pd)?;
+            }
 
             rc.map_err(|e| anyhow::anyhow!("cublasLtMatmul: {e:?}"))?;
             Ok(())

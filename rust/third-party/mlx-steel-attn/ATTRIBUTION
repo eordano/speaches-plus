@@ -1,0 +1,5 @@
+steel attention headers vendored verbatim from the mlx 0.32.2 wheel
+(mlx/include/mlx/backend/metal/kernels/steel), MIT, Copyright Apple Inc.
+Source: https://github.com/ml-explore/mlx
+The runtime concatenation, constant baking and instantiation live in
+rust/crates/nv-models/src/dots_ocr/vision_attn_msl.rs.

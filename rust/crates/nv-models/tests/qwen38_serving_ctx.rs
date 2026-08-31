@@ -4,6 +4,8 @@ mod common;
 use common::argmax;
 use common::ctx_tokens_from_env_default_256_8k_196k;
 use common::percentile_of_sorted;
+use common::serving_feed_argmax_and_basis_label_env_selects_the_pre_2026_08_20_scalar;
+use common::serving_feed_device_argmax_env_default_off_because_every_published_ladder_number_is_a_host_feed;
 use candle_core::{DType, Device, Tensor};
 use nv_models::graph_engine::GraphedQwen3Moe;
 use nv_models::qwen3_5_moe::{LayerType, Qwen3Moe, Qwen3_5DenseConfig};
@@ -20,6 +22,8 @@ use common::qwen38_snapshot_dir_env_override_then_home_hub;
 const PRIME_CKPT_FILL_MODE_SYNTHFILL512_V1_FIXED_SEED_CHUNKED: &str = "synthfill512v1";
 
 const SYNTHETIC_FILL_CHUNK_512_MATCHES_THE_PROVEN_QWEN35_DENSE_PREFILL_BLOCK: usize = 512;
+const STREAM_IDENTITY_GATE_32_STEPS_OLD_AND_NEW_ARGMAX_MUST_AGREE_ON_REAL_LOGITS_ONCE_PER_SESSION:
+    usize = 32;
 const TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN: usize = 64;
 const KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS: usize = 16;
 
@@ -252,13 +256,18 @@ fn qwen38_cuda_dense_serving_decode_ms_per_token_vs_context_depth_synthetic_cach
     let per_depth_extra_slots =
         ctx_timing_common::WORST_CASE_PLATEAU_WARMUP_200_STEPS_SIZES_KV_SLOT_HEADROOM
             + TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN
-            + KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS;
+            + KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS
+            + STREAM_IDENTITY_GATE_32_STEPS_OLD_AND_NEW_ARGMAX_MUST_AGREE_ON_REAL_LOGITS_ONCE_PER_SESSION;
     assert!(
         max_depth + per_depth_extra_slots < max_pos,
         "depth {max_depth} + decode steps exceeds max_position_embeddings {max_pos}; a model \
          declaring {max_pos} must serve this depth, so a trip here is a config bug"
     );
     let cache_slots = max_depth + per_depth_extra_slots;
+    nv_models::qwen3_5_moe::trunk_events::prebuild_if_armed_because_the_ladder_cannot_allocate_mid_capture(
+        &device,
+        model.config().num_hidden_layers,
+    );
     let mut eng = GraphedQwen3Moe::new(model, &device, cache_slots)
         .unwrap_or_else(|e| panic!("GraphedQwen3Moe with {cache_slots} kv slots: {e:#}"));
 
@@ -275,6 +284,16 @@ fn qwen38_cuda_dense_serving_decode_ms_per_token_vs_context_depth_synthetic_cach
         .to_dtype(DType::BF16)
         .expect("v bf16");
 
+    let (feed_argmax, host_feed_basis) =
+        serving_feed_argmax_and_basis_label_env_selects_the_pre_2026_08_20_scalar();
+    let device_feed =
+        serving_feed_device_argmax_env_default_off_because_every_published_ladder_number_is_a_host_feed();
+    let feed_basis = if device_feed {
+        "engine_device_argmax_f32_rows_4_byte_exit"
+    } else {
+        host_feed_basis
+    };
+    let mut stream_identity_gate_ran = false;
     for &depth in &depths {
         eng.set_moe_dispatch(None);
         eng.reset().expect("engine reset");
@@ -317,12 +336,54 @@ fn qwen38_cuda_dense_serving_decode_ms_per_token_vs_context_depth_synthetic_cach
         );
 
         let mut cur = 2000u32;
+        if !stream_identity_gate_ran {
+            for _ in
+                0..STREAM_IDENTITY_GATE_32_STEPS_OLD_AND_NEW_ARGMAX_MUST_AGREE_ON_REAL_LOGITS_ONCE_PER_SESSION
+            {
+                eng.forward_decode(cur)
+                    .unwrap_or_else(|e| panic!("stream-identity gate decode at depth {depth}: {e:#}"));
+                let device_tok = if device_feed {
+                    Some(eng.next_token_argmax_on_device().unwrap_or_else(|e| {
+                        panic!("stream-identity gate device argmax at depth {depth}: {e:#}")
+                    }))
+                } else {
+                    None
+                };
+                let r = eng.logits_host().expect("gate logits to host");
+                let old_tok = argmax(&r);
+                let new_tok = feed_argmax(&r);
+                assert_eq!(
+                    old_tok, new_tok,
+                    "the {host_feed_basis} argmax diverged from the pre-2026-08-20 scalar on real \
+                     logits at gate pos {}; the depth ladder's measured token stream must be \
+                     IDENTICAL across feed paths or old/new medians are not comparable",
+                    eng.current_pos()
+                );
+                if let Some(dt) = device_tok {
+                    assert_eq!(
+                        dt, new_tok,
+                        "the {feed_basis} diverged from the host feed on real logits at gate pos \
+                         {}; next_token_argmax_on_device must reproduce argmax_checked semantics \
+                         (cast_bf16_f32 widens exactly, argmax_f32_rows skips non-finite and \
+                         breaks ties lowest-index) or the device-fed ladder measures a different \
+                         token stream",
+                        eng.current_pos()
+                    );
+                }
+                cur = new_tok;
+            }
+            stream_identity_gate_ran = true;
+        }
         let (warmup_steps, step_ms) = ctx_timing_common::warmup_to_plateau_then_time_steps(
             || {
                 eng.forward_decode(cur)
                     .unwrap_or_else(|e| panic!("serving decode at depth {depth}: {e:#}"));
-                let r = eng.logits_host().expect("logits to host");
-                cur = argmax(&r);
+                cur = if device_feed {
+                    eng.next_token_argmax_on_device()
+                        .unwrap_or_else(|e| panic!("device argmax at depth {depth}: {e:#}"))
+                } else {
+                    feed_argmax(&eng.logits_host().expect("logits to host"))
+                };
             },
             TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN,
         );
@@ -343,8 +404,13 @@ fn qwen38_cuda_dense_serving_decode_ms_per_token_vs_context_depth_synthetic_cach
             median.is_finite() && median > 0.0,
             "median decode step time is not a positive number: {median}"
         );
+        eng.underlying()
+            .dump_trunk_phase_ladder_after_replay_when_nv_q36_trunk_events_1();
+        for (tok, census) in eng.captured_graph_node_type_census_per_shape_token() {
+            eprintln!("[q38-serving-ctx] census shape_token={tok} {census:?}");
+        }
         eprintln!(
-            "CTX-SCALING qwen38-cuda-serving-synthfill depth={depth} basis=graphed_dense_fused_gdn_free_running_decode_argmax_feed_includes_logits_host_synthetic_kv_fill decode_kernel={} capture_active={} median_ms_tok={median:.3} p10={p10:.3} p90={p90:.3} tok_s={:.1} fill_s={fill_s:.1} steps={} warmup_steps={warmup_steps}",
+            "CTX-SCALING qwen38-cuda-serving-synthfill depth={depth} basis=graphed_dense_fused_gdn_free_running_decode_argmax_feed_includes_logits_host_synthetic_kv_fill argmax_feed={feed_basis} decode_kernel={} capture_active={} median_ms_tok={median:.3} p10={p10:.3} p90={p90:.3} tok_s={:.1} fill_s={fill_s:.1} steps={} warmup_steps={warmup_steps}",
             decode_fix_label_reports_the_nv_q36_graphed_decode_fix_gate_state(),
             eng.capture_active(),
             1000.0 / median,

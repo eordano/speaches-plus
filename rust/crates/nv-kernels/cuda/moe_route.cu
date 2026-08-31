@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 #include "nv_kernels.h"
+#include "nvk_pdl.cuh"
 
 #define ROUTE_MAX_E 4096
 #define ROUTE_MAX_K 32
@@ -27,14 +28,14 @@ __device__ __forceinline__ uint8_t rgq_encode_e2m1(float x) {
     return (uint8_t)(sign | best);
 }
 
-#define RGQ_UE4M3_MIN_NORMAL      0.015625f
-#define RGQ_UE4M3_SUBNORMAL_STEP  0.001953125f
+#define NV_UE4M3_MIN_NORMAL      0.015625f
+#define NV_UE4M3_SUBNORMAL_STEP  0.001953125f
 
 __device__ __forceinline__ uint8_t rgq_encode_ue4m3(float scale) {
     if (!isfinite(scale) || scale <= 0.f) return 0;
     float clamped = fminf(scale, 448.f);
-    if (clamped < RGQ_UE4M3_MIN_NORMAL) {
-        int sub = (int)roundf(clamped / RGQ_UE4M3_SUBNORMAL_STEP);
+    if (clamped < NV_UE4M3_MIN_NORMAL) {
+        int sub = (int)roundf(clamped / NV_UE4M3_SUBNORMAL_STEP);
         if (sub <= 0) return 0;
         if (sub <= 7) return (uint8_t)sub;
         return 0x08;
@@ -56,7 +57,7 @@ __device__ __forceinline__ uint8_t rgq_encode_ue4m3(float scale) {
 __device__ __forceinline__ float rgq_decode_ue4m3(uint8_t b) {
     int biased = (int)(b >> 3) & 0x0F;
     float mant = (float)(b & 0x07);
-    if (biased == 0) return mant * RGQ_UE4M3_SUBNORMAL_STEP;
+    if (biased == 0) return mant * NV_UE4M3_SUBNORMAL_STEP;
     return (1.f + mant / 8.f) * exp2f((float)(biased - 7));
 }
 
@@ -87,6 +88,7 @@ __global__ void moe_route_topk_kernel(
     int out_stride,
     int shared_tail_id
 ) {
+    NVK_PDL_PROLOG();
     extern __shared__ float smem[];
     float* sel = smem;
     float* raw = smem + E;
@@ -328,7 +330,7 @@ extern "C" int nv_kernels_moe_route_topk_shared_tail(
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
-__global__ void moe_route_gather_quant_m1_kernel(
+__global__ void moe_route_gather_quant_small_m_kernel(
     const float* __restrict__ logits,
     const float* __restrict__ bias,
     const __nv_bfloat16* __restrict__ x,
@@ -350,6 +352,7 @@ __global__ void moe_route_gather_quant_m1_kernel(
     int hidden,
     int min_tile
 ) {
+    NVK_PDL_PROLOG();
     extern __shared__ float smem[];
     float* sel = smem;
     float* raw = smem + E;
@@ -362,9 +365,11 @@ __global__ void moe_route_gather_quant_m1_kernel(
     const int lane = tid & (kW - 1);
     const int warp = tid >> 5;
     const int tiles = K + (shared_tail_id >= 0 ? 1 : 0);
+    const int n = blockIdx.y;
+    const bool writer_cta = blockIdx.x == 0;
 
     if (tid < E) {
-        float xv = logits[tid];
+        float xv = logits[(size_t)n * E + tid];
         if (softcap > 0.f) {
             xv = softcap * tanhf(xv / softcap);
         }
@@ -435,13 +440,15 @@ __global__ void moe_route_gather_quant_m1_kernel(
                     for (int j = 0; j < K; ++j) win_w[j] /= sum;
                 }
             }
-            for (int j = 0; j < K; ++j) {
-                topk_ids[j] = win_ids[j];
-                topk_weights[j] = win_w[j] * routed_scaling;
-            }
-            if (shared_tail_id >= 0) {
-                topk_ids[K] = shared_tail_id;
-                topk_weights[K] = 1.f;
+            if (writer_cta) {
+                for (int j = 0; j < K; ++j) {
+                    topk_ids[n * tiles + j] = win_ids[j];
+                    topk_weights[n * tiles + j] = win_w[j] * routed_scaling;
+                }
+                if (shared_tail_id >= 0) {
+                    topk_ids[n * tiles + K] = shared_tail_id;
+                    topk_weights[n * tiles + K] = 1.f;
+                }
             }
         }
     }
@@ -451,21 +458,24 @@ __global__ void moe_route_gather_quant_m1_kernel(
         int id = (tid < K) ? win_ids[tid] : shared_tail_id;
         float g_gu = (id >= 0) ? globals_gu[id] : 0.f;
         float g_dn = (id >= 0) ? globals_dn[id] : 0.f;
-        gu_mini[tid] = g_gu;
-        dn_mini[tid] = g_dn;
+        if (writer_cta) {
+            gu_mini[n * tiles + tid] = g_gu;
+            dn_mini[n * tiles + tid] = g_dn;
+        }
         s_stored[tid] = (g_gu == 0.f || !isfinite(g_gu)) ? 1.f : g_gu;
     }
     __syncthreads();
 
     int groups = hidden / 16;
-    for (int gidx = tid; gidx < tiles * groups; gidx += blockDim.x) {
+    for (int gidx = tid + blockIdx.x * blockDim.x; gidx < tiles * groups;
+         gidx += blockDim.x * gridDim.x) {
         int t = gidx / groups;
         int kb = gidx % groups;
         float vals[16];
         float amax = 0.f;
         #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            float v = __bfloat162float(x[kb * 16 + i]);
+            float v = __bfloat162float(x[(size_t)n * hidden + kb * 16 + i]);
             vals[i] = v;
             float av = fabsf(v);
             if (av > amax) amax = av;
@@ -477,7 +487,7 @@ __global__ void moe_route_gather_quant_m1_kernel(
         float scale_decoded = rgq_decode_ue4m3(scale_byte);
         float inv = (scale_decoded == 0.f) ? 1.f : (stored / scale_decoded);
 
-        int row = t * min_tile;
+        int row = (n * tiles + t) * min_tile;
         uint8_t* pblock = x_fp4 + (size_t)row * (hidden / 2) + kb * 8;
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -489,9 +499,10 @@ __global__ void moe_route_gather_quant_m1_kernel(
         }
         x_sf[rgq_swizzled_scale_dst(row, kb, groups)] = scale_byte;
     }
+    NVK_PDL_EPILOG();
 }
 
-extern "C" int nv_kernels_moe_route_gather_quant_m1(
+extern "C" int nv_kernels_moe_route_gather_quant_small_m(
     void* stream,
     const float* logits,
     const float* bias,
@@ -504,6 +515,7 @@ extern "C" int nv_kernels_moe_route_gather_quant_m1(
     float* dn_mini,
     uint8_t* x_fp4,
     uint8_t* x_sf,
+    int n_tokens,
     int E,
     int K,
     int mode,
@@ -512,23 +524,152 @@ extern "C" int nv_kernels_moe_route_gather_quant_m1(
     float routed_scaling,
     int shared_tail_id,
     int hidden,
-    int min_tile
+    int min_tile,
+    int quant_ctas
 ) {
-    if (E <= 0 || K <= 0 || hidden <= 0 || min_tile <= 0) return -1;
+    if (n_tokens <= 0 || E <= 0 || K <= 0 || hidden <= 0 || min_tile <= 0) return -1;
     if (E > 256 || K + 1 > ROUTE_MAX_K || K > E) return -2;
     if ((hidden % 16) != 0 || (min_tile % 128) != 0) return -3;
+    if (n_tokens > 65535) return -4;
+    if (quant_ctas <= 0 || quant_ctas > 64) return -5;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     const int tx = 256;
     size_t shmem = (size_t)2 * E * sizeof(float);
-    moe_route_gather_quant_m1_kernel<<<1, tx, shmem, s>>>(
-        logits, bias,
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
-        globals_gu, globals_dn,
-        topk_ids, topk_weights, gu_mini, dn_mini,
-        x_fp4, x_sf,
-        E, K, mode, softcap, norm_topk, routed_scaling,
-        shared_tail_id, hidden, min_tile
-    );
+    dim3 grid((unsigned)quant_ctas, (unsigned)n_tokens);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, grid, dim3((unsigned)tx), shmem, s);
+        cudaLaunchKernelEx(&cfg, moe_route_gather_quant_small_m_kernel,
+            logits, bias,
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            globals_gu, globals_dn,
+            topk_ids, topk_weights, gu_mini, dn_mini,
+            x_fp4, x_sf,
+            E, K, mode, softcap, norm_topk, routed_scaling,
+            shared_tail_id, hidden, min_tile);
+    } else {
+        moe_route_gather_quant_small_m_kernel<<<grid, tx, shmem, s>>>(
+            logits, bias,
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            globals_gu, globals_dn,
+            topk_ids, topk_weights, gu_mini, dn_mini,
+            x_fp4, x_sf,
+            E, K, mode, softcap, norm_topk, routed_scaling,
+            shared_tail_id, hidden, min_tile
+        );
+    }
+    cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+#define ROUTER_GEMV_MAX_SHARED_K 4096
+
+__global__ void moe_router_gemv_sg_xstage_small_m_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ wg,
+    const __nv_bfloat16* __restrict__ wsg,
+    float* __restrict__ logits_f32,
+    __nv_bfloat16* __restrict__ sg_out,
+    __nv_bfloat16* __restrict__ x_stage,
+    int E,
+    int K
+) {
+    NVK_PDL_PROLOG();
+    __shared__ float xs[ROUTER_GEMV_MAX_SHARED_K];
+    constexpr int kW = 32;
+    constexpr int kRows = 8;
+    constexpr int kDim = kW * kRows;
+    int r = blockIdx.y;
+    const __nv_bfloat16* x_row = x + (size_t)r * K;
+    for (int k = threadIdx.x; k < K; k += kDim) {
+        xs[k] = __bfloat162float(x_row[k]);
+    }
+    if (x_stage != nullptr && blockIdx.x == 0) {
+        const uint16_t* xr = reinterpret_cast<const uint16_t*>(x_row);
+        uint16_t* xw = reinterpret_cast<uint16_t*>(x_stage) + (size_t)r * K;
+        for (int k = threadIdx.x; k < K; k += kDim) {
+            xw[k] = xr[k];
+        }
+    }
+    __syncthreads();
+
+    int lane = threadIdx.x & (kW - 1);
+    int warp = threadIdx.x / kW;
+    int n = blockIdx.x * kRows + warp;
+    int n_total = E + (wsg != nullptr ? 1 : 0);
+    if (n >= n_total) return;
+
+    const __nv_bfloat16* w_row = (n < E) ? (wg + (size_t)n * K) : wsg;
+    int Kv = K / 8;
+    const uint4* w4 = reinterpret_cast<const uint4*>(w_row);
+
+    float acc = 0.0f;
+    for (int v = lane; v < Kv; v += kW) {
+        uint4 pw = __ldg(&w4[v]);
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&pw);
+        int kb = v * 8;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 wf = __bfloat1622float2(wp[j]);
+            float xa = xs[kb + 2 * j];
+            float xb = xs[kb + 2 * j + 1];
+            acc += wf.x * xa + wf.y * xb;
+        }
+    }
+
+    #pragma unroll
+    for (int offset = kW / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) {
+        __nv_bfloat16 rounded = __float2bfloat16(acc);
+        if (n < E) {
+            logits_f32[(size_t)r * E + n] = __bfloat162float(rounded);
+        } else {
+            sg_out[r] = rounded;
+        }
+    }
+    NVK_PDL_EPILOG();
+}
+
+extern "C" int nv_kernels_moe_router_gemv_sg_xstage_small_m(
+    void* stream,
+    const uint16_t* x_bf16,
+    const uint16_t* wg_bf16,
+    const uint16_t* wsg_bf16,
+    float* logits_f32,
+    uint16_t* sg_out_bf16,
+    uint16_t* x_stage_bf16,
+    int m,
+    int E,
+    int K
+) {
+    if (m <= 0 || E <= 0 || K <= 0) return -1;
+    if (m > 8 || (K & 7) != 0 || K > ROUTER_GEMV_MAX_SHARED_K) return -2;
+    if ((wsg_bf16 == nullptr) != (sg_out_bf16 == nullptr)) return -3;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    int n_total = E + (wsg_bf16 != nullptr ? 1 : 0);
+    dim3 grid((unsigned)((n_total + 7) / 8), (unsigned)m);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, grid, dim3(256), 0, s);
+        cudaLaunchKernelEx(&cfg, moe_router_gemv_sg_xstage_small_m_kernel,
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(wg_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(wsg_bf16),
+            logits_f32,
+            reinterpret_cast<__nv_bfloat16*>(sg_out_bf16),
+            reinterpret_cast<__nv_bfloat16*>(x_stage_bf16),
+            E, K);
+    } else {
+        moe_router_gemv_sg_xstage_small_m_kernel<<<grid, dim3(256), 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(wg_bf16),
+            reinterpret_cast<const __nv_bfloat16*>(wsg_bf16),
+            logits_f32,
+            reinterpret_cast<__nv_bfloat16*>(sg_out_bf16),
+            reinterpret_cast<__nv_bfloat16*>(x_stage_bf16),
+            E, K
+        );
+    }
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
 }

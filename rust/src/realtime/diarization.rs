@@ -65,22 +65,24 @@ pub(super) async fn run_diarization(
 
     if !segments.is_empty() {
         session
-            .emit(super::wire::OutboundEvent::Diarization {
-                item_id: item_id.clone().into(),
-                audio_end_ms,
-                elapsed_ms: Some(elapsed_ms),
-                segments: segments
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "speaker": format!("SPEAKER_{:02}", s.speaker),
-                            "start": s.t_start_ms as f64 / 1000.0,
-                            "end": s.t_end_ms as f64 / 1000.0,
-                            "confidence": s.confidence,
+            .emit(super::wire::OutboundEvent::Diarization(
+                super::wire::DiarizationEvent {
+                    item_id: item_id.clone().into(),
+                    audio_end_ms,
+                    elapsed_ms: Some(elapsed_ms),
+                    segments: segments
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "speaker": format!("SPEAKER_{:02}", s.speaker),
+                                "start": s.t_start_ms as f64 / 1000.0,
+                                "end": s.t_end_ms as f64 / 1000.0,
+                                "confidence": s.confidence,
+                            })
                         })
-                    })
-                    .collect(),
-            })
+                        .collect(),
+                },
+            ))
             .await;
     }
 

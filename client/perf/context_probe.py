@@ -7,13 +7,13 @@ import pyarrow.parquet as pq
 import onnxruntime as ort
 import soundfile as sf
 
-sys.path.insert(0, "/tmp/eot-scratch")
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+sys.path.insert(0, "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad")
+sys.path.insert(0, "/persist/colmena/projects/speaches-plus/client/perf")
 from text_head_fnv import hashed_features
 import eot_silence_ab as F
 
-SMART_TURN = "/tmp/models/smart-turn-v3.2-cpu.onnx"
-HEAD = "/tmp/eot-scratch/text-head-fnv.bin"
+SMART_TURN = "/nix/store/572qm60y75bmrzj74kbshfrkrxrrd62i-hf-model-pipecat-ai-smart-turn-v3-f766f81d3cfdf7737ac64aad813d91bbfd56bf93/smart-turn-v3.2-cpu.onnx"
+HEAD = "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/text-head-fnv.bin"
 SR = 16000
 DECIDE_AT = 0.2
 
@@ -47,7 +47,7 @@ def context_feats(msgs):
         1.0 if "yes or no" in a or a.endswith("correct?") else 0.0,
     ]
 
-t = pq.read_table("/tmp/eot-scratch/eot-en.parquet")
+t = pq.read_table("/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/eot-en.parquet")
 rows = t.to_pylist()
 X_pa, X_pt, X_ctx, Y, CLIP = [], [], [], [], []
 for ci, r in enumerate(rows):

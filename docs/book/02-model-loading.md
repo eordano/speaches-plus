@@ -142,7 +142,7 @@ worse, as plausible-looking garbage.
 | `Gemma4` | `Arc<Gemma4>` | shared, no lock |
 | `Gemma4E4b` | `Arc<Gemma4E4b>` | shared |
 | `Gemma4Moe` | `Arc<Gemma4Moe>` | shared |
-| `Qwen3_5Moe` | `QwenMoeShared::{Eager, Graphed, Batch}` | serialised, except `Batch` (a `Qwen38BatchScheduler`) |
+| `Qwen3_5Moe` | `QwenMoeShared::{Eager, Graphed, Batch}` | serialised, except `Batch` (an `Arc<QwenBatchScheduler>`) |
 | `Laguna` | `LagunaShared` (`Arc<Laguna>` + `unsafe impl Send/Sync`) | shared |
 | `Omni` | `Arc<OmniShared>` | shared |
 | `GptOss` | `Arc<GptOssCuda>` | shared |
@@ -160,14 +160,19 @@ config list or the raw JSON, and Qwen3.5-MoE from
 `resolve_qwen3_5_moe_eos_ids`, which unions `tokenizer_config.json:eos_token`
 mapped through the tokenizer, the literal `<|im_end|>` id, and the config field.
 
-`kv_max_seq_len_for` caps at 8192 by default; the Gemma4 variant defaults to the
-checkpoint's full `max_position_embeddings` and then runs `fit_gemma4_kv_max`,
-halving down to `KV_FIT_FLOOR` until the KV budget plus the measured weight
-residency fits `NV_VRAM_BUDGET_GIB`. **`decide_gemma4_kv_max` returns a `KvFit`
-enum rather than a bare number** specifically so a *failed* `nvidia-smi` probe
-(`ProbeFailed`) is distinguishable from a genuine fit — when they were the same
-value, auto-fit silently became a no-op and the boot failed later inside an
-allocation with no explanation. The Gemma4 arm additionally loads the Eagle3 and
+**A family the VRAM solver does not model gets a conservative KV ceiling, not
+the checkpoint's.** `kv_max_seq_len_for_unplanned_family` resolves the per-family
+KV env, then the global one, then falls back through `kv_max_seq_len_resolved` to
+`KV_DEFAULT_8192_TOKENS_FOR_FAMILIES_WITHOUT_A_VRAM_SOLVER_MODEL_SO_MULTI_ENGINE_BOOTS_DO_NOT_OOM_LIFT_VIA_THE_GLOBAL_OR_PER_FAMILY_KV_ENV`
+— the constant's name is the reason, and either env lifts it. `NV_KV_MAX_SEQ_LEN`
+is always clamped to `max_position_embeddings`, so an env can only lower the
+ceiling, never invent context the checkpoint does not have.
+`kv_max_seq_len_for_gemma4` is the exception that defaults to the checkpoint's
+full `max_position_embeddings`, because Gemma4 *is* modelled: fitting the KV
+budget against `NV_VRAM_BUDGET_GIB` is the `vram_plan` solver's job, and it
+refuses to boot a plan that would OOM, naming the smallest changes that would fit
+in ranked order rather than failing later inside an allocation. The Gemma4 arm
+additionally loads the Eagle3 and
 DFlash drafters and sets `spec_status`, and the Qwen3.8 arm loads the MTP head
 and boot-fails when `NV_DRAFTER=mtp` and the head is missing
 (03-speculative-decoding.md).

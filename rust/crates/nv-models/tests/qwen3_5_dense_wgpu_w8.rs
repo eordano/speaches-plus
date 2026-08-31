@@ -10,7 +10,13 @@ use common::LcgOddSeedShift33SignedUnit as Lcg;
 fn pin_fusion_off_process_wide_because_these_gates_pin_unfused_quant_staging_dispatch_counts() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        for e in ["NV_Q3D_FUSE_DN", "NV_Q3D_FUSE_ATTN", "NV_Q3D_FUSE_DN_GEMV", "NV_Q3D_FUSE_MLP"] {
+        for e in [
+            "NV_Q3D_FUSE_DN",
+            "NV_Q3D_FUSE_ATTN",
+            "NV_Q3D_FUSE_DN_GEMV",
+            "NV_Q3D_FUSE_MLP",
+            "NV_Q3D_MLP_W4A8",
+        ] {
             std::env::set_var(e, "0");
         }
     });
@@ -92,6 +98,7 @@ fn tiny_weights(cfg: &Qwen3_5DenseConfig, seed: u64, quantized: bool) -> q3d::Ho
                     o: lin(bf16_lin(&mut r, hidden, cfg.num_attention_heads * hd, 0.12)),
                     q_norm: norm_vec(&mut r, hd),
                     k_norm: norm_vec(&mut r, hd),
+                    qkv_bias_bf16: vec![],
                 }))
             }
         };

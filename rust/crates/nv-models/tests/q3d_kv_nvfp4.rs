@@ -129,6 +129,7 @@ fn tiny_weights(cfg: &Qwen3_5DenseConfig, seed: u64) -> q3d::HostDenseWeights {
                     o: bf16_lin(&mut r, hidden, cfg.num_attention_heads * hd, 0.12).into(),
                     q_norm: norm_vec(&mut r, hd),
                     k_norm: norm_vec(&mut r, hd),
+                    qkv_bias_bf16: vec![],
                 }))
             }
         };
@@ -162,6 +163,7 @@ const PROMPT_LEN_CROSSES_A_32_TOKEN_K_BLOCK_AND_A_16_ROW_CHUNK: usize = 39;
 const GREEDY_STEPS: usize = 8;
 
 fn build(cfg: &Qwen3_5DenseConfig, hw: &q3d::HostDenseWeights, arm: Option<&str>) -> q3d::Qwen3_5DenseWgpu {
+    std::env::set_var("NV_Q3D_KV_FP8_TP", "0");
     if let Some(a) = arm {
         std::env::set_var(ARM_ENV, a);
     }

@@ -139,6 +139,23 @@ fn gemma4_wgpu_decode_ms_per_token_vs_context_depth_step_primed() {
             1000.0 / median,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_dense_wgpu_decode_step_step_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+            ],
+        );
     }
 }
 
@@ -227,6 +244,26 @@ fn gemma4_wgpu_chunked_prefill_tok_s_then_decode_ms_tok_vs_context_depth() {
             depth as f64 / prefill_s,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-prefill",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: depth as f64 / prefill_s,
+                unit: "tok/s",
+                basis: "chunked_prefill_wall_clock_synthetic_repeat_prompt_then_decode_tail",
+            },
+            &[
+                ("prefill_s", format!("{prefill_s:.3}")),
+                ("decode_median_ms_tok", format!("{median:.3}")),
+                ("decode_mean_ms_tok", format!("{mean:.3}")),
+                ("chunk_done", done.to_string()),
+            ],
+        );
     }
 }
 
@@ -309,6 +346,26 @@ fn gemma4_wgpu_decode_ms_per_token_vs_context_depth_chunked_prefill_primed() {
             depth as f64 / prime_s,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_dense_wgpu_decode_step_chunked_prefill_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+                ("prime_tok_s", format!("{:.1}", depth as f64 / prime_s)),
+                ("prime", "chunked".to_string()),
+                ("chunk_done", done.to_string()),
+            ],
+        );
     }
 }
 
@@ -352,12 +409,21 @@ fn gemma4_moe_wgpu_chunked_prefill_tok_s_then_decode_ms_tok_vs_context_depth() {
         "max_seq {max_seq} exceeds max_position_embeddings {}; drop the offending NV_CTX_TOKENS depth",
         cfg.base.max_position_embeddings
     );
-    let loader =
-        nv_weights::WeightLoader::open_dir(&dir, &candle_core::Device::Cpu).expect("weights");
     let t0 = std::time::Instant::now();
-    let mut m = nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu::from_loader(cfg, &loader, max_seq)
-        .expect("wgpu moe model");
-    drop(loader);
+    let mut m = match nv_models::gemma4_gguf::opted_in_qat_q4_gguf_for_snapshot(&cfg) {
+        Some(gguf) => {
+            eprintln!("weights arm: OPT-IN qat q4 gguf {}", gguf.display());
+            nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu::from_gguf(&gguf, max_seq)
+                .expect("wgpu moe model from qat q4 gguf")
+        }
+        None => {
+            eprintln!("weights arm: snapshot safetensors (the serving default)");
+            let loader = nv_weights::WeightLoader::open_dir(&dir, &candle_core::Device::Cpu)
+                .expect("weights");
+            nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu::from_loader(cfg, &loader, max_seq)
+                .expect("wgpu moe model")
+        }
+    };
     let wired_gib = m.load_report().wired_bytes as f64 / (1u64 << 30) as f64;
     eprintln!(
         "built in {:.1}s wired={wired_gib:.2} GiB | prefill chunk m={} passes/chunk={} decode passes/token={}",
@@ -407,6 +473,26 @@ fn gemma4_moe_wgpu_chunked_prefill_tok_s_then_decode_ms_tok_vs_context_depth() {
             depth as f64 / prefill_s,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-prefill",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: depth as f64 / prefill_s,
+                unit: "tok/s",
+                basis: "chunked_prefill_wall_clock_synthetic_repeat_prompt_then_decode_tail",
+            },
+            &[
+                ("prefill_s", format!("{prefill_s:.3}")),
+                ("decode_median_ms_tok", format!("{median:.3}")),
+                ("decode_mean_ms_tok", format!("{mean:.3}")),
+                ("chunk_done", done.to_string()),
+            ],
+        );
     }
 }
 
@@ -436,12 +522,21 @@ fn g4moe_wgpu_decode_ms_per_token_vs_context_depth_chunked_prefill_primed() {
         "ladder needs {max_seq} positions but max_position_embeddings is {}",
         config.base.max_position_embeddings
     );
-    let loader = nv_weights::WeightLoader::open_dir(&dir, &candle_core::Device::Cpu)
-        .expect("open safetensors");
     let t_build = std::time::Instant::now();
-    let mut m = nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu::from_loader(config, &loader, max_seq)
-        .expect("build from loader");
-    drop(loader);
+    let mut m = match nv_models::gemma4_gguf::opted_in_qat_q4_gguf_for_snapshot(&config) {
+        Some(gguf) => {
+            eprintln!("weights arm: OPT-IN qat q4 gguf {}", gguf.display());
+            nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu::from_gguf(&gguf, max_seq)
+                .expect("build from qat q4 gguf")
+        }
+        None => {
+            eprintln!("weights arm: snapshot safetensors (the serving default)");
+            let loader = nv_weights::WeightLoader::open_dir(&dir, &candle_core::Device::Cpu)
+                .expect("open safetensors");
+            nv_models::gemma4_moe_wgpu::Gemma4MoeWgpu::from_loader(config, &loader, max_seq)
+                .expect("build from loader")
+        }
+    };
     let wired_gib = m.load_report().wired_bytes as f64 / (1u64 << 30) as f64;
     eprintln!(
         "built in {:.1}s wired={wired_gib:.2} GiB ring={} | prefill chunk m={} passes/chunk={} decode passes/token={}",
@@ -491,6 +586,26 @@ fn g4moe_wgpu_decode_ms_per_token_vs_context_depth_chunked_prefill_primed() {
             1000.0 / median,
             depth as f64 / prime_s,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "moe_wgpu_decode_step_chunked_prefill_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+                ("prime_tok_s", format!("{:.1}", depth as f64 / prime_s)),
+                ("prime", "chunked".to_string()),
+                ("chunk_done", done.to_string()),
+            ],
         );
     }
 }
@@ -550,6 +665,23 @@ fn qwen36_wgpu_decode_ms_per_token_vs_context_depth_step_primed() {
             "CTX-SCALING qwen36-wgpu depth={depth} median_ms_tok={median:.3} tok_s={:.1} prime_s={prime_s:.1} steps={} warmup_steps={warmup_steps}",
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "moe_wgpu_decode_step_step_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+            ],
         );
     }
 }
@@ -632,6 +764,26 @@ fn qwen36_wgpu_chunked_prefill_tok_s_then_decode_ms_tok_vs_context_depth() {
             "CTX-PREFILL qwen36-wgpu depth={depth} prefill_s={prefill_s:.3} prefill_tok_s={:.1} chunk_done={done} decode_mean_ms_tok={mean:.3} decode_median_ms_tok={median:.3} steps={} warmup_steps={warmup_steps}",
             depth as f64 / prefill_s,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-prefill",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: depth as f64 / prefill_s,
+                unit: "tok/s",
+                basis: "mrow_chunked_prefill_wall_clock_synthetic_repeat_prompt_then_decode_tail",
+            },
+            &[
+                ("prefill_s", format!("{prefill_s:.3}")),
+                ("decode_median_ms_tok", format!("{median:.3}")),
+                ("decode_mean_ms_tok", format!("{mean:.3}")),
+                ("chunk_done", done.to_string()),
+            ],
         );
     }
 }
@@ -1047,6 +1199,23 @@ fn gptoss_wgpu_decode_ms_per_token_vs_context_depth_step_primed_max_pos_131072_c
             1000.0 / median,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "moe_wgpu_decode_step_step_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+            ],
+        );
     }
 }
 
@@ -1116,6 +1285,24 @@ fn e4b_wgpu_decode_ms_per_token_vs_context_depth_step_primed_max_pos_131072_caps
             1000.0 / median,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_wgpu_decode_step_step_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+                ("ckpt", ckpt.to_string()),
+            ],
+        );
     }
 }
 
@@ -1174,6 +1361,23 @@ fn g4moe_wgpu_decode_ms_per_token_vs_context_depth_step_primed() {
             "CTX-SCALING g4moe-wgpu depth={depth} median_ms_tok={median:.3} tok_s={:.1} prime_s={prime_s:.1} steps={} warmup_steps={warmup_steps}",
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "moe_wgpu_decode_step_step_primed",
+            },
+            &[
+                ("prime_s", format!("{prime_s:.1}")),
+            ],
         );
     }
 }
@@ -1291,6 +1495,25 @@ fn gemma4_wgpu_decode_ms_per_token_vs_context_depth_synthetic_cache_fill_ring_wr
             1000.0 / median,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_dense_wgpu_decode_step_synthetic_state_fill",
+            },
+            &[
+                ("fill_s", format!("{fill_s:.1}")),
+                ("ring", ring.to_string()),
+            ],
+        );
+        print_wgpu_profile_share_table_then_reset(&format!("g4dense-synthfill-{depth}"));
     }
 }
 
@@ -1353,6 +1576,25 @@ fn g4moe_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_t
             "CTX-SCALING g4moe-wgpu-synthfill depth={depth} median_ms_tok={median:.3} tok_s={:.1} fill_s={fill_s:.1} ring={ring} flash={flash} steps={} warmup_steps={warmup_steps}",
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "moe_wgpu_decode_step_synthetic_state_fill",
+            },
+            &[
+                ("fill_s", format!("{fill_s:.1}")),
+                ("ring", ring.to_string()),
+                ("flash", flash.to_string()),
+            ],
         );
         print_wgpu_profile_share_table_then_reset(&format!("g4moe-synthfill-{depth}"));
     }
@@ -1507,6 +1749,23 @@ fn qwen36_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_
             1000.0 / median,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "moe_wgpu_decode_step_synthetic_state_fill",
+            },
+            &[
+                ("fill_s", format!("{fill_s:.1}")),
+            ],
+        );
     }
 }
 
@@ -1575,6 +1834,23 @@ fn qwen38_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_
             "CTX-SCALING qwen38-wgpu-synthfill depth={depth} basis=eager_dense_wgpu_decode_step_synthetic_state_fill median_ms_tok={median:.3} tok_s={:.1} fill_s={fill_s:.1} steps={} warmup_steps={warmup_steps}",
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "wgpu",
+                device: ctx_timing_common::wgpu_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_dense_wgpu_decode_step_synthetic_state_fill",
+            },
+            &[
+                ("fill_s", format!("{fill_s:.1}")),
+            ],
         );
         print_wgpu_profile_share_table_then_reset(&format!("qwen38-wgpu decode depth={depth}"));
     }

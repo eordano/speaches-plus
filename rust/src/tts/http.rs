@@ -763,12 +763,59 @@ async fn stream_audio(
         }
     });
 
+    if matches!(format, ResponseFormat::Wav) {
+        return buffered_wav_response(rx).await;
+    }
     let stream = ReceiverStream::new(rx);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, format.mime_type())
         .body(Body::from_stream(stream))
         .map_err(|e| io_err(format!("response build: {e}")))
+}
+
+async fn buffered_wav_response(
+    mut rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+) -> std::io::Result<Response> {
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        body.extend_from_slice(&chunk?);
+    }
+    patch_riff_lengths(&mut body)?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ResponseFormat::Wav.mime_type())
+        .header(header::CONTENT_LENGTH, body.len())
+        .body(Body::from(body))
+        .map_err(|e| io_err(format!("response build: {e}")))
+}
+
+fn patch_riff_lengths(wav: &mut [u8]) -> std::io::Result<()> {
+    if wav.len() < 44 || &wav[..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return Err(io_err(
+            "ffmpeg wav output is missing the RIFF/WAVE header; cannot patch stream-placeholder \
+             lengths",
+        ));
+    }
+    let riff_size = (wav.len() as u64 - 8).min(u32::MAX as u64) as u32;
+    wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    let mut off = 12usize;
+    while off + 8 <= wav.len() {
+        let is_data = &wav[off..off + 4] == b"data";
+        let size = u32::from_le_bytes(wav[off + 4..off + 8].try_into().expect("4-byte slice"));
+        if is_data {
+            let data_size = (wav.len() - (off + 8)).min(u32::MAX as usize) as u32;
+            wav[off + 4..off + 8].copy_from_slice(&data_size.to_le_bytes());
+            return Ok(());
+        }
+        off = off
+            .saturating_add(8)
+            .saturating_add(size as usize)
+            .saturating_add((size & 1) as usize);
+    }
+    Err(io_err(
+        "ffmpeg wav output has no data chunk; cannot patch stream-placeholder lengths",
+    ))
 }
 
 fn spawn_ffmpeg(format: ResponseFormat, source_sr: u32, target_sr: u32) -> std::io::Result<Child> {
@@ -825,6 +872,34 @@ mod tests {
             stream_format: None,
             sample_rate: None,
         }
+    }
+
+    #[test]
+    fn riff_patch_replaces_ffmpeg_stream_placeholder_lengths() {
+        let pcm = [0u8; 100];
+        let mut wav: Vec<u8> = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&u32::MAX.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&[0u8; 16]);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&u32::MAX.to_le_bytes());
+        wav.extend_from_slice(&pcm);
+        patch_riff_lengths(&mut wav).expect("well-formed wav must patch");
+        let riff = u32::from_le_bytes(wav[4..8].try_into().unwrap());
+        assert_eq!(riff as usize, wav.len() - 8);
+        let data = u32::from_le_bytes(wav[40..44].try_into().unwrap());
+        assert_eq!(data as usize, pcm.len());
+    }
+
+    #[test]
+    fn riff_patch_refuses_non_wav_bodies_instead_of_corrupting_them() {
+        let mut mp3 = vec![0xFFu8; 64];
+        assert!(patch_riff_lengths(&mut mp3).is_err());
+        let mut truncated = b"RIFF".to_vec();
+        assert!(patch_riff_lengths(&mut truncated).is_err());
     }
 
     #[tokio::test]

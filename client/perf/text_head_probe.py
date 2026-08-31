@@ -24,7 +24,7 @@ import numpy as np
 
 FEAT = os.environ.get(
     "TH_FEATURES",
-    "/tmp/eot-scratch/fusion-features",
+    "/tmp/claude-1000/-persist-colmena/4aaeb6fd-bd7e-4e36-a072-ec3bfa3fb6d1/scratchpad/fusion-features",
 )
 TRAIN_GLOBS = os.environ.get("TH_TRAIN_GLOB", "train-*.csv").split(",")
 EVAL_GLOBS = os.environ.get("TH_EVAL_GLOB", "test-*.csv").split(",")

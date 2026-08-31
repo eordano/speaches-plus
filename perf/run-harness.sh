@@ -41,7 +41,7 @@ shift
 BUILD_NAME="" MODEL="" BACKEND="" SUITE="" EXACT="" PARSE="" PKG="nv-models"
 FEATURES="cuda,wgpu" TIMEOUT=1800 MAX_SEQ="" CORPUS="" NOTES="" SAMPLING="greedy"
 BATCH=1 BIN="" GGUF="" BENCH_ARGS="" CHECKPOINT_REPO="" STATUS_OVERRIDE="" BENCH_ENV_RECORD=""
-CMD="" ENGINE_NAME="" FLAGS_JSON=""
+CMD="" ENGINE_NAME="" FLAGS_JSON="" CHECKPOINT_REV=""
 declare -a ENVS=()
 
 while [ $# -gt 0 ]; do
@@ -65,6 +65,7 @@ while [ $# -gt 0 ]; do
     --gguf) GGUF="$2"; shift 2 ;;
     --bench-args) BENCH_ARGS="$2"; shift 2 ;;
     --checkpoint-repo) CHECKPOINT_REPO="$2"; shift 2 ;;
+    --checkpoint-rev) CHECKPOINT_REV="$2"; shift 2 ;;
     --status-override) STATUS_OVERRIDE="$2"; shift 2 ;;
     --cmd) CMD="$2"; shift 2 ;;
     --engine-name) ENGINE_NAME="$2"; shift 2 ;;
@@ -94,21 +95,55 @@ COMMIT_HASH=$(git -C "$REPO" rev-parse HEAD)
 COMMIT_DATE=$(git -C "$REPO" show -s --format=%cI HEAD)
 STARTED_AT=$(date -Iseconds)
 
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
-DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
-POWER_LIMIT=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1)
-VRAM_BEFORE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+HAVE_SMI=0
+command -v nvidia-smi >/dev/null 2>&1 && HAVE_SMI=1
+if [ "$HAVE_SMI" = "1" ]; then
+  GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+  DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+  POWER_LIMIT=$(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | head -1)
+  ENTRY_STATE=$(nvidia-smi --query-gpu=clocks.sm,temperature.gpu,power.draw --format=csv,noheader,nounits | head -1)
+  VRAM_BEFORE=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+  (
+    while true; do
+      nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >>"$VRAM_SAMPLES" 2>/dev/null || true
+      sleep 5
+    done
+  ) &
+  VRAM_PID=$!
+  trap 'kill $VRAM_PID 2>/dev/null || true' EXIT
+elif [ "$(uname)" = "Darwin" ]; then
+  GPU_NAME=$(sysctl -n machdep.cpu.brand_string)
+  DRIVER="macOS $(sw_vers -productVersion)"
+  POWER_LIMIT=""
+  PAGE_BYTES=$(sysctl -n hw.pagesize)
+  darwin_wired_mb() {
+    vm_stat | awk -v pb="$PAGE_BYTES" '/Pages wired down/ {gsub(/\./,"",$NF); printf "%d", $NF*pb/1048576}'
+  }
+  VRAM_BEFORE=$(darwin_wired_mb)
+  (
+    while true; do
+      darwin_wired_mb >>"$VRAM_SAMPLES" 2>/dev/null || true
+      echo >>"$VRAM_SAMPLES"
+      sleep 5
+    done
+  ) &
+  VRAM_PID=$!
+  trap 'kill $VRAM_PID 2>/dev/null || true' EXIT
+else
+  echo "run-harness: no nvidia-smi and not Darwin; refusing to record a device-less row" >&2
+  exit 1
+fi
 
-(
-  while true; do
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits >>"$VRAM_SAMPLES" 2>/dev/null || true
-    sleep 5
-  done
-) &
-VRAM_PID=$!
-trap 'kill $VRAM_PID 2>/dev/null || true' EXIT
+LOCK_CMD=""
+if command -v flock >/dev/null 2>&1; then
+  GPU_LOCK="${NVK_GPU_LOCK:-/tmp/claude-1000/nvk-gpu0.lock}"
+  mkdir -p "$(dirname "$GPU_LOCK")"
+  LOCK_CMD="flock $GPU_LOCK"
+else
+  echo "run-harness: flock(1) absent (macOS); runs are unserialized -- keep them strictly serial yourself" >&2
+fi
 
-T0=$(date +%s.%N)
+T0=$(python3 -c 'import time; print(f"{time.time():.3f}")')
 EXIT_CODE=0
 
 if [ "$ENGINE_MODE" = "ours" ]; then
@@ -141,6 +176,11 @@ elif [ "$ENGINE_MODE" = "llamacpp" ]; then
       BENCH_ENV_RECORD="GGML_VK_VISIBLE_DEVICES=$GGML_VK_VISIBLE_DEVICES"
       ;;
     cuda) BENCH="$LLAMA_BENCH_CUDA"; BACKEND="${BACKEND:-cuda}" ;;
+    metal)
+      BENCH="${LLAMA_BENCH_METAL:-$(command -v llama-bench || true)}"
+      BACKEND="${BACKEND:-metal}"
+      [ -n "$BENCH" ] && [ -x "$BENCH" ] || { echo "run-harness: no llama-bench for metal (set LLAMA_BENCH_METAL)" >&2; exit 1; }
+      ;;
     *) usage ;;
   esac
   INSTRUMENT="llama-bench"
@@ -155,7 +195,7 @@ elif [ "$ENGINE_MODE" = "llamacpp" ]; then
   CHECKPOINT_REPO="${CHECKPOINT_REPO:-gguf:$GGUF_BASE}"
   set +e
   LD_LIBRARY_PATH="/run/opengl-driver/lib:$(dirname "$BENCH")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    flock "${NVK_GPU_LOCK:-/tmp/nvk-gpu0.lock}" \
+    $LOCK_CMD \
     timeout "$TIMEOUT" "$BENCH" -m "$GGUF" $BENCH_ARGS -o json \
     >"$LOG" 2>&1
   EXIT_CODE=$?
@@ -168,7 +208,7 @@ elif [ "$ENGINE_MODE" = "exec" ]; then
   SOURCE_FILE=""
   BUILD_HASH=$(printf '%s' "$CMD" | sha256sum | cut -c1-16)
   set +e
-  flock "${NVK_GPU_LOCK:-/tmp/nvk-gpu0.lock}" \
+  $LOCK_CMD \
     timeout "$TIMEOUT" bash -c "$CMD" >"$LOG" 2>&1
   EXIT_CODE=$?
   set -e
@@ -176,13 +216,18 @@ else
   usage
 fi
 
-T1=$(date +%s.%N)
+T1=$(python3 -c 'import time; print(f"{time.time():.3f}")')
 WALL_S=$(python3 -c "print(round($T1 - $T0, 1))")
 kill $VRAM_PID 2>/dev/null || true
 trap - EXIT
-VRAM_AFTER=$(sort -n "$VRAM_SAMPLES" 2>/dev/null | tail -1)
+VRAM_AFTER=""
+[ -s "$VRAM_SAMPLES" ] && VRAM_AFTER=$(sort -n "$VRAM_SAMPLES" | tail -1)
 VRAM_AFTER="${VRAM_AFTER:-$VRAM_BEFORE}"
-THROTTLE=$(nvidia-smi --query-gpu=clocks_event_reasons.active --format=csv,noheader | head -1)
+if [ "$HAVE_SMI" = "1" ]; then
+  THROTTLE=$(nvidia-smi --query-gpu=clocks_event_reasons.active --format=csv,noheader | head -1)
+else
+  THROTTLE=""
+fi
 
 if [ "$EXIT_CODE" = "124" ]; then
   NOTES="${NOTES:+$NOTES | }timed out after ${TIMEOUT}s (30-min single-probe cap)"
@@ -197,11 +242,12 @@ RUN_ID_BASE="$RUN_ID" LOG_PATH="$LOG" META_ENGINE="$ENGINE" META_BACKEND="$BACKE
 META_MODEL="$MODEL" META_BUILD_NAME="$BUILD_NAME" META_BUILD_HASH="$BUILD_HASH" \
 META_COMMIT_HASH="$COMMIT_HASH" META_COMMIT_DATE="$COMMIT_DATE" META_STARTED_AT="$STARTED_AT" \
 META_GPU_NAME="$GPU_NAME" META_DRIVER="$DRIVER" META_POWER_LIMIT="$POWER_LIMIT" \
+META_ENTRY_STATE="${ENTRY_STATE:-}" \
 META_THROTTLE="$THROTTLE" META_VRAM_BEFORE="$VRAM_BEFORE" META_VRAM_AFTER="$VRAM_AFTER" \
 META_WALL_S="$WALL_S" META_INSTRUMENT="$INSTRUMENT" META_SOURCE_FILE="${SOURCE_FILE:-}" \
 META_NOTES="$NOTES" META_SAMPLING="$SAMPLING" META_BATCH="$BATCH" META_MAX_SEQ="$MAX_SEQ" \
 META_CORPUS="$CORPUS" META_CORPUS_SHA="$CORPUS_SHA" META_CHECKPOINT_REPO="$CHECKPOINT_REPO" \
-META_GGUF_SHA="${GGUF_SHA:-}" META_BENCH_ARGS="$BENCH_ARGS${BENCH_ENV_RECORD:+ [env] $BENCH_ENV_RECORD}" META_STATUS_OVERRIDE="$STATUS_OVERRIDE" \
+META_GGUF_SHA="${GGUF_SHA:-$CHECKPOINT_REV}" META_BENCH_ARGS="$BENCH_ARGS${BENCH_ENV_RECORD:+ [env] $BENCH_ENV_RECORD}" META_STATUS_OVERRIDE="$STATUS_OVERRIDE" \
 META_FLAGS_JSON="$FLAGS_JSON" \
 META_ENVS=$(printf '%s\n' ${ENVS[@]+"${ENVS[@]}"}) \
 python3 - "$META" <<'PYEOF'
@@ -215,6 +261,12 @@ if os.environ["META_ENGINE"] == "llama.cpp":
     flags = {"llama_bench_args": os.environ.get("META_BENCH_ARGS", "")}
 if os.environ.get("META_FLAGS_JSON"):
     flags = json.loads(os.environ["META_FLAGS_JSON"])
+entry_state = [p.strip() for p in os.environ.get("META_ENTRY_STATE", "").split(",")]
+def entry_field(i):
+    try:
+        return float(entry_state[i])
+    except (IndexError, ValueError):
+        return None
 meta = {
     "run_id_base": os.environ["RUN_ID_BASE"],
     "started_at": os.environ["META_STARTED_AT"],
@@ -229,15 +281,18 @@ meta = {
     "device": {
         "gpu_name": os.environ["META_GPU_NAME"],
         "driver": os.environ["META_DRIVER"],
-        "power_limit_w": float(os.environ["META_POWER_LIMIT"]),
+        "power_limit_w": float(os.environ["META_POWER_LIMIT"]) if os.environ.get("META_POWER_LIMIT") else None,
         "throttle_flags": os.environ["META_THROTTLE"],
+        "entry_clocks_sm_mhz": entry_field(0),
+        "entry_temperature_c": entry_field(1),
+        "entry_power_draw_w": entry_field(2),
     },
     "instrument": os.environ["META_INSTRUMENT"],
     "source_file": os.environ.get("META_SOURCE_FILE") or None,
     "inference_args": {"sampling": os.environ["META_SAMPLING"], "batch": int(os.environ["META_BATCH"])},
     "max_seq_allocated": int(os.environ["META_MAX_SEQ"]) if os.environ.get("META_MAX_SEQ") else None,
-    "vram_mb_before": int(os.environ["META_VRAM_BEFORE"]),
-    "vram_mb_after": int(os.environ["META_VRAM_AFTER"]),
+    "vram_mb_before": int(os.environ["META_VRAM_BEFORE"]) if os.environ.get("META_VRAM_BEFORE") else None,
+    "vram_mb_after": int(os.environ["META_VRAM_AFTER"]) if os.environ.get("META_VRAM_AFTER") else None,
     "wall_s": float(os.environ["META_WALL_S"]),
     "log_path": os.environ["LOG_PATH"],
     "notes": os.environ.get("META_NOTES") or "",

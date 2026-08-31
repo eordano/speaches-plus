@@ -7,6 +7,7 @@ use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
+use nv_layers::weight_load::{load_linear, load_rmsnorm};
 use nv_weights::WeightLoader;
 #[cfg(test)]
 use std::path::Path;
@@ -792,9 +793,9 @@ impl DeepseekMoe {
 pub(crate) fn moe_batch_gather() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_MOE_BATCH")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_DSOCR_MOE_BATCH",
+        )
     })
 }
 
@@ -802,9 +803,9 @@ pub(crate) fn moe_batch_gather() -> bool {
 pub(crate) fn moe_overlap_shared() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_MOE_OVERLAP")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_DSOCR_MOE_OVERLAP",
+        )
     })
 }
 
@@ -1171,6 +1172,35 @@ impl LinearFactory for Bf16Factory {
     }
 }
 
+struct GgmlFactory {
+    dtype: DType,
+    gdt: candle_core::quantized::GgmlDType,
+}
+
+impl LinearFactory for GgmlFactory {
+    fn load(
+        &self,
+        weights: &WeightLoader,
+        name: &str,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<Linear> {
+        if !in_features.is_multiple_of(self.gdt.block_size()) {
+            return load_linear(weights, name, out_features, in_features, self.dtype);
+        }
+        let w = weights
+            .get(name, DType::BF16)
+            .with_context(|| format!("load {name}"))?;
+        anyhow::ensure!(
+            w.dims2()? == (out_features, in_features),
+            "{name}: expected [{out_features}, {in_features}], got {:?}",
+            w.dims()
+        );
+        Linear::from_bf16_quantized_ggml(&w.contiguous()?, None, self.gdt)
+            .with_context(|| format!("quantize {name} to {:?}", self.gdt))
+    }
+}
+
 #[cfg(feature = "cuda")]
 struct Nvfp4Factory {
     dtype: DType,
@@ -1282,6 +1312,17 @@ impl DeepseekOcrDecoder {
         dtype: DType,
     ) -> Result<Self> {
         let factory = Bf16Factory { dtype };
+        Self::build(config, weights, device, dtype, &factory)
+    }
+
+    pub fn from_loader_ggml(
+        config: DeepseekOcrDecoderConfig,
+        weights: &WeightLoader,
+        device: &Device,
+        dtype: DType,
+        gdt: candle_core::quantized::GgmlDType,
+    ) -> Result<Self> {
+        let factory = GgmlFactory { dtype, gdt };
         Self::build(config, weights, device, dtype, &factory)
     }
 
@@ -2005,45 +2046,6 @@ pub fn vision_token_count(n_tiles: usize) -> usize {
     n_tiles * 144 + 256 + 1
 }
 
-fn load_rmsnorm(
-    weights: &WeightLoader,
-    name: &str,
-    dim: usize,
-    eps: f64,
-    dtype: DType,
-) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("rmsnorm {name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(RmsNorm::new(w, eps))
-}
-
-fn load_linear(
-    weights: &WeightLoader,
-    name: &str,
-    out_features: usize,
-    in_features: usize,
-    dtype: DType,
-) -> Result<Linear> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
-            "linear {name}: expected [{}, {}], got {:?}",
-            out_features,
-            in_features,
-            d
-        );
-    }
-    Linear::new(w, None)
-}
-
 fn load_mlp(
     factory: &dyn LinearFactory,
     weights: &WeightLoader,
@@ -2079,7 +2081,7 @@ mod tests {
 
     #[test]
     fn decoder_dtype_defaults_to_bf16() {
-        if std::env::var("NV_DSOCR_DEC_DTYPE").is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_DEC_DTYPE") {
             return;
         }
         assert_eq!(env_decoder_dtype(), DType::BF16);

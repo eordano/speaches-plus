@@ -17,6 +17,17 @@ pub struct NvEngineChat {
     pub(crate) inner: NvEngineInner,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EngineBuildMode {
+    Full,
+    AdapterServingLean,
+}
+
+pub(crate) fn adapter_serving_lean_keeps_the_i8_decode_head_by_default_because_the_bf16_fallback_epilogue_costs_0_88_ms_per_token_escape_nv_lora_ada_i8_head_0(
+) -> bool {
+    std::env::var("NV_LORA_ADA_I8_HEAD").as_deref() != Ok("0")
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) enum LoadedModel {
     Qwen3(Arc<tokio::sync::Mutex<nv_models::qwen3::Qwen3>>),
@@ -34,7 +45,7 @@ pub(crate) enum LoadedModel {
 pub(crate) enum QwenMoeShared {
     Eager(Arc<tokio::sync::Mutex<nv_models::qwen3_5_moe::Qwen3Moe>>),
     Graphed(Arc<tokio::sync::Mutex<nv_models::graph_engine::GraphedQwen3Moe>>),
-    Batch(Arc<Qwen38BatchScheduler>),
+    Batch(Arc<QwenBatchScheduler>),
 }
 
 #[cfg(feature = "cuda")]
@@ -140,6 +151,41 @@ pub(crate) fn qwen_graph_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) const Q38_SERVE_GRAPHED_ENV: &str = "NV_Q38_SERVE_GRAPHED";
+
+pub(crate) const Q38_SERVE_GRAPHED_DEFAULT_ON_YIELDS_TO_EXPLICIT_BATCH_SET_0_FOR_THE_EAGER_SESSION:
+    &str = "the graphed solo session serves 1.6-2.0x eager decode with faster TTFT at every \
+     measured depth (gserve rows, perf/runs.jsonl); unset env means graphed unless \
+     NV_Q38_BATCH=1 booted the lane pool, which owns the model -- an explicit \
+     NV_Q38_SERVE_GRAPHED=1 beside batch stays the loud boot refusal";
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen38_serve_graphed_explicit() -> bool {
+    matches!(
+        std::env::var(Q38_SERVE_GRAPHED_ENV).ok().as_deref(),
+        Some("1") | Some("on")
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen38_serve_graphed_enabled() -> bool {
+    let _ = Q38_SERVE_GRAPHED_DEFAULT_ON_YIELDS_TO_EXPLICIT_BATCH_SET_0_FOR_THE_EAGER_SESSION;
+    match std::env::var(Q38_SERVE_GRAPHED_ENV).ok().as_deref() {
+        Some("0") | Some("off") => false,
+        Some("1") | Some("on") => true,
+        _ => !nv_models::qwen3_5_moe::qwen38_batch::nv_q38_batch_env_opt_in_nv_q38_batch_1_the_serving_loop_routes_batch_xor_spec_per_request_group(),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen38_serve_graphed_selected(family: ModelFamily, raw_cfg: &str) -> bool {
+    matches!(family, ModelFamily::Qwen3_5Moe)
+        && qwen3_5_config_declares_dense_ffn(raw_cfg)
+        && qwen3_5_dense_cuda_serve_enabled()
+        && qwen38_serve_graphed_enabled()
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn qwen_moe_grouped_enabled() -> bool {
     !matches!(
         std::env::var("NV_QWEN_MOE_GROUPED").ok().as_deref(),
@@ -193,7 +239,10 @@ pub(crate) fn device_stream_flip_is_cleared_for(family: ModelFamily) -> bool {
 #[cfg(feature = "cuda")]
 pub(crate) fn capture_needs_the_device_stream(family: ModelFamily, raw_cfg: &str) -> bool {
     qwen_graph_decode_selected(family, raw_cfg)
+        || qwen38_serve_graphed_selected(family, raw_cfg)
         || qwen38_batch_lanes_boot_selected(family, raw_cfg)
+        || qwen36_batch_lanes_boot_selected(family, raw_cfg)
+        || qwen36_mtp_captured_serving_selected(family, raw_cfg)
         || (graph_body_is_a_candle_forward(family) && device_stream_flip_is_cleared_for(family))
 }
 
@@ -206,10 +255,17 @@ pub(crate) fn qwen38_batch_lanes_boot_selected(family: ModelFamily, raw_cfg: &st
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) fn qwen36_batch_lanes_boot_selected(family: ModelFamily, raw_cfg: &str) -> bool {
+    matches!(family, ModelFamily::Qwen3_5Moe)
+        && !qwen3_5_config_declares_dense_ffn(raw_cfg)
+        && nv_models::qwen3_5_moe::qwen36_batch::nv_q36_batch_env_opt_in_nv_q36_batch_1_the_serving_loop_routes_batch_xor_spec_per_request_group()
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) const QWEN35_DENSE_CUDA_SERVE_ENV: &str = "NV_QWEN35_DENSE_CUDA_SERVE";
 
 #[cfg(feature = "cuda")]
-pub(crate) const QWEN35_DENSE_CUDA_OPT_IN_MATCHES_THE_WGPU_ORACLE_AND_STAYS_OPT_IN: &str = "qwen3.5-dense cuda serving is wired and opted into per boot: with NV_QWEN35_DENSE_CUDA_SERVE=1 detect_family stops refusing and try_load parses the checkpoint with nv_models::qwen3_5_moe::Qwen3_5DenseConfig (the same parser the wgpu decoder uses, top-level fields read out of text_config) and builds it through nv_models::qwen3_5_moe::Qwen3Moe::from_loader_dense_quantized, which gives every linear_attention entry of layer_types a LayerMixer::Linear over nv_layers::linear_attn::LinearAttention and every layer a LayerFfn::Dense over nv_layers::mlp::Mlp. Every trunk component this uses -- the output-gated attention, the partial rope, the GDN linear-attention mixer, the nvfp4 linears -- is byte-for-byte the one the qwen3.5-moe cuda path already serves, because Qwen3.5-9B and Qwen3.5-35B-A3B declare the same head_dim, attn_output_gate, partial_rotary_factor and linear_* block; the ONLY surface this path adds over the served MoE path is LayerFfn::Dense. That surface is now executed and compared against nv_models::qwen3_5_dense_wgpu, the real-weights-verified decoder for this family, by the suite covering the dense cuda serving arm (rust/tests/qwen35_dense_cuda_serving_ab.rs, NV_QWEN35_DENSE_CUDA_SERVE_TEST=1): on ig1/Qwen3.5-9B-NVFP4 snapshot 3b9e07b0 the two backends return the same 7 tokens byte for byte through the checkpoint's own chat template, cuda repeats itself across two requests and an engine reload, and a 512-token thinking trace stays on subject while separating from the oracle at character 225, which is NVFP4 accumulation order and not a decode defect. It stays opt-in because that is two prompts on one checkpoint rather than a parity measurement, and because flipping it would move backend_select's auto choice for this whole checkpoint class onto a backend that holds more VRAM for the same weights. Without the variable, detect_family keeps refusing with backend_select::QWEN35_DENSE_NO_CUDA and the default behavior is unchanged";
+pub(crate) const QWEN35_DENSE_CUDA_OPT_IN_MATCHES_THE_WGPU_ORACLE_AND_STAYS_OPT_IN: &str = "qwen3.5-dense cuda serving is wired and opted into per boot: with NV_QWEN35_DENSE_CUDA_SERVE=1 detect_family stops refusing and try_load parses the checkpoint with nv_models::qwen3_5_moe::Qwen3_5DenseConfig (the same parser the wgpu decoder uses, top-level fields read out of text_config) and builds it through nv_models::qwen3_5_moe::Qwen3Moe::from_loader_dense_quantized, which gives every linear_attention entry of layer_types a LayerMixer::Linear over nv_layers::linear_attn::LinearAttention and every layer a LayerFfn::Dense over nv_layers::mlp::Mlp. Every trunk component this uses -- the output-gated attention, the partial rope, the GDN linear-attention mixer, the nvfp4 linears -- is byte-for-byte the one the qwen3.5-moe cuda path already serves, because Qwen3.5-9B and Qwen3.5-35B-A3B declare the same head_dim, attn_output_gate, partial_rotary_factor and linear_* block; the ONLY surface this path adds over the served MoE path is LayerFfn::Dense. That surface is now executed and compared against nv_models::qwen3_5_dense_wgpu, the real-weights-verified decoder for this family, by the suite covering the dense cuda serving arm (rust/tests/qwen35_dense_cuda_serving_ab.rs, NV_QWEN35_DENSE_CUDA_SERVE_TEST=1): on ig1/Qwen3.5-9B-NVFP4 snapshot 3b9e07b0 the two backends return the same 7 tokens byte for byte through the checkpoint's own chat template, cuda repeats itself across two requests and an engine reload, and a 512-token thinking trace stays on subject while separating from the oracle at character 225, which is NVFP4 accumulation order and not a decode defect. Both the unarmed trunk and the eleven-arm serving stack QWEN35_DENSE_9B_OPT_IN_ARMS_ITS_MEASURED_STACK_AND_NV_QWEN35_DENSE_ARM_0_IS_THE_ESCAPE describes reproduce that seven-token answer byte for byte, and the armed stack separates from the oracle LATER on the long trace (character 357 against 218) while reusing more of its content words (38 of 49 against 35 of 49), so arming is not a coarsening on this checkpoint. It stays opt-in because that is two prompts on one checkpoint rather than a parity measurement, and because flipping it would move backend_select's auto choice for this whole checkpoint class onto a backend that holds more VRAM for the same weights. Without the variable, detect_family keeps refusing with backend_select::QWEN35_DENSE_NO_CUDA and the default behavior is unchanged";
 
 #[cfg(feature = "cuda")]
 pub(crate) const GPTOSS_CUDA_OPT_IN_IS_A_DEQUANT_RUNG_AND_WGPU_STAYS_THE_GPT_OSS_DEFAULT: &str = "gpt-oss cuda serving is wired and opted into per boot: with NV_GPTOSS_CUDA_SERVE=1 detect_family answers ModelFamily::GptOss instead of refusing, and try_load parses the checkpoint with nv_models::gpt_oss::GptOssConfig -- the very parser nv_models::gpt_oss_wgpu uses, so the two backends cannot disagree about layer_types, sliding_window, swiglu_limit or the YaRN block -- and builds nv_models::gpt_oss_cuda::GptOssCuda. That decoder adds exactly two things cuda did not have. First, mxfp4: every expert tensor is dequantized to bf16 at load through nv_quant::mxfp4::Mxfp4Tensor::dequantize, which is the same host semantics the wgpu mxfp4 GEMV is already pinned against, and which is lossless into bf16 because an e2m1 value times an e8m0 block scale needs one mantissa bit. Second, attention sinks: nv_layers::attn::sdpa_with_sinks appends the learned per-head sink as one more score column and one all-zero value row, which is algebraically the fold gow_attn.wgsl and gow_prefill.wgsl perform as `m = max(red[0], sink); z = red[0] + exp(sink - m)`. candle_flash_attn takes no sink argument, so this decoder is eager by construction and the alternating sliding_window=128 layers are masked in the same builder rather than by flash_attn_windowed. It stays opt-in on cost, not correctness: dequant-to-bf16 puts openai/gpt-oss-20b at about 41.8 GB resident against about 13.7 GB for a native mxfp4 path, and eager scoring costs heads*rows*context f32 of transient scratch per prefill chunk that the wgpu decoder never materializes. Flipping it would move backend_select's auto choice for this checkpoint class onto the backend that holds three times the weights and cannot yet stream its softmax. Without the variable, detect_family keeps refusing with backend_select::GPTOSS_NO_CUDA_WITHOUT_THE_OPT_IN and the default behavior is unchanged";
@@ -217,6 +273,241 @@ pub(crate) const GPTOSS_CUDA_OPT_IN_IS_A_DEQUANT_RUNG_AND_WGPU_STAYS_THE_GPT_OSS
 #[cfg(feature = "cuda")]
 pub(crate) fn gpt_oss_cuda_serve_enabled() -> bool {
     crate::oapi::backend_select::gpt_oss_cuda_serve_enabled()
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN3_WEIGHTS_ENV: &str = "NV_QWEN3_WEIGHTS";
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN3_DEFAULT_IS_NVFP4_AT_LOAD_AND_NV_QWEN3_WEIGHTS_BF16_IS_THE_ESCAPE: &str = "plain qwen3 dense checkpoints (ModelFamily::Qwen3, nv_models::qwen3 -- model_type qwen3 with top-level trunk fields, e.g. Qwen/Qwen3-Embedding-0.6B) serve with 4-bit weights by default: try_load_inner routes through nv_models::qwen3::Qwen3::from_loader_quantized, and when the checkpoint's config.json declares no quantization_config, qwen3_weight_qconfig_default_nvfp4 supplies QuantScheme::Nvfp4, which quantizes every per-layer projection (q/k/v/o and gate/up/down) from the bf16 checkpoint at load through nv_layers Linear::from_bf16_quantized_nvfp4 (weights-only; 16-element ue4m3 block scales per nv_quant::nvfp4; served by the same cuda nvfp4 GEMM/GEMV the other nvfp4 families use). embed_tokens, lm_head and every RmsNorm stay bf16 because from_loader_quantized never quantizes them, and any projection under nv_quant::nvfp4::MIN_TILE falls back to bf16 inside load_linear_quant. A checkpoint that declares its own quantization_config keeps the declared scheme -- the default only fills the undeclared case. NV_QWEN3_WEIGHTS=bf16 restores the pre-flip all-bf16 Qwen3::from_loader behavior byte for byte. The flip is gated by this family's quality instrument, the suite covering teacher-forced ppl for plain qwen3 (nv-models/tests/ppl_qwen3.rs, NV_PPL_TEST=1, arm selected by the same env), with same-session bf16-vs-nvfp4 A/B rows plus decode-timing rows (nv-models/tests/qwen3_ctx_scaling.rs) in perf/runs.jsonl under model 'qwen3': on the Qwen3-Embedding-0.6B vehicle the nvfp4 arm holds top-1 accuracy within 0.7 points and ppl within 9 percent of bf16 on identical scored positions, inside the 1-point/10-percent acceptance band, and its cost is stated there too -- at 0.6B decode shapes the nvfp4 projections run 10-22 percent slower than bf16 (m=1 tiles this small do not amortize the block-scale path; the same kernels win at 31B shapes per NVFP4_M1_GEMV_IS_A_SERVING_DEFAULT_WHERE_A_SERVING_AB_LANDED_AND_OPT_IN_EVERYWHERE_ELSE), so what the default buys is roughly 3.5x smaller projection weights, which is what decides whether a large plain-qwen3 dense checkpoint fits at all. No published document quotes a chat-path number measured on the old bf16 default (runs.jsonl carried no model 'qwen3' rows before the flip's own reference rows). /v1/embeddings (oapi::text_embeddings) is a different surface with a cosine-similarity contract that this ppl instrument does not cover -- the MTEB numbers docs/book/08.1 quotes for Qwen3-Embedding-0.6B belong to that surface -- so it keeps loading Qwen3::from_loader bf16 deliberately";
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen3_weight_qconfig_default_nvfp4(
+    raw_cfg: &str,
+    weights_env: Option<&str>,
+) -> anyhow::Result<nv_weights::QuantizationConfig> {
+    let declared = nv_weights::QuantizationConfig::from_hf_json_str(raw_cfg)?;
+    if !matches!(declared.scheme, nv_weights::QuantScheme::None) {
+        return Ok(declared);
+    }
+    match weights_env {
+        Some("bf16") => Ok(declared),
+        None | Some("nvfp4") => Ok(nv_weights::QuantizationConfig {
+            scheme: nv_weights::QuantScheme::Nvfp4,
+            ignored_modules: Vec::new(),
+            group_size: None,
+        }),
+        Some(other) => anyhow::bail!(
+            "{QWEN3_WEIGHTS_ENV}={other} is not a weight format; accepted values are 'bf16' \
+             (the pre-flip escape) and 'nvfp4' (the default) -- refusing rather than silently \
+             serving a format the caller did not ask for"
+        ),
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) const GEMMA4_SERVING_ARM_ENV: &str = "NV_G4_SERVING_ARM";
+
+#[cfg(feature = "cuda")]
+pub(crate) const GEMMA4_NVFP4_SERVES_THE_THREE_KEY_RECORD_ARM_AND_NV_G4_SERVING_ARM_0_IS_THE_ESCAPE: &str = "gemma4 dense checkpoints whose config.json declares QuantScheme::Nvfp4 (ModelFamily::Gemma4 over nv_models::gemma4::Gemma4, e.g. nvidia/Gemma-4-31B-IT-NVFP4) serve with three keys armed, and try_load_inner arms them before the boot plan so oapi::vram_plan::plan_gemma4 charges the requanted attention pool rather than the bf16 one: NV_ATTN_PROJ_QUANT=nvfp4 requants q/k/v/o at load through Gemma4::from_loader_quantized (16.956 -> 4.769 GB read per token, 60 layers), NV_NVFP4_M1_GEMV=1 routes every short-row NVFP4 linear off the padded cutlass block-scaled tile onto nvfp4_gemv_bf16act, and NV_G4_LMHEAD_I8=1 makes the m=1 decode epilogue read the resident int8 lm_head copy the verify path already reads (2.819 -> 1.410 GB, no new weights). The three are ONE decision over GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL, never a subset, because NV_ATTN_PROJ_QUANT=nvfp4 alone is a quality REJECT and only NV_NVFP4_M1_GEMV rescues it -- nv_models::gemma4::ATTN_PROJ_NVFP4_ALONE_IS_A_MEASURED_QUALITY_REJECT_RESCUED_ONLY_BY_NV_NVFP4_M1_GEMV carries that measurement, and try_load refuses to boot any process that reaches the pair without the rescue, escape or no escape. NV_G4_SERVING_ARM=0 (or off) arms nothing at all and restores the pre-flip zero-env behavior exactly: it is the absence of three environment variables, so the restored process runs the identical code the pre-flip binary ran. What the default buys, measured on the default per-request serving decode (GraphedGemma4Decoder over new_kv_cache_fp8_windowed, the shape run_sampling_gemma4 builds), interleaved same-session base/arm pairs on a quiet card: 27.876/27.985 -> 19.419/19.542 ms/tok at 256 and 29.472/29.638 -> 21.313/21.515 at 8192, with free VRAM at the paged ladder's own choice point going 59.6 -> 74.3 GB because the requantized projections replace the bf16 originals. What it costs is stated where it is measured, not hidden: this is a quantization-class arm, so it is read against the family's OWN measured null -- gemma4-31B's reassociation ladder spreads 0.41 ppl on the family's only valid eval (ppl_gemma4::gemma4_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode; #94 ruled raw-corpus gemma4 ppl invalid; the +0.0973 figure once cited here is a qwen3.8 wikitext ARM delta, not a floor, and binds no other family per 08.2) -- and it reads -0.018 ppl on the eager bf16-KV scoring path (16.308 -> 16.290) and +0.068 on the graphed fp8-KV serving shape (16.276 -> 16.344): both inside the 0.41 family null by ~6x, so the quality cost is contained-and-unresolved rather than held-or-better, with top-1 accuracy 0.6699 -> 0.6641 (3 tokens of 512, 0.28 sd) and the shuffled control intact on every row. One suite changes colour in the other direction: gemma4_verify_forward went 1-pass/2-fail under this arm and is 5-pass/0-fail since verify blocks started taking the same nvfp4_gemv_bf16act row by row. The one measured harm is speculative: a k=4 GraphedGemma4Verify round costs 21.57 -> 54.3 ms armed on the fixed route, so a deployment that sets NV_EAGLE3_DRAFT_DIR or NV_DFLASH_DRAFT_DIR (spec decode is itself opt-in -- load_eagle3_state_for_target returns None without the directory, so the default deployment never enters that path) should hold NV_G4_SERVING_ARM=0 until gemm_nvfp4_w4a16_mk_dual is wired as the verify-block route. Published numbers measured on the pre-flip default are enumerated in /home/user/tmp/wf/servingfix/RESULTS.md by document and line; all of them are ladder rungs in nv-models tests, which do not call this file and therefore still measure what they always measured -- what changes is that they now describe NV_G4_SERVING_ARM=0 rather than a live request stream";
+
+#[cfg(feature = "cuda")]
+pub(crate) const GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL: [(&str, &str); 3] = [
+    ("NV_ATTN_PROJ_QUANT", "nvfp4"),
+    ("NV_NVFP4_M1_GEMV", "1"),
+    ("NV_G4_LMHEAD_I8", "1"),
+];
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN35_DENSE_SERVING_ARM_ENV: &str = "NV_QWEN35_DENSE_ARM";
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN35_DENSE_9B_OPT_IN_ARMS_ITS_MEASURED_STACK_AND_NV_QWEN35_DENSE_ARM_0_IS_THE_ESCAPE: &str = "the qwen3.5-dense cuda path stays opt-in per QWEN35_DENSE_CUDA_OPT_IN_MATCHES_THE_WGPU_ORACLE_AND_STAYS_OPT_IN -- this arms it, it does not promote it, and without NV_QWEN35_DENSE_CUDA_SERVE=1 detect_family still refuses with backend_select::QWEN35_DENSE_NO_CUDA and the checkpoint still goes to wgpu. What changes is that taking the opt-in no longer means decoding with none of the eleven arms this checkpoint's speed-of-light round measured: try_load_inner arms QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL before Qwen3Moe::from_loader_dense_quantized, because NV_Q36_GDN_FP8 and NV_Q36_LM_HEAD_FP8 decide resident weight dtype at load and NV_Q36_GRAPHED_DECODE_FIX decides whether the kv cache allocates the splitk scratch that routes the 8 full-attention layers off the serial_smem decode kernel. Unarmed the path decodes at 12.514 ms/tok at 256 and 79.629 at 8192; armed it decodes at 5.425 and 5.900, and the depth term is where the defect really was -- serial_smem serializes a block reduce per KV position, which is why 256->8k cost 6.4x unarmed and costs 1.09x armed. It costs no quality and no VRAM: on ppl_qwen35_dense::qwen35_dense_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode the stack scores 4.833 against a 4.862 zero-env basis (better on the headline, and the largest single-arm cost in it is NV_Q36_GDN_FP8 at +0.042 -- a cost that stays UNRESOLVED because qwen3.5-9B has no measured reassociation null, its 3-rung ladder spanning only 0.025; the +0.0973 figure once cited here is a qwen3.8 wikitext arm delta, not a floor), its eager and graphed 128-step greedy chains are token-identical, and peak VRAM through a live 256-depth run drops 15877 -> 9183 MiB because the fp8 copies replace their bf16 originals. NV_QWEN35_DENSE_ARM=0 (or off) arms nothing and restores the unarmed opt-in path exactly. The stack is armed ONLY for the trunk it was measured on, QWEN35_DENSE_9B_TRUNK_THE_ARM_STACK_WAS_MEASURED_ON: qwen3.8-27B declares the same model_type qwen3_5 and lands in the same dense arm, but its published serving band belongs to a different twelve-arm stack with NV_NVFP4_M1_GEMV unset, so arming this one for it would flip a performance default nobody measured. Any other dense trunk keeps today's behavior and says so at load";
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL: [(&str, &str); 11] = [
+    ("NV_Q36_GRAPHED_DECODE_FIX", "1"),
+    ("NV_Q36_GDN_FP8", "1"),
+    ("NV_Q36_LM_HEAD_FP8", "1"),
+    ("NV_Q38_FP4_MLP", "1"),
+    ("NV_Q38_GDN_SPLIT", "1"),
+    ("NV_Q38_MLP_W4A8", "1"),
+    ("NV_Q38_W4A8_MK", "1"),
+    ("NV_Q38_SILUQ_SPLIT", "1"),
+    ("NV_Q38_NORM_QUANT_FOLD", "1"),
+    ("NV_Q38_NORM_WRITEOUT", "1"),
+    ("NV_NVFP4_M1_GEMV", "1"),
+];
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN35_DENSE_9B_TRUNK_THE_ARM_STACK_WAS_MEASURED_ON: (usize, usize, usize) =
+    (4096, 32, 12288);
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ServingArm {
+    ArmEveryKey,
+    OperatorHeldTheEscape,
+    CheckpointOutsideTheMeasuredBasis,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn serving_arm_from(
+    escape: Option<&str>,
+    checkpoint_is_the_measured_basis: bool,
+) -> ServingArm {
+    match escape {
+        Some("0") | Some("off") | Some("false") | Some("no") => ServingArm::OperatorHeldTheEscape,
+        _ if !checkpoint_is_the_measured_basis => ServingArm::CheckpointOutsideTheMeasuredBasis,
+        _ => ServingArm::ArmEveryKey,
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn arm_keys_the_operator_already_set_to_something_else<'a>(
+    keys: &'a [(&'a str, &'a str)],
+    read: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'a str, String, &'a str)> {
+    keys.iter()
+        .filter_map(|(k, want)| {
+            read(k)
+                .filter(|held| held != want)
+                .map(|held| (*k, held, *want))
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn keys_armed_by_this_one_decision<'a>(
+    arm: ServingArm,
+    keys: &'a [(&'a str, &'a str)],
+) -> &'a [(&'a str, &'a str)] {
+    match arm {
+        ServingArm::ArmEveryKey => keys,
+        ServingArm::OperatorHeldTheEscape | ServingArm::CheckpointOutsideTheMeasuredBasis => &[],
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn apply_serving_arm(
+    label: &str,
+    escape_env: &str,
+    why: &str,
+    keys: &[(&str, &str)],
+    arm: ServingArm,
+) -> anyhow::Result<()> {
+    let armed = keys_armed_by_this_one_decision(arm, keys);
+    if armed.is_empty() {
+        let reason = match arm {
+            ServingArm::OperatorHeldTheEscape => format!("{escape_env}=0 is held"),
+            _ => "this checkpoint is outside the trunk the stack was measured on".to_string(),
+        };
+        eprintln!(
+            "[{label}] serving arm OFF ({reason}): none of {} is armed, so this process runs the \
+             pre-flip default, which is the absence of those variables",
+            keys.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(" ")
+        );
+        return Ok(());
+    }
+    let conflicts =
+        arm_keys_the_operator_already_set_to_something_else(armed, |k| std::env::var(k).ok());
+    anyhow::ensure!(
+        conflicts.is_empty(),
+        "{}",
+        conflicts
+            .iter()
+            .map(|(k, held, want)| format!(
+                "{k}={held} is set in the environment but this checkpoint serves {k}={want} by \
+                 default, and these keys are armed together or not at all because a subset is a \
+                 configuration nothing measured; set {escape_env}=0 to run the pre-flip default \
+                 instead of hand-picking one key"
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    for (k, v) in armed {
+        std::env::set_var(k, v);
+    }
+    eprintln!(
+        "[{label}] serving arm ON: {} (escape: {escape_env}=0)",
+        armed
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    eprintln!("[{label}] {why}");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gemma4_checkpoint_declares_nvfp4(raw_cfg: &str) -> bool {
+    nv_weights::QuantizationConfig::from_hf_json_str(raw_cfg)
+        .map(|q| matches!(q.scheme, nv_weights::QuantScheme::Nvfp4))
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen35_dense_trunk_is_the_measured_9b(raw_cfg: &str) -> bool {
+    let (hidden, layers, intermediate) = QWEN35_DENSE_9B_TRUNK_THE_ARM_STACK_WAS_MEASURED_ON;
+    nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(raw_cfg)
+        .map(|c| {
+            c.hidden_size == hidden
+                && c.num_hidden_layers == layers
+                && c.intermediate_size == intermediate
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn gemma4_attn_nvfp4_without_the_m1_gemv_rescue(
+    attn_proj_quant: Option<&str>,
+    m1_gemv: Option<&str>,
+) -> bool {
+    nv_models::gemma4::attn_proj_env_selects_nvfp4_projections(attn_proj_quant)
+        && m1_gemv != Some("1")
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn arm_the_serving_defaults_for_this_checkpoint(
+    family: ModelFamily,
+    qwen3_5_dense: bool,
+    raw_cfg: &str,
+) -> anyhow::Result<()> {
+    match family {
+        ModelFamily::Gemma4 => {
+            apply_serving_arm(
+                "gemma4",
+                GEMMA4_SERVING_ARM_ENV,
+                GEMMA4_NVFP4_SERVES_THE_THREE_KEY_RECORD_ARM_AND_NV_G4_SERVING_ARM_0_IS_THE_ESCAPE,
+                &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+                serving_arm_from(
+                    std::env::var(GEMMA4_SERVING_ARM_ENV).ok().as_deref(),
+                    gemma4_checkpoint_declares_nvfp4(raw_cfg),
+                ),
+            )?;
+            anyhow::ensure!(
+                !gemma4_attn_nvfp4_without_the_m1_gemv_rescue(
+                    std::env::var("NV_ATTN_PROJ_QUANT").ok().as_deref(),
+                    std::env::var("NV_NVFP4_M1_GEMV").ok().as_deref(),
+                ),
+                "{}",
+                nv_models::gemma4::ATTN_PROJ_NVFP4_ALONE_IS_A_MEASURED_QUALITY_REJECT_RESCUED_ONLY_BY_NV_NVFP4_M1_GEMV
+            );
+            Ok(())
+        }
+        ModelFamily::Qwen3_5Moe if qwen3_5_dense => apply_serving_arm(
+            "qwen3.5-dense",
+            QWEN35_DENSE_SERVING_ARM_ENV,
+            QWEN35_DENSE_9B_OPT_IN_ARMS_ITS_MEASURED_STACK_AND_NV_QWEN35_DENSE_ARM_0_IS_THE_ESCAPE,
+            &QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+            serving_arm_from(
+                std::env::var(QWEN35_DENSE_SERVING_ARM_ENV).ok().as_deref(),
+                qwen35_dense_trunk_is_the_measured_9b(raw_cfg),
+            ),
+        ),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -252,6 +543,26 @@ pub(crate) fn qwen_graph_decode_selected(family: ModelFamily, raw_cfg: &str) -> 
         && !qwen3_5_config_declares_dense_ffn(raw_cfg)
         && qwen_graph_enabled()
         && qwen_moe_grouped_enabled()
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN36_MTP_EAGER_ESCAPE_ENV: &str = "NV_Q36_MTP_EAGER";
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen36_mtp_eager_escape() -> bool {
+    matches!(
+        std::env::var(QWEN36_MTP_EAGER_ESCAPE_ENV).ok().as_deref(),
+        Some("1") | Some("on")
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen36_mtp_captured_serving_selected(family: ModelFamily, raw_cfg: &str) -> bool {
+    matches!(family, ModelFamily::Qwen3_5Moe)
+        && !qwen3_5_config_declares_dense_ffn(raw_cfg)
+        && nv_specdecode::qwen38_mtp::mtp_drafter_selected_from_env()
+        && qwen_moe_grouped_enabled()
+        && !qwen36_mtp_eager_escape()
 }
 
 #[cfg(feature = "cuda")]
@@ -332,6 +643,13 @@ pub(crate) struct DFlashShared {
 }
 
 #[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) enum QwenMtpHead {
+    Dense(Arc<nv_specdecode::qwen38_mtp::Qwen38DenseMtpHead>),
+    Moe(Arc<nv_models::qwen3_5_mtp::MtpHead>),
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) struct NvEngineInner {
     pub(crate) model_id: String,
     pub(crate) family: ModelFamily,
@@ -350,8 +668,10 @@ pub(crate) struct NvEngineInner {
     pub(crate) gemma4_engine: Option<Arc<nv_engine::BatchEngineHandle>>,
     pub(crate) laguna_spec: Option<Arc<LagunaSpecServe>>,
     pub(crate) qwen_moe_dispatch: Option<Arc<nv_models::qwen3_5_moe::GroupedMoeDispatch>>,
-    pub(crate) qwen_mtp: Option<Arc<nv_specdecode::qwen38_mtp::Qwen38DenseMtpHead>>,
+    pub(crate) qwen_mtp: Option<QwenMtpHead>,
     pub(crate) mm_towers: Option<Arc<crate::oapi::chat_multimodal::Gemma4MmTowers>>,
+    pub(crate) vram_plan_record_released_on_engine_drop:
+        Option<crate::oapi::vram_plan::RecordedBootPlan>,
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -368,14 +688,16 @@ pub(crate) fn refuse_gguf_checkpoint_dir(model_dir: &Path) -> anyhow::Result<()>
         return Ok(());
     };
     anyhow::bail!(
-        "{} is a GGUF checkpoint dir ({}): the CUDA chat engine has no GGUF load path -- it \
-         detects the family from config.json and reads weights through \
-         nv_weights::WeightLoader::open_dir, which is safetensors-only, so it never reaches \
-         nv_models::gemma4_moe::Gemma4Moe::from_gguf. The gemma4-MoE serving family itself is \
-         wired on cuda (LoadedModel::Gemma4Moe + run_sampling_gemma4_moe); only the GGUF \
-         checkpoint format is missing. Serve this dir on the wgpu chat engine (feature \
-         \"wgpu\"; NV_SERVE_BACKEND=wgpu) via Gemma4MoeWgpu::from_gguf, or convert it to \
-         safetensors.",
+        "{} is a GGUF checkpoint dir ({}): the CUDA chat engine cannot boot from a bare GGUF \
+         dir -- it detects the family from config.json and reads weights through \
+         nv_weights::WeightLoader::open_dir, which is safetensors-only, so a dir without \
+         config.json never reaches nv_models::gemma4_moe::Gemma4Moe::from_gguf. The gemma4-MoE \
+         serving family itself is wired on cuda (LoadedModel::Gemma4Moe + \
+         run_sampling_gemma4_moe), and a gemma4-MoE safetensors snapshot dir can opt its \
+         weight VALUES into the QAT Q4 GGUF via that from_gguf (NV_G4MOE_SERVE_QAT_Q4=1; \
+         opt-in only, its top-1 accuracy is out of band). Serve this bare dir on the wgpu \
+         chat engine (feature \"wgpu\"; NV_SERVE_BACKEND=wgpu) via Gemma4MoeWgpu::from_gguf, \
+         or serve the safetensors snapshot dir.",
         model_dir.display(),
         gguf.display()
     );
@@ -384,6 +706,28 @@ pub(crate) fn refuse_gguf_checkpoint_dir(model_dir: &Path) -> anyhow::Result<()>
 #[cfg(not(feature = "cuda"))]
 pub(crate) fn refuse_gguf_checkpoint_dir(_model_dir: &Path) -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn plan_family_for(
+    family: ModelFamily,
+    qwen3_5_dense: bool,
+    qwen_graph: bool,
+) -> crate::oapi::vram_plan::PlanFamily {
+    use crate::oapi::vram_plan::PlanFamily;
+    match family {
+        ModelFamily::Gemma4 => PlanFamily::Gemma4,
+        ModelFamily::Qwen3_5Moe if qwen3_5_dense => PlanFamily::Qwen35Dense,
+        ModelFamily::Qwen3_5Moe => PlanFamily::Qwen35Moe {
+            grouped_graph: qwen_graph,
+        },
+        ModelFamily::Qwen3 => PlanFamily::Unmodeled("qwen3"),
+        ModelFamily::Gemma4E4b => PlanFamily::Unmodeled("gemma4-e4b"),
+        ModelFamily::Gemma4Moe => PlanFamily::Unmodeled("gemma4-moe"),
+        ModelFamily::Laguna => PlanFamily::Unmodeled("laguna"),
+        ModelFamily::Omni => PlanFamily::Unmodeled("omni"),
+        ModelFamily::GptOss => PlanFamily::Unmodeled("gpt-oss"),
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -430,6 +774,16 @@ impl NvEngineChat {
     }
 
     pub fn try_load(model_dir: &Path) -> anyhow::Result<Self> {
+        Self::preflight_checkpoint_dir(model_dir)?;
+        Self::try_load_inner(model_dir, EngineBuildMode::Full)
+    }
+
+    pub(crate) fn try_load_for_adapter_serving(model_dir: &Path) -> anyhow::Result<Self> {
+        Self::preflight_checkpoint_dir(model_dir)?;
+        Self::try_load_inner(model_dir, EngineBuildMode::AdapterServingLean)
+    }
+
+    fn preflight_checkpoint_dir(model_dir: &Path) -> anyhow::Result<()> {
         refuse_gguf_checkpoint_dir(model_dir)?;
         let required = [
             ("config.json", model_dir.join("config.json")),
@@ -446,12 +800,14 @@ impl NvEngineChat {
                 model_dir.display()
             );
         }
-
-        Self::try_load_inner(model_dir)
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn try_load_inner(model_dir: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn try_load_inner(
+        model_dir: &Path,
+        mode: EngineBuildMode,
+    ) -> anyhow::Result<Self> {
         use anyhow::Context;
         use candle_core::Device;
 
@@ -461,6 +817,23 @@ impl NvEngineChat {
             .with_context(|| format!("read {}", cfg_path.display()))?;
         let family = detect_family(&raw_cfg)
             .with_context(|| format!("detect model family from {}", cfg_path.display()))?;
+        const ADAPTER_SERVING_LEAN_FAMILIES_WHOSE_EAGER_DECODE_ROUTES_EVERY_LORA_TARGET_THROUGH_NV_LAYERS_LINEAR:
+            [ModelFamily; 2] = [ModelFamily::Gemma4, ModelFamily::Laguna];
+        if mode == EngineBuildMode::AdapterServingLean
+            && !ADAPTER_SERVING_LEAN_FAMILIES_WHOSE_EAGER_DECODE_ROUTES_EVERY_LORA_TARGET_THROUGH_NV_LAYERS_LINEAR
+                .contains(&family)
+        {
+            anyhow::bail!(
+                "cuda lora serving attaches nv-layers Linear delta hooks, which only the \
+                 gemma4 dense family (the has_lora seams in nv_models::gemma4) and the laguna \
+                 family (eager q/k/v/o/g_proj and dense-mlp Linears, with the w8 gemv \
+                 disabled at install) route through; {} loads as family {:?}, whose \
+                 projections are not hookable Linears. Serve this base on the wgpu engine to \
+                 use its lora path.",
+                model_dir.display(),
+                family
+            );
+        }
 
         let chat_template = crate::oapi::chat_template::ChatTemplate::load(model_dir);
         if chat_template.is_some() {
@@ -470,7 +843,30 @@ impl NvEngineChat {
         }
 
         let qwen3_5_dense = qwen3_5_config_declares_dense_ffn(&raw_cfg);
+        arm_the_serving_defaults_for_this_checkpoint(family, qwen3_5_dense, &raw_cfg)?;
         let qwen_graph = qwen_graph_decode_selected(family, &raw_cfg);
+        let qwen36_mtp_captured = qwen36_mtp_captured_serving_selected(family, &raw_cfg);
+        let (boot_plan, recorded_boot_plan) = crate::oapi::vram_plan::plan_and_enforce_boot_shaped(
+            plan_family_for(
+                family,
+                qwen3_5_dense,
+                qwen_graph
+                    || qwen36_mtp_captured
+                    || qwen36_batch_lanes_boot_selected(family, &raw_cfg),
+            ),
+            model_dir,
+            &raw_cfg,
+            match mode {
+                EngineBuildMode::Full => crate::oapi::vram_plan::BootPlanShape::Full,
+                EngineBuildMode::AdapterServingLean => {
+                    if adapter_serving_lean_keeps_the_i8_decode_head_by_default_because_the_bf16_fallback_epilogue_costs_0_88_ms_per_token_escape_nv_lora_ada_i8_head_0() {
+                        crate::oapi::vram_plan::BootPlanShape::AdapterServingLeanKeepsTheI8DecodeHeadNeverBuildsDrafters
+                    } else {
+                        crate::oapi::vram_plan::BootPlanShape::AdapterServingLeanNeverBuildsDraftersOrTheI8VerifyHead
+                    }
+                }
+            },
+        )?;
         let device = if capture_needs_the_device_stream(family, &raw_cfg) {
             Device::new_cuda_with_stream(0).context("init CUDA device 0 (stream mode)")?
         } else {
@@ -495,15 +891,26 @@ impl NvEngineChat {
 
         let model_id = crate::oapi::model_ids::model_id_for_dir(model_dir);
 
-        match family {
+        let built = match family {
             ModelFamily::Qwen3 => {
                 let config = nv_models::qwen3::Qwen3Config::from_hf_json_str(&raw_cfg)
                     .with_context(|| format!("parse {}", cfg_path.display()))?;
-                let model = nv_models::qwen3::Qwen3::from_loader(config.clone(), &weights, &device)
-                    .context("instantiate Qwen3 from weights")?;
+                let qconfig = qwen3_weight_qconfig_default_nvfp4(
+                    &raw_cfg,
+                    std::env::var(QWEN3_WEIGHTS_ENV).ok().as_deref(),
+                )
+                .with_context(|| format!("parse quant {}", cfg_path.display()))?;
+                let model = nv_models::qwen3::Qwen3::from_loader_quantized(
+                    config.clone(),
+                    &weights,
+                    &qconfig,
+                    &device,
+                )
+                .context("instantiate Qwen3 from weights")?;
                 let eos_token_ids = vec![config.eos_token_id];
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(config.max_position_embeddings);
+                let kv_max_seq_len =
+                    kv_max_seq_len_for_unplanned_family("qwen3", config.max_position_embeddings);
                 Ok(Self {
                     inner: NvEngineInner {
                         model_id,
@@ -524,6 +931,7 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers: None,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -532,22 +940,48 @@ impl NvEngineChat {
                     .with_context(|| format!("parse gemma4 {}", cfg_path.display()))?;
                 let qconfig = nv_weights::QuantizationConfig::from_hf_json_str(&raw_cfg)
                     .with_context(|| format!("parse quant {}", cfg_path.display()))?;
-                let model = nv_models::gemma4::Gemma4::from_loader_quantized(
-                    config.clone(),
-                    &weights,
-                    &qconfig,
-                    &device,
-                )
+                let model = match mode {
+                    EngineBuildMode::Full => nv_models::gemma4::Gemma4::from_loader_quantized(
+                        config.clone(),
+                        &weights,
+                        &qconfig,
+                        &device,
+                    ),
+                    EngineBuildMode::AdapterServingLean => {
+                        if adapter_serving_lean_keeps_the_i8_decode_head_by_default_because_the_bf16_fallback_epilogue_costs_0_88_ms_per_token_escape_nv_lora_ada_i8_head_0() {
+                            nv_models::gemma4::Gemma4::from_loader_quantized(
+                                config.clone(),
+                                &weights,
+                                &qconfig,
+                                &device,
+                            )
+                        } else {
+                            nv_models::gemma4::Gemma4::from_loader_quantized_without_the_i8_verify_head_because_adapter_serving_engines_never_verify(
+                                config.clone(),
+                                &weights,
+                                &qconfig,
+                                &device,
+                            )
+                        }
+                    }
+                }
                 .context("instantiate Gemma4 from weights")?;
                 let eos_token_ids = eos_ids_from_dir(model_dir)?;
                 let bos_token_id = bos_id_from_dir(model_dir);
 
-                let kv_max_seq_len = kv_max_seq_len_for_gemma4(config.max_position_embeddings);
+                let kv_max_seq_len = boot_plan.kv_max_seq_len;
                 let no_spec = nv_no_spec(std::env::var("NV_NO_SPEC").ok().as_deref());
                 let drafter_kind = nv_drafter_kind(std::env::var("NV_DRAFTER").ok().as_deref());
                 let target_dims = gemma4_target_dims(&model_id, &config);
                 let td = Some(&target_dims);
-                let (eagle3, dflash) = if no_spec {
+                let (eagle3, dflash) = if mode == EngineBuildMode::AdapterServingLean {
+                    tracing::info!(
+                        "adapter-serving lean build: drafters are never built because \
+                         spec verify chains and drafter KV would charge the vram plan for \
+                         arms the adapter engine strips"
+                    );
+                    (None, None)
+                } else if no_spec {
                     tracing::info!("NV_NO_SPEC set: skipping drafter load");
                     (None, None)
                 } else if drafter_kind == "dflash" {
@@ -579,7 +1013,8 @@ impl NvEngineChat {
                 let dflash_required_flag =
                     dflash_required(std::env::var("NV_DFLASH_REQUIRED").ok().as_deref());
                 match eagle3_gate(
-                    dflash_spec_requested(no_spec, drafter_kind),
+                    mode != EngineBuildMode::AdapterServingLean
+                        && dflash_spec_requested(no_spec, drafter_kind),
                     dflash_required_flag,
                     dflash.is_some(),
                 ) {
@@ -605,7 +1040,11 @@ impl NvEngineChat {
                     }
                 }
                 let drafter_loaded = eagle3.is_some() || dflash.is_some();
-                let spec_status = match eagle3_gate(spec_requested, required, drafter_loaded) {
+                let spec_status = match eagle3_gate(
+                    mode != EngineBuildMode::AdapterServingLean && spec_requested,
+                    required,
+                    drafter_loaded,
+                ) {
                     Eagle3Gate::NotRequested => None,
                     Eagle3Gate::Enabled => Some("on"),
                     Eagle3Gate::DegradedWarn => {
@@ -642,13 +1081,12 @@ impl NvEngineChat {
                     .unwrap_or(0);
                 let drafter_row_elems =
                     drafter_row_elems_charge(eagle3_row_elems, dflash_row_elems);
-                let drafter_charge = DrafterKvCharge::from_env(eagle3_row_elems, dflash_row_elems);
-                let kv_max_seq_len = fit_gemma4_kv_max(&config, kv_max_seq_len, drafter_charge);
-                let measured_static =
-                    enforce_gemma4_vram_budget(&config, kv_max_seq_len, drafter_charge)?;
+                let measured_static = our_process_vram_bytes();
                 let model = Arc::new(model);
 
-                let gemma4_engine = if std::env::var("NV_BATCH_ENGINE").is_ok() {
+                let gemma4_engine = if mode == EngineBuildMode::AdapterServingLean {
+                    None
+                } else if std::env::var("NV_BATCH_ENGINE").is_ok() {
                     match build_gemma4_batch_engine(model.clone(), device.clone(), kv_max_seq_len) {
                         Ok(h) => {
                             tracing::info!(
@@ -690,7 +1128,9 @@ impl NvEngineChat {
                         measured_static
                     }
                 };
-                crate::oapi::admission::init_gemma4(admit_static, drafter_row_elems);
+                if mode != EngineBuildMode::AdapterServingLean {
+                    crate::oapi::admission::init_gemma4(admit_static, drafter_row_elems);
+                }
 
                 Ok(Self {
                     inner: NvEngineInner {
@@ -712,6 +1152,7 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -759,21 +1200,50 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
             ModelFamily::Gemma4Moe => {
                 let config = nv_models::gemma4_moe::Gemma4MoeConfig::from_hf_json_str(&raw_cfg)
                     .with_context(|| format!("parse gemma4 moe {}", cfg_path.display()))?;
-                let model = nv_models::gemma4_moe::Gemma4Moe::from_loader(
-                    config.clone(),
-                    &weights,
-                    &device,
-                )
-                .context("instantiate Gemma4Moe from weights")?;
+                let model = match nv_models::gemma4_gguf::opted_in_qat_q4_gguf_for_snapshot(
+                    &config,
+                ) {
+                    Some(gguf) => {
+                        tracing::info!(
+                            weights = %gguf.display(),
+                            tokenizer_and_template = %model_dir.display(),
+                            opt_in_env = nv_models::gemma4_gguf::G4MOE_SERVE_QAT_Q4_OPT_IN_ENV,
+                            why_not_default = nv_models::gemma4_gguf::QAT_Q4_GGUF_STAYS_OPT_IN_TOP1_ACC_0_4531_VS_BF16_0_5254_SAME_SESSION,
+                            "gemma4-moe serves the 4-bit QAT GGUF weight values because the \
+                             opt-in env is set; this from_gguf path keeps bf16-stacked expert \
+                             residency, because requantizing the Q4_K dequant to nvfp4 would \
+                             stack a third quantization on the double one that already put \
+                             this arm out of band"
+                        );
+                        nv_models::gemma4_moe::Gemma4Moe::from_gguf(
+                            &gguf,
+                            &device,
+                            candle_core::DType::BF16,
+                        )
+                        .with_context(|| {
+                            format!("instantiate Gemma4Moe from default qat gguf {}", gguf.display())
+                        })?
+                    }
+                    None => nv_models::gemma4_moe::Gemma4Moe::from_loader(
+                        config.clone(),
+                        &weights,
+                        &device,
+                    )
+                    .context("instantiate Gemma4Moe from weights")?,
+                };
                 let eos_token_ids = eos_ids_from_dir(model_dir)?;
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(config.base.max_position_embeddings);
+                let kv_max_seq_len = kv_max_seq_len_for_unplanned_family(
+                    "gemma4-moe",
+                    config.base.max_position_embeddings,
+                );
                 let mm_towers = load_mm_towers_or_serve_text_only(model_dir, &device, &model_id);
                 Ok(Self {
                     inner: NvEngineInner {
@@ -795,6 +1265,7 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -813,7 +1284,7 @@ impl NvEngineChat {
                     "[qwen3.5-dense] {QWEN35_DENSE_CUDA_OPT_IN_MATCHES_THE_WGPU_ORACLE_AND_STAYS_OPT_IN}"
                 );
                 eprintln!(
-                    "[qwen3.5-dense] decode: EAGER (no graph capture, no grouped MoE), {n_linear}/{} layers are nv_layers::linear_attn::LinearAttention, dense ffn intermediate_size={}",
+                    "[qwen3.5-dense] trunk: {n_linear}/{} layers are nv_layers::linear_attn::LinearAttention, dense ffn intermediate_size={}",
                     trunk.num_hidden_layers, config.intermediate_size
                 );
                 let model = nv_models::qwen3_5_moe::Qwen3Moe::from_loader_dense_quantized(
@@ -833,7 +1304,7 @@ impl NvEngineChat {
                 );
                 let eos_token_ids = resolve_qwen3_5_moe_eos_ids(&tokenizer, model_dir, &trunk);
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(config.max_position_embeddings);
+                let kv_max_seq_len = boot_plan.kv_max_seq_len;
                 let qwen_mtp = if nv_specdecode::qwen38_mtp::mtp_drafter_selected_from_env() {
                     let head = nv_specdecode::qwen38_mtp::Qwen38DenseMtpHead::from_checkpoint(
                         nv_specdecode::qwen38_mtp::mtp_draft_dir_override_from_env().as_deref(),
@@ -856,12 +1327,24 @@ impl NvEngineChat {
                 };
                 let tokenizer = Arc::new(tokenizer);
                 let shared = if nv_models::qwen3_5_moe::qwen38_batch::nv_q38_batch_env_opt_in_nv_q38_batch_1_the_serving_loop_routes_batch_xor_spec_per_request_group() {
-                    let plan =
-                        nv_models::qwen3_5_moe::qwen38_batch::q38_batch_bucket_plan_env_nv_q38_batch_sizes();
+                    anyhow::ensure!(
+                        !qwen38_serve_graphed_explicit(),
+                        "NV_Q38_BATCH=1 boots the lane-pool scheduler, which owns the model, but \
+                         {Q38_SERVE_GRAPHED_ENV}=1 pins the persistent graphed solo engine, which \
+                         also owns it -- drop one of the two"
+                    );
+                    let plan = boot_plan
+                        .batch_bucket_sizes
+                        .clone()
+                        .map(nv_models::gemma4_batch_graph::BucketPlan::new)
+                        .unwrap_or_else(
+                            nv_models::qwen3_5_moe::qwen38_batch::q38_batch_bucket_plan_env_nv_q38_batch_sizes,
+                        );
+                    let lane_kv = boot_plan.batch_lane_kv.unwrap_or(kv_max_seq_len);
                     let lanes = nv_models::qwen3_5_moe::qwen38_batch::Qwen38BatchLanes::new(
                         model,
                         &device,
-                        kv_max_seq_len,
+                        lane_kv,
                         plan,
                     )
                     .context(
@@ -869,15 +1352,17 @@ impl NvEngineChat {
                          boot failure rather than a silent fall-back to solo serving",
                     )?;
                     eprintln!(
-                        "[qwen3.8-batch] request-group scheduler on: {} lanes x {} kv slots, \
-                         window {} ms",
+                        "[qwen3.8-batch] request-group scheduler on: {} lanes x {} kv slots \
+                         ({} caps lane depth below the solo kv window {}), window {} ms",
                         lanes.lanes(),
+                        lane_kv,
+                        crate::oapi::vram_plan::Q38_BATCH_KV_ENV_CAPS_LANE_POOL_DEPTH_SO_PREPAID_BATCH_LANES_STAY_SHALLOW_WHILE_SOLO_REQUESTS_GO_DEEP,
                         kv_max_seq_len,
                         q38_batch_window_ms_env_nv_q38_batch_window_ms()
                     );
-                    let sched = Qwen38BatchScheduler::spawn(
-                        lanes,
-                        qwen_mtp.clone(),
+                    let sched = QwenBatchScheduler::spawn(
+                        QwenLanePool::Dense38(lanes),
+                        qwen_mtp.clone().map(QwenMtpHead::Dense),
                         tokenizer.clone(),
                         device.clone(),
                         eos_token_ids.clone(),
@@ -885,7 +1370,34 @@ impl NvEngineChat {
                         256,
                     )?;
                     QwenMoeShared::Batch(sched)
+                } else if qwen38_serve_graphed_enabled() {
+                    let mut graphed = nv_models::graph_engine::GraphedQwen3Moe::new(
+                        model,
+                        &device,
+                        kv_max_seq_len,
+                    )
+                    .context(
+                        "NV_Q38_SERVE_GRAPHED=1 was requested, so a graphed engine that cannot \
+                         build is a boot failure rather than a silent fall-back to eager serving",
+                    )?;
+                    graphed.install_grouped_moe().context(
+                        "arm capture on the dense trunk (no dispatch is built; every ffn is a \
+                         plain mlp)",
+                    )?;
+                    eprintln!(
+                        "[qwen3.8] decode: GRAPHED ({Q38_SERVE_GRAPHED_ENV}=1; persistent \
+                         GraphedQwen3Moe, kv cache bound once at boot to the {kv_max_seq_len}-token \
+                         window; greedy MTP requests self-speculate through \
+                         Qwen38MtpGraphedDecodeSession, whose rows-keyed verify graph is \
+                         recaptured after each request's prefill; unset for the per-request eager \
+                         engine)"
+                    );
+                    QwenMoeShared::Graphed(Arc::new(tokio::sync::Mutex::new(graphed)))
                 } else {
+                    eprintln!(
+                        "[qwen3.8] decode: EAGER (no graph capture; {Q38_SERVE_GRAPHED_ENV}=1 \
+                         for the persistent graphed engine)"
+                    );
                     QwenMoeShared::Eager(Arc::new(tokio::sync::Mutex::new(model)))
                 };
                 Ok(Self {
@@ -906,8 +1418,9 @@ impl NvEngineChat {
                         gemma4_engine: None,
                         laguna_spec: None,
                         qwen_moe_dispatch: None,
-                        qwen_mtp,
+                        qwen_mtp: qwen_mtp.map(QwenMtpHead::Dense),
                         mm_towers: None,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -925,8 +1438,98 @@ impl NvEngineChat {
                 .context("instantiate Qwen3.5-MoE from weights")?;
                 let eos_token_ids = resolve_qwen3_5_moe_eos_ids(&tokenizer, model_dir, &config);
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(config.max_position_embeddings);
-                let (shared, qwen_moe_dispatch) = if qwen_graph {
+                let kv_max_seq_len = boot_plan.kv_max_seq_len;
+                let qwen_mtp = if nv_specdecode::qwen38_mtp::mtp_drafter_selected_from_env() {
+                    anyhow::ensure!(
+                        !(qwen_graph && qwen36_mtp_eager_escape()),
+                        "NV_QWEN_GRAPH=1 pins graph decode but \
+                         {QWEN36_MTP_EAGER_ESCAPE_ENV}=1 demands the eager MTP session, \
+                         which serves only off the eager engine -- drop one of the two; with \
+                         neither set, NV_DRAFTER=mtp serves greedy requests through the \
+                         captured-verify MtpMoeGraphedDecodeSession by default"
+                    );
+                    let mtp_path = nv_specdecode::qwen38_mtp::mtp_draft_dir_override_from_env()
+                        .unwrap_or_else(|| model_dir.to_path_buf())
+                        .join(nv_specdecode::qwen38_mtp::MTP_WEIGHTS_FILE_NAME);
+                    let head = nv_models::qwen3_5_mtp::MtpHead::from_safetensors(
+                        &mtp_path, &model, &device,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "NV_DRAFTER=mtp was requested, so a missing or misshapen MoE MTP \
+                             head ({}) is a boot failure rather than a silent fall-back to \
+                             non-speculative decode",
+                            mtp_path.display()
+                        )
+                    })?;
+                    let k = nv_specdecode::qwen38_mtp::mtp_chain_depth_from_env();
+                    eprintln!(
+                        "[qwen3.6-mtp] drafter: shipped MoE MTP head loaded (k={k}, greedy \
+                         requests self-speculate through the {} session; sampled requests \
+                         decode normally)",
+                        if qwen36_mtp_captured {
+                            "CAPTURED verify-lane (NV_Q36_MTP_EAGER=1 for eager)"
+                        } else {
+                            "EAGER (grouped MoE opted out or NV_Q36_MTP_EAGER set)"
+                        }
+                    );
+                    Some(QwenMtpHead::Moe(Arc::new(head)))
+                } else {
+                    None
+                };
+                let tokenizer = Arc::new(tokenizer);
+                let qwen36_batch = qwen36_batch_lanes_boot_selected(family, &raw_cfg);
+                let (shared, qwen_moe_dispatch) = if qwen36_batch {
+                    anyhow::ensure!(
+                        !qwen_graph,
+                        "NV_Q36_BATCH=1 boots the lane-pool scheduler, which owns the model, but \
+                         NV_QWEN_GRAPH=1 pins the graphed solo engine, which also owns it -- \
+                         drop one of the two"
+                    );
+                    let plan = boot_plan
+                        .batch_bucket_sizes
+                        .clone()
+                        .map(nv_models::gemma4_batch_graph::BucketPlan::new)
+                        .unwrap_or_else(
+                            nv_models::qwen3_5_moe::qwen36_batch::q36_batch_bucket_plan_env_nv_q36_batch_sizes,
+                        );
+                    let lane_kv = boot_plan.batch_lane_kv.unwrap_or(kv_max_seq_len);
+                    let lanes = nv_models::qwen3_5_moe::qwen36_batch::Qwen36BatchLanes::new(
+                        model,
+                        &device,
+                        lane_kv,
+                        plan,
+                    )
+                    .context(
+                        "NV_Q36_BATCH=1 was requested, so a lane pool that cannot build is a \
+                         boot failure rather than a silent fall-back to solo serving",
+                    )?;
+                    eprintln!(
+                        "[qwen3.6-batch] request-group scheduler on: {} lanes x {} kv slots \
+                         ({} caps lane depth below the solo kv window {}), window {} ms; solo \
+                         greedy requests {} (batch XOR spec)",
+                        lanes.lanes(),
+                        lane_kv,
+                        crate::oapi::vram_plan::Q36_BATCH_KV_ENV_CAPS_LANE_POOL_DEPTH_SO_PREPAID_BATCH_LANES_STAY_SHALLOW_WHILE_SOLO_REQUESTS_GO_DEEP,
+                        kv_max_seq_len,
+                        q36_batch_window_ms_env_nv_q36_batch_window_ms(),
+                        if qwen_mtp.is_some() {
+                            "self-speculate through the EAGER MoE MTP session off the lane pool's model (the captured verify lane needs the graphed engine this boot did not build)"
+                        } else {
+                            "decode through the eager solo body with the lane pool's installed MoE hook"
+                        }
+                    );
+                    let sched = QwenBatchScheduler::spawn(
+                        QwenLanePool::Moe36(lanes),
+                        qwen_mtp.clone(),
+                        tokenizer.clone(),
+                        device.clone(),
+                        eos_token_ids.clone(),
+                        kv_max_seq_len,
+                        256,
+                    )?;
+                    (QwenMoeShared::Batch(sched), None)
+                } else if qwen_graph || qwen36_mtp_captured {
                     let mut graphed = nv_models::graph_engine::GraphedQwen3Moe::new(
                         model,
                         &device,
@@ -948,7 +1551,12 @@ impl NvEngineChat {
                                     before.saturating_sub(after) as f64 / (1024.0 * 1024.0)
                                 });
                             eprintln!(
-                                "[qwen3.6-moe] decode: GRAPH (grouped device MoE + CUDA graph capture; NV_QWEN_GRAPH=0 for eager), kv window {kv_max_seq_len}, grouped expert copy +{} MiB VRAM",
+                                "[qwen3.6-moe] decode: GRAPH (grouped device MoE + CUDA graph capture; {}), kv window {kv_max_seq_len}, grouped expert copy +{} MiB VRAM",
+                                if qwen_graph {
+                                    "NV_QWEN_GRAPH=0 for eager"
+                                } else {
+                                    "selected by NV_DRAFTER=mtp captured serving; NV_Q36_MTP_EAGER=1 for eager"
+                                },
                                 delta_mib.map(|m| format!("{m:.0}")).unwrap_or_else(|| "?".into())
                             );
                         }
@@ -979,7 +1587,7 @@ impl NvEngineChat {
                         model_id,
                         family,
                         model: LoadedModel::Qwen3_5Moe(shared),
-                        tokenizer: Arc::new(tokenizer),
+                        tokenizer,
                         device,
                         kv_max_seq_len,
                         default_max_new_tokens: 256,
@@ -992,8 +1600,9 @@ impl NvEngineChat {
                         gemma4_engine: None,
                         laguna_spec: None,
                         qwen_moe_dispatch,
-                        qwen_mtp: None,
+                        qwen_mtp,
                         mm_towers: None,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -1015,9 +1624,21 @@ impl NvEngineChat {
                     config.eos_token_id.clone()
                 };
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(config.max_position_embeddings);
+                let kv_max_seq_len =
+                    kv_max_seq_len_for_unplanned_family("laguna", config.max_position_embeddings);
                 let shared = LagunaShared(Arc::new(model));
-                let laguna_spec = build_laguna_spec_serve(&shared, kv_max_seq_len);
+                let laguna_spec = if mode == EngineBuildMode::AdapterServingLean {
+                    tracing::info!(
+                        "adapter-serving lean build: the laguna spec-serve engine is never \
+                         built because its captured step-graph body (raw nv-* kernels plus \
+                         candle proj fallbacks captured on a forked stream) never routes the \
+                         nv-layers Linear hooks a resident adapter needs; adapter requests \
+                         decode on the eager per-request path"
+                    );
+                    None
+                } else {
+                    build_laguna_spec_serve(&shared, kv_max_seq_len)
+                };
                 Ok(Self {
                     inner: NvEngineInner {
                         model_id,
@@ -1038,6 +1659,7 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers: None,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -1067,7 +1689,8 @@ impl NvEngineChat {
                 .context("instantiate GptOss from weights")?;
                 let eos_token_ids = eos_ids_from_dir(model_dir)?;
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(config.max_position_embeddings);
+                let kv_max_seq_len =
+                    kv_max_seq_len_for_unplanned_family("gpt-oss", config.max_position_embeddings);
                 Ok(Self {
                     inner: NvEngineInner {
                         model_id,
@@ -1088,6 +1711,7 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers: None,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
@@ -1098,7 +1722,10 @@ impl NvEngineChat {
                     .with_context(|| format!("parse omni thinker config {}", cfg_path.display()))?;
                 let eos_token_ids = eos_ids_from_dir(model_dir)?;
                 let bos_token_id = bos_id_from_dir(model_dir);
-                let kv_max_seq_len = kv_max_seq_len_for(text_config.max_position_embeddings);
+                let kv_max_seq_len = kv_max_seq_len_for_unplanned_family(
+                    "omni",
+                    text_config.max_position_embeddings,
+                );
                 Ok(Self {
                     inner: NvEngineInner {
                         model_id,
@@ -1119,14 +1746,22 @@ impl NvEngineChat {
                         qwen_moe_dispatch: None,
                         qwen_mtp: None,
                         mm_towers: None,
+                        vram_plan_record_released_on_engine_drop: None,
                     },
                 })
             }
-        }
+        };
+        built.map(|mut engine| {
+            engine.inner.vram_plan_record_released_on_engine_drop = Some(recorded_boot_plan);
+            engine
+        })
     }
 
     #[cfg(not(feature = "cuda"))]
-    pub(crate) fn try_load_inner(_model_dir: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn try_load_inner(
+        _model_dir: &Path,
+        _mode: EngineBuildMode,
+    ) -> anyhow::Result<Self> {
         anyhow::bail!(
             "NvEngineChat::try_load requires the `cuda` cargo feature; \
              rebuild with --features cuda or unset NV_CHAT_MODEL_DIR"
@@ -1141,15 +1776,37 @@ pub(crate) fn spec_serve_max_seq(env: Option<usize>, kv_max_seq_len: usize) -> u
     }
 }
 
-pub(crate) fn kv_max_seq_len_for(max_position_embeddings: usize) -> usize {
-    let default = max_position_embeddings.min(8192);
-    match std::env::var("NV_KV_MAX_SEQ_LEN")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+pub(crate) const KV_DEFAULT_8192_TOKENS_FOR_FAMILIES_WITHOUT_A_VRAM_SOLVER_MODEL_SO_MULTI_ENGINE_BOOTS_DO_NOT_OOM_LIFT_VIA_THE_GLOBAL_OR_PER_FAMILY_KV_ENV: usize = 8192;
+
+pub(crate) fn kv_max_seq_len_resolved(
+    env_bound: Option<usize>,
+    max_position_embeddings: usize,
+) -> usize {
+    match env_bound {
         Some(n) if n > 0 => n.min(max_position_embeddings.max(1)),
-        _ => default,
+        _ => max_position_embeddings
+            .min(KV_DEFAULT_8192_TOKENS_FOR_FAMILIES_WITHOUT_A_VRAM_SOLVER_MODEL_SO_MULTI_ENGINE_BOOTS_DO_NOT_OOM_LIFT_VIA_THE_GLOBAL_OR_PER_FAMILY_KV_ENV),
     }
+}
+
+pub(crate) fn kv_max_seq_len_for_unplanned_family(
+    family: &'static str,
+    max_position_embeddings: usize,
+) -> usize {
+    let per_env = crate::oapi::vram_plan::per_engine_kv_env_for_family(family);
+    let bound = crate::oapi::vram_plan::kv_binding_from(
+        per_env,
+        per_env.and_then(|e| std::env::var(e).ok()).as_deref(),
+        std::env::var(
+            crate::oapi::vram_plan::KV_MAX_SEQ_LEN_GLOBAL_ENV_THE_DEFAULT_EVERY_ENGINE_INHERITS,
+        )
+        .ok()
+        .as_deref(),
+    );
+    if let Some((n, env)) = bound {
+        tracing::info!(family, kv_max_seq_len = n, env, "kv ceiling from env");
+    }
+    kv_max_seq_len_resolved(bound.map(|(n, _)| n), max_position_embeddings)
 }
 
 pub(crate) fn kv_max_seq_len_for_gemma4(max_position_embeddings: usize) -> usize {
@@ -1164,25 +1821,7 @@ pub(crate) fn kv_max_seq_len_for_gemma4(max_position_embeddings: usize) -> usize
 
 #[cfg(feature = "cuda")]
 pub(crate) fn our_process_vram_bytes() -> Option<u64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args([
-            "--query-compute-apps=pid,used_memory",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
-    let me = std::process::id();
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    for line in text.lines() {
-        let mut it = line.split(',').map(|f| f.trim());
-        let (Some(pid), Some(mib)) = (it.next(), it.next()) else {
-            continue;
-        };
-        if pid.parse::<u32>().ok() == Some(me) {
-            return mib.parse::<u64>().ok().map(|m| m * 1024 * 1024);
-        }
-    }
-    None
+    crate::oapi::vram_plan::process_vram_bytes_via_nvidia_smi()
 }
 
 #[cfg(feature = "cuda")]
@@ -1241,212 +1880,6 @@ impl DrafterKvCharge {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn enforce_gemma4_vram_budget(
-    config: &nv_models::gemma4::Gemma4Config,
-    kv_max: usize,
-    drafter_charge: DrafterKvCharge,
-) -> anyhow::Result<Option<u64>> {
-    let fp8 = nv_models::gemma4::verify_kv_use_fp8();
-    let rings = nv_models::gemma4::kv_ring_enabled();
-    let (drafter_rows, drafter_row_elems) = drafter_charge.rows_elems(kv_max);
-    let b = nv_models::gemma4::kv_budget_capped(
-        config,
-        kv_max,
-        fp8,
-        rings,
-        drafter_row_elems,
-        drafter_rows,
-    );
-    let hd512_scratch = nv_models::gemma4::gqa512_verify_scratch_bytes(config);
-    let gib = |x: usize| x as f64 / (1u64 << 30) as f64;
-    let weights = our_process_vram_bytes();
-    let budget_gib: f64 = crate::oapi::admission::default_budget_gib();
-    let weights_gib = weights.map(|w| w as f64 / (1u64 << 30) as f64);
-    tracing::info!(
-        kv_max,
-        verify_kv = if fp8 { "fp8" } else { "bf16" },
-        rings,
-        ring_slots = b.ring_slots,
-        verify_full_gib = format!("{:.2}", gib(b.verify_full_bytes)),
-        verify_sliding_gib = format!("{:.3}", gib(b.verify_sliding_bytes)),
-        verify_scratch_gib = format!("{:.3}", gib(b.verify_scratch_bytes)),
-        verify_hd512 = hd512_scratch > 0,
-        verify_hd512_scratch_gib = format!("{:.3}", gib(hd512_scratch)),
-        decode_full_gib = format!("{:.2}", gib(b.decode_full_bytes)),
-        decode_sliding_gib = format!("{:.3}", gib(b.decode_sliding_bytes)),
-        drafter_kv_gib = format!("{:.2}", gib(b.drafter_kv_bytes)),
-        kv_worst_total_gib = format!("{:.2}", gib(b.worst_total())),
-        weights_measured_gib = weights_gib
-            .map(|w| format!("{w:.2}"))
-            .unwrap_or_else(|| "unknown".into()),
-        budget_gib,
-        "gemma4 VRAM budget at kv_max"
-    );
-    if weights_gib.is_none() {
-        tracing::warn!(
-            kv_max,
-            budget_gib,
-            kv_worst_total_gib = format!("{:.2}", gib(b.worst_total() + hd512_scratch)),
-            "gemma4 VRAM BUDGET GUARD IS INOPERATIVE: nvidia-smi did not report this process's \
-             memory, so the weights term is unknown and the check below can only see the KV \
-             term. It will not refuse a configuration that does not fit. Treat the \
-             weights_measured_gib=unknown line above as the real signal."
-        );
-    }
-    let total_gib = weights_gib.unwrap_or(0.0) + gib(b.worst_total() + hd512_scratch);
-    if total_gib > budget_gib {
-        anyhow::bail!(
-            "gemma4 VRAM budget exceeded: weights {} GiB + worst-case KV {:.2} GiB at              kv_max={} > budget {budget_gib} GiB. Lower NV_KV_MAX_SEQ_LEN, keep              NV_KV_RING enabled, or raise NV_VRAM_BUDGET_GIB if the GPU allows.",
-            weights_gib.map(|w| format!("{w:.2}")).unwrap_or_else(|| "?".into()),
-            gib(b.worst_total() + hd512_scratch),
-            kv_max,
-        )
-    }
-    Ok(weights)
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn gemma4_kv_max_is_explicit() -> bool {
-    std::env::var("NV_KV_MAX_SEQ_LEN")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .is_some_and(|n| n > 0)
-}
-
-#[cfg(feature = "cuda")]
-fn gemma4_kv_max_fits(
-    config: &nv_models::gemma4::Gemma4Config,
-    kv_max: usize,
-    drafter_charge: DrafterKvCharge,
-    weights_gib: f64,
-    budget_gib: f64,
-) -> bool {
-    let fp8 = nv_models::gemma4::verify_kv_use_fp8();
-    let rings = nv_models::gemma4::kv_ring_enabled();
-    let (drafter_rows, drafter_row_elems) = drafter_charge.rows_elems(kv_max);
-    let b = nv_models::gemma4::kv_budget_capped(
-        config,
-        kv_max,
-        fp8,
-        rings,
-        drafter_row_elems,
-        drafter_rows,
-    );
-    let extra = b.worst_total() + nv_models::gemma4::gqa512_verify_scratch_bytes(config);
-    weights_gib + (extra as f64 / (1u64 << 30) as f64) <= budget_gib
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) const KV_FIT_FLOOR: usize = 4096;
-
-#[cfg(feature = "cuda")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KvFit {
-    Explicit(usize),
-    Fits(usize),
-    Reduced { requested: usize, fitted: usize },
-    ProbeFailed(usize),
-    NoFit { requested: usize, floor: usize },
-}
-
-#[cfg(feature = "cuda")]
-impl KvFit {
-    pub(crate) fn value(self) -> usize {
-        match self {
-            KvFit::Explicit(n) | KvFit::Fits(n) | KvFit::ProbeFailed(n) => n,
-            KvFit::Reduced { fitted, .. } => fitted,
-            KvFit::NoFit { requested, .. } => requested,
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn decide_gemma4_kv_max(
-    config: &nv_models::gemma4::Gemma4Config,
-    requested: usize,
-    drafter_charge: DrafterKvCharge,
-    weights_gib: Option<f64>,
-    budget_gib: f64,
-    explicit: bool,
-) -> KvFit {
-    if explicit {
-        return KvFit::Explicit(requested);
-    }
-    let Some(weights_gib) = weights_gib else {
-        return KvFit::ProbeFailed(requested);
-    };
-    if gemma4_kv_max_fits(config, requested, drafter_charge, weights_gib, budget_gib) {
-        return KvFit::Fits(requested);
-    }
-    let mut fitted = requested;
-    while fitted > KV_FIT_FLOOR {
-        fitted /= 2;
-        if gemma4_kv_max_fits(config, fitted, drafter_charge, weights_gib, budget_gib) {
-            return KvFit::Reduced { requested, fitted };
-        }
-    }
-    KvFit::NoFit {
-        requested,
-        floor: KV_FIT_FLOOR,
-    }
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn fit_gemma4_kv_max(
-    config: &nv_models::gemma4::Gemma4Config,
-    requested: usize,
-    drafter_charge: DrafterKvCharge,
-) -> usize {
-    let budget_gib: f64 = crate::oapi::admission::default_budget_gib();
-    let explicit = gemma4_kv_max_is_explicit();
-    let weights_gib = if explicit {
-        None
-    } else {
-        our_process_vram_bytes().map(|w| w as f64 / (1u64 << 30) as f64)
-    };
-    let decision = decide_gemma4_kv_max(
-        config,
-        requested,
-        drafter_charge,
-        weights_gib,
-        budget_gib,
-        explicit,
-    );
-    match decision {
-        KvFit::Explicit(_) | KvFit::Fits(_) => {}
-        KvFit::Reduced { requested, fitted } => tracing::warn!(
-            requested,
-            fitted,
-            weights_gib = weights_gib.map(|w| format!("{w:.2}")).unwrap_or_default(),
-            budget_gib,
-            "gemma4 kv_max does not fit the VRAM budget at the checkpoint's full context; \
-             auto-reduced. Set NV_KV_MAX_SEQ_LEN to choose explicitly, or raise \
-             NV_VRAM_BUDGET_GIB if the GPU allows."
-        ),
-        KvFit::ProbeFailed(requested) => tracing::warn!(
-            requested,
-            budget_gib,
-            "gemma4 kv_max AUTO-FIT IS DISABLED: could not read this process's VRAM usage from \
-             nvidia-smi, so there is no weights figure to fit against and kv_max is being used \
-             as requested. If the checkpoint does not actually fit, this boot will fail later \
-             with an allocation error rather than being reduced here. Set NV_KV_MAX_SEQ_LEN \
-             explicitly to make the choice yourself."
-        ),
-        KvFit::NoFit { requested, floor } => tracing::warn!(
-            requested,
-            floor,
-            weights_gib = weights_gib.map(|w| format!("{w:.2}")).unwrap_or_default(),
-            budget_gib,
-            "gemma4 kv_max does not fit the VRAM budget even at the auto-fit floor; proceeding \
-             at the requested value, which is expected to fail. Raise NV_VRAM_BUDGET_GIB, or set \
-             NV_KV_MAX_SEQ_LEN below the floor to choose explicitly."
-        ),
-    }
-    decision.value()
-}
-
-#[cfg(feature = "cuda")]
-
 pub(crate) fn detect_family(raw_cfg: &str) -> anyhow::Result<ModelFamily> {
     detect_family_with_dense_cuda_serve(raw_cfg, qwen3_5_dense_cuda_serve_enabled())
 }
@@ -1980,11 +2413,22 @@ fn warn_unknown_model_fallback(requested: &str, served: &str) {
     );
 }
 
+struct RegistryInner {
+    engines: std::collections::HashMap<String, Arc<dyn ChatEngine>>,
+    default_id: String,
+    order: Vec<String>,
+    the_unknown_model_fallback_reads_boot_engine_count_so_runtime_adapters_cannot_flip_it: usize,
+}
+
 #[derive(Clone)]
 pub struct ChatRegistry {
-    pub(crate) engines: Arc<std::collections::HashMap<String, Arc<dyn ChatEngine>>>,
-    pub(crate) default_id: String,
-    pub(crate) order: Arc<Vec<String>>,
+    inner: Arc<std::sync::RwLock<RegistryInner>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoveDenied {
+    NotFound,
+    DefaultEngine,
 }
 
 impl ChatRegistry {
@@ -2001,15 +2445,26 @@ impl ChatRegistry {
                 order.push(id);
             }
         }
+        let boot_count = order.len();
         Some(Self {
-            engines: Arc::new(map),
-            default_id,
-            order: Arc::new(order),
+            inner: Arc::new(std::sync::RwLock::new(RegistryInner {
+                engines: map,
+                default_id,
+                order,
+                the_unknown_model_fallback_reads_boot_engine_count_so_runtime_adapters_cannot_flip_it:
+                    boot_count,
+            })),
         })
     }
 
     pub fn single(engine: Arc<dyn ChatEngine>) -> Self {
         Self::from_engines(vec![engine]).expect("single engine is non-empty")
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, RegistryInner> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn resolve(&self, model: Option<&str>) -> Option<Arc<dyn ChatEngine>> {
@@ -2021,19 +2476,25 @@ impl ChatRegistry {
         model: Option<&str>,
         allow_unknown: bool,
     ) -> Option<Arc<dyn ChatEngine>> {
+        let inner = self.read();
         match model {
-            None | Some("") => self.engines.get(&self.default_id).cloned(),
-            Some(m) => match self.engines.get(m) {
+            None | Some("") => inner.engines.get(&inner.default_id).cloned(),
+            Some(m) => match inner.engines.get(m) {
                 Some(eng) => Some(eng.clone()),
                 None => {
                     if let Some(canon) = crate::oapi::model_ids::canonical_model_id(m) {
-                        if let Some(eng) = self.engines.get(&canon) {
+                        if let Some(eng) = inner.engines.get(&canon) {
                             return Some(eng.clone());
                         }
                     }
-                    if allow_unknown && self.order.len() == 1 {
-                        warn_unknown_model_fallback(m, &self.default_id);
-                        return self.engines.get(&self.default_id).cloned();
+                    if allow_unknown
+                        && inner
+                            .the_unknown_model_fallback_reads_boot_engine_count_so_runtime_adapters_cannot_flip_it
+                            == 1
+                        && inner.engines.contains_key(&inner.default_id)
+                    {
+                        warn_unknown_model_fallback(m, &inner.default_id);
+                        return inner.engines.get(&inner.default_id).cloned();
                     }
                     None
                 }
@@ -2042,19 +2503,66 @@ impl ChatRegistry {
     }
 
     pub fn default_engine(&self) -> Arc<dyn ChatEngine> {
-        self.engines
-            .get(&self.default_id)
+        let inner = self.read();
+        inner
+            .engines
+            .get(&inner.default_id)
             .cloned()
             .expect("default engine present")
     }
 
-    pub fn model_ids(&self) -> &[String] {
-        &self.order
+    pub fn model_ids(&self) -> Vec<String> {
+        self.read().order.clone()
     }
 
     pub fn contains(&self, model: &str) -> bool {
-        self.engines.contains_key(model)
+        self.read().engines.contains_key(model)
     }
+
+    pub fn entries_in_order(&self) -> Vec<(String, Arc<dyn ChatEngine>)> {
+        let inner = self.read();
+        inner
+            .order
+            .iter()
+            .filter_map(|id| inner.engines.get(id).map(|e| (id.clone(), e.clone())))
+            .collect()
+    }
+
+    pub fn insert(&self, engine: Arc<dyn ChatEngine>) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = engine.model_id().to_string();
+        if inner.engines.insert(id.clone(), engine).is_none() {
+            inner.order.push(id);
+        }
+    }
+
+    pub fn remove(&self, id: &str) -> Result<(), RemoveDenied> {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if id == inner.default_id {
+            return Err(RemoveDenied::DefaultEngine);
+        }
+        if inner.engines.remove(id).is_none() {
+            return Err(RemoveDenied::NotFound);
+        }
+        inner.order.retain(|x| x != id);
+        Ok(())
+    }
+}
+
+static LIVE_REGISTRY: std::sync::OnceLock<ChatRegistry> = std::sync::OnceLock::new();
+
+pub fn publish_live_registry(reg: &ChatRegistry) {
+    let _ = LIVE_REGISTRY.set(reg.clone());
+}
+
+pub fn live_registry() -> Option<ChatRegistry> {
+    LIVE_REGISTRY.get().cloned()
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -2107,7 +2615,7 @@ pub fn registry_from_env() -> Option<ChatRegistry> {
     if let Some(list) = std::env::var_os("NV_CHAT_MODEL_DIRS") {
         let list = list.to_string_lossy().into_owned();
         let dirs: Vec<PathBuf> = list
-            .split(|c| c == ',' || c == ':')
+            .split([',', ':'])
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -2115,13 +2623,31 @@ pub fn registry_from_env() -> Option<ChatRegistry> {
         if dirs.is_empty() {
             return None;
         }
-        return build_registry_strict(&dirs, try_load_engine_dir);
+        let mut bases: Vec<(String, PathBuf)> = Vec::with_capacity(dirs.len());
+        let reg = build_registry_strict(&dirs, |d| {
+            let eng = try_load_engine_dir(d)?;
+            bases.push((eng.model_id().to_string(), d.to_path_buf()));
+            Ok(eng)
+        })?;
+        let mut engines: Vec<Arc<dyn ChatEngine>> =
+            reg.entries_in_order().into_iter().map(|(_, e)| e).collect();
+        super::lora_cuda::attach_boot_adapters(&mut engines, &bases);
+        return ChatRegistry::from_engines(engines);
     }
     #[cfg(not(feature = "cuda"))]
     if std::env::var_os("NV_CHAT_MODEL_DIRS").is_some() {
         tracing::warn!(
             "NV_CHAT_MODEL_DIRS set but this build lacks the `cuda` feature; nv-engine chat disabled"
         );
+    }
+    #[cfg(feature = "cuda")]
+    if let Some(dir) = std::env::var_os("NV_CHAT_MODEL_DIR") {
+        let dir = PathBuf::from(dir);
+        let eng = load_engine_dir(&dir);
+        let bases = vec![(eng.model_id().to_string(), dir)];
+        let mut engines: Vec<Arc<dyn ChatEngine>> = vec![eng];
+        super::lora_cuda::attach_boot_adapters(&mut engines, &bases);
+        return ChatRegistry::from_engines(engines);
     }
     default_engine_from_env().map(ChatRegistry::single)
 }
@@ -2337,7 +2863,7 @@ mod gguf_seam_tests {
         let dir = seam_dir("inner");
         std::fs::write(dir.join("model.gguf"), b"x").unwrap();
 
-        let err = match NvEngineChat::try_load_inner(&dir) {
+        let err = match NvEngineChat::try_load_inner(&dir, EngineBuildMode::Full) {
             Ok(_) => panic!("gguf dir must be refused"),
             Err(e) => e,
         };
@@ -2533,6 +3059,49 @@ mod registry_policy_tests {
         assert!(allow_unknown_model_from(Some(" TRUE ")));
         assert!(allow_unknown_model_from(Some("on")));
     }
+
+    #[test]
+    fn a_runtime_insert_is_visible_through_every_clone_of_the_registry() {
+        let reg = single_reg();
+        let clone_taken_before_the_insert = reg.clone();
+        reg.insert(Arc::new(EchoEngine::new("ft:e4b:custom:1234", "y")));
+        assert_eq!(
+            clone_taken_before_the_insert
+                .resolve_with(Some("ft:e4b:custom:1234"), false)
+                .unwrap()
+                .model_id(),
+            "ft:e4b:custom:1234"
+        );
+        assert_eq!(
+            reg.model_ids(),
+            &["gemma-4-E4B-it".to_string(), "ft:e4b:custom:1234".to_string()]
+        );
+    }
+
+    #[test]
+    fn insert_of_an_existing_id_replaces_without_duplicating_the_order_row() {
+        let reg = single_reg();
+        reg.insert(Arc::new(EchoEngine::new("ft:x", "a")));
+        reg.insert(Arc::new(EchoEngine::new("ft:x", "b")));
+        assert_eq!(
+            reg.model_ids(),
+            &["gemma-4-E4B-it".to_string(), "ft:x".to_string()]
+        );
+    }
+
+    #[test]
+    fn remove_refuses_the_default_engine_and_404s_an_unknown_name() {
+        let reg = single_reg();
+        assert_eq!(
+            reg.remove("gemma-4-E4B-it"),
+            Err(RemoveDenied::DefaultEngine)
+        );
+        assert_eq!(reg.remove("never-loaded"), Err(RemoveDenied::NotFound));
+        reg.insert(Arc::new(EchoEngine::new("ft:x", "a")));
+        assert_eq!(reg.remove("ft:x"), Ok(()));
+        assert!(reg.resolve_with(Some("ft:x"), false).is_none());
+        assert_eq!(reg.model_ids(), &["gemma-4-E4B-it".to_string()]);
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -2577,99 +3146,43 @@ mod kv_fit_tests {
     }
 
     #[test]
-    fn probe_failure_is_reported_not_silently_treated_as_a_fit() {
+    fn plan_solver_lands_on_the_largest_granular_kv_that_fits() {
         let c = cfg();
-        let d = decide_gemma4_kv_max(&c, 131072, DrafterKvCharge::default(), None, 76.0, false);
-        assert_eq!(
-            d,
-            KvFit::ProbeFailed(131072),
-            "a failed VRAM probe must be its own outcome. It used to return the requested \
-             value indistinguishably from a genuine fit, so the auto-fit silently became a \
-             no-op and the boot failed later in allocation with no hint why."
+        let weights = 40.0f64;
+        let budget = weights + kv_gib(&c, 65536, 0) + 0.001;
+        let fits = |kv: usize| weights + kv_gib(&c, kv, 0) <= budget;
+        let kv = crate::oapi::vram_plan::solve_max_kv_tokens_monotone(fits, 131072)
+            .expect("65536 fits by construction so the solver must find at least that");
+        assert!(fits(kv), "solver answered a kv that does not fit: {kv}");
+        assert!(
+            kv == 131072 || !fits(kv + 1024),
+            "solver left budget on the table: {kv} fits and so does {}",
+            kv + 1024
         );
-        assert_eq!(
-            d.value(),
-            131072,
-            "the value is unchanged; only the reporting is"
-        );
+        assert!(kv >= 65536);
+        assert_eq!(kv % 1024, 0);
     }
 
     #[test]
-    fn explicit_request_is_honoured_without_probing() {
+    fn plan_solver_reports_no_fit_when_weights_alone_exceed_the_budget() {
         let c = cfg();
-        assert_eq!(
-            decide_gemma4_kv_max(&c, 8192, DrafterKvCharge::default(), None, 0.001, true),
-            KvFit::Explicit(8192),
-            "an explicit NV_KV_MAX_SEQ_LEN is the operator's decision and must not be fitted"
-        );
-    }
-
-    #[test]
-    fn generous_budget_fits_unchanged() {
-        let c = cfg();
-        let budget = 40.0 + kv_gib(&c, 131072, 0) + 1.0;
-        assert_eq!(
-            decide_gemma4_kv_max(
-                &c,
-                131072,
-                DrafterKvCharge::default(),
-                Some(40.0),
-                budget,
-                false
-            ),
-            KvFit::Fits(131072)
-        );
-    }
-
-    #[test]
-    fn budget_below_the_floor_reports_nofit_rather_than_a_fit() {
-        let c = cfg();
-        let d = decide_gemma4_kv_max(
-            &c,
-            131072,
-            DrafterKvCharge::default(),
-            Some(100.0),
-            76.0,
-            false,
-        );
-        assert_eq!(
-            d,
-            KvFit::NoFit {
-                requested: 131072,
-                floor: KV_FIT_FLOOR
-            },
+        let fits = |kv: usize| 100.0 + kv_gib(&c, kv, 0) <= 76.0;
+        assert!(
+            crate::oapi::vram_plan::solve_max_kv_tokens_monotone(fits, 131072).is_none(),
             "weights alone exceed the budget, so no kv_max fits -- that must not read as a fit"
         );
-        assert_eq!(d.value(), 131072);
     }
 
     #[test]
-    fn a_budget_between_two_levels_reduces_to_the_larger_one_that_fits() {
+    fn explicit_kv_env_bypasses_the_solver_in_the_gemma4_plan() {
         let c = cfg();
-        let (requested, weights) = (131072usize, 40.0f64);
-        let mut oracle = requested;
-        let budget = weights + kv_gib(&c, requested / 4, 0);
-        while oracle > KV_FIT_FLOOR && weights + kv_gib(&c, oracle, 0) > budget {
-            oracle /= 2;
-        }
-        if oracle == requested {
-            eprintln!("SKIP: KV does not shrink with kv_max for this config; nothing to reduce");
-            return;
-        }
+        assert_eq!(c.max_position_embeddings, 4096);
+        let requested = 999_999usize;
         assert_eq!(
-            decide_gemma4_kv_max(
-                &c,
-                requested,
-                DrafterKvCharge::default(),
-                Some(weights),
-                budget,
-                false
-            ),
-            KvFit::Reduced {
-                requested,
-                fitted: oracle
-            },
-            "auto-fit must land on the largest halving that fits, not overshoot past it"
+            requested.min(c.max_position_embeddings.max(1)),
+            4096,
+            "an explicit NV_KV_MAX_SEQ_LEN is the operator's decision, only clamped to the \
+             checkpoint's max_position_embeddings, never fitted"
         );
     }
 
@@ -2728,16 +3241,23 @@ mod kv_fit_tests {
         let capped_drafter_gib = (4 * capped_rows * elems) as f64 / (1u64 << 30) as f64;
         let weights = 40.0f64;
         let budget = weights + kv_gib(&c, requested, 0) + capped_drafter_gib + 0.01;
-        assert_eq!(
-            decide_gemma4_kv_max(&c, requested, capped, Some(weights), budget, false),
-            KvFit::Fits(requested),
+        let fits_with = |ch: DrafterKvCharge, kv: usize| {
+            let (rows, row_elems) = ch.rows_elems(kv);
+            let fp8 = nv_models::gemma4::verify_kv_use_fp8();
+            let rings = nv_models::gemma4::kv_ring_enabled();
+            let b = nv_models::gemma4::kv_budget_capped(&c, kv, fp8, rings, row_elems, rows);
+            let total = (b.worst_total() + nv_models::gemma4::gqa512_verify_scratch_bytes(&c))
+                as f64
+                / (1u64 << 30) as f64;
+            weights + total <= budget
+        };
+        assert!(
+            fits_with(capped, requested),
             "with the drafter KV cap the accounting must admit the full context"
         );
-        let d = decide_gemma4_kv_max(&c, requested, uncapped, Some(weights), budget, false);
         assert!(
-            !matches!(d, KvFit::Fits(_)),
-            "the uncapped drafter charge (4*131072*4096 = 2 GiB) must not fit this \
-             budget, got {d:?}"
+            !fits_with(uncapped, requested),
+            "the uncapped drafter charge (4*131072*4096 = 2 GiB) must not fit this budget"
         );
     }
 }
@@ -2972,7 +3492,7 @@ mod qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed {
             .join(", ")
     }
 
-    fn qwen38_27b_config_json() -> String {
+    pub(crate) fn qwen38_27b_config_json() -> String {
         format!(
             r#"{{
   "architectures": ["Qwen3_5ForConditionalGeneration"],
@@ -3117,6 +3637,297 @@ mod qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed {
 }
 
 #[cfg(all(test, feature = "cuda"))]
+mod a_serving_arm_is_one_decision_and_a_subset_of_its_keys_is_unreachable {
+    use super::qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed::qwen38_27b_config_json;
+    use super::*;
+    use std::collections::HashMap;
+
+    fn qwen35_9b_config_json() -> String {
+        let layer_types = (0..32)
+            .map(|i| {
+                if (i + 1) % 4 == 0 {
+                    "\"full_attention\""
+                } else {
+                    "\"linear_attention\""
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"{{
+  "architectures": ["Qwen3_5ForConditionalGeneration"],
+  "model_type": "qwen3_5",
+  "tie_word_embeddings": false,
+  "text_config": {{
+    "model_type": "qwen3_5_text",
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 4,
+    "head_dim": 256,
+    "intermediate_size": 12288,
+    "full_attention_interval": 4,
+    "vocab_size": 248320,
+    "max_position_embeddings": 262144,
+    "rms_norm_eps": 1e-06,
+    "attn_output_gate": true,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "eos_token_id": 248044,
+    "rope_parameters": {{"rope_theta": 10000000.0, "partial_rotary_factor": 0.25, "rope_type": "default"}},
+    "layer_types": [{layer_types}]
+  }}
+}}"#
+        )
+    }
+
+    const GEMMA4_NVFP4_CFG: &str = r#"{"architectures": ["Gemma4ForConditionalGeneration"],
+      "model_type": "gemma4",
+      "quantization_config": {"format": "nvfp4-pack-quantized",
+        "config_groups": {"group_0": {"targets": ["Linear"],
+          "weights": {"num_bits": 4, "type": "float", "group_size": 16, "symmetric": true, "strategy": "tensor_group"}}}}}"#;
+
+    const GEMMA4_BF16_CFG: &str =
+        r#"{"architectures": ["Gemma4ForConditionalGeneration"], "model_type": "gemma4"}"#;
+
+    #[test]
+    fn every_variant_arms_the_whole_key_set_or_none_of_it() {
+        for keys in [
+            &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL[..],
+            &QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL[..],
+        ] {
+            for arm in [
+                ServingArm::ArmEveryKey,
+                ServingArm::OperatorHeldTheEscape,
+                ServingArm::CheckpointOutsideTheMeasuredBasis,
+            ] {
+                let armed = keys_armed_by_this_one_decision(arm, keys);
+                assert!(
+                    armed.is_empty() || armed.len() == keys.len(),
+                    "{arm:?} armed {} of {} keys: a subset of a measured stack is a \
+                     configuration nothing measured, and for gemma4 the specific subset \
+                     NV_ATTN_PROJ_QUANT-without-NV_NVFP4_M1_GEMV is a quality REJECT",
+                    armed.len(),
+                    keys.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_gemma4_default_is_exactly_the_three_key_record_arm() {
+        assert_eq!(
+            GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+            [
+                ("NV_ATTN_PROJ_QUANT", "nvfp4"),
+                ("NV_NVFP4_M1_GEMV", "1"),
+                ("NV_G4_LMHEAD_I8", "1"),
+            ],
+            "these three keys and these values are the arm the 27.876/29.472 -> 19.419/21.313 \
+             pairs and the 16.290 / 16.344 ppl rows were measured on"
+        );
+        assert_eq!(
+            serving_arm_from(None, gemma4_checkpoint_declares_nvfp4(GEMMA4_NVFP4_CFG)),
+            ServingArm::ArmEveryKey
+        );
+    }
+
+    #[test]
+    fn the_escape_restores_the_pre_flip_default_by_arming_nothing() {
+        for escape in ["0", "off", "false", "no"] {
+            let arm = serving_arm_from(Some(escape), true);
+            assert_eq!(arm, ServingArm::OperatorHeldTheEscape, "{escape}");
+            assert!(
+                keys_armed_by_this_one_decision(
+                    arm,
+                    &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL
+                )
+                .is_empty(),
+                "{GEMMA4_SERVING_ARM_ENV}={escape} must leave the process with none of the three \
+                 variables set, which is the pre-flip default itself and not an imitation of it"
+            );
+            assert!(keys_armed_by_this_one_decision(
+                arm,
+                &QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL
+            )
+            .is_empty());
+        }
+        for on in [None, Some("1"), Some("on")] {
+            assert_eq!(serving_arm_from(on, true), ServingArm::ArmEveryKey, "{on:?}");
+        }
+    }
+
+    #[test]
+    fn a_hand_set_key_that_disagrees_refuses_instead_of_serving_a_subset() {
+        let held: HashMap<&str, &str> = HashMap::from([
+            ("NV_ATTN_PROJ_QUANT", "nvfp4"),
+            ("NV_NVFP4_M1_GEMV", "0"),
+        ]);
+        let conflicts = arm_keys_the_operator_already_set_to_something_else(
+            &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+            |k| held.get(k).map(|v| v.to_string()),
+        );
+        assert_eq!(
+            conflicts
+                .iter()
+                .map(|(k, _, _)| *k)
+                .collect::<Vec<_>>(),
+            vec!["NV_NVFP4_M1_GEMV"],
+            "a key the operator pinned away from the measured value is a refusal, not a silent \
+             overwrite and not a partial arm"
+        );
+        assert!(arm_keys_the_operator_already_set_to_something_else(
+            &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+            |_| None
+        )
+        .is_empty());
+        assert!(arm_keys_the_operator_already_set_to_something_else(
+            &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+            |k| GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn quantized_attention_projections_without_the_gemv_rescue_are_refused_at_boot() {
+        for raw in ["nvfp4", "1", "on", "true", "yes", "all", "fp4", "qkv+o", "qkv", "o"] {
+            assert!(
+                gemma4_attn_nvfp4_without_the_m1_gemv_rescue(Some(raw), None),
+                "NV_ATTN_PROJ_QUANT={raw} without NV_NVFP4_M1_GEMV=1 is the +0.748 ppl \
+                 configuration and must never boot"
+            );
+            assert!(gemma4_attn_nvfp4_without_the_m1_gemv_rescue(
+                Some(raw),
+                Some("0")
+            ));
+            assert!(!gemma4_attn_nvfp4_without_the_m1_gemv_rescue(
+                Some(raw),
+                Some("1")
+            ));
+        }
+        for raw in [None, Some("off"), Some("0"), Some("bf16")] {
+            assert!(!gemma4_attn_nvfp4_without_the_m1_gemv_rescue(raw, None));
+        }
+        assert!(
+            !gemma4_attn_nvfp4_without_the_m1_gemv_rescue(Some("fp8"), None),
+            "the fp8 scheme is a different route the m=1 nvfp4 gemv does not serve, and it \
+             refuses at model load on sm_120 with its own message"
+        );
+    }
+
+    #[test]
+    fn the_gemma4_arm_reaches_only_checkpoints_that_declare_nvfp4() {
+        assert!(gemma4_checkpoint_declares_nvfp4(GEMMA4_NVFP4_CFG));
+        assert!(!gemma4_checkpoint_declares_nvfp4(GEMMA4_BF16_CFG));
+        assert_eq!(
+            serving_arm_from(None, gemma4_checkpoint_declares_nvfp4(GEMMA4_BF16_CFG)),
+            ServingArm::CheckpointOutsideTheMeasuredBasis,
+            "attn_proj_quant_mode ignores NV_ATTN_PROJ_QUANT unless the checkpoint declares \
+             QuantScheme::Nvfp4, so arming a bf16 gemma4 would move only the int8 lm_head, on a \
+             checkpoint class nothing measured"
+        );
+    }
+
+    #[test]
+    fn the_qwen35_dense_stack_is_the_eleven_arms_round_twelve_measured() {
+        assert_eq!(
+            QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL
+                .iter()
+                .map(|(k, v)| {
+                    assert_eq!(*v, "1", "{k} is an opt-in flag read as eq-some-1");
+                    *k
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                "NV_Q36_GRAPHED_DECODE_FIX",
+                "NV_Q36_GDN_FP8",
+                "NV_Q36_LM_HEAD_FP8",
+                "NV_Q38_FP4_MLP",
+                "NV_Q38_GDN_SPLIT",
+                "NV_Q38_MLP_W4A8",
+                "NV_Q38_W4A8_MK",
+                "NV_Q38_SILUQ_SPLIT",
+                "NV_Q38_NORM_QUANT_FOLD",
+                "NV_Q38_NORM_WRITEOUT",
+                "NV_NVFP4_M1_GEMV",
+            ],
+            "this is the eleven-arm record the 12.514/79.629 -> 5.425/5.900 pairs and the 4.833 \
+             ppl row were measured on"
+        );
+    }
+
+    #[test]
+    fn the_qwen35_arm_stack_stops_at_the_trunk_it_was_measured_on() {
+        assert!(
+            qwen35_dense_trunk_is_the_measured_9b(&qwen35_9b_config_json()),
+            "hidden 4096 / 32 layers / intermediate 12288 is the Qwen3.5-9B trunk the eleven \
+             arms were measured on"
+        );
+        assert!(
+            !qwen35_dense_trunk_is_the_measured_9b(&qwen38_27b_config_json()),
+            "qwen3.8-27B lands in the same dense arm but its published serving band belongs to a \
+             different twelve-arm stack with NV_NVFP4_M1_GEMV unset; arming this stack for it \
+             would flip a performance default nobody measured"
+        );
+        assert_eq!(
+            serving_arm_from(
+                None,
+                qwen35_dense_trunk_is_the_measured_9b(&qwen38_27b_config_json())
+            ),
+            ServingArm::CheckpointOutsideTheMeasuredBasis
+        );
+    }
+
+    #[test]
+    fn both_rationales_name_their_escape_their_instrument_and_their_cost() {
+        for (why, needles) in [
+            (
+                GEMMA4_NVFP4_SERVES_THE_THREE_KEY_RECORD_ARM_AND_NV_G4_SERVING_ARM_0_IS_THE_ESCAPE,
+                vec![
+                    GEMMA4_SERVING_ARM_ENV,
+                    "NV_ATTN_PROJ_QUANT",
+                    "NV_NVFP4_M1_GEMV",
+                    "NV_G4_LMHEAD_I8",
+                    "ppl_gemma4::gemma4_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode",
+                    "0.41 family null",
+                    "16.290",
+                    "16.344",
+                    "19.419",
+                    "gemma4_verify_forward",
+                ],
+            ),
+            (
+                QWEN35_DENSE_9B_OPT_IN_ARMS_ITS_MEASURED_STACK_AND_NV_QWEN35_DENSE_ARM_0_IS_THE_ESCAPE,
+                vec![
+                    QWEN35_DENSE_SERVING_ARM_ENV,
+                    QWEN35_DENSE_CUDA_SERVE_ENV,
+                    "ppl_qwen35_dense::qwen35_dense_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode",
+                    "4.833",
+                    "4.862",
+                    "5.900",
+                    "9183",
+                    "qwen3.8-27B",
+                ],
+            ),
+        ] {
+            for needle in needles {
+                assert!(
+                    why.contains(needle),
+                    "the notice printed at load is the only durable record of what this default \
+                     does and what it cost; it must name {needle}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
 mod capture_stream_device_policy {
     use super::*;
 
@@ -3162,7 +3973,8 @@ mod capture_stream_device_policy {
     }
 
     #[test]
-    fn the_device_selection_is_the_qwen_graph_selector_plus_only_the_q38_batch_opt_in() {
+    fn the_device_selection_is_the_qwen_graph_selector_the_q38_batch_opt_in_and_the_q36_mtp_captured_default(
+    ) {
         for (family, cfg) in [
             (ModelFamily::Qwen3, QWEN3_CFG),
             (ModelFamily::Gemma4, GEMMA4_CFG),
@@ -3174,14 +3986,25 @@ mod capture_stream_device_policy {
             assert_eq!(
                 capture_needs_the_device_stream(family, cfg),
                 qwen_graph_decode_selected(family, cfg)
-                    || qwen38_batch_lanes_boot_selected(family, cfg),
+                    || qwen38_batch_lanes_boot_selected(family, cfg)
+                    || qwen36_batch_lanes_boot_selected(family, cfg)
+                    || qwen36_mtp_captured_serving_selected(family, cfg),
                 "{family:?}: try_load_inner must keep choosing Device::new_cuda_with_stream on \
-                 exactly the qwen-graph condition plus the NV_Q38_BATCH dense lane opt-in and \
-                 nothing else. Task #63 records grouped MoE on a non-default stream producing \
-                 all-NaN logits, and gemma4 prefill produced all -inf on the same axis; the one \
-                 permitted widening is qwen38_batch_lanes_boot_selected, whose serving \
-                 measurement is rust/tests/qwen38_batch_serving_e2e.rs (solo MTP and batch \
-                 groups byte-match their flag-off references on the stream-mode device)"
+                 exactly the qwen-graph condition plus the NV_Q38_BATCH dense lane opt-in plus \
+                 the NV_Q36_BATCH moe lane opt-in plus the NV_DRAFTER=mtp captured-verify \
+                 serving default and nothing else. Task #63 records grouped MoE on a \
+                 non-default stream producing all-NaN logits, and gemma4 prefill produced all \
+                 -inf on the same axis; the permitted widenings are \
+                 qwen38_batch_lanes_boot_selected, whose serving measurement is \
+                 rust/tests/qwen38_batch_serving_e2e.rs (solo MTP and batch groups byte-match \
+                 their flag-off references on the stream-mode device), \
+                 qwen36_batch_lanes_boot_selected, whose serving measurement is \
+                 rust/tests/qwen36_http_concurrency_ladder.rs (lane groups byte-match their \
+                 flag-off eager references on the stream-mode device under the rowwise=moe pin \
+                 plus twin basis), and \
+                 qwen36_mtp_captured_serving_selected, whose serving measurement is \
+                 rust/tests/qwen36_mtp_serving_e2e.rs (byte-identical greedy repeats through \
+                 the captured verify lane on the stream-mode device)"
             );
         }
     }
@@ -3213,6 +4036,65 @@ mod capture_stream_device_policy {
                 "the refusal must name {needle}: a refusal without its measurement is an opinion"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod qwen3_default_weight_format_tests {
+    use super::*;
+
+    const PLAIN_QWEN3_CFG_NO_QUANT_SECTION: &str = r#"{"model_type":"qwen3","hidden_size":1024}"#;
+
+    #[test]
+    fn an_undeclared_checkpoint_defaults_to_nvfp4_weights() {
+        let q = qwen3_weight_qconfig_default_nvfp4(PLAIN_QWEN3_CFG_NO_QUANT_SECTION, None).unwrap();
+        assert!(
+            matches!(q.scheme, nv_weights::QuantScheme::Nvfp4),
+            "the qwen3 serving default is 4-bit at-load quantization; getting {:?} here means \
+             the flip regressed to bf16 without the escape env being set",
+            q.scheme
+        );
+        assert!(q.ignored_modules.is_empty() && q.group_size.is_none());
+    }
+
+    #[test]
+    fn nv_qwen3_weights_bf16_is_the_escape_to_the_old_path() {
+        let q = qwen3_weight_qconfig_default_nvfp4(PLAIN_QWEN3_CFG_NO_QUANT_SECTION, Some("bf16"))
+            .unwrap();
+        assert!(
+            matches!(q.scheme, nv_weights::QuantScheme::None),
+            "NV_QWEN3_WEIGHTS=bf16 must reproduce the pre-flip Qwen3::from_loader behavior \
+             (from_loader_quantized with QuantScheme::None delegates to from_loader)"
+        );
+    }
+
+    #[test]
+    fn an_explicit_nvfp4_value_matches_the_default() {
+        let q = qwen3_weight_qconfig_default_nvfp4(PLAIN_QWEN3_CFG_NO_QUANT_SECTION, Some("nvfp4"))
+            .unwrap();
+        assert!(matches!(q.scheme, nv_weights::QuantScheme::Nvfp4));
+    }
+
+    #[test]
+    fn a_declared_quantization_config_wins_over_both_default_and_escape() {
+        let cfg = r#"{"model_type":"qwen3","quantization_config":{"quant_method":"modelopt","quant_algo":"FP8"}}"#;
+        let q = qwen3_weight_qconfig_default_nvfp4(cfg, Some("bf16")).unwrap();
+        assert!(
+            matches!(q.scheme, nv_weights::QuantScheme::Fp8E4m3),
+            "a checkpoint that states its own scheme must keep it; the env only fills the \
+             undeclared case, it never overrides the checkpoint's declaration"
+        );
+    }
+
+    #[test]
+    fn a_typo_in_the_weights_env_is_refused_not_served() {
+        let err = qwen3_weight_qconfig_default_nvfp4(PLAIN_QWEN3_CFG_NO_QUANT_SECTION, Some("int4"))
+            .expect_err("unknown value must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bf16") && msg.contains("nvfp4"),
+            "the refusal must name the accepted values: {msg}"
+        );
     }
 }
 
@@ -3279,7 +4161,7 @@ mod bos_and_eos_resolution_tests {
     fn a_checkpoint_with_no_eos_anywhere_is_refused_rather_than_given_gemmas() {
         let dir = checkpoint_dir("silent", &[("config.json", r#"{"model_type":"gemma4"}"#)]);
         assert_eq!(bos_id_from_dir(&dir), None);
-        let err = eos_ids_from_dir(&dir).err().expect("must be refused");
+        let err = eos_ids_from_dir(&dir).expect_err("must be refused");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("no stop condition") && msg.contains("[1, 106]"),
@@ -3367,5 +4249,54 @@ mod bos_and_eos_resolution_tests {
         assert_eq!(head, PromptHead::EnginePrependedBosAtPosition0);
         assert_eq!(ids, vec![2, 105, 2364, 107]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod kv_ceiling_for_unplanned_families_tests {
+    use super::*;
+    use crate::oapi::vram_plan::{kv_binding_from, per_engine_kv_env_for_family};
+
+    #[test]
+    fn env_unset_keeps_the_8192_default_bit_identical_to_the_old_bare_number() {
+        for mpe in [0usize, 1, 4096, 8192, 32768, 262144] {
+            assert_eq!(
+                kv_max_seq_len_resolved(None, mpe),
+                mpe.min(8192),
+                "mpe={mpe} with no env must resolve exactly as the old min(mpe, 8192)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bound_from_either_kv_env_lifts_the_ceiling_clamped_only_to_the_checkpoint_window() {
+        assert_eq!(kv_max_seq_len_resolved(Some(196608), 262144), 196608);
+        assert_eq!(
+            kv_max_seq_len_resolved(Some(500_000), 262144),
+            262144,
+            "the env lift clamps to max_position_embeddings, the operator cannot exceed the model"
+        );
+        assert_eq!(kv_max_seq_len_resolved(Some(0), 262144), 8192);
+    }
+
+    #[test]
+    fn each_unplanned_family_lifts_alone_through_its_per_engine_env_without_the_global() {
+        for family in ["qwen3", "gemma4-moe", "laguna", "gpt-oss", "omni"] {
+            let env = per_engine_kv_env_for_family(family)
+                .unwrap_or_else(|| panic!("{family} lost its per-engine kv env"));
+            let bound = kv_binding_from(Some(env), Some("196608"), None);
+            assert_eq!(bound, Some((196608, env)), "{family}");
+            assert_eq!(
+                kv_max_seq_len_resolved(bound.map(|(n, _)| n), 262144),
+                196608,
+                "{family} must reach 196k via {env} while cobooted engines keep their default"
+            );
+            let global_only = kv_binding_from(Some(env), None, Some("32768"));
+            assert_eq!(
+                kv_max_seq_len_resolved(global_only.map(|(n, _)| n), 262144),
+                32768,
+                "{family} still inherits the global NV_KV_MAX_SEQ_LEN when its own env is unset"
+            );
+        }
     }
 }

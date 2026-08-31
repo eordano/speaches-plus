@@ -1,0 +1,17 @@
+[typescript.type_mappings]
+"Value" = "unknown"
+"ItemId" = "string"
+"ResponseId" = "string"
+"EventId" = "string"
+
+[kotlin.type_mappings]
+"Value" = "kotlinx.serialization.json.JsonElement"
+"ItemId" = "String"
+"ResponseId" = "String"
+"EventId" = "String"
+
+[go.type_mappings]
+"Value" = "json.RawMessage"
+"ItemId" = "string"
+"ResponseId" = "string"
+"EventId" = "string"

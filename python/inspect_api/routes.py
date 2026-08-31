@@ -14,7 +14,7 @@ from oapi import kind as oapi_kind
 from . import registry
 from .audio_store import Channel, wav_header
 from .retention import session_dir
-from .types import AudioQuery, SessionHistoryEntry, SessionMeta
+from .types import SessionHistoryEntry, SessionMeta
 
 logger = logging.getLogger(__name__)
 

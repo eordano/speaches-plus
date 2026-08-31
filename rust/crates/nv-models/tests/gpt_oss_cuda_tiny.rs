@@ -60,6 +60,7 @@ fn tiny_config() -> GptOssConfig {
         yarn_beta_fast: 32.0,
         yarn_beta_slow: 1.0,
         yarn_original_max: 16,
+        yarn_truncate_correction_dims: true,
         tie_word_embeddings: false,
     }
 }

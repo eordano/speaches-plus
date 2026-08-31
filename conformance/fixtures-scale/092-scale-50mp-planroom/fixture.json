@@ -1,0 +1,180 @@
+{
+  "name": "092-scale-50mp-planroom",
+  "family": "092-scale",
+  "description": "50MP A0-class plan sheet: 20px em notes and 18px em mono schedules at native detail; 0.475x single-pass downscale drops them under 10px em, the regime segmentation exists to save.",
+  "input": "input.png",
+  "expected_text": "SITE PLAN SP-04: QUAYSIDE ENERGY CENTRE\nScale 1:200 at A0. Grid: local datum QEC-2026. Sheet 4 of 12.\nGENERAL NOTES\n1. All dimensions are in millimetres unless noted. Verify every setting-out dimension on site\nagainst the QEC-2026 grid monuments before excavation. Report discrepancies over 15 mm to the\nengineer before proceeding with the affected work.\n2. Underground HV cable route 11kV-R2 crosses the northern access at chainage 48.20. Hand dig\nwithin 1500 mm of the marked route. Cable cover tiles must be reinstated with warning tape at\n300 mm above the duct crown.\n3. Drainage runs DR-7 to DR-11 fall at 1:150 toward manhole MH-19. Invert levels are tabulated\non sheet SP-09. Flexible couplings within 600 mm of every structure face, both sides.\n4. The attenuation tank base slab is cast on 50 mm blinding over compacted type 1 fill at 95\npercent modified proctor. Waterstop at every construction joint; the kicker pour includes the\nnorth wall starter bars.\nSETTING OUT TABLE\nPoint ST-01: E 4821.440  N 9310.220  cover level 5.840\nPoint ST-02: E 4874.905  N 9310.220  cover level 5.815\nPoint ST-03: E 4874.905  N 9268.130  cover level 5.760\nPoint ST-04: E 4821.440  N 9268.130  cover level 5.790\nBenchmark TBM-2: brass stud in fuel store plinth, level 6.112\nEARTHWORKS\nStrip topsoil to 300 mm and stockpile on the western bund at a maximum height of 2.5 metres.\nCut material classified 2C may be reused in landscape mounding north of gridline 14 subject to\nmoisture conditioning between 12 and 16 percent.\nExcavations deeper than 1200 mm require trench support to the temporary works designer's\ndetails. Groundwater strike below 4.1 metres was recorded in borehole BH-06; allow for sump\npumping in the tank excavation.\nDOOR AND GATE SCHEDULE\nG-01 sliding gate  6000 x 2400  powder RAL 7016  motor DK-9\nG-02 swing gate    1200 x 2400  powder RAL 7016  keyed alike\nD-01 fuel store    1000 x 2100  steel FD60       panic bar\nD-02 switchroom     900 x 2100  steel FD60       louvre 600\nD-03 control room  1000 x 2100  timber FD30S     vision panel\nFENCING\nPerimeter fence type F2: 2.4 metre paladin mesh on 60 x 60 SHS posts at 3.0 metre centres, set\n750 mm into C20 concrete. Three lines of barbed tape above the switchyard section only, per the\nsecurity consultant's memo SC-11.\nAcoustic barrier along gridline 2 from chainage 0 to 64: 3.6 metre absorptive panels, minimum\nsurface density 20 kilograms per square metre, colour to match RAL 7035. Posts designed for a 3\nsecond gust of 24 metres per second.\nSERVICES CROSSING NOTES\nTelecoms duct T-4 enters the site under the eastern verge at 900 mm depth and rises into\ncabinet CAB-2. Maintain 300 mm clearance from the LV route and 500 mm from drainage crossings.\nMarker posts at every change of direction.\nREVISION TABLE\nP1  2026-05-02  first issue for comment            KMB\nP2  2026-06-18  tank moved 1.2 m north, note 4     KMB\nC1  2026-07-30  issued for construction            RGA\nC2  2026-09-12  gate G-01 motor spec revised       RGA\nQUAYSIDE ENERGY CENTRE\nDrawing SP-04 revision C2. Drawn KMB, checked RGA, approved TW.\nMeridian Consulting Engineers, 22 Quay Road, Boston. Job 26-118.",
+  "render": {
+    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "page_px": [
+      8426,
+      5960
+    ],
+    "megapixels": 50.22,
+    "single_pass_downscale_at_default_cap": 0.474
+  },
+  "regions": [
+    {
+      "bbox": [
+        220,
+        211,
+        1696,
+        263
+      ],
+      "tier": "heading",
+      "text": "SITE PLAN SP-04: QUAYSIDE ENERGY CENTRE"
+    },
+    {
+      "bbox": [
+        220,
+        347,
+        884,
+        367
+      ],
+      "tier": "body",
+      "text": "Scale 1:200 at A0. Grid: local datum QEC-2026. Sheet 4 of 12."
+    },
+    {
+      "bbox": [
+        220,
+        468,
+        1101,
+        565
+      ],
+      "tier": "body",
+      "text": "GENERAL NOTES\n1. All dimensions are in millimetres unless noted. Verify every setting-out dimension on site\nagainst the QEC-2026 grid monuments before excavation. Report discrepancies over 15 mm to the\nengineer before proceeding with the affected work."
+    },
+    {
+      "bbox": [
+        220,
+        642,
+        1094,
+        709
+      ],
+      "tier": "body",
+      "text": "2. Underground HV cable route 11kV-R2 crosses the northern access at chainage 48.20. Hand dig\nwithin 1500 mm of the marked route. Cable cover tiles must be reinstated with warning tape at\n300 mm above the duct crown."
+    },
+    {
+      "bbox": [
+        220,
+        790,
+        1072,
+        835
+      ],
+      "tier": "body",
+      "text": "3. Drainage runs DR-7 to DR-11 fall at 1:150 toward manhole MH-19. Invert levels are tabulated\non sheet SP-09. Flexible couplings within 600 mm of every structure face, both sides."
+    },
+    {
+      "bbox": [
+        220,
+        912,
+        1034,
+        979
+      ],
+      "tier": "body",
+      "text": "4. The attenuation tank base slab is cast on 50 mm blinding over compacted type 1 fill at 95\npercent modified proctor. Waterstop at every construction joint; the kicker pour includes the\nnorth wall starter bars."
+    },
+    {
+      "bbox": [
+        220,
+        1081,
+        891,
+        1209
+      ],
+      "tier": "fine",
+      "text": "SETTING OUT TABLE\nPoint ST-01: E 4821.440  N 9310.220  cover level 5.840\nPoint ST-02: E 4874.905  N 9310.220  cover level 5.815\nPoint ST-03: E 4874.905  N 9268.130  cover level 5.760\nPoint ST-04: E 4821.440  N 9268.130  cover level 5.790\nBenchmark TBM-2: brass stud in fuel store plinth, level 6.112"
+    },
+    {
+      "bbox": [
+        220,
+        1308,
+        1060,
+        1405
+      ],
+      "tier": "body",
+      "text": "EARTHWORKS\nStrip topsoil to 300 mm and stockpile on the western bund at a maximum height of 2.5 metres.\nCut material classified 2C may be reused in landscape mounding north of gridline 14 subject to\nmoisture conditioning between 12 and 16 percent."
+    },
+    {
+      "bbox": [
+        220,
+        1482,
+        1051,
+        1553
+      ],
+      "tier": "body",
+      "text": "Excavations deeper than 1200 mm require trench support to the temporary works designer's\ndetails. Groundwater strike below 4.1 metres was recorded in borehole BH-06; allow for sump\npumping in the tank excavation."
+    },
+    {
+      "bbox": [
+        4460,
+        205,
+        5131,
+        333
+      ],
+      "tier": "fine",
+      "text": "DOOR AND GATE SCHEDULE\nG-01 sliding gate  6000 x 2400  powder RAL 7016  motor DK-9\nG-02 swing gate    1200 x 2400  powder RAL 7016  keyed alike\nD-01 fuel store    1000 x 2100  steel FD60       panic bar\nD-02 switchroom     900 x 2100  steel FD60       louvre 600\nD-03 control room  1000 x 2100  timber FD30S     vision panel"
+    },
+    {
+      "bbox": [
+        4460,
+        432,
+        5323,
+        529
+      ],
+      "tier": "body",
+      "text": "FENCING\nPerimeter fence type F2: 2.4 metre paladin mesh on 60 x 60 SHS posts at 3.0 metre centres, set\n750 mm into C20 concrete. Three lines of barbed tape above the switchyard section only, per the\nsecurity consultant's memo SC-11."
+    },
+    {
+      "bbox": [
+        4459,
+        606,
+        5330,
+        677
+      ],
+      "tier": "body",
+      "text": "Acoustic barrier along gridline 2 from chainage 0 to 64: 3.6 metre absorptive panels, minimum\nsurface density 20 kilograms per square metre, colour to match RAL 7035. Posts designed for a 3\nsecond gust of 24 metres per second."
+    },
+    {
+      "bbox": [
+        4460,
+        774,
+        5353,
+        871
+      ],
+      "tier": "body",
+      "text": "SERVICES CROSSING NOTES\nTelecoms duct T-4 enters the site under the eastern verge at 900 mm depth and rises into\ncabinet CAB-2. Maintain 300 mm clearance from the LV route and 500 mm from drainage crossings.\nMarker posts at every change of direction."
+    },
+    {
+      "bbox": [
+        4460,
+        969,
+        5054,
+        1074
+      ],
+      "tier": "fine",
+      "text": "REVISION TABLE\nP1  2026-05-02  first issue for comment            KMB\nP2  2026-06-18  tank moved 1.2 m north, note 4     KMB\nC1  2026-07-30  issued for construction            RGA\nC2  2026-09-12  gate G-01 motor spec revised       RGA"
+    },
+    {
+      "bbox": [
+        4460,
+        1189,
+        5246,
+        1234
+      ],
+      "tier": "heading",
+      "text": "QUAYSIDE ENERGY CENTRE"
+    },
+    {
+      "bbox": [
+        4460,
+        1296,
+        5210,
+        1349
+      ],
+      "tier": "body",
+      "text": "Drawing SP-04 revision C2. Drawn KMB, checked RGA, approved TW.\nMeridian Consulting Engineers, 22 Quay Road, Boston. Job 26-118."
+    }
+  ],
+  "comparison_strategy": "cer",
+  "skip_when_no_model": true
+}

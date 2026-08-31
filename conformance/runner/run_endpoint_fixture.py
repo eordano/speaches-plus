@@ -1,8 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
 """run_endpoint_fixture -- PRD §11.4 manifest-fixture runner.
 
 Companion to `run_fixture.py` (which drives the Realtime corpus). This

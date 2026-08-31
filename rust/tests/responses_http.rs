@@ -471,7 +471,7 @@ async fn function_call_outputs_are_accepted_as_continuation_input() {
 #[cfg(feature = "wgpu")]
 mod gated {
     use super::*;
-    use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, PREFIX_REUSE_ENV};
+    use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM};
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
@@ -484,7 +484,7 @@ mod gated {
         );
         let _guard = lock_env();
         let _store = StoreDir::set();
-        std::env::set_var(PREFIX_REUSE_ENV, "1");
+        std::env::set_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM, "1");
         let engine = Arc::new(
             WgpuChatEngine::load_with(std::path::Path::new(&dir), 4096, None)
                 .expect("wgpu engine did not load"),
@@ -529,7 +529,7 @@ mod gated {
             resumed["output_text"], control["output_text"],
             "a resumed continuation must serve the same completion as the sequential one"
         );
-        std::env::remove_var(PREFIX_REUSE_ENV);
+        std::env::remove_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM);
     }
 }
 

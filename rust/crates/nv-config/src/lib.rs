@@ -1,4 +1,13 @@
+pub mod env_arm;
 pub mod measure;
+
+pub use env_arm::{
+    env_arm_dependency_assert_enabled_arm_requires_prerequisite,
+    env_arm_opt_in_eq_some_1_reread_every_call,
+    env_arm_opt_in_set_to_anything_but_0_reread_every_call,
+    env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call,
+    env_arm_present_at_all_reread_every_call,
+};
 
 use serde::{Deserialize, Serialize};
 

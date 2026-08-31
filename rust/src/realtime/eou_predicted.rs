@@ -64,12 +64,22 @@ pub(super) fn spawn_predicted_stt(
     cancel: &super::cancel::SessionCancel,
     whisper: WhisperHandle,
     audio: MonoF32At16k,
+    language: Option<String>,
 ) -> PredictedRunner {
     let shared = Arc::new(PredictedSharedState::new());
     let shared_for_task = shared.clone();
     let task: JoinHandle<()> = tokio::spawn(cancel.wrap_unit(async move {
         let samples = audio.into_vec();
-        let result = tokio::task::spawn_blocking(move || whisper.transcribe(&samples)).await;
+        let opts = crate::stt::SttRequestOptions {
+            language,
+            initial_prompt: None,
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            whisper
+                .transcribe_full_with_opts(&samples, crate::stt::WhisperTask::Transcribe, &opts)
+                .map(|r| r.text)
+        })
+        .await;
         let stored = match result {
             Ok(Ok(t)) => Ok(t),
             Ok(Err(e)) => Err(e.to_string()),
@@ -85,14 +95,20 @@ pub(super) fn spawn_predicted_stt(
 }
 
 pub async fn await_predicted_stt(runner: &PredictedRunner) -> Result<String, String> {
+    await_predicted_stt_shared(&runner.shared).await
+}
+
+pub(super) async fn await_predicted_stt_shared(
+    shared: &Arc<PredictedSharedState>,
+) -> Result<String, String> {
     loop {
         {
-            let guard = runner.shared.user_transcript.lock().await;
+            let guard = shared.user_transcript.lock().await;
             if let Some(r) = guard.as_ref() {
                 return r.clone();
             }
         }
-        runner.shared.done.notified().await;
+        shared.done.notified().await;
     }
 }
 
@@ -105,6 +121,7 @@ pub struct PredictedLlmShared {
     pub cancelled: AtomicBool,
     pub finished: Notify,
     pub progress: Notify,
+    pub prompt_user_text: AsyncMutex<Option<String>>,
 }
 
 impl PredictedLlmShared {
@@ -118,6 +135,7 @@ impl PredictedLlmShared {
             cancelled: AtomicBool::new(false),
             finished: Notify::new(),
             progress: Notify::new(),
+            prompt_user_text: AsyncMutex::new(None),
         }
     }
 }
@@ -174,6 +192,10 @@ impl PredictedLlmRunner {
         self.shared.chars_seen.load(Ordering::Relaxed)
     }
 
+    pub async fn prompt_user_text(&self) -> Option<String> {
+        self.shared.prompt_user_text.lock().await.clone()
+    }
+
     pub async fn wait_finished(&self) {
         loop {
             if self.is_done() || self.is_cancelled() {
@@ -184,73 +206,108 @@ impl PredictedLlmRunner {
     }
 }
 
+async fn buffer_llm_stream_into(
+    cfg: LlmConfig,
+    messages: Vec<ChatMessage>,
+    trajectory_tag: Option<String>,
+    shared: &Arc<PredictedLlmShared>,
+    cap_usize: usize,
+) {
+    let mut rx = complete_stream_messages(&cfg, messages, trajectory_tag);
+    loop {
+        if shared.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let item = match rx.recv().await {
+            Some(v) => v,
+            None => break,
+        };
+        match item {
+            Ok(delta) => {
+                if delta.is_empty() {
+                    continue;
+                }
+                let n = delta.chars().count() as u32;
+                shared.chars_seen.fetch_add(n, Ordering::Relaxed);
+                let mut buf = shared.buffer.lock().await;
+                buf.push(delta);
+                if buf.len() > cap_usize {
+                    let drop_n = buf.len() - cap_usize;
+                    let _ = buf.drain(..drop_n).count();
+                    shared
+                        .dropped_tokens
+                        .fetch_add(drop_n as u32, Ordering::Relaxed);
+                    shared.overflowed.store(true, Ordering::Relaxed);
+                }
+                drop(buf);
+                shared.progress.notify_waiters();
+            }
+            Err(_) => {
+                break;
+            }
+        }
+    }
+}
+
+fn mark_llm_shared_finished(shared: &Arc<PredictedLlmShared>) {
+    shared.done.store(true, Ordering::SeqCst);
+    shared.finished.notify_waiters();
+    shared.progress.notify_waiters();
+}
+
 pub(super) fn spawn_predicted_llm(
     cancel: &super::cancel::SessionCancel,
     cfg: LlmConfig,
     messages: Vec<ChatMessage>,
     cap: u32,
+    trajectory_tag: Option<String>,
 ) -> PredictedLlmRunner {
     let shared = Arc::new(PredictedLlmShared::new());
     let shared_for_task = shared.clone();
     let cap_usize = cap.max(1) as usize;
     let task: JoinHandle<()> = tokio::spawn(cancel.wrap_unit(async move {
-        let mut rx = complete_stream_messages(&cfg, messages);
-        loop {
-            if shared_for_task.cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            let item = match rx.recv().await {
-                Some(v) => v,
-                None => break,
-            };
-            match item {
-                Ok(delta) => {
-                    if delta.is_empty() {
-                        continue;
-                    }
-                    let n = delta.chars().count() as u32;
-                    shared_for_task.chars_seen.fetch_add(n, Ordering::Relaxed);
-                    let mut buf = shared_for_task.buffer.lock().await;
-                    buf.push(delta);
-                    if buf.len() > cap_usize {
-                        let drop_n = buf.len() - cap_usize;
-                        let _ = buf.drain(..drop_n).count();
-                        shared_for_task
-                            .dropped_tokens
-                            .fetch_add(drop_n as u32, Ordering::Relaxed);
-                        shared_for_task.overflowed.store(true, Ordering::Relaxed);
-                    }
-                    drop(buf);
-                    shared_for_task.progress.notify_waiters();
-                }
-                Err(_) => {
-                    break;
-                }
-            }
-        }
-        shared_for_task.done.store(true, Ordering::SeqCst);
-        shared_for_task.finished.notify_waiters();
-        shared_for_task.progress.notify_waiters();
+        buffer_llm_stream_into(cfg, messages, trajectory_tag, &shared_for_task, cap_usize).await;
+        mark_llm_shared_finished(&shared_for_task);
     }));
     PredictedLlmRunner { task, shared, cap }
 }
 
-pub fn transcripts_materially_differ(predicted: &str, finalized: &str, ratio: f32) -> bool {
-    let p = predicted.trim().to_lowercase();
-    let f = finalized.trim().to_lowercase();
-    if p.is_empty() || f.is_empty() {
-        return p != f;
-    }
-    if p == f {
-        return false;
-    }
-    let pset: std::collections::HashSet<char> = p.chars().filter(|c| !c.is_whitespace()).collect();
-    let fset: std::collections::HashSet<char> = f.chars().filter(|c| !c.is_whitespace()).collect();
-    let intersect = pset.intersection(&fset).count();
-    let union = pset.union(&fset).count().max(1);
-    let jaccard = intersect as f32 / union as f32;
-    let threshold = (1.0 - ratio).clamp(0.0, 1.0);
-    jaccard < threshold
+pub(super) fn spawn_predicted_llm_after_stt(
+    cancel: &super::cancel::SessionCancel,
+    cfg: LlmConfig,
+    base_messages: Vec<ChatMessage>,
+    stt_shared: Arc<PredictedSharedState>,
+    cap: u32,
+    trajectory_tag: Option<String>,
+) -> PredictedLlmRunner {
+    let shared = Arc::new(PredictedLlmShared::new());
+    let shared_for_task = shared.clone();
+    let cap_usize = cap.max(1) as usize;
+    let task: JoinHandle<()> = tokio::spawn(cancel.wrap_unit(async move {
+        let partial = match await_predicted_stt_shared(&stt_shared).await {
+            Ok(t) if !t.trim().is_empty() => t,
+            _ => {
+                mark_llm_shared_finished(&shared_for_task);
+                return;
+            }
+        };
+        if shared_for_task.cancelled.load(Ordering::Relaxed) {
+            mark_llm_shared_finished(&shared_for_task);
+            return;
+        }
+        {
+            let mut guard = shared_for_task.prompt_user_text.lock().await;
+            *guard = Some(partial.clone());
+        }
+        let mut messages = base_messages;
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: partial,
+        });
+        buffer_llm_stream_into(cfg, messages, trajectory_tag, &shared_for_task, cap_usize).await;
+        mark_llm_shared_finished(&shared_for_task);
+    }));
+    PredictedLlmRunner { task, shared, cap }
 }
 
 #[cfg(test)]
@@ -302,44 +359,6 @@ mod tests {
         };
         let r = await_predicted_stt(&runner).await;
         assert_eq!(r.ok().as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn transcripts_match_when_equal() {
-        assert!(!transcripts_materially_differ(
-            "hello there",
-            "hello there",
-            0.5
-        ));
-    }
-
-    #[test]
-    fn transcripts_match_with_minor_punctuation() {
-        assert!(!transcripts_materially_differ(
-            "hello there",
-            "hello there.",
-            0.5
-        ));
-    }
-
-    #[test]
-    fn transcripts_diverge_when_completely_different() {
-        assert!(transcripts_materially_differ(
-            "tell me about cats",
-            "what is the weather",
-            0.5,
-        ));
-    }
-
-    #[test]
-    fn transcripts_one_empty_diverges() {
-        assert!(transcripts_materially_differ("hello", "", 0.5));
-        assert!(transcripts_materially_differ("", "hello", 0.5));
-    }
-
-    #[test]
-    fn transcripts_both_empty_match() {
-        assert!(!transcripts_materially_differ("", "", 0.5));
     }
 }
 
@@ -420,8 +439,13 @@ mod llm_runner_tests {
             "world".into(),
         ]))
         .await;
-        let runner =
-            spawn_predicted_llm(&SessionCancel::new(), cfg(base), vec![user_msg("hi")], 16);
+        let runner = spawn_predicted_llm(
+            &SessionCancel::new(),
+            cfg(base),
+            vec![user_msg("hi")],
+            16,
+            None,
+        );
         runner.wait_finished().await;
         assert!(runner.is_done());
         assert!(!runner.overflowed());
@@ -433,7 +457,13 @@ mod llm_runner_tests {
     #[tokio::test]
     async fn predicted_llm_overflow_drops_oldest_and_sets_flag() {
         let base = spawn_mock(Behavior::ManyTokens(20)).await;
-        let runner = spawn_predicted_llm(&SessionCancel::new(), cfg(base), vec![user_msg("hi")], 4);
+        let runner = spawn_predicted_llm(
+            &SessionCancel::new(),
+            cfg(base),
+            vec![user_msg("hi")],
+            4,
+            None,
+        );
         runner.wait_finished().await;
         assert!(runner.is_done());
         assert!(runner.overflowed());
@@ -446,8 +476,13 @@ mod llm_runner_tests {
     #[tokio::test]
     async fn predicted_llm_abort_marks_cancelled_and_finishes_wait() {
         let base = spawn_mock(Behavior::ManyTokens(2)).await;
-        let runner =
-            spawn_predicted_llm(&SessionCancel::new(), cfg(base), vec![user_msg("hi")], 16);
+        let runner = spawn_predicted_llm(
+            &SessionCancel::new(),
+            cfg(base),
+            vec![user_msg("hi")],
+            16,
+            None,
+        );
         runner.abort();
         let waited = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -461,10 +496,111 @@ mod llm_runner_tests {
     #[tokio::test]
     async fn predicted_llm_chars_seen_tracks_unicode_count() {
         let base = spawn_mock(Behavior::Tokens(vec!["héllo".into(), "世界".into()])).await;
-        let runner =
-            spawn_predicted_llm(&SessionCancel::new(), cfg(base), vec![user_msg("hi")], 16);
+        let runner = spawn_predicted_llm(
+            &SessionCancel::new(),
+            cfg(base),
+            vec![user_msg("hi")],
+            16,
+            None,
+        );
         runner.wait_finished().await;
         assert_eq!(runner.chars_seen(), "héllo".chars().count() as u32 + 2);
         runner.abort();
+    }
+
+    async fn spawn_echo_last_user_mock() -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|body: String| async move {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let last_user = v["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|m| m["role"] == "user")
+                    .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+                    .unwrap_or_default();
+                let chunk = serde_json::json!({
+                    "choices": [{"delta": {"content": last_user}}]
+                });
+                let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                Response::builder()
+                    .status(200)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/v1")
+    }
+
+    fn stt_shared_with(result: Result<String, String>) -> StdArc<PredictedSharedState> {
+        let shared = StdArc::new(PredictedSharedState::new());
+        {
+            let mut guard = shared.user_transcript.try_lock().unwrap();
+            *guard = Some(result);
+        }
+        shared.done.notify_waiters();
+        shared
+    }
+
+    #[tokio::test]
+    async fn eager_llm_prompt_is_the_speculative_stt_partial_transcript() {
+        let base = spawn_echo_last_user_mock().await;
+        let stt = stt_shared_with(Ok("what is the weather in lisbon".into()));
+        let runner = spawn_predicted_llm_after_stt(
+            &SessionCancel::new(),
+            cfg(base),
+            vec![ChatMessage {
+                role: "system".into(),
+                content: "be brief".into(),
+            }],
+            stt,
+            16,
+            None,
+        );
+        runner.wait_finished().await;
+        assert_eq!(
+            runner.prompt_user_text().await.as_deref(),
+            Some("what is the weather in lisbon"),
+            "the eager LLM prompt must be the real partial transcript, never a placeholder"
+        );
+        assert_eq!(
+            runner.snapshot_text().await,
+            "what is the weather in lisbon",
+            "echo mock proves the LLM request carried the partial as its last user message"
+        );
+        runner.abort();
+    }
+
+    #[tokio::test]
+    async fn eager_llm_is_skipped_when_speculative_stt_fails_or_is_empty() {
+        for stt_result in [Err("stt exploded".to_string()), Ok("   ".to_string())] {
+            let base = spawn_echo_last_user_mock().await;
+            let stt = stt_shared_with(stt_result);
+            let runner = spawn_predicted_llm_after_stt(
+                &SessionCancel::new(),
+                cfg(base),
+                vec![user_msg("earlier turn")],
+                stt,
+                16,
+                None,
+            );
+            runner.wait_finished().await;
+            assert!(runner.is_done());
+            assert_eq!(runner.prompt_user_text().await, None);
+            assert_eq!(
+                runner.snapshot_text().await,
+                "",
+                "no partial transcript means no eager LLM call and no trajectory record"
+            );
+            runner.abort();
+        }
     }
 }

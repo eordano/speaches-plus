@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/tts/phonemize_glue.c");
+    emit_build_git_sha();
 
     if cfg!(target_os = "macos") && std::env::var_os("CC").is_none() {
         let xcode_clang = "/usr/bin/clang";
@@ -10,6 +11,7 @@ fn main() {
 
     let mut build = cc::Build::new();
     build.file("src/tts/phonemize_glue.c");
+    build.opt_level(2);
 
     let mut candidates: Vec<String> = Vec::new();
     if let Ok(prefix) = std::env::var("ESPEAK_PREFIX") {
@@ -67,6 +69,50 @@ fn main() {
             want.swap_remove(idx);
         }
     }
+}
+
+fn emit_build_git_sha() {
+    println!("cargo:rerun-if-env-changed=NV_BUILD_GIT_SHA");
+    let sha = std::env::var("NV_BUILD_GIT_SHA")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(git_head_sha)
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=NV_BUILD_GIT_SHA={sha}");
+}
+
+fn git_head_sha() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sha.is_empty() {
+        return None;
+    }
+    if let Some(git_dir) = git_dir_path() {
+        println!("cargo:rerun-if-changed={}/HEAD", git_dir);
+    }
+    let dirty = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .is_some_and(|o| o.status.success() && !o.stdout.is_empty());
+    Some(if dirty { format!("{sha}-dirty") } else { sha })
+}
+
+fn git_dir_path() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
 }
 
 fn python3_framework_parent() -> Option<String> {

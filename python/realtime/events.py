@@ -4,7 +4,7 @@ import enum
 import json
 from typing import Any
 
-from .state import ConversationItem, ItemContent, ItemRole, ItemStatus
+from .state import ConversationItem, ItemRole
 from .wire import (
     ErrorPayload,
     OutboundEvent,

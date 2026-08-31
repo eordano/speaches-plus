@@ -3,7 +3,6 @@ package realtime
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 
 	"github.com/eordano/speaches-plus-go/internal/audio"
 	"github.com/eordano/speaches-plus-go/internal/stt"
+	"github.com/eordano/speaches-plus-go/internal/wire"
 )
 
 func base64Encode(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
@@ -192,7 +192,7 @@ func (p *sessionPipeline) startResponse(itemID string, transcript string, t0Ms i
 	defer llmSpan.End()
 	_ = llmCtx
 
-	deltas, err := llm.StreamWithInstructions(ctx, p.session.Model, instructions, transcript)
+	deltas, err := llm.StreamWithInstructions(ctx, p.session.Model, instructions, transcript, respID)
 	if err != nil {
 		p.logger.Error("llm stream open failed", "err", err)
 
@@ -846,14 +846,12 @@ func (p *sessionPipeline) emitResponseFunctionCallArgumentsDone(respID, itemID s
 	p.dispatch(ev, ev.EventID)
 }
 
-func (p *sessionPipeline) emitResponseToolProgress(respID, itemID string, outIdx int, progress json.RawMessage) {
+func (p *sessionPipeline) emitResponseToolProgress(respID string, tools []wire.ToolProgressEntry) {
 	ev := responseToolProgressEvent{
-		EventID:     newEventID(),
-		Type:        SETResponseToolProgress,
-		ResponseID:  respID,
-		ItemID:      itemID,
-		OutputIndex: outIdx,
-		Progress:    progress,
+		EventID:    newEventID(),
+		Type:       SETResponseToolProgress,
+		ResponseID: respID,
+		Tools:      tools,
 	}
 	p.dispatch(ev, ev.EventID)
 }

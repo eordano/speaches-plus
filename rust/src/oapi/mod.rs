@@ -19,26 +19,42 @@ pub mod deadline;
 pub mod fine_tuning;
 pub mod gate;
 pub mod lora;
+pub mod lora_runtime;
 pub mod messages;
+pub mod model_family_tags;
 pub mod model_ids;
 pub mod responses;
 pub mod models_handler;
 pub mod ocr;
 pub mod ocr_batch;
 pub mod ocr_orient;
+pub mod ocr_stream;
 pub mod ocr_suspect;
 #[cfg(feature = "cuda")]
 pub mod ocr_batch_n;
 pub mod text_embeddings;
 pub mod tool_parse;
+pub mod trajectory;
 pub mod transcriptions;
 pub mod voice_profiles;
+pub mod vram_plan;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
 use serde_json::json;
+
+#[cfg(test)]
+pub(crate) fn lock_serializing_every_test_that_mutates_the_process_global_env(
+) -> std::sync::MutexGuard<'static, ()> {
+    static PROCESS_ENV_IS_SHARED_BY_ALL_TEST_THREADS: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    PROCESS_ENV_IS_SHARED_BY_ALL_TEST_THREADS
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub mod kind {
     pub const INVALID_REQUEST: &str = "invalid_request_error";
@@ -107,6 +123,30 @@ pub fn missing_field(loc: &[&str]) -> serde_json::Value {
         "loc": loc,
         "msg": "Field required",
     })
+}
+
+pub type SseSender = tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>;
+
+pub async fn send_sse_event(
+    tx: &SseSender,
+    event: &str,
+    data: &serde_json::Value,
+) -> Result<(), ()> {
+    let frame = format!("event: {event}\ndata: {data}\n\n");
+    tx.send(Ok(bytes::Bytes::from(frame.into_bytes())))
+        .await
+        .map_err(|_| ())
+}
+
+pub fn sse_response(rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(axum::body::Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ))
+        .unwrap()
 }
 
 #[derive(Clone, Debug)]

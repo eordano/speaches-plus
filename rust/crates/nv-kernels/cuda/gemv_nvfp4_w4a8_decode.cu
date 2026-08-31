@@ -456,6 +456,7 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
     float alpha_a,
     float alpha_b,
     int N,
+    int N_b,
     int K
 ) {
     extern __shared__ int xs_q8_words[];
@@ -471,7 +472,7 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
     int lane = threadIdx.x & (kWarp - 1);
     int warp = threadIdx.x / kWarp;
     int row = blockIdx.x * kWarpsPerBlockSharesOneStagedX + warp;
-    if (row >= 2 * N) return;
+    if (row >= N + N_b) return;
     bool second = row >= N;
     int r = second ? row - N : row;
     const uint8_t* wq = second ? wq_b : wq_a;
@@ -511,6 +512,7 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
     }
     float alpha = second ? alpha_b : alpha_a;
     __nv_bfloat16* y = second ? y_b : y_a;
+    int y_stride = second ? N_b : N;
     #pragma unroll
     for (int j = 0; j < TM; ++j) {
         float a = acc[j];
@@ -518,7 +520,7 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
         for (int o = kWarp / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
         if (lane == 0) {
             float s = alpha * kHalfUndoesTheDoubledE2m1IntTables * __ldg(&x_dequant_scales[j]);
-            y[(size_t)j * N + r] = __float2bfloat16(a * s);
+            y[(size_t)j * y_stride + r] = __float2bfloat16(a * s);
         }
     }
 }
@@ -611,6 +613,7 @@ static int launch_dual_mk(
     float alpha_a,
     float alpha_b,
     int N,
+    int N_b,
     int K
 ) {
     size_t smem = (size_t)TM * K;
@@ -618,11 +621,11 @@ static int launch_dual_mk(
     int orc = raise_dynamic_smem_optin_above_48k(
         optin, (const void*)gemv_nvfp4_w4a8_dual_mk_kernel<TM>, smem);
     if (orc != 0) return orc;
-    unsigned grid = (unsigned)((2 * N + kWarpsPerBlockSharesOneStagedX - 1)
+    unsigned grid = (unsigned)((N + N_b + kWarpsPerBlockSharesOneStagedX - 1)
         / kWarpsPerBlockSharesOneStagedX);
     gemv_nvfp4_w4a8_dual_mk_kernel<TM><<<grid, dim3(kWarpsPerBlockSharesOneStagedX * kWarp),
                                          smem, s>>>(
-        wq_a, sc_a, wq_b, sc_b, x_q8, x_scales, y_a, y_b, alpha_a, alpha_b, N, K);
+        wq_a, sc_a, wq_b, sc_b, x_q8, x_scales, y_a, y_b, alpha_a, alpha_b, N, N_b, K);
     return (int)cudaGetLastError();
 }
 
@@ -856,9 +859,10 @@ extern "C" int nv_kernels_gemv_nvfp4_w4a8_dual_mk(
     float alpha_b,
     int M,
     int N,
+    int N_b,
     int K
 ) {
-    if (M <= 0 || N <= 0 || K <= 0 || (K & 31) != 0) return -1;
+    if (M <= 0 || N <= 0 || N_b < 0 || K <= 0 || (K & 31) != 0) return -1;
     int chunk_max = w4a8_mk_chunk_tokens_bounded_by_96k_smem(K);
     if (chunk_max < 1) return -1;
     cudaStream_t s = (cudaStream_t)stream;
@@ -867,17 +871,17 @@ extern "C" int nv_kernels_gemv_nvfp4_w4a8_dual_mk(
         const int8_t* xj = x_q8 + (size_t)j0 * K;
         const float* sj = x_dequant_scales + j0;
         __nv_bfloat16* ya = reinterpret_cast<__nv_bfloat16*>(y_a) + (size_t)j0 * N;
-        __nv_bfloat16* yb = reinterpret_cast<__nv_bfloat16*>(y_b) + (size_t)j0 * N;
+        __nv_bfloat16* yb = reinterpret_cast<__nv_bfloat16*>(y_b) + (size_t)j0 * N_b;
         int rc;
         switch (tm) {
-            case 1: rc = launch_dual_mk<1>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 2: rc = launch_dual_mk<2>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 3: rc = launch_dual_mk<3>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 4: rc = launch_dual_mk<4>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 5: rc = launch_dual_mk<5>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 6: rc = launch_dual_mk<6>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 7: rc = launch_dual_mk<7>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
-            case 8: rc = launch_dual_mk<8>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, K); break;
+            case 1: rc = launch_dual_mk<1>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 2: rc = launch_dual_mk<2>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 3: rc = launch_dual_mk<3>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 4: rc = launch_dual_mk<4>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 5: rc = launch_dual_mk<5>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 6: rc = launch_dual_mk<6>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 7: rc = launch_dual_mk<7>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
+            case 8: rc = launch_dual_mk<8>(s, wq_a, sc_a, wq_b, sc_b, xj, sj, ya, yb, alpha_a, alpha_b, N, N_b, K); break;
             default: rc = -1;
         }
         if (rc != 0) return rc;

@@ -368,6 +368,7 @@ fn q3d_tiny_weights(cfg: &Qwen3_5DenseConfig, seed: u64, nvfp4: bool) -> q3d::Ho
                     )),
                     q_norm: r.norm_vec(hd),
                     k_norm: r.norm_vec(hd),
+                    qkv_bias_bf16: vec![],
                 }))
             }
         };

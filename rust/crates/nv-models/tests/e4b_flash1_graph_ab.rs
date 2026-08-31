@@ -129,9 +129,10 @@ fn e4b_flash1_graph_arm() {
     let want_sg = std::env::var("NV_E4B_WGPU_FLASH1_SG").ok().as_deref() != Some("0");
     let want_hd = std::env::var("NV_E4B_WGPU_FLASH1_HD").ok().as_deref() != Some("0");
     assert_eq!(
-        entry.trim_end_matches("_sd").ends_with("sg_fp8"),
+        entry.contains("sg"),
         want_sg,
-        "flash1 entry {entry} does not match NV_E4B_WGPU_FLASH1_SG"
+        "flash1 entry {entry} does not match NV_E4B_WGPU_FLASH1_SG (shared fold_stage1 naming: \
+         fdf<hd><sg|wb><fold>_stage1_fp8[_sd])"
     );
     assert_eq!(
         hds.len() > 1,

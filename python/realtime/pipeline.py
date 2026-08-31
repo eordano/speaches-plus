@@ -19,7 +19,6 @@ from eou.types import sigmoid_lerp
 from ids import next_phrase_id, next_turn_id
 
 from . import response_defaults
-from . import eou_defaults
 from .errors import code as errcode
 from . import eou_eager, eou_predicted
 from .events import (
@@ -238,24 +237,6 @@ async def commit_after_eou(
             runner.abort()
             predicted_llm_text = text or None
 
-    if predicted_llm_text and predicted_transcript:
-        if eou_predicted.transcripts_materially_differ(
-            predicted_transcript,
-            predicted_transcript,
-            eou_defaults.EAGER_TRANSCRIPT_MISMATCH_RATIO,
-        ):
-            rid = predicted_id_for_log or ""
-            try:
-                session._observer.on_predicted_rollback(
-                    session.id,
-                    response_id=rid,
-                    reason="transcript_mismatch",
-                    llm_chars_thrown=len(predicted_llm_text),
-                )
-            except Exception as err:
-                log.warning("observer on_predicted_rollback failed: %s", err)
-            predicted_llm_text = None
-
     sink = await session.event_sink()
     if sink is not None:
         await sink.send_value(OutboundEvent.buffer_committed(item_id))
@@ -279,6 +260,9 @@ async def commit_after_eou(
                 audio_ms,
                 cached_transcript=predicted_transcript,
                 predicted_llm_text=predicted_llm_text,
+                promoted_response_id=(
+                    predicted_id_for_log if predicted_llm_text else None
+                ),
             ),
             name=f"resp-after-eou-{item_id}",
         )
@@ -291,6 +275,7 @@ async def _drive_response_after_eou(
     *,
     cached_transcript: str | None,
     predicted_llm_text: str | None,
+    promoted_response_id: str | None = None,
 ) -> None:
     transcribe = getattr(session, "_transcribe", None)
     transcript: str | None = cached_transcript
@@ -324,6 +309,7 @@ async def _drive_response_after_eou(
         item_id,
         transcript,
         predicted_llm_text=predicted_llm_text,
+        promoted_response_id=promoted_response_id,
     )
 
 async def commit_bargein(session: "Session", item_id: str, audio_start_ms: int) -> None:
@@ -635,6 +621,7 @@ async def _iter_llm_deltas(
     messages: list[ChatMessage],
     cancel: asyncio.Event | None,
     predicted_text: str | None = None,
+    trajectory_tag: str | None = None,
 ) -> AsyncIterator[str]:
     """Default LLM delta source -- one delta per upstream SSE chunk.
 
@@ -655,7 +642,9 @@ async def _iter_llm_deltas(
         if predicted_text:
             yield predicted_text
         return
-    async for delta in complete_stream_messages(cfg, messages, cancel=cancel):
+    async for delta in complete_stream_messages(
+        cfg, messages, cancel=cancel, trajectory_tag=trajectory_tag
+    ):
         yield delta
 
 def _put_sentinels_nowait(*qs: asyncio.Queue) -> None:
@@ -672,6 +661,7 @@ async def _llm_pump(
     tts_q: asyncio.Queue,
     cancel: asyncio.Event | None,
     predicted_text: str | None = None,
+    trajectory_tag: str | None = None,
 ) -> None:
     """Pump LLM SSE deltas into two consumer queues.
 
@@ -681,7 +671,9 @@ async def _llm_pump(
     independently of how slow the TTS pipeline is.
     """
     try:
-        async for delta in _iter_llm_deltas(cfg, messages, cancel, predicted_text=predicted_text):
+        async for delta in _iter_llm_deltas(
+            cfg, messages, cancel, predicted_text=predicted_text, trajectory_tag=trajectory_tag
+        ):
             if cancel is not None and cancel.is_set():
                 break
             await text_q.put(delta)
@@ -936,12 +928,15 @@ async def commit_after_eou_with_response(
     *,
     instructions_override: str | None = None,
     predicted_llm_text: str | None = None,
+    promoted_response_id: str | None = None,
 ) -> None:
     """Drive the LLM -> TTS pipeline after an utterance's STT completes.
 
     Called by VadRunner after `transcription_completed` for conversation-intent
-    sessions whose `turn_detection.create_response` is true. Mints the response
-    id and assistant item id, registers the response with the session for
+    sessions whose `turn_detection.create_response` is true. Keeps the
+    promoted eager response id as the wire id (so a trajectory label on the
+    wire id joins the eager LLM record) or mints a fresh one, mints the
+    assistant item id, registers the response with the session for
     barge-in tracking, and spawns `run_response` as a tracked task.
 
     Ordering note: we register the response (state.resp -> Created) BEFORE the
@@ -980,7 +975,11 @@ async def commit_after_eou_with_response(
             await session.emit(done)
             await session.apply_truncate_to_assistant_item(snap)
 
-    response_id = session.id_source.response()
+    response_id = (
+        promoted_response_id
+        if promoted_response_id and predicted_llm_text
+        else session.id_source.response()
+    )
     assistant_item_id = session.id_source.item()
 
     cancel_evt = asyncio.Event()
@@ -1138,7 +1137,15 @@ async def run_response(
     transcript_lock = asyncio.Lock()
 
     llm_task = asyncio.create_task(
-        _llm_pump(cfg, messages, text_q, tts_q, cancel, predicted_text=predicted_llm_text),
+        _llm_pump(
+            cfg,
+            messages,
+            text_q,
+            tts_q,
+            cancel,
+            predicted_text=predicted_llm_text,
+            trajectory_tag=response_id,
+        ),
         name=f"llm-pump-{response_id}",
     )
     transcript_task = asyncio.create_task(

@@ -345,7 +345,7 @@ fn sm_params_raw(d: &SpecDims, m_rows: usize, total: usize) -> SmParamsRaw {
 }
 
 fn smallm_env() -> bool {
-    std::env::var(SMALLM_ENV).ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(SMALLM_ENV)
 }
 
 fn smallm_supported(ctx: &WgpuContext, dims: &SpecDims, k_max: usize) -> bool {

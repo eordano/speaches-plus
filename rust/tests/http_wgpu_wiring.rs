@@ -7,6 +7,7 @@ const WHY_THE_CONST_IS_NOT_AN_ORACLE: &str =
      point must route a wgpu-servable id to the wgpu backend, and the registry plan must hand \
      that model directory to the wgpu loader instead of delegating it to cuda.";
 
+#[allow(clippy::assertions_on_constants)]
 #[test]
 fn the_chat_router_can_reach_a_wgpu_engine_in_this_build() {
     use nv_layers::backend::BackendKind;

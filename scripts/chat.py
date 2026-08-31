@@ -17,7 +17,7 @@ Commands inside the chat:
     /embed <text>   get text embedding (prints first 8 dims + norm)
 """
 
-import json, os, sys, struct, time
+import json, os, sys, time
 
 BASE = os.environ.get("SPEACHES_URL", "http://127.0.0.1:8000")
 MODEL = "qwen3.6"

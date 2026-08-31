@@ -71,6 +71,7 @@ class PredictedLlmShared:
     cancelled: bool = False
     finished: asyncio.Event = field(default_factory=asyncio.Event)
     progress: asyncio.Event = field(default_factory=asyncio.Event)
+    prompt_user_text: str | None = None
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 @dataclass
@@ -147,18 +148,3 @@ def spawn_predicted_llm(
 
     task = asyncio.create_task(_runner())
     return PredictedLlmRunner(task=task, shared=shared, cap=cap_n)
-
-def transcripts_materially_differ(predicted: str, finalized: str, ratio: float) -> bool:
-    p = predicted.strip().lower()
-    f = finalized.strip().lower()
-    if not p or not f:
-        return p != f
-    if p == f:
-        return False
-    pset = {c for c in p if not c.isspace()}
-    fset = {c for c in f if not c.isspace()}
-    inter = len(pset & fset)
-    union = max(1, len(pset | fset))
-    jaccard = inter / float(union)
-    threshold = max(0.0, min(1.0, 1.0 - ratio))
-    return jaccard < threshold

@@ -1,5 +1,6 @@
 use anyhow::{ensure, Context, Result};
-use std::collections::BTreeMap;
+use candle_core::{DType, Tensor};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 pub const NV_DRAFTER_ENV: &str = "NV_DRAFTER";
@@ -16,6 +17,40 @@ pub fn draft_fast_device_chained_tokens_selected(raw: Option<&str>) -> bool {
 pub fn draft_fast_device_chained_tokens_selected_from_env() -> bool {
     draft_fast_device_chained_tokens_selected(
         std::env::var(NV_Q38_DRAFT_FAST_ENV).ok().as_deref(),
+    )
+}
+
+pub const NV_Q38_DRAFTER_ATTN_SPLITK_ENV_OPT_IN_1_ROUTES_THE_Q1_DRAFTER_SCAN_THROUGH_THE_FUSED_BF16_SPLITK_DECODE_KERNEL_BECAUSE_CANDLE_FA2_FILLS_ONLY_N_HEADS_BLOCKS:
+    &str = "NV_Q38_DRAFTER_ATTN_SPLITK";
+
+pub fn drafter_attn_splitk_selected(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+pub fn drafter_attn_splitk_selected_from_env() -> bool {
+    drafter_attn_splitk_selected(
+        std::env::var(
+            NV_Q38_DRAFTER_ATTN_SPLITK_ENV_OPT_IN_1_ROUTES_THE_Q1_DRAFTER_SCAN_THROUGH_THE_FUSED_BF16_SPLITK_DECODE_KERNEL_BECAUSE_CANDLE_FA2_FILLS_ONLY_N_HEADS_BLOCKS,
+        )
+        .ok()
+        .as_deref(),
+    )
+}
+
+pub const NV_Q38_BOOT_WARM_DRAFTER_ENV_OPT_IN_1_RUNS_ONE_THROWAWAY_CATCHUP_AND_DRAFT_AT_HEAD_BUILD_SIBLING_OF_THE_TRUNK_BOOT_WARM_BECAUSE_THE_DRAFTERS_FIRST_FORWARD_PAYS_ITS_OWN_ONE_TIME_INIT_THE_TRUNK_WARM_CHUNK_NEVER_TOUCHES:
+    &str = "NV_Q38_BOOT_WARM_DRAFTER";
+
+pub fn drafter_boot_warm_selected(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+pub fn drafter_boot_warm_selected_from_env() -> bool {
+    drafter_boot_warm_selected(
+        std::env::var(
+            NV_Q38_BOOT_WARM_DRAFTER_ENV_OPT_IN_1_RUNS_ONE_THROWAWAY_CATCHUP_AND_DRAFT_AT_HEAD_BUILD_SIBLING_OF_THE_TRUNK_BOOT_WARM_BECAUSE_THE_DRAFTERS_FIRST_FORWARD_PAYS_ITS_OWN_ONE_TIME_INIT_THE_TRUNK_WARM_CHUNK_NEVER_TOUCHES,
+        )
+        .ok()
+        .as_deref(),
     )
 }
 
@@ -46,6 +81,50 @@ pub fn mtp_draft_lm_head_nvfp4_twin(raw: Option<&str>) -> bool {
 
 pub fn mtp_draft_lm_head_nvfp4_twin_from_env() -> bool {
     mtp_draft_lm_head_nvfp4_twin(std::env::var(NV_Q38_DRAFT_LMHEAD_NVFP4_ENV).ok().as_deref())
+}
+
+pub const NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE_ENV: &str = "NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE";
+
+pub fn mtp_draft_lmhead_argmax_fuse(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+pub fn mtp_draft_lmhead_argmax_fuse_from_env() -> bool {
+    mtp_draft_lmhead_argmax_fuse(
+        std::env::var(NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE_ENV).ok().as_deref(),
+    )
+}
+
+pub fn draft_lmhead_argmax_fuse_route_eligible_because_probs_top3_and_forced_drafts_need_logits(
+    fuse_env_on: bool,
+    nvfp4_twin_active: bool,
+    want_top_probs: bool,
+    want_step_top3: bool,
+    forced_drafts_present: bool,
+) -> bool {
+    fuse_env_on
+        && nvfp4_twin_active
+        && !want_top_probs
+        && !want_step_top3
+        && !forced_drafts_present
+}
+
+pub fn ordered_u32_key_from_f32_monotone_under_unsigned_max_with_neg_zero_tying_pos_zero(
+    v: f32,
+) -> u32 {
+    let b = v.to_bits();
+    if v >= 0.0 {
+        b | 0x8000_0000
+    } else {
+        !b
+    }
+}
+
+pub fn fused_argmax_packed_key_whose_inverted_index_makes_atomic_max_prefer_the_lowest_index(
+    ord: u32,
+    idx: u32,
+) -> u64 {
+    ((ord as u64) << 32) | ((idx ^ 0xFFFF_FFFF) as u64)
 }
 
 pub const MTP_WEIGHTS_FILE_NAME: &str = "model_mtp.safetensors";
@@ -122,6 +201,203 @@ pub fn assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling(
     Ok(())
 }
 
+pub const NV_Q38_MTP_EAGER_DEEP_K_ENV: &str = "NV_Q38_MTP_EAGER_DEEP_K";
+
+pub const MTP_EAGER_VERIFY_ROWS_CEILING_16_BECAUSE_THE_SEQ_N_FORWARD_HAS_NO_MK_TEMPLATE_BOUND:
+    usize = 16;
+
+pub fn mtp_eager_deep_k_selected(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+pub fn mtp_eager_deep_k_selected_from_env() -> bool {
+    mtp_eager_deep_k_selected(std::env::var(NV_Q38_MTP_EAGER_DEEP_K_ENV).ok().as_deref())
+}
+
+pub fn assert_eager_session_verify_rows_fit(hidden: usize, k: usize) -> Result<()> {
+    if mtp_eager_deep_k_selected_from_env() {
+        ensure!(
+            mtp_verify_rows_per_round(k)
+                <= MTP_EAGER_VERIFY_ROWS_CEILING_16_BECAUSE_THE_SEQ_N_FORWARD_HAS_NO_MK_TEMPLATE_BOUND,
+            "{NV_Q38_MTP_EAGER_DEEP_K_ENV}=1 lifts only the graphed-route kernel proxies; an \
+             eager round still verifies rows=k+1={} and this probe ceiling is {}",
+            mtp_verify_rows_per_round(k),
+            MTP_EAGER_VERIFY_ROWS_CEILING_16_BECAUSE_THE_SEQ_N_FORWARD_HAS_NO_MK_TEMPLATE_BOUND
+        );
+        return Ok(());
+    }
+    assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling(hidden, k, 0)
+}
+
+pub const NV_Q38_MTP_P_MIN_ENV: &str = "NV_Q38_MTP_P_MIN";
+
+pub fn mtp_draft_p_min(raw: Option<&str>) -> Option<f32> {
+    raw.and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|p| *p > 0.0 && *p < 1.0)
+}
+
+pub fn mtp_draft_p_min_from_env() -> Option<f32> {
+    mtp_draft_p_min(std::env::var(NV_Q38_MTP_P_MIN_ENV).ok().as_deref())
+}
+
+pub const NV_Q38_MTP_PRECAPTURE_ENV: &str = "NV_Q38_MTP_PRECAPTURE";
+
+pub fn mtp_precapture_selected(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+pub fn mtp_precapture_selected_from_env() -> bool {
+    mtp_precapture_selected(std::env::var(NV_Q38_MTP_PRECAPTURE_ENV).ok().as_deref())
+}
+
+pub const ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX: usize = 2;
+
+pub fn adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run(
+    top_probs: &[f32],
+    p_min: f32,
+) -> usize {
+    top_probs
+        .iter()
+        .take_while(|&&p| p >= p_min)
+        .count()
+        .max(ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX)
+        .min(top_probs.len().max(1))
+}
+
+pub const NV_Q38_MTP_TREE_ENV: &str = "NV_Q38_MTP_TREE";
+
+pub fn mtp_tree_selected(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+pub fn mtp_tree_selected_from_env() -> bool {
+    mtp_tree_selected(std::env::var(NV_Q38_MTP_TREE_ENV).ok().as_deref())
+}
+
+pub const MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION: usize =
+    6;
+
+pub const MTP_TREE_BRANCH_A_DEPTH_3_SO_THE_TREE_NEEDS_EXACTLY_NV_MTP_K_3: usize = 3;
+
+pub const MTP_TREE_BRANCH_B_FIRST_ROW_4_ROWS_ARE_ANCHOR_A1_A2_A3_B1_B2: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwoBranchTreeAccept {
+    pub emitted: Vec<u32>,
+    pub drafts_accepted: usize,
+    pub depth_consumed: usize,
+    pub bonus_row: usize,
+    pub branch_b_accepted_rows: Option<usize>,
+}
+
+pub fn accept_two_branch_tree_m6(
+    rows_tokens: &[u32],
+    greedy: &[u32],
+) -> Result<TwoBranchTreeAccept> {
+    let rows = MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION;
+    ensure!(
+        rows_tokens.len() == rows && greedy.len() == rows,
+        "two-branch tree accept: rows_tokens {} greedy {} != {rows}",
+        rows_tokens.len(),
+        greedy.len()
+    );
+    let b0 = MTP_TREE_BRANCH_B_FIRST_ROW_4_ROWS_ARE_ANCHOR_A1_A2_A3_B1_B2;
+    let t1 = greedy[0];
+    if t1 == rows_tokens[1] {
+        let mut a = 1usize;
+        while a < MTP_TREE_BRANCH_A_DEPTH_3_SO_THE_TREE_NEEDS_EXACTLY_NV_MTP_K_3
+            && greedy[a] == rows_tokens[a + 1]
+        {
+            a += 1;
+        }
+        let mut emitted: Vec<u32> = rows_tokens[1..=a].to_vec();
+        emitted.push(greedy[a]);
+        return Ok(TwoBranchTreeAccept {
+            emitted,
+            drafts_accepted: a,
+            depth_consumed: a + 1,
+            bonus_row: a,
+            branch_b_accepted_rows: None,
+        });
+    }
+    if t1 == rows_tokens[b0] {
+        let b = if greedy[b0] == rows_tokens[b0 + 1] { 2 } else { 1 };
+        let bonus_row = b0 + b - 1;
+        let mut emitted: Vec<u32> = rows_tokens[b0..b0 + b].to_vec();
+        emitted.push(greedy[bonus_row]);
+        return Ok(TwoBranchTreeAccept {
+            emitted,
+            drafts_accepted: b,
+            depth_consumed: b + 1,
+            bonus_row,
+            branch_b_accepted_rows: Some(b),
+        });
+    }
+    Ok(TwoBranchTreeAccept {
+        emitted: vec![t1],
+        drafts_accepted: 0,
+        depth_consumed: 1,
+        bonus_row: 0,
+        branch_b_accepted_rows: None,
+    })
+}
+
+pub const NV_Q38_W4A8_MK_ENV: &str = "NV_Q38_W4A8_MK";
+
+pub const NV_Q38_MTP_ROUND_DEBUG_ENV: &str = "NV_Q38_MTP_ROUND_DEBUG";
+
+#[cfg(feature = "cuda")]
+fn top2_host_row_for_argmax_margin_triage(row: &[f32]) -> (u32, f32, u32, f32) {
+    let mut t1 = 0u32;
+    let mut v1 = f32::NEG_INFINITY;
+    let mut t2 = 0u32;
+    let mut v2 = f32::NEG_INFINITY;
+    for (i, &v) in row.iter().enumerate() {
+        if v > v1 {
+            t2 = t1;
+            v2 = v1;
+            t1 = i as u32;
+            v1 = v;
+        } else if v > v2 {
+            t2 = i as u32;
+            v2 = v;
+        }
+    }
+    (t1, v1, t2, v2)
+}
+
+#[cfg(feature = "cuda")]
+fn top3_host_row_ids_lowest_index_tie_break_matching_device_argmax(row: &[f32]) -> [u32; 3] {
+    let mut ids = [0u32; 3];
+    let mut vals = [f32::NEG_INFINITY; 3];
+    for (i, &v) in row.iter().enumerate() {
+        if v > vals[0] {
+            ids[2] = ids[1];
+            vals[2] = vals[1];
+            ids[1] = ids[0];
+            vals[1] = vals[0];
+            ids[0] = i as u32;
+            vals[0] = v;
+        } else if v > vals[1] {
+            ids[2] = ids[1];
+            vals[2] = vals[1];
+            ids[1] = i as u32;
+            vals[1] = v;
+        } else if v > vals[2] {
+            ids[2] = i as u32;
+            vals[2] = v;
+        }
+    }
+    ids
+}
+
+pub fn adaptive_verify_pins_the_env_unset_auto_dp4a_mlp_off_because_greedy_argmax_must_not_depend_on_which_m_the_cut_produced(
+) {
+    if !nv_config::env_arm_present_at_all_reread_every_call(NV_Q38_W4A8_MK_ENV) {
+        std::env::set_var(NV_Q38_W4A8_MK_ENV, "0");
+    }
+}
+
 pub fn mtp_drafter_selected(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("mtp"))
 }
@@ -173,7 +449,12 @@ pub const MTP_VERIFY_INC2_COMMITS_BATCHED_ROWS_AND_TOLERATES_MROW_VS_M1_DRIFT: &
      be byte-identical to sequential M=1 decode; the contract is the acceptance A/B gate, the \
      teacher-forced ppl match, and the empirical logit-drift pin, all in \
      nv-specdecode/tests/qwen38_mtp_wgpu_inc2.rs. NV_Q38_MTP_VERIFY_REPLAY=1 restores the \
-     increment-1 replay commit as the debugging escape.";
+     increment-1 replay commit as the debugging escape. NV_Q3D_MTP_COMMIT_SCAN_REPLAY=1 \
+     commits the same partial accept without the commit-only trunk reforward: advance(n) \
+     restores the snapshot and re-dispatches only each DeltaNet layer's conv_shift and scan \
+     over per-layer rows the first forward already landed, reproducing the reforward's \
+     committed state bit-for-bit (qwen3_5_dense_wgpu's \
+     MTP_COMMIT_SCAN_REPLAY_RESTORES_THE_SNAPSHOT_AND_REDISPATCHES_ONLY_EACH_DELTANET_CONV_SHIFT_AND_SCAN).";
 
 pub const Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN: f32 = 6.0;
 
@@ -183,6 +464,9 @@ pub trait MtpBatchedVerifyTarget {
         self.verify_chain(batch).map(|_| ())
     }
     fn advance(&mut self, n: usize) -> Result<()>;
+    fn advance_commits_partial_prefix_without_reforward(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -203,7 +487,10 @@ pub fn run_mtp_verify_round<T: MtpBatchedVerifyTarget + ?Sized>(
     let amax = target.verify_chain(&batch)?;
     let accept = crate::chain::accept_prefix_argmax(&batch, &amax)?;
     let full = accept.commit_len == batch.len();
-    if replay_commit || full {
+    let scan_replay = !replay_commit
+        && !full
+        && target.advance_commits_partial_prefix_without_reforward();
+    if replay_commit || full || scan_replay {
         target.advance(accept.commit_len)?;
     } else {
         target.advance(0)?;
@@ -216,7 +503,7 @@ pub fn run_mtp_verify_round<T: MtpBatchedVerifyTarget + ?Sized>(
         batch,
         accept,
         emitted,
-        prefix_reforwarded_batched: !replay_commit && !full,
+        prefix_reforwarded_batched: !replay_commit && !full && !scan_replay,
     })
 }
 
@@ -232,6 +519,10 @@ impl MtpBatchedVerifyTarget for nv_models::qwen3_5_dense_wgpu::Qwen3_5DenseWgpu 
 
     fn advance(&mut self, n: usize) -> Result<()> {
         Qwen3_5DenseWgpu::advance(self, n)
+    }
+
+    fn advance_commits_partial_prefix_without_reforward(&self) -> bool {
+        Qwen3_5DenseWgpu::mtp_commit_scan_replay_active(self)
     }
 }
 
@@ -419,6 +710,159 @@ pub fn resolve_mtp_weight_files(
     )
 }
 
+pub const SPECULATOR_SUBDIR_MIRRORS_NV_TRAIN_SPECULATOR_SUBDIR: &str = "speculator";
+
+pub const SPECULATOR_KIND_KEY_READ_FROM_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_IT:
+    &str = "nv_speculator_kind";
+
+pub const QWEN38_MTP_SPECULATOR_KIND_MIRRORS_NV_TRAIN: &str = "qwen38_mtp_head";
+
+pub const MTP_SPECULATOR_LORA_MODULES_MATCH_Q38_MTP_TRAIN_HEAD_PROJECTIONS_NORMS_EMBED_LM_HEAD_D2T_T2D_ARE_NEVER_TARGETS:
+    [&str; 8] = [
+    "mtp.fc",
+    "mtp.layers.0.mlp.down_proj",
+    "mtp.layers.0.mlp.gate_proj",
+    "mtp.layers.0.mlp.up_proj",
+    "mtp.layers.0.self_attn.k_proj",
+    "mtp.layers.0.self_attn.o_proj",
+    "mtp.layers.0.self_attn.q_proj",
+    "mtp.layers.0.self_attn.v_proj",
+];
+
+pub fn mtp_speculator_dir_if_advertised(adapter_dir: &Path) -> Result<Option<PathBuf>> {
+    let subdir = adapter_dir.join(SPECULATOR_SUBDIR_MIRRORS_NV_TRAIN_SPECULATOR_SUBDIR);
+    let config_path = adapter_dir.join("adapter_config.json");
+    let raw = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {}", config_path.display()))?;
+    let kind = v
+        .get(SPECULATOR_KIND_KEY_READ_FROM_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_IT)
+        .and_then(|k| k.as_str());
+    match (kind, subdir.is_dir()) {
+        (None, false) => Ok(None),
+        (Some(kind), true) => {
+            ensure!(
+                kind == QWEN38_MTP_SPECULATOR_KIND_MIRRORS_NV_TRAIN,
+                "adapter {} ships a speculator of kind {kind}, but this engine's drafter is the \
+                 qwen38 MTP head ({QWEN38_MTP_SPECULATOR_KIND_MIRRORS_NV_TRAIN}); merging a \
+                 mismatched speculator would serve deltas trained against a different drafter, \
+                 so the load refuses",
+                adapter_dir.display()
+            );
+            Ok(Some(subdir))
+        }
+        (Some(kind), false) => anyhow::bail!(
+            "adapter {}: adapter_config.json advertises speculator kind {kind} but no {}/ subdir \
+             exists; serving would silently drop the co-trained drafter deltas",
+            adapter_dir.display(),
+            SPECULATOR_SUBDIR_MIRRORS_NV_TRAIN_SPECULATOR_SUBDIR
+        ),
+        (None, true) => anyhow::bail!(
+            "adapter {}: a {}/ subdir exists but the MAIN adapter_config.json carries no {} key; \
+             the kind is authoritative in the main config (eagle3 subdir configs omit it), so an \
+             unkinded speculator cannot be classified and refuses to merge",
+            adapter_dir.display(),
+            SPECULATOR_SUBDIR_MIRRORS_NV_TRAIN_SPECULATOR_SUBDIR,
+            SPECULATOR_KIND_KEY_READ_FROM_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_IT
+        ),
+    }
+}
+
+pub fn merge_speculator_lora_into_mtp_map_before_any_quant_arm_so_the_drafter_serves_at_base_speed(
+    map: &mut HashMap<String, Tensor>,
+    speculator_dir: &Path,
+) -> Result<Vec<String>> {
+    let peft = nv_weights::lora_adapter::PeftConfig::from_dir(speculator_dir)
+        .with_context(|| format!("read speculator peft config in {}", speculator_dir.display()))?;
+    let st_path = speculator_dir.join("adapter_model.safetensors");
+    let device = map
+        .values()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("speculator merge over an empty MTP tensor map"))?
+        .device()
+        .clone();
+    let deltas = candle_core::safetensors::load(&st_path, &device)
+        .with_context(|| format!("load speculator deltas {}", st_path.display()))?;
+    let mut pairs: BTreeMap<String, [Option<Tensor>; 2]> = BTreeMap::new();
+    for (name, t) in deltas {
+        let parsed = name.strip_prefix("base_model.model.").and_then(|rest| {
+            rest.strip_suffix(".lora_A.weight")
+                .map(|m| (m, 0usize))
+                .or_else(|| rest.strip_suffix(".lora_B.weight").map(|m| (m, 1usize)))
+        });
+        let Some((module, side)) = parsed else {
+            anyhow::bail!(
+                "speculator tensor {name} is not a base_model.model.<module>.lora_A/lora_B.weight \
+                 pair member; norms, embeddings, lm_head, d2t/t2d and DoRA vectors are never MTP \
+                 speculator targets, so the whole merge refuses rather than skipping"
+            );
+        };
+        ensure!(
+            MTP_SPECULATOR_LORA_MODULES_MATCH_Q38_MTP_TRAIN_HEAD_PROJECTIONS_NORMS_EMBED_LM_HEAD_D2T_T2D_ARE_NEVER_TARGETS
+                .contains(&module),
+            "speculator names module {module}, which is not one of the 8 LoRA-targetable MTP head \
+             projections; refusing the whole merge (no partial merge)"
+        );
+        let slot = &mut pairs.entry(module.to_string()).or_default()[side];
+        ensure!(slot.is_none(), "duplicate speculator tensor {name}");
+        *slot = Some(t);
+    }
+    ensure!(
+        !pairs.is_empty(),
+        "{} holds no lora_A/lora_B delta tensors; an empty speculator advertises a co-trained \
+         drafter that was never trained",
+        st_path.display()
+    );
+    let mut staged: Vec<(String, Tensor)> = Vec::with_capacity(pairs.len());
+    for (module, [a, b]) in &pairs {
+        let a = a
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("speculator module {module} is missing lora_A"))?;
+        let b = b
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("speculator module {module} is missing lora_B"))?;
+        let weight_name = format!("{module}.weight");
+        let w = map.get(&weight_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "speculator targets {weight_name} but the MTP checkpoint map has no such tensor"
+            )
+        })?;
+        let (out_f, in_f) = w.dims2()?;
+        let (a_r, a_in) = a.dims2()?;
+        let (b_out, b_r) = b.dims2()?;
+        ensure!(
+            a_r == peft.r && b_r == peft.r,
+            "speculator module {module}: adapter_config claims r={} but lora_A is [{a_r}, {a_in}] \
+             and lora_B is [{b_out}, {b_r}]; a rank the config does not claim is a corrupted \
+             artifact",
+            peft.r
+        );
+        ensure!(
+            a_in == in_f && b_out == out_f,
+            "speculator module {module}: the serving drafter weight is [{out_f}, {in_f}] (the \
+             loaded Linear's own dims, which is where gated q_proj rows and fc in-features come \
+             from) but the deltas compose to [{b_out}, {a_in}]; this speculator was trained \
+             against a different drafter, refusing the whole merge (no partial merge)"
+        );
+        let delta_f32_scaled_after_the_matmul_never_rounding_the_delta_separately = b
+            .to_dtype(DType::F32)?
+            .matmul(&a.to_dtype(DType::F32)?)?
+            .affine(peft.scaling, 0.0)?;
+        let merged = w
+            .to_dtype(DType::F32)?
+            .add(&delta_f32_scaled_after_the_matmul_never_rounding_the_delta_separately)?
+            .to_dtype(w.dtype())?
+            .contiguous()?;
+        staged.push((weight_name, merged));
+    }
+    let merged_modules: Vec<String> = pairs.keys().cloned().collect();
+    for (name, t) in staged {
+        map.insert(name, t);
+    }
+    Ok(merged_modules)
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;
@@ -436,11 +880,24 @@ mod cuda_impl {
     pub const DRAFTER_FP8_CATCHUP_ROWS_PER_CALL_16_THE_GEMV_E4M3_MK_LEADING_CAP_BECAUSE_THIS_DEVICE_SERVES_NO_CUBLASLT_PER_ROW_FP8:
         usize = 16;
 
+    pub const DRAFTER_BOOT_WARM_PROMPT_TOKENS_17_COVER_BOTH_THE_16_ROW_FP8_CATCHUP_CALL_SHAPE_AND_THE_REMAINDER_ROW:
+        usize = 17;
+
+    struct SplitkRouteBuffers {
+        scratch: cudarc::driver::CudaSlice<f32>,
+        fan_in: cudarc::driver::CudaSlice<u32>,
+        len_dev: cudarc::driver::CudaSlice<i32>,
+        host_len: Box<[i32; 1]>,
+        heads: usize,
+    }
+
     pub struct MtpKvCache {
         k_bf16_rows_stay_exact_because_the_drafter_never_shares_the_trunk_fp8_slots: Tensor,
         v_rows: Tensor,
         len: usize,
         max_seq: usize,
+        splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query:
+            Option<SplitkRouteBuffers>,
     }
 
     impl MtpKvCache {
@@ -457,6 +914,8 @@ mod cuda_impl {
                 v_rows: Tensor::zeros((1usize, max_seq, kv_heads, head_dim), dtype, device)?,
                 len: 0,
                 max_seq,
+                splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query:
+                    None,
             })
         }
 
@@ -508,6 +967,138 @@ mod cuda_impl {
                 self.k_bf16_rows_stay_exact_because_the_drafter_never_shares_the_trunk_fp8_slots
                     .narrow(1, 0, self.len)?,
                 self.v_rows.narrow(1, 0, self.len)?,
+            ))
+        }
+
+        pub fn decode_attention_splitk_bf16kv_reading_each_kv_row_once(
+            &mut self,
+            q_roped_1_1_nh_hd: &Tensor,
+            heads: usize,
+            softmax_scale: f32,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            use half::bf16;
+            use std::ffi::c_void;
+
+            ensure!(self.len > 0, "splitk drafter attention on an empty cache");
+            let k_buf =
+                &self.k_bf16_rows_stay_exact_because_the_drafter_never_shares_the_trunk_fp8_slots;
+            let (_b, _s, kv_heads, hd) = k_buf.dims4()?;
+            ensure!(
+                q_roped_1_1_nh_hd.dims() == [1, 1, heads, hd],
+                "splitk drafter attention: q must be [1, 1, {heads}, {hd}], got {:?}",
+                q_roped_1_1_nh_hd.dims()
+            );
+            ensure!(
+                heads % kv_heads == 0,
+                "splitk drafter attention: heads {heads} not a multiple of kv_heads {kv_heads}"
+            );
+            ensure!(
+                k_buf.dtype() == DType::BF16,
+                "{} routes a bf16-KV kernel but this drafter cache holds {:?}; unset the env \
+                 for a non-bf16 drafter",
+                NV_Q38_DRAFTER_ATTN_SPLITK_ENV_OPT_IN_1_ROUTES_THE_Q1_DRAFTER_SCAN_THROUGH_THE_FUSED_BF16_SPLITK_DECODE_KERNEL_BECAUSE_CANDLE_FA2_FILLS_ONLY_N_HEADS_BLOCKS,
+                k_buf.dtype()
+            );
+            let dev = match q_roped_1_1_nh_hd.device() {
+                Device::Cuda(d) => d.clone(),
+                _ => anyhow::bail!("splitk drafter attention needs a CUDA device"),
+            };
+            let stream = nv_layers::cuda_stream::current_stream(&dev);
+            if self
+                .splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query
+                .is_none()
+            {
+                let scratch_elems =
+                    nv_kernels::cuda::flash_splitk_scratch_elems(heads as i32, hd as i32);
+                self.splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query =
+                    Some(SplitkRouteBuffers {
+                        scratch: stream
+                            .alloc_zeros::<f32>(scratch_elems)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        fan_in: stream
+                            .alloc_zeros::<u32>(heads)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        len_dev: stream
+                            .alloc_zeros::<i32>(1)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        host_len: Box::new([0i32; 1]),
+                        heads,
+                    });
+            }
+            let q_f32_prescaled_because_the_kernel_scores_raw_qk = q_roped_1_1_nh_hd
+                .to_dtype(DType::F32)?
+                .affine(softmax_scale as f64, 0.0)?
+                .contiguous()?;
+            let mut out: cudarc::driver::CudaSlice<bf16> = unsafe {
+                stream
+                    .alloc::<bf16>(heads * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let rc = {
+                let bufs = self
+                    .splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query
+                    .as_mut()
+                    .expect("splitk route buffers were just installed");
+                ensure!(
+                    bufs.heads == heads,
+                    "splitk drafter attention: buffers sized for {} heads, called with {heads}",
+                    bufs.heads
+                );
+                bufs.host_len[0] = self.len as i32;
+                stream
+                    .memcpy_htod(&bufs.host_len[..], &mut bufs.len_dev)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let (qs, ql) = q_f32_prescaled_because_the_kernel_scores_raw_qk.storage_and_layout();
+                let (ks, kl) = k_buf.storage_and_layout();
+                let (vs, vl) = self.v_rows.storage_and_layout();
+                let q_cuda = match &*qs {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => anyhow::bail!("splitk drafter attention: q storage not cuda"),
+                };
+                let k_cuda = match &*ks {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => anyhow::bail!("splitk drafter attention: k storage not cuda"),
+                };
+                let v_cuda = match &*vs {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => anyhow::bail!("splitk drafter attention: v storage not cuda"),
+                };
+                let q_view = q_cuda.as_cuda_slice::<f32>()?.slice(ql.start_offset()..);
+                let k_view = k_cuda.as_cuda_slice::<bf16>()?.slice(kl.start_offset()..);
+                let v_view = v_cuda.as_cuda_slice::<bf16>()?.slice(vl.start_offset()..);
+                let (pq, _gq) = q_view.device_ptr(&stream);
+                let (pk, _gk) = k_view.device_ptr(&stream);
+                let (pv, _gv) = v_view.device_ptr(&stream);
+                let (pl, _gl) = bufs.len_dev.device_ptr(&stream);
+                let (ps, _gs) = bufs.scratch.device_ptr_mut(&stream);
+                let (pf, _gf) = bufs.fan_in.device_ptr_mut(&stream);
+                let (po, _go) = out.device_ptr_mut(&stream);
+                unsafe {
+                    nv_kernels::cuda::flash_decode_fused_bf16kv(
+                        stream.cu_stream() as *mut c_void,
+                        pq as *const f32,
+                        pk as *const u16,
+                        pv as *const u16,
+                        po as *mut u16,
+                        pl as *const i32,
+                        0,
+                        ps as *mut f32,
+                        pf as *mut u32,
+                        heads as i32,
+                        kv_heads as i32,
+                        hd as i32,
+                        0,
+                    )
+                }
+            };
+            ensure!(rc == 0, "flash_decode_fused_bf16kv drafter q1 rc={rc}");
+            let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+            Ok(Tensor::from_storage(
+                candle_core::Storage::Cuda(storage),
+                (1usize, 1usize, heads, hd),
+                candle_core::op::BackpropOp::none(),
+                false,
             ))
         }
 
@@ -578,6 +1169,12 @@ mod cuda_impl {
     pub struct DraftLmHeadNvfp4W4a8DualHalves {
         top: Linear,
         bottom: Linear,
+        bottom_token_id_base: usize,
+    }
+
+    enum DraftHeadTail {
+        Logits(Tensor),
+        FusedArgmaxTokIdU32OnDevice(Tensor),
     }
 
     impl DraftLmHeadNvfp4W4a8DualHalves {
@@ -596,6 +1193,13 @@ mod cuda_impl {
                 _ => anyhow::bail!("w4a8 draft lm_head needs a CUDA device"),
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
+            anyhow::ensure!(
+                self.bottom_token_id_base == self.top.out_features(),
+                "the unfused dual-gemv logits index rows as vocab ids, which only holds for \
+                 the symmetric halves layout; under NV_Q38_DRAFT_VOCAB_PREFIX the fused \
+                 argmax route (NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE=1, greedy, no probs_top3) is \
+                 the only correct path"
+            );
             let n2 = self.top.out_features();
             let n = n2 + self.bottom.out_features();
             let k = self.top.in_features();
@@ -643,6 +1247,72 @@ mod cuda_impl {
                 false,
             ))
         }
+
+        fn dual_gemv_argmax_fused_token_id_stays_on_device_and_no_logits_are_materialized(
+            &self,
+            x_q8: &cudarc::driver::CudaSlice<i8>,
+            x_scale: &cudarc::driver::CudaSlice<f32>,
+            device: &Device,
+        ) -> Result<Tensor> {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            use std::ffi::c_void;
+
+            let dev = match device {
+                Device::Cuda(d) => d.clone(),
+                _ => anyhow::bail!("fused w4a8 draft lm_head argmax needs a CUDA device"),
+            };
+            let stream = nv_layers::cuda_stream::current_stream(&dev);
+            let n2 = self.top.out_features();
+            let k = self.top.in_features();
+            let (tw, ts, t_alpha, t_ig) = self.top.nvfp4_parts().ok_or_else(|| {
+                anyhow::anyhow!("fused w4a8 draft lm_head: top half lost nvfp4 parts")
+            })?;
+            let (bw, bs, b_alpha, b_ig) = self.bottom.nvfp4_parts().ok_or_else(|| {
+                anyhow::anyhow!("fused w4a8 draft lm_head: bottom half lost nvfp4 parts")
+            })?;
+            let mut packed_best: cudarc::driver::CudaSlice<u64> =
+                unsafe { stream.alloc::<u64>(1).map_err(|e| anyhow::anyhow!(e))? };
+            let mut out_id: cudarc::driver::CudaSlice<u32> =
+                unsafe { stream.alloc::<u32>(1).map_err(|e| anyhow::anyhow!(e))? };
+            let rc = {
+                let (twp, _g1) = tw.device_ptr(&stream);
+                let (tsp, _g2) = ts.device_ptr(&stream);
+                let (bwp, _g3) = bw.device_ptr(&stream);
+                let (bsp, _g4) = bs.device_ptr(&stream);
+                let (xqp, _g5) = x_q8.device_ptr(&stream);
+                let (xsp, _g6) = x_scale.device_ptr(&stream);
+                let (pbp, _g7) = packed_best.device_ptr_mut(&stream);
+                let (oip, _g8) = out_id.device_ptr_mut(&stream);
+                unsafe {
+                    nv_kernels::cuda::gemv_nvfp4_w4a8_dual_argmax_m1(
+                        stream.cu_stream() as *mut c_void,
+                        twp as *const u8,
+                        tsp as *const u8,
+                        bwp as *const u8,
+                        bsp as *const u8,
+                        xqp as *const i8,
+                        xsp as *const f32,
+                        pbp as *mut u64,
+                        oip as *mut u32,
+                        std::ptr::null_mut(),
+                        t_alpha * t_ig,
+                        b_alpha * b_ig,
+                        n2 as i32,
+                        self.bottom.out_features() as i32,
+                        self.bottom_token_id_base as i32,
+                        k as i32,
+                    )
+                }
+            };
+            ensure!(rc == 0, "gemv_nvfp4_w4a8_dual_argmax_m1 draft lm_head rc={rc}");
+            let storage = candle_core::CudaStorage::wrap_cuda_slice(out_id, dev);
+            Ok(Tensor::from_storage(
+                candle_core::Storage::Cuda(storage),
+                1usize,
+                candle_core::op::BackpropOp::none(),
+                false,
+            ))
+        }
     }
 
     impl Qwen38DenseMtpHead {
@@ -670,6 +1340,22 @@ mod cuda_impl {
             base: &Qwen3Moe,
             device: &Device,
         ) -> Result<Self> {
+            Self::from_checkpoint_with_speculator(
+                explicit_dir,
+                main_checkpoint_dir,
+                None,
+                base,
+                device,
+            )
+        }
+
+        pub fn from_checkpoint_with_speculator(
+            explicit_dir: Option<&Path>,
+            main_checkpoint_dir: &Path,
+            lora_adapter_dir_whose_speculator_deltas_merge_into_the_head: Option<&Path>,
+            base: &Qwen3Moe,
+            device: &Device,
+        ) -> Result<Self> {
             let files = resolve_mtp_weight_files(explicit_dir, main_checkpoint_dir)?;
             let mut map: HashMap<String, Tensor> = HashMap::new();
             for f in &files {
@@ -680,6 +1366,22 @@ mod cuda_impl {
                         .into_iter()
                         .filter(|(k, _)| k.starts_with(MTP_TENSOR_PREFIX)),
                 );
+            }
+            if let Some(adapter_dir) =
+                lora_adapter_dir_whose_speculator_deltas_merge_into_the_head
+            {
+                if let Some(spec_dir) = mtp_speculator_dir_if_advertised(adapter_dir)? {
+                    let modules =
+                        merge_speculator_lora_into_mtp_map_before_any_quant_arm_so_the_drafter_serves_at_base_speed(
+                            &mut map, &spec_dir,
+                        )?;
+                    eprintln!(
+                        "[qwen3.8-mtp] merged co-trained speculator deltas from {} into {} MTP \
+                         modules at load; the drafter serves at base speed",
+                        spec_dir.display(),
+                        modules.len()
+                    );
+                }
             }
             let mut head = Self::from_map(&map, base)?;
             if mtp_draft_lm_head_nvfp4_twin_from_env() {
@@ -698,7 +1400,50 @@ mod cuda_impl {
                     )?,
                 );
             }
+            if crate::qwen38_mtp::drafter_boot_warm_selected_from_env() {
+                head.boot_warm_one_throwaway_catchup_and_draft_into_a_scratch_kv_dropped_before_return(
+                    base, device,
+                )?;
+            }
             Ok(head)
+        }
+
+        pub fn boot_warm_one_throwaway_catchup_and_draft_into_a_scratch_kv_dropped_before_return(
+            &self,
+            base: &Qwen3Moe,
+            device: &Device,
+        ) -> Result<()> {
+            let t =
+                DRAFTER_BOOT_WARM_PROMPT_TOKENS_17_COVER_BOTH_THE_16_ROW_FP8_CATCHUP_CALL_SHAPE_AND_THE_REMAINDER_ROW;
+            let h = self.geometry.hidden;
+            let mut scratch_kv = self.new_kv_cache(t + 2, device)?;
+            let warm_prompt = vec![0u32; t];
+            let ones_hiddens_stay_finite_through_every_norm_and_activation_quant =
+                Tensor::ones((1usize, t, h), self.dtype, device)?;
+            self.prefill_prompt_kv_shifted_by_one_with_position_zero_on_a_zero_hidden(
+                base,
+                &warm_prompt,
+                &ones_hiddens_stay_finite_through_every_norm_and_activation_quant,
+                &mut scratch_kv,
+            )?;
+            let anchor_hidden = ones_hiddens_stay_finite_through_every_norm_and_activation_quant
+                .narrow(1, t - 1, 1)?
+                .contiguous()?;
+            if draft_fast_device_chained_tokens_selected_from_env() {
+                let _ = self
+                    .draft_chain_reading_tokens_back_once_because_per_step_readback_stalls_the_stream(
+                        base,
+                        0,
+                        &anchor_hidden,
+                        1,
+                        None,
+                        &mut scratch_kv,
+                    )?;
+            } else {
+                let _ = self.forward_draft_tok(base, &anchor_hidden, 0, &mut scratch_kv)?;
+            }
+            device.synchronize()?;
+            Ok(())
         }
 
         pub fn from_safetensors(
@@ -879,18 +1624,41 @@ mod cuda_impl {
             let runner = std::sync::Arc::new(std::sync::Mutex::new(
                 nv_quant::nvfp4::Nvfp4GemmRunner::new(stream)?,
             ));
-            let n2 = n / 2;
+            let vocab_prefix_arm_frspec_class_draft_only_subset_full_vocab_verify_keeps_output_distribution =
+                std::env::var("NV_Q38_DRAFT_VOCAB_PREFIX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok());
+            let (top_rows, bot_start, bot_rows) = match
+                vocab_prefix_arm_frspec_class_draft_only_subset_full_vocab_verify_keeps_output_distribution
+            {
+                Some(p) => {
+                    const SPECIALS_TAIL_512_COVERS_QWEN_CONTROL_TOKENS_SO_STOPS_STAY_PROPOSABLE:
+                        usize = 512;
+                    let t = SPECIALS_TAIL_512_COVERS_QWEN_CONTROL_TOKENS_SO_STOPS_STAY_PROPOSABLE;
+                    ensure!(
+                        p % 256 == 0 && p + t < n,
+                        "NV_Q38_DRAFT_VOCAB_PREFIX={p} must be 256-aligned and leave room for \
+                         the {t}-row specials tail below vocab {n}"
+                    );
+                    (p, n - t, t)
+                }
+                None => (n / 2, n / 2, n / 2),
+            };
             let top = lm.nvfp4_draft_twin_rows_quantized_from_this_resident_copy_which_stays_untouched(
                 runner.clone(),
                 0,
-                n2,
+                top_rows,
             )?;
             let bottom = lm
                 .nvfp4_draft_twin_rows_quantized_from_this_resident_copy_which_stays_untouched(
-                    runner, n2, n2,
+                    runner, bot_start, bot_rows,
                 )?;
             self.draft_only_lm_head_nvfp4_w4a8_halves_twin_of_the_shared_fp8 =
-                Some(DraftLmHeadNvfp4W4a8DualHalves { top, bottom });
+                Some(DraftLmHeadNvfp4W4a8DualHalves {
+                    top,
+                    bottom,
+                    bottom_token_id_base: bot_start,
+                });
             Ok(())
         }
 
@@ -1130,6 +1898,50 @@ mod cuda_impl {
             next_token: &Tensor,
             cache: &mut MtpKvCache,
         ) -> Result<(Tensor, Tensor)> {
+            match self.forward_draft_core_whose_tail_is_logits_or_a_fused_on_device_argmax_id(
+                base,
+                base_hidden,
+                next_token,
+                cache,
+                false,
+            )? {
+                (DraftHeadTail::Logits(logits), h) => Ok((logits, h)),
+                (DraftHeadTail::FusedArgmaxTokIdU32OnDevice(_), _) => anyhow::bail!(
+                    "draft core returned a fused argmax tail although logits were requested"
+                ),
+            }
+        }
+
+        pub fn forward_draft_fused_argmax_tok_on_device_from_token_ids_already_on_device(
+            &self,
+            base: &Qwen3Moe,
+            base_hidden: &Tensor,
+            next_token: &Tensor,
+            cache: &mut MtpKvCache,
+        ) -> Result<(Tensor, Tensor)> {
+            match self.forward_draft_core_whose_tail_is_logits_or_a_fused_on_device_argmax_id(
+                base,
+                base_hidden,
+                next_token,
+                cache,
+                true,
+            )? {
+                (DraftHeadTail::FusedArgmaxTokIdU32OnDevice(tok), h) => Ok((tok, h)),
+                (DraftHeadTail::Logits(_), _) => anyhow::bail!(
+                    "draft core returned logits although the fused argmax tail was requested; \
+                     the fused route needs {NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1's resident twin"
+                ),
+            }
+        }
+
+        fn forward_draft_core_whose_tail_is_logits_or_a_fused_on_device_argmax_id(
+            &self,
+            base: &Qwen3Moe,
+            base_hidden: &Tensor,
+            next_token: &Tensor,
+            cache: &mut MtpKvCache,
+            fuse_argmax_tail: bool,
+        ) -> Result<(DraftHeadTail, Tensor)> {
             let d = base_hidden.dims();
             let hidden = self.geometry.hidden;
             ensure!(
@@ -1153,7 +1965,6 @@ mod cuda_impl {
                 .project_qkv_roped_for_a_drafter_owned_kv(&normed, base.rope(), &positions)?;
             cache.append(&k, &v)?;
             decode_prof::lap("draft_kv_append");
-            let (k_full, v_full) = cache.views()?;
             let attn_cfg = AttnConfig {
                 num_heads: self.geometry.heads,
                 num_kv_heads: self.geometry.kv_heads,
@@ -1161,13 +1972,27 @@ mod cuda_impl {
                 softmax_scale: 1.0 / (self.geometry.head_dim as f32).sqrt(),
                 causal: true,
             };
-            let attn_out = flash_attn(
-                &q.contiguous()?,
-                &k_full.contiguous()?,
-                &v_full.contiguous()?,
-                &attn_cfg,
-            )?;
-            decode_prof::lap("draft_attn_flash");
+            let attn_out = if crate::qwen38_mtp::drafter_attn_splitk_selected_from_env()
+                && matches!(device, Device::Cuda(_))
+            {
+                let out = cache.decode_attention_splitk_bf16kv_reading_each_kv_row_once(
+                    &q.contiguous()?,
+                    self.geometry.heads,
+                    attn_cfg.softmax_scale,
+                )?;
+                decode_prof::lap("draft_attn_splitk");
+                out
+            } else {
+                let (k_full, v_full) = cache.views()?;
+                let out = flash_attn(
+                    &q.contiguous()?,
+                    &k_full.contiguous()?,
+                    &v_full.contiguous()?,
+                    &attn_cfg,
+                )?;
+                decode_prof::lap("draft_attn_flash");
+                out
+            };
             let attn = self.self_attn.finalize_attn_from_a_drafter_owned_kv(
                 attn_out,
                 q_gate,
@@ -1196,14 +2021,33 @@ mod cuda_impl {
                     h.clone()
                 };
                 decode_prof::lap("draft_final_norm");
+                if fuse_argmax_tail {
+                    let tok = halves
+                        .dual_gemv_argmax_fused_token_id_stays_on_device_and_no_logits_are_materialized(
+                            &x_q8,
+                            &x_scale,
+                            h.device(),
+                        )?;
+                    decode_prof::lap("draft_lm_head_argmax_fused");
+                    return Ok((
+                        DraftHeadTail::FusedArgmaxTokIdU32OnDevice(tok),
+                        chained_hidden,
+                    ));
+                }
                 let logits = halves.dual_gemv_logits_one_pass_over_both_row_halves(
                     &x_q8,
                     &x_scale,
                     h.device(),
                 )?;
                 decode_prof::lap("draft_lm_head");
-                return Ok((logits, chained_hidden));
+                return Ok((DraftHeadTail::Logits(logits), chained_hidden));
             }
+            ensure!(
+                !fuse_argmax_tail,
+                "the fused draft lm_head argmax covers only the \
+                 {NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1 nvfp4 twin; the bf16 lm_head fallback \
+                 stays on the materialize-then-argmax path"
+            );
 
             h = residual2.add(&mlp_out)?;
             decode_prof::lap("draft_mlp");
@@ -1218,7 +2062,7 @@ mod cuda_impl {
             let logits = base.lm_head().forward(&normed_final)?;
             let logits = logits.reshape((1usize, logits.dim(D::Minus1)?))?;
             decode_prof::lap("draft_lm_head");
-            Ok((logits, chained_hidden))
+            Ok((DraftHeadTail::Logits(logits), chained_hidden))
         }
 
         pub fn forward_draft_tok(
@@ -1228,6 +2072,26 @@ mod cuda_impl {
             next_token_id: u32,
             cache: &mut MtpKvCache,
         ) -> Result<(u32, Tensor)> {
+            if draft_lmhead_argmax_fuse_route_eligible_because_probs_top3_and_forced_drafts_need_logits(
+                mtp_draft_lmhead_argmax_fuse_from_env(),
+                self.draft_lm_head_nvfp4_twin_active(),
+                false,
+                false,
+                false,
+            ) {
+                let device = base_hidden.device().clone();
+                let t = Tensor::from_vec(vec![next_token_id], 1usize, &device)?;
+                let (tok_t, mtp_hidden) = self
+                    .forward_draft_fused_argmax_tok_on_device_from_token_ids_already_on_device(
+                        base,
+                        base_hidden,
+                        &t,
+                        cache,
+                    )?;
+                let tok = tok_t.to_vec1::<u32>()?[0];
+                decode_prof::lap("draft_argmax_readback");
+                return Ok((tok, mtp_hidden));
+            }
             let (logits, mtp_hidden) = self.forward_draft(base, base_hidden, next_token_id, cache)?;
             let tok = logits
                 .argmax(D::Minus1)?
@@ -1236,6 +2100,25 @@ mod cuda_impl {
                 .to_vec1::<u32>()?[0];
             decode_prof::lap("draft_argmax_readback");
             Ok((tok, mtp_hidden))
+        }
+
+        pub fn forward_draft_tok_with_top_prob(
+            &self,
+            base: &Qwen3Moe,
+            base_hidden: &Tensor,
+            next_token_id: u32,
+            cache: &mut MtpKvCache,
+        ) -> Result<(u32, f32, Tensor)> {
+            let (logits, mtp_hidden) = self.forward_draft(base, base_hidden, next_token_id, cache)?;
+            let tok = logits
+                .argmax(D::Minus1)?
+                .flatten_all()?
+                .to_dtype(DType::U32)?
+                .to_vec1::<u32>()?[0];
+            let p = Self::drafter_top_prob_scalar_is_recip_sum_exp_logits_minus_max(&logits)?
+                .to_vec1::<f32>()?[0];
+            decode_prof::lap("draft_argmax_readback");
+            Ok((tok, p, mtp_hidden))
         }
 
         fn device_row_argmax_u32_matching_candle_lowest_index_tie_break(
@@ -1321,6 +2204,65 @@ mod cuda_impl {
             forced_drafts: Option<&[u32]>,
             cache: &mut MtpKvCache,
         ) -> Result<Vec<u32>> {
+            Ok(self
+                .draft_chain_with_top_probs_reading_back_once(
+                    base,
+                    anchor,
+                    base_hidden,
+                    k,
+                    forced_drafts,
+                    false,
+                    cache,
+                )?
+                .0)
+        }
+
+        fn drafter_top_prob_scalar_is_recip_sum_exp_logits_minus_max(
+            logits: &Tensor,
+        ) -> Result<Tensor> {
+            let lf = logits.to_dtype(DType::F32)?;
+            let mx = lf.max_keepdim(D::Minus1)?;
+            let z = lf.broadcast_sub(&mx)?.exp()?.sum(D::Minus1)?;
+            Ok(z.recip()?.flatten_all()?)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn draft_chain_with_top_probs_reading_back_once(
+            &self,
+            base: &Qwen3Moe,
+            anchor: u32,
+            base_hidden: &Tensor,
+            k: usize,
+            forced_drafts: Option<&[u32]>,
+            want_top_probs: bool,
+            cache: &mut MtpKvCache,
+        ) -> Result<(Vec<u32>, Vec<f32>)> {
+            let (drafts, probs, _) = self
+                .draft_chain_with_top_probs_and_step_top3_whose_per_step_host_readback_syncs_so_headroom_probes_only(
+                    base,
+                    anchor,
+                    base_hidden,
+                    k,
+                    forced_drafts,
+                    want_top_probs,
+                    false,
+                    cache,
+                )?;
+            Ok((drafts, probs))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn draft_chain_with_top_probs_and_step_top3_whose_per_step_host_readback_syncs_so_headroom_probes_only(
+            &self,
+            base: &Qwen3Moe,
+            anchor: u32,
+            base_hidden: &Tensor,
+            k: usize,
+            forced_drafts: Option<&[u32]>,
+            want_top_probs: bool,
+            want_step_top3: bool,
+            cache: &mut MtpKvCache,
+        ) -> Result<(Vec<u32>, Vec<f32>, Vec<[u32; 3]>)> {
             ensure!(k >= 1, "draft chain: k must be >= 1");
             if let Some(f) = forced_drafts {
                 ensure!(
@@ -1333,9 +2275,40 @@ mod cuda_impl {
             let mut h = base_hidden.clone();
             let mut tok = Tensor::from_vec(vec![anchor], 1usize, &device)?;
             let mut sampled: Vec<Tensor> = Vec::with_capacity(k);
+            let mut top_probs: Vec<Tensor> = Vec::with_capacity(k);
+            let mut step_top3: Vec<[u32; 3]> = Vec::new();
+            let fused_route =
+                draft_lmhead_argmax_fuse_route_eligible_because_probs_top3_and_forced_drafts_need_logits(
+                    mtp_draft_lmhead_argmax_fuse_from_env(),
+                    self.draft_lm_head_nvfp4_twin_active(),
+                    want_top_probs,
+                    want_step_top3,
+                    forced_drafts.is_some(),
+                );
             for j in 0..k {
+                if fused_route {
+                    let (am, dhidden) = self
+                        .forward_draft_fused_argmax_tok_on_device_from_token_ids_already_on_device(
+                            base, &h, &tok, cache,
+                        )?;
+                    sampled.push(am.clone());
+                    tok = am;
+                    h = dhidden;
+                    continue;
+                }
                 let (logits, dhidden) =
                     self.forward_draft_from_token_ids_already_on_device(base, &h, &tok, cache)?;
+                if want_top_probs && forced_drafts.is_none() {
+                    top_probs
+                        .push(Self::drafter_top_prob_scalar_is_recip_sum_exp_logits_minus_max(
+                            &logits,
+                        )?);
+                }
+                if want_step_top3 && forced_drafts.is_none() {
+                    let row: Vec<f32> = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+                    step_top3
+                        .push(top3_host_row_ids_lowest_index_tie_break_matching_device_argmax(&row));
+                }
                 tok = match forced_drafts {
                     Some(f) => Tensor::from_vec(vec![f[j]], 1usize, &device)?,
                     None => {
@@ -1349,10 +2322,60 @@ mod cuda_impl {
                 };
                 h = dhidden;
             }
+            let probs_host: Vec<f32> = if top_probs.is_empty() {
+                Vec::new()
+            } else {
+                Tensor::cat(&top_probs, 0)?.to_vec1::<f32>()?
+            };
             match forced_drafts {
-                Some(f) => Ok(f.to_vec()),
-                None => Ok(Tensor::cat(&sampled, 0)?.to_vec1::<u32>()?),
+                Some(f) => Ok((f.to_vec(), probs_host, step_top3)),
+                None => Ok((
+                    Tensor::cat(&sampled, 0)?.to_vec1::<u32>()?,
+                    probs_host,
+                    step_top3,
+                )),
             }
+        }
+
+        pub fn draft_two_branch_tree_chain_plus_top2_sibling_step(
+            &self,
+            base: &Qwen3Moe,
+            anchor: u32,
+            base_hidden: &Tensor,
+            cache: &mut MtpKvCache,
+        ) -> Result<(Vec<u32>, u32, u32)> {
+            let k = MTP_TREE_BRANCH_A_DEPTH_3_SO_THE_TREE_NEEDS_EXACTLY_NV_MTP_K_3;
+            let device = base_hidden.device().clone();
+            let anchor_row_len = cache.len() + 1;
+            let mut h = base_hidden.clone();
+            let mut tok = Tensor::from_vec(vec![anchor], 1usize, &device)?;
+            let mut sampled: Vec<Tensor> = Vec::with_capacity(k);
+            let mut step0_logits: Option<Tensor> = None;
+            let mut step0_hidden: Option<Tensor> = None;
+            for j in 0..k {
+                let (logits, dhidden) =
+                    self.forward_draft_from_token_ids_already_on_device(base, &h, &tok, cache)?;
+                let am =
+                    Self::device_row_argmax_u32_matching_candle_lowest_index_tie_break(&logits)?;
+                if j == 0 {
+                    step0_logits = Some(logits);
+                    step0_hidden = Some(dhidden.clone());
+                }
+                sampled.push(am.clone());
+                tok = am;
+                h = dhidden;
+            }
+            let drafts: Vec<u32> = Tensor::cat(&sampled, 0)?.to_vec1::<u32>()?;
+            let row: Vec<f32> = step0_logits
+                .expect("k >= 1 so step 0 ran")
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            let (_t1, _v1, c2, _v2) = top2_host_row_for_argmax_margin_triage(&row);
+            let dh0 = step0_hidden.expect("k >= 1 so step 0 ran");
+            cache.rewind_to(anchor_row_len)?;
+            let (c2d2, _sib_hidden) = self.forward_draft_tok(base, &dh0, c2, cache)?;
+            Ok((drafts, c2, c2d2))
         }
     }
 
@@ -1360,12 +2383,14 @@ mod cuda_impl {
         base: &'a Qwen3Moe,
         mtp: &'a Qwen38DenseMtpHead,
         k: usize,
+        p_min_drafter_confidence_cut_none_means_fixed_k: Option<f32>,
         cache: Qwen3MoeKvCache,
         mtp_kv: MtpKvCache,
         anchor: u32,
         base_hidden: Tensor,
         max_seq: usize,
         pub stats: MtpSpecStats,
+        pub submitted_draft_len_hist: BTreeMap<usize, usize>,
     }
 
     impl<'a> Qwen38MtpDecodeSession<'a> {
@@ -1385,55 +2410,108 @@ mod cuda_impl {
                 k + 1
             );
             let hidden = base.config().hidden_size;
-            assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling(hidden, k, 0)?;
-            let device_reported_rows_ceiling =
-                nv_kernels::cuda::gemv_i8_normed_mk_max_m(hidden as i32).max(0) as usize;
-            ensure!(
-                mtp_verify_rows_per_round(k) <= device_reported_rows_ceiling,
-                "this device's lm_head rows-per-call ceiling is {device_reported_rows_ceiling} \
-                 for hidden={hidden}; a k={k} mtp round verifies {} rows (the #107 dflash k=8 \
-                 overflow is the cautionary tale)",
-                mtp_verify_rows_per_round(k)
-            );
+            assert_eager_session_verify_rows_fit(hidden, k)?;
+            if !mtp_eager_deep_k_selected_from_env() {
+                let device_reported_rows_ceiling =
+                    nv_kernels::cuda::gemv_i8_normed_mk_max_m(hidden as i32).max(0) as usize;
+                ensure!(
+                    mtp_verify_rows_per_round(k) <= device_reported_rows_ceiling,
+                    "this device's lm_head rows-per-call ceiling is \
+                     {device_reported_rows_ceiling} for hidden={hidden}; a k={k} mtp round \
+                     verifies {} rows (the #107 dflash k=8 overflow is the cautionary tale)",
+                    mtp_verify_rows_per_round(k)
+                );
+            }
             let device = base.device().clone();
             let mut cache = base.new_kv_cache(max_seq)?;
             let mut mtp_kv = mtp.new_kv_cache(max_seq, &device)?;
 
             let seq = prompt.len();
-            let tokens = Tensor::from_vec(prompt.to_vec(), (1usize, seq), &device)?;
-            let pos = Tensor::from_vec((0..seq as i32).collect::<Vec<i32>>(), seq, &device)?;
-            let (logits, hidden) = base.forward_with_cache_dispatched_hidden_rows(
-                &tokens,
-                &pos,
-                &mut cache,
-                None,
-                Some(1),
-            )?;
-            let anchor = argmax_last_row(&logits)?;
             ensure!(
                 !mtp_reanchor_post_norm_selected_from_env() || mtp.reanchor_post_norm_active(),
                 "{NV_Q38_MTP_REANCHOR_ENV}=1 but this head was not loaded through from_checkpoint \
                  so it carries no trunk output norm"
             );
-            let hidden = mtp.trunk_hidden_rows_as_drafter_anchor_input(&hidden)?;
-            let base_hidden = hidden.narrow(1, seq - 1, 1)?.contiguous()?;
-            mtp.prefill_prompt_kv_shifted_by_one_with_position_zero_on_a_zero_hidden(
-                base, prompt, &hidden, &mut mtp_kv,
+            let chunk = nv_models::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
+                .filter(|&c| seq > c)
+                .unwrap_or(seq);
+            let mut carry_normed_last_row_the_shift_by_one_hands_it_to_the_next_chunk: Option<
+                Tensor,
+            > = None;
+            let mut last_logits: Option<Tensor> = None;
+            let mut fed = 0usize;
+            while fed < seq {
+                let n = chunk.min(seq - fed);
+                let tokens =
+                    Tensor::from_vec(prompt[fed..fed + n].to_vec(), (1usize, n), &device)?;
+                let pos = Tensor::from_vec(
+                    (fed as i32..(fed + n) as i32).collect::<Vec<i32>>(),
+                    n,
+                    &device,
+                )?;
+                let (logits, hidden) = base.forward_with_cache_dispatched_hidden_rows(
+                    &tokens,
+                    &pos,
+                    &mut cache,
+                    None,
+                    Some(1),
+                )?;
+                let normed = mtp.trunk_hidden_rows_as_drafter_anchor_input(&hidden)?;
+                drop(hidden);
+                let first = match carry_normed_last_row_the_shift_by_one_hands_it_to_the_next_chunk
+                    .take()
+                {
+                    Some(prev) => prev,
+                    None => Tensor::zeros(
+                        (1usize, 1usize, normed.dim(2)?),
+                        normed.dtype(),
+                        normed.device(),
+                    )?,
+                };
+                let shifted = if n == 1 {
+                    first
+                } else {
+                    Tensor::cat(&[&first, &normed.narrow(1, 0, n - 1)?], 1)?.contiguous()?
+                };
+                mtp.catch_up_kv_recomputing_and_discarding_q_which_v1_prices_over_a_kv_only_projection(
+                    base,
+                    &prompt[fed..fed + n],
+                    &shifted,
+                    &mut mtp_kv,
+                )?;
+                carry_normed_last_row_the_shift_by_one_hands_it_to_the_next_chunk =
+                    Some(normed.narrow(1, n - 1, 1)?.contiguous()?);
+                last_logits = Some(logits);
+                fed += n;
+            }
+            let anchor = argmax_last_row(
+                &last_logits.expect("mtp session: the non-empty prompt fed at least one chunk"),
             )?;
-            drop(logits);
-            drop(hidden);
+            let base_hidden = carry_normed_last_row_the_shift_by_one_hands_it_to_the_next_chunk
+                .expect("mtp session: the non-empty prompt left a carry row");
             let _ = device.synchronize();
 
+            let p_min = mtp_draft_p_min_from_env();
+            if p_min.is_some() {
+                ensure!(
+                    k >= ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX,
+                    "{NV_Q38_MTP_P_MIN_ENV} needs k >= 2: the cut keeps at least two drafts so \
+                     every submitted verify shares the m>=3 shape"
+                );
+                adaptive_verify_pins_the_env_unset_auto_dp4a_mlp_off_because_greedy_argmax_must_not_depend_on_which_m_the_cut_produced();
+            }
             Ok(Self {
                 base,
                 mtp,
                 k,
+                p_min_drafter_confidence_cut_none_means_fixed_k: p_min,
                 cache,
                 mtp_kv,
                 anchor,
                 base_hidden,
                 max_seq,
                 stats: MtpSpecStats::default(),
+                submitted_draft_len_hist: BTreeMap::new(),
             })
         }
 
@@ -1483,39 +2561,79 @@ mod cuda_impl {
                 self.mtp_kv.len()
             );
 
-            let drafts: Vec<u32> = if draft_fast_device_chained_tokens_selected_from_env() {
-                self.mtp
-                    .draft_chain_reading_tokens_back_once_because_per_step_readback_stalls_the_stream(
+            let p_min_cut = self
+                .p_min_drafter_confidence_cut_none_means_fixed_k
+                .filter(|_| forced_drafts.is_none());
+            let (mut drafts, draft_top_probs): (Vec<u32>, Vec<f32>) =
+                if draft_fast_device_chained_tokens_selected_from_env() {
+                    self.mtp.draft_chain_with_top_probs_reading_back_once(
                         self.base,
                         self.anchor,
                         &self.base_hidden,
                         k,
                         forced_drafts,
+                        p_min_cut.is_some(),
                         &mut self.mtp_kv,
                     )?
-            } else {
-                let mut drafts: Vec<u32> = Vec::with_capacity(k);
-                let mut h = self.base_hidden.clone();
-                let mut tok = self.anchor;
-                for j in 0..k {
-                    let (d, dhidden) =
-                        self.mtp
-                            .forward_draft_tok(self.base, &h, tok, &mut self.mtp_kv)?;
-                    let d = match forced_drafts {
-                        Some(f) => f[j],
-                        None => d,
-                    };
-                    drafts.push(d);
-                    tok = d;
-                    h = dhidden;
-                }
-                drafts
-            };
+                } else if let Some(pmin) = p_min_cut {
+                    let mut drafts: Vec<u32> = Vec::with_capacity(k);
+                    let mut probs: Vec<f32> = Vec::with_capacity(k);
+                    let mut h = self.base_hidden.clone();
+                    let mut tok = self.anchor;
+                    for _ in 0..k {
+                        let (d, p, dhidden) = self.mtp.forward_draft_tok_with_top_prob(
+                            self.base,
+                            &h,
+                            tok,
+                            &mut self.mtp_kv,
+                        )?;
+                        drafts.push(d);
+                        probs.push(p);
+                        tok = d;
+                        h = dhidden;
+                        if p < pmin
+                            && drafts.len()
+                                >= ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX
+                        {
+                            break;
+                        }
+                    }
+                    (drafts, probs)
+                } else {
+                    let mut drafts: Vec<u32> = Vec::with_capacity(k);
+                    let mut h = self.base_hidden.clone();
+                    let mut tok = self.anchor;
+                    for j in 0..k {
+                        let (d, dhidden) =
+                            self.mtp
+                                .forward_draft_tok(self.base, &h, tok, &mut self.mtp_kv)?;
+                        let d = match forced_drafts {
+                            Some(f) => f[j],
+                            None => d,
+                        };
+                        drafts.push(d);
+                        tok = d;
+                        h = dhidden;
+                    }
+                    (drafts, Vec::new())
+                };
+            if let Some(pmin) = p_min_cut {
+                let keep = adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run(
+                    &draft_top_probs,
+                    pmin,
+                );
+                drafts.truncate(keep);
+            }
+            *self
+                .submitted_draft_len_hist
+                .entry(drafts.len())
+                .or_insert(0) += 1;
             let _ = device.synchronize();
             let draft_dt = round_t0.elapsed().as_secs_f64();
 
             let verify_t0 = std::time::Instant::now();
-            let batch = crate::chain::build_chain_batch(self.anchor, &drafts, k + 1, true)?;
+            let batch =
+                crate::chain::build_chain_batch(self.anchor, &drafts, drafts.len() + 1, true)?;
             let m = batch.len();
             let block_pos: Vec<i32> = (0..m as i32).map(|i| l as i32 + i).collect();
             let bt = Tensor::from_vec(batch.clone(), (1usize, m), &device)?;
@@ -1580,6 +2698,7 @@ mod cuda_impl {
                 .push(1000.0 * round_t0.elapsed().as_secs_f64());
             self.stats.draft_ms += 1000.0 * draft_dt;
             self.stats.verify_ms += 1000.0 * verify_dt;
+            self.stats.verify_ms_rounds.push(1000.0 * verify_dt);
             self.stats.commit_ms += 1000.0 * commit_dt;
             self.stats.rounds += 1;
             self.stats.drafted += drafts.len();
@@ -1597,11 +2716,54 @@ mod cuda_impl {
         engine: &'a mut GraphedQwen3Moe,
         mtp: &'a Qwen38DenseMtpHead,
         k: usize,
+        p_min_drafter_confidence_cut_none_means_fixed_k: Option<f32>,
         mtp_kv: MtpKvCache,
         anchor: u32,
         base_hidden: Tensor,
         max_seq: usize,
         pub stats: MtpSpecStats,
+        pub submitted_draft_len_hist: BTreeMap<usize, usize>,
+        pub emitted_argmax_margins_aligned_to_tokens_after_the_anchor_so_a_cross_shape_divergence_can_be_triaged_tie_vs_corruption:
+            Vec<f32>,
+        pub draft_top_prob_rounds_present_only_when_the_p_min_cut_or_round_debug_asked_the_chain_for_probs:
+            Vec<Vec<f32>>,
+        pub tree_headroom_rounds_round_debug_fast_chain_only_drafter_top3_by_step_verify_greedy_rows_accepted:
+            Vec<(Vec<[u32; 3]>, Vec<u32>, usize)>,
+        suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token:
+            Option<crate::qwen38_sufspec::SuffixSpecArm>,
+        tree_env_opt_in_two_branch_m6_rounds: bool,
+        pub tree_rounds: usize,
+        pub tree_branch_b_rounds: usize,
+        pub tree_branch_b_recovered_tokens: usize,
+    }
+
+    const _: () = assert!(
+        MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION
+            == nv_models::qwen3_5_moe::VERIFY_TREE_TWO_BRANCH_M6_ROWS
+    );
+    const _: () = assert!(
+        MTP_TREE_BRANCH_B_FIRST_ROW_4_ROWS_ARE_ANCHOR_A1_A2_A3_B1_B2
+            == nv_models::qwen3_5_moe::VERIFY_TREE_TWO_BRANCH_M6_BRANCH_B_FIRST_ROW
+    );
+
+    fn oapi_phase_walls_selected_from_env_stderr_only_so_streamed_bytes_never_move() -> bool {
+        std::env::var("NV_OAPI_PHASE_WALLS").ok().as_deref() == Some("1")
+    }
+
+    fn session_phase_wall_synced(
+        device: &Device,
+        walls_on: bool,
+        t: &mut std::time::Instant,
+        label: &str,
+        acc: &mut String,
+    ) {
+        if !walls_on {
+            return;
+        }
+        let _ = device.synchronize();
+        use std::fmt::Write;
+        let _ = write!(acc, " {label}_ms={:.1}", t.elapsed().as_secs_f64() * 1000.0);
+        *t = std::time::Instant::now();
     }
 
     impl<'a> Qwen38MtpGraphedDecodeSession<'a> {
@@ -1621,6 +2783,9 @@ mod cuda_impl {
                 k + 1
             );
             let hidden = engine.underlying().config().hidden_size;
+            engine
+                .underlying()
+                .prebuild_gdn_nvfp4_verify_twins_if_armed(engine.device());
             assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling(hidden, k, 0)?;
             let device_reported_rows_ceiling =
                 nv_kernels::cuda::gemv_i8_normed_mk_max_m(hidden as i32).max(0) as usize;
@@ -1630,12 +2795,78 @@ mod cuda_impl {
                  for hidden={hidden}; a k={k} mtp round verifies {} rows",
                 mtp_verify_rows_per_round(k)
             );
+            let walls_on = oapi_phase_walls_selected_from_env_stderr_only_so_streamed_bytes_never_move();
+            let mut acc = String::new();
+            let t_all = std::time::Instant::now();
+            let mut t_phase = std::time::Instant::now();
+            let device = engine.device().clone();
             engine.reset()?;
             engine.install_grouped_moe()?;
-            let device = engine.device().clone();
+            session_phase_wall_synced(&device, walls_on, &mut t_phase, "reset_install", &mut acc);
             let mut mtp_kv = mtp.new_kv_cache(max_seq, &device)?;
+            session_phase_wall_synced(&device, walls_on, &mut t_phase, "drafter_kv_alloc", &mut acc);
             let (last_row, hidden_t) = engine.prefill_hidden_serving_last_row_logits(prompt)?;
+            session_phase_wall_synced(&device, walls_on, &mut t_phase, "trunk_prefill", &mut acc);
             engine.ensure_verify_lane(k + 1)?;
+            session_phase_wall_synced(&device, walls_on, &mut t_phase, "verify_capture", &mut acc);
+            let p_min = mtp_draft_p_min_from_env();
+            if p_min.is_some() {
+                ensure!(
+                    k >= ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX,
+                    "{NV_Q38_MTP_P_MIN_ENV} needs k >= 2: the cut keeps at least two drafts so \
+                     every submitted verify shares the m>=3 graph shape"
+                );
+                adaptive_verify_pins_the_env_unset_auto_dp4a_mlp_off_because_greedy_argmax_must_not_depend_on_which_m_the_cut_produced();
+            }
+            let suffix_on = crate::qwen38_sufspec::spec_suffix_selected_from_env();
+            if suffix_on {
+                adaptive_verify_pins_the_env_unset_auto_dp4a_mlp_off_because_greedy_argmax_must_not_depend_on_which_m_the_cut_produced();
+            }
+            if p_min.is_some() || suffix_on || mtp_precapture_selected_from_env() {
+                let mut shapes: Vec<usize> = if p_min.is_some() {
+                    (1 + ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX
+                        ..=k + 1)
+                        .collect()
+                } else {
+                    vec![k + 1]
+                };
+                if suffix_on {
+                    shapes.extend(crate::qwen38_sufspec::SuffixSpecArm::verify_shapes_to_precapture());
+                }
+                engine
+                    .precapture_verify_graphs_then_discard_state_so_no_mid_run_capture_pollutes_verify_ms(
+                        &shapes,
+                    )?;
+            }
+            let tree_on = mtp_tree_selected_from_env();
+            if tree_on {
+                ensure!(
+                    k == MTP_TREE_BRANCH_A_DEPTH_3_SO_THE_TREE_NEEDS_EXACTLY_NV_MTP_K_3,
+                    "{NV_Q38_MTP_TREE_ENV}=1 serves the fixed two-branch m=6 shape whose branch \
+                     A is the k=3 chain; got k={k}"
+                );
+                ensure!(
+                    draft_fast_device_chained_tokens_selected_from_env(),
+                    "{NV_Q38_MTP_TREE_ENV}=1 forks the fast device-chained draft loop; set \
+                     NV_Q38_DRAFT_FAST=1"
+                );
+                ensure!(
+                    p_min.is_none(),
+                    "{NV_Q38_MTP_TREE_ENV}=1 needs the fixed 6-row shape; the {NV_Q38_MTP_P_MIN_ENV} \
+                     adaptive cut changes the submitted length per round"
+                );
+                adaptive_verify_pins_the_env_unset_auto_dp4a_mlp_off_because_greedy_argmax_must_not_depend_on_which_m_the_cut_produced();
+                let tree_rows =
+                    MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION;
+                assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling(hidden, tree_rows - 1, 0)?;
+                ensure!(
+                    tree_rows <= device_reported_rows_ceiling,
+                    "tree verify rows {tree_rows} > device lm_head rows ceiling \
+                     {device_reported_rows_ceiling}"
+                );
+                engine
+                    .precapture_verify_tree_graph_then_discard_state_so_no_mid_run_capture_pollutes_verify_ms()?;
+            }
             let anchor = argmax_host_row(&last_row)?;
             ensure!(
                 !mtp_reanchor_post_norm_selected_from_env() || mtp.reanchor_post_norm_active(),
@@ -1644,6 +2875,7 @@ mod cuda_impl {
             );
             let hidden_t = mtp.trunk_hidden_rows_as_drafter_anchor_input(&hidden_t)?;
             let base_hidden = hidden_t.narrow(1, prompt.len() - 1, 1)?.contiguous()?;
+            session_phase_wall_synced(&device, walls_on, &mut t_phase, "anchor_prep", &mut acc);
             mtp.prefill_prompt_kv_shifted_by_one_with_position_zero_on_a_zero_hidden(
                 engine.underlying(),
                 prompt,
@@ -1651,16 +2883,58 @@ mod cuda_impl {
                 &mut mtp_kv,
             )?;
             let _ = device.synchronize();
+            if walls_on {
+                session_phase_wall_synced(
+                    &device,
+                    walls_on,
+                    &mut t_phase,
+                    "drafter_catchup",
+                    &mut acc,
+                );
+                eprintln!(
+                    "Q38-SESSION-PHASES depth={} k={k} max_seq={max_seq}{acc} total_ms={:.1}",
+                    prompt.len(),
+                    t_all.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            let suffix_arm = if suffix_on {
+                let mut arm = crate::qwen38_sufspec::SuffixSpecArm::new();
+                arm.extend_capped(prompt);
+                arm.extend_capped(&[anchor]);
+                Some(arm)
+            } else {
+                None
+            };
             Ok(Self {
                 engine,
                 mtp,
                 k,
+                p_min_drafter_confidence_cut_none_means_fixed_k: p_min,
                 mtp_kv,
                 anchor,
                 base_hidden,
                 max_seq,
                 stats: MtpSpecStats::default(),
+                submitted_draft_len_hist: BTreeMap::new(),
+                emitted_argmax_margins_aligned_to_tokens_after_the_anchor_so_a_cross_shape_divergence_can_be_triaged_tie_vs_corruption:
+                    Vec::new(),
+                draft_top_prob_rounds_present_only_when_the_p_min_cut_or_round_debug_asked_the_chain_for_probs:
+                    Vec::new(),
+                tree_headroom_rounds_round_debug_fast_chain_only_drafter_top3_by_step_verify_greedy_rows_accepted:
+                    Vec::new(),
+                suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token:
+                    suffix_arm,
+                tree_env_opt_in_two_branch_m6_rounds: tree_on,
+                tree_rounds: 0,
+                tree_branch_b_rounds: 0,
+                tree_branch_b_recovered_tokens: 0,
             })
+        }
+
+        pub fn suffix_rounds_drafted_accepted(&self) -> Option<(usize, usize, usize)> {
+            self.suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                .as_ref()
+                .map(|a| (a.rounds, a.drafted, a.accepted))
         }
 
         pub fn anchor(&self) -> u32 {
@@ -1680,7 +2954,12 @@ mod cuda_impl {
         }
 
         pub fn round_fits(&self) -> bool {
-            self.engine.current_pos() + self.k + 1 <= self.max_seq
+            let rows = if self.tree_env_opt_in_two_branch_m6_rounds {
+                MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION
+            } else {
+                self.k + 1
+            };
+            self.engine.current_pos() + rows <= self.max_seq
         }
 
         pub fn round(&mut self) -> Result<Vec<u32>> {
@@ -1729,6 +3008,31 @@ mod cuda_impl {
             self.mtp_kv.rewind_to(l)
         }
 
+        pub fn drafts_and_top_probs_for_one_round_then_rewind_so_an_ab_gate_reads_the_chain_without_committing(
+            &mut self,
+            want_top_probs: bool,
+        ) -> Result<(Vec<u32>, Vec<f32>)> {
+            let l = self.mtp_kv.len();
+            ensure!(
+                l == self.engine.current_pos(),
+                "draft ab probe needs a settled session: drafter kv holds {} rows, trunk \
+                 committed {}",
+                l,
+                self.engine.current_pos()
+            );
+            let out = self.mtp.draft_chain_with_top_probs_reading_back_once(
+                self.engine.underlying(),
+                self.anchor,
+                &self.base_hidden,
+                self.k,
+                None,
+                want_top_probs,
+                &mut self.mtp_kv,
+            )?;
+            self.mtp_kv.rewind_to(l)?;
+            Ok(out)
+        }
+
         fn round_inner(&mut self, forced_drafts: Option<&[u32]>) -> Result<Vec<u32>> {
             let device = self.engine.device().clone();
             let round_t0 = std::time::Instant::now();
@@ -1746,43 +3050,119 @@ mod cuda_impl {
                 self.mtp_kv.len()
             );
 
-            let drafts: Vec<u32> = if draft_fast_device_chained_tokens_selected_from_env() {
-                self.mtp
-                    .draft_chain_reading_tokens_back_once_because_per_step_readback_stalls_the_stream(
-                        self.engine.underlying(),
-                        self.anchor,
-                        &self.base_hidden,
-                        k,
-                        forced_drafts,
-                        &mut self.mtp_kv,
-                    )?
+            let round_debug_on =
+                nv_config::env_arm_opt_in_eq_some_1_reread_every_call(NV_Q38_MTP_ROUND_DEBUG_ENV);
+            let p_min_cut = self
+                .p_min_drafter_confidence_cut_none_means_fixed_k
+                .filter(|_| forced_drafts.is_none());
+            let want_probs = forced_drafts.is_none() && (p_min_cut.is_some() || round_debug_on);
+            let suffix_drafts: Option<Vec<u32>> = if forced_drafts.is_none() {
+                self.suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                    .as_ref()
+                    .and_then(|arm| arm.propose_for_round(self.max_seq - l - 1))
             } else {
-                let mut drafts: Vec<u32> = Vec::with_capacity(k);
-                let mut h = self.base_hidden.clone();
-                let mut tok = self.anchor;
-                for j in 0..k {
-                    let (d, dhidden) = self.mtp.forward_draft_tok(
-                        self.engine.underlying(),
-                        &h,
-                        tok,
-                        &mut self.mtp_kv,
-                    )?;
-                    let d = match forced_drafts {
-                        Some(f) => f[j],
-                        None => d,
-                    };
-                    drafts.push(d);
-                    tok = d;
-                    h = dhidden;
-                }
-                drafts
+                None
             };
+            let suffix_round = suffix_drafts.is_some();
+            if self.tree_env_opt_in_two_branch_m6_rounds && forced_drafts.is_none() && !suffix_round
+            {
+                return self.tree_round_two_branch_m6(l, round_t0);
+            }
+            let mut round_drafter_top3_by_step: Vec<[u32; 3]> = Vec::new();
+            let (mut drafts, draft_top_probs): (Vec<u32>, Vec<f32>) =
+                if let Some(sd) = suffix_drafts {
+                    self.mtp
+                        .catch_up_kv_recomputing_and_discarding_q_which_v1_prices_over_a_kv_only_projection(
+                            self.engine.underlying(),
+                            &[self.anchor],
+                            &self.base_hidden,
+                            &mut self.mtp_kv,
+                        )?;
+                    (sd, Vec::new())
+                } else if draft_fast_device_chained_tokens_selected_from_env() {
+                    let (d, p, t3) = self
+                        .mtp
+                        .draft_chain_with_top_probs_and_step_top3_whose_per_step_host_readback_syncs_so_headroom_probes_only(
+                            self.engine.underlying(),
+                            self.anchor,
+                            &self.base_hidden,
+                            k,
+                            forced_drafts,
+                            want_probs,
+                            round_debug_on,
+                            &mut self.mtp_kv,
+                        )?;
+                    round_drafter_top3_by_step = t3;
+                    (d, p)
+                } else {
+                    let mut drafts: Vec<u32> = Vec::with_capacity(k);
+                    let mut probs: Vec<f32> = Vec::with_capacity(k);
+                    let mut h = self.base_hidden.clone();
+                    let mut tok = self.anchor;
+                    for j in 0..k {
+                        let (d, p, dhidden) = if want_probs {
+                            self.mtp.forward_draft_tok_with_top_prob(
+                                self.engine.underlying(),
+                                &h,
+                                tok,
+                                &mut self.mtp_kv,
+                            )?
+                        } else {
+                            let (d, dhidden) = self.mtp.forward_draft_tok(
+                                self.engine.underlying(),
+                                &h,
+                                tok,
+                                &mut self.mtp_kv,
+                            )?;
+                            (d, f32::NAN, dhidden)
+                        };
+                        if want_probs {
+                            probs.push(p);
+                        }
+                        let d = match forced_drafts {
+                            Some(f) => f[j],
+                            None => d,
+                        };
+                        drafts.push(d);
+                        tok = d;
+                        h = dhidden;
+                        if let Some(pmin) = p_min_cut {
+                            if p < pmin
+                                && drafts.len()
+                                    >= ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    (drafts, probs)
+                };
+            if !draft_top_probs.is_empty() {
+                self.draft_top_prob_rounds_present_only_when_the_p_min_cut_or_round_debug_asked_the_chain_for_probs
+                    .push(draft_top_probs.clone());
+            }
+            if let Some(pmin) = p_min_cut {
+                if !suffix_round {
+                    let keep =
+                        adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run(
+                            &draft_top_probs,
+                            pmin,
+                        );
+                    drafts.truncate(keep);
+                }
+            }
+            *self
+                .submitted_draft_len_hist
+                .entry(drafts.len())
+                .or_insert(0) += 1;
             let _ = device.synchronize();
             let draft_dt = round_t0.elapsed().as_secs_f64();
 
             let verify_t0 = std::time::Instant::now();
-            let batch = crate::chain::build_chain_batch(self.anchor, &drafts, k + 1, true)?;
+            let batch =
+                crate::chain::build_chain_batch(self.anchor, &drafts, drafts.len() + 1, true)?;
             let m = batch.len();
+            self.engine.ensure_verify_lane(m)?;
             self.engine.forward_verify_chain(&batch)?;
             let flat = self.engine.verify_logits_host()?;
             let vocab = self.engine.vocab_size();
@@ -1791,12 +3171,49 @@ mod cuda_impl {
 
             let commit_t0 = std::time::Instant::now();
             let acc = crate::chain::accept_prefix_argmax(&batch, &greedy)?;
+            if !round_drafter_top3_by_step.is_empty() {
+                self.tree_headroom_rounds_round_debug_fast_chain_only_drafter_top3_by_step_verify_greedy_rows_accepted
+                    .push((round_drafter_top3_by_step, greedy.clone(), acc.draft_accepted));
+            }
+            if round_debug_on {
+                for r in 0..m {
+                    let row = &flat[r * vocab..(r + 1) * vocab];
+                    let (t1, v1, t2, v2) = top2_host_row_for_argmax_margin_triage(row);
+                    eprintln!(
+                        "[q38-mtp-round-debug] l={l} m={m} row={r} pos={} tok_in={} greedy={} \
+                         top1={t1}:{v1:.4} top2={t2}:{v2:.4} margin={:.6} commit_len={} bonus={}",
+                        l + r,
+                        batch[r],
+                        greedy[r],
+                        v1 - v2,
+                        acc.commit_len,
+                        acc.next_bonus
+                    );
+                }
+            }
             let consumed = acc.commit_len;
             let accepted = acc.draft_accepted;
             let bonus = acc.next_bonus;
 
             let mut emitted: Vec<u32> = drafts[..accepted].to_vec();
             emitted.push(bonus);
+            if let Some(arm) = self
+                .suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                .as_mut()
+            {
+                arm.extend_capped(&emitted);
+                if suffix_round {
+                    arm.rounds += 1;
+                    arm.drafted += drafts.len();
+                    arm.accepted += accepted;
+                }
+            }
+            for r in 0..consumed {
+                let (_t1, v1, _t2, v2) =
+                    top2_host_row_for_argmax_margin_triage(&flat[r * vocab..(r + 1) * vocab]);
+                self.emitted_argmax_margins_aligned_to_tokens_after_the_anchor_so_a_cross_shape_divergence_can_be_triaged_tie_vs_corruption
+                    .push(v1 - v2);
+            }
 
             let vhidden = self
                 .engine
@@ -1834,6 +3251,7 @@ mod cuda_impl {
                 .push(1000.0 * round_t0.elapsed().as_secs_f64());
             self.stats.draft_ms += 1000.0 * draft_dt;
             self.stats.verify_ms += 1000.0 * verify_dt;
+            self.stats.verify_ms_rounds.push(1000.0 * verify_dt);
             self.stats.commit_ms += 1000.0 * commit_dt;
             self.stats.rounds += 1;
             self.stats.drafted += drafts.len();
@@ -1844,6 +3262,199 @@ mod cuda_impl {
             }
             *self.stats.accept_len_hist.entry(accepted).or_insert(0) += 1;
             Ok(emitted)
+        }
+
+        fn tree_round_two_branch_m6(
+            &mut self,
+            l: usize,
+            round_t0: std::time::Instant,
+        ) -> Result<Vec<u32>> {
+            let device = self.engine.device().clone();
+            let rows =
+                MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION;
+            ensure!(
+                l + rows <= self.max_seq,
+                "tree verify overflow: committed={l} + rows={rows} > max_seq={}",
+                self.max_seq
+            );
+            let (drafts, c2, c2d2) = self.mtp.draft_two_branch_tree_chain_plus_top2_sibling_step(
+                self.engine.underlying(),
+                self.anchor,
+                &self.base_hidden,
+                &mut self.mtp_kv,
+            )?;
+            *self
+                .submitted_draft_len_hist
+                .entry(rows - 1)
+                .or_insert(0) += 1;
+            let _ = device.synchronize();
+            let draft_dt = round_t0.elapsed().as_secs_f64();
+
+            let verify_t0 = std::time::Instant::now();
+            let rows_tokens: Vec<u32> =
+                vec![self.anchor, drafts[0], drafts[1], drafts[2], c2, c2d2];
+            self.engine.ensure_verify_tree_lane_two_branch_m6()?;
+            self.engine.forward_verify_tree_two_branch_m6(&rows_tokens)?;
+            let flat = self.engine.verify_logits_host()?;
+            let vocab = self.engine.vocab_size();
+            let greedy = argmax_host_rows(&flat, rows, vocab)?;
+            let verify_dt = verify_t0.elapsed().as_secs_f64();
+
+            let commit_t0 = std::time::Instant::now();
+            let acc = accept_two_branch_tree_m6(&rows_tokens, &greedy)?;
+            let decided_rows: Vec<usize> = match acc.branch_b_accepted_rows {
+                None => (0..acc.depth_consumed).collect(),
+                Some(b) => std::iter::once(0)
+                    .chain(
+                        MTP_TREE_BRANCH_B_FIRST_ROW_4_ROWS_ARE_ANCHOR_A1_A2_A3_B1_B2
+                            ..MTP_TREE_BRANCH_B_FIRST_ROW_4_ROWS_ARE_ANCHOR_A1_A2_A3_B1_B2 + b,
+                    )
+                    .collect(),
+            };
+            for &r in &decided_rows {
+                let (_t1, v1, _t2, v2) =
+                    top2_host_row_for_argmax_margin_triage(&flat[r * vocab..(r + 1) * vocab]);
+                self.emitted_argmax_margins_aligned_to_tokens_after_the_anchor_so_a_cross_shape_divergence_can_be_triaged_tie_vs_corruption
+                    .push(v1 - v2);
+            }
+
+            let vhidden = self
+                .engine
+                .verify_hidden_rows_tensor_valid_until_next_forward()?;
+            let vhidden_for_drafter = self
+                .mtp
+                .trunk_hidden_rows_as_drafter_anchor_input(&vhidden)?;
+            self.base_hidden = vhidden_for_drafter.narrow(1, acc.bonus_row, 1)?.copy()?;
+
+            self.mtp_kv.rewind_to(l + 1)?;
+            match acc.branch_b_accepted_rows {
+                None if acc.drafts_accepted >= 1 => {
+                    self.mtp.catch_up_kv_recomputing_and_discarding_q_which_v1_prices_over_a_kv_only_projection(
+                        self.engine.underlying(),
+                        &rows_tokens[1..=acc.drafts_accepted],
+                        &vhidden_for_drafter
+                            .narrow(1, 0, acc.drafts_accepted)?
+                            .contiguous()?,
+                        &mut self.mtp_kv,
+                    )?;
+                }
+                Some(b) => {
+                    let b0 = MTP_TREE_BRANCH_B_FIRST_ROW_4_ROWS_ARE_ANCHOR_A1_A2_A3_B1_B2;
+                    let toks: Vec<u32> = rows_tokens[b0..b0 + b].to_vec();
+                    let hiddens = if b == 1 {
+                        vhidden_for_drafter.narrow(1, 0, 1)?.contiguous()?
+                    } else {
+                        Tensor::cat(
+                            &[
+                                &vhidden_for_drafter.narrow(1, 0, 1)?,
+                                &vhidden_for_drafter.narrow(1, b0, 1)?,
+                            ],
+                            1,
+                        )?
+                        .contiguous()?
+                    };
+                    self.mtp.catch_up_kv_recomputing_and_discarding_q_which_v1_prices_over_a_kv_only_projection(
+                        self.engine.underlying(),
+                        &toks,
+                        &hiddens,
+                        &mut self.mtp_kv,
+                    )?;
+                }
+                None => {}
+            }
+            ensure!(
+                self.mtp_kv.len() == l + acc.depth_consumed,
+                "tree round kv catch-up desync: drafter cache holds {} rows, trunk commits {}",
+                self.mtp_kv.len(),
+                l + acc.depth_consumed
+            );
+
+            self.engine.commit_verify_tree(
+                acc.depth_consumed,
+                acc.bonus_row,
+                acc.branch_b_accepted_rows,
+            )?;
+            let bonus = *acc
+                .emitted
+                .last()
+                .expect("tree accept always emits at least the bonus");
+            self.anchor = bonus;
+            if let Some(arm) = self
+                .suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                .as_mut()
+            {
+                arm.extend_capped(&acc.emitted);
+            }
+
+            let _ = device.synchronize();
+            let commit_dt = commit_t0.elapsed().as_secs_f64();
+            self.stats
+                .round_ms
+                .push(1000.0 * round_t0.elapsed().as_secs_f64());
+            self.stats.draft_ms += 1000.0 * draft_dt;
+            self.stats.verify_ms += 1000.0 * verify_dt;
+            self.stats.verify_ms_rounds.push(1000.0 * verify_dt);
+            self.stats.commit_ms += 1000.0 * commit_dt;
+            self.stats.rounds += 1;
+            self.stats.drafted += rows - 1;
+            self.stats.accepted += acc.drafts_accepted;
+            self.stats.emitted += acc.emitted.len();
+            if acc.drafts_accepted > 0 {
+                self.stats.pos0_accepted += 1;
+            }
+            *self
+                .stats
+                .accept_len_hist
+                .entry(acc.drafts_accepted)
+                .or_insert(0) += 1;
+            self.tree_rounds += 1;
+            if let Some(b) = acc.branch_b_accepted_rows {
+                self.tree_branch_b_rounds += 1;
+                self.tree_branch_b_recovered_tokens += b;
+            }
+            Ok(acc.emitted)
+        }
+    }
+
+    impl nv_models::qwen3_5_mtp::MtpMoeServingRounds for Qwen38MtpDecodeSession<'_> {
+        fn anchor(&self) -> u32 {
+            Qwen38MtpDecodeSession::anchor(self)
+        }
+        fn round_fits(&self) -> bool {
+            Qwen38MtpDecodeSession::round_fits(self)
+        }
+        fn round(&mut self) -> Result<Vec<u32>> {
+            Qwen38MtpDecodeSession::round(self)
+        }
+        fn stats(&self) -> &MtpSpecStats {
+            &self.stats
+        }
+        fn arm_name(&self) -> &'static str {
+            "eager"
+        }
+        fn capture_active(&self) -> bool {
+            false
+        }
+    }
+
+    impl nv_models::qwen3_5_mtp::MtpMoeServingRounds for Qwen38MtpGraphedDecodeSession<'_> {
+        fn anchor(&self) -> u32 {
+            Qwen38MtpGraphedDecodeSession::anchor(self)
+        }
+        fn round_fits(&self) -> bool {
+            Qwen38MtpGraphedDecodeSession::round_fits(self)
+        }
+        fn round(&mut self) -> Result<Vec<u32>> {
+            Qwen38MtpGraphedDecodeSession::round(self)
+        }
+        fn stats(&self) -> &MtpSpecStats {
+            &self.stats
+        }
+        fn arm_name(&self) -> &'static str {
+            "captured-verify"
+        }
+        fn capture_active(&self) -> bool {
+            self.engine.capture_active()
         }
     }
 
@@ -1883,15 +3494,18 @@ mod cuda_impl {
     impl<'a> Qwen38MtpSelfSpecEngine<'a> {
         pub fn new(base: &'a Qwen3Moe, mtp: &'a Qwen38DenseMtpHead, k: usize) -> Result<Self> {
             let hidden = base.config().hidden_size;
-            assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling(hidden, k, 0)?;
-            let device_reported_rows_ceiling =
-                nv_kernels::cuda::gemv_i8_normed_mk_max_m(hidden as i32).max(0) as usize;
-            ensure!(
-                mtp_verify_rows_per_round(k) <= device_reported_rows_ceiling,
-                "this device's lm_head rows-per-call ceiling is {device_reported_rows_ceiling} \
-                 for hidden={hidden}; a k={k} mtp round verifies {} rows",
-                mtp_verify_rows_per_round(k)
-            );
+            assert_eager_session_verify_rows_fit(hidden, k)?;
+            if !mtp_eager_deep_k_selected_from_env() {
+                let device_reported_rows_ceiling =
+                    nv_kernels::cuda::gemv_i8_normed_mk_max_m(hidden as i32).max(0) as usize;
+                ensure!(
+                    mtp_verify_rows_per_round(k) <= device_reported_rows_ceiling,
+                    "this device's lm_head rows-per-call ceiling is \
+                     {device_reported_rows_ceiling} for hidden={hidden}; a k={k} mtp round \
+                     verifies {} rows",
+                    mtp_verify_rows_per_round(k)
+                );
+            }
             Ok(Self {
                 base,
                 mtp,
@@ -1965,13 +3579,51 @@ mod cuda_impl {
             let mut cache = self.base.new_kv_cache(max_seq)?;
             let mut stats = MtpSpecStats::default();
             let seq = prompt.len();
-            let tokens = Tensor::from_vec(prompt.to_vec(), (1usize, seq), &device)?;
-            let pos = Tensor::from_vec((0..seq as i32).collect::<Vec<i32>>(), seq, &device)?;
-            let (logits, _hidden) =
-                self.base
-                    .forward_with_cache_dispatched_hidden(&tokens, &pos, &mut cache, None)?;
-            let mut anchor = argmax_last_row(&logits)?;
-            drop(logits);
+            let mut anchor = match nv_models::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
+                .filter(|&c| seq > c)
+            {
+                Some(chunk) => {
+                    let mut fed = 0usize;
+                    let mut last: Option<Tensor> = None;
+                    while fed < seq {
+                        let n = chunk.min(seq - fed);
+                        let toks = Tensor::from_vec(
+                            prompt[fed..fed + n].to_vec(),
+                            (1usize, n),
+                            &device,
+                        )?;
+                        let pos = Tensor::from_vec(
+                            (fed as i32..(fed + n) as i32).collect::<Vec<i32>>(),
+                            n,
+                            &device,
+                        )?;
+                        let (logits, _h) = self.base.forward_with_cache_dispatched_hidden_rows(
+                            &toks,
+                            &pos,
+                            &mut cache,
+                            None,
+                            Some(1),
+                        )?;
+                        last = Some(logits);
+                        fed += n;
+                    }
+                    argmax_last_row(
+                        &last.expect("reference: the non-empty prompt fed at least one chunk"),
+                    )?
+                }
+                None => {
+                    let tokens = Tensor::from_vec(prompt.to_vec(), (1usize, seq), &device)?;
+                    let pos =
+                        Tensor::from_vec((0..seq as i32).collect::<Vec<i32>>(), seq, &device)?;
+                    let (logits, _hidden) = self.base.forward_with_cache_dispatched_hidden(
+                        &tokens,
+                        &pos,
+                        &mut cache,
+                        None,
+                    )?;
+                    argmax_last_row(&logits)?
+                }
+            };
 
             let mut generated: Vec<u32> = vec![anchor];
             if self.stop_ids.contains(&anchor) {
@@ -2014,3 +3666,82 @@ pub use cuda_impl::{
     MtpKvCache, Qwen38DenseMtpHead, Qwen38MtpDecodeSession, Qwen38MtpGraphedDecodeSession,
     Qwen38MtpSelfSpecEngine,
 };
+
+#[cfg(test)]
+mod two_branch_tree_accept_tests {
+    use super::*;
+
+    const ROWS: [u32; 6] = [10, 11, 12, 13, 21, 22];
+
+    #[test]
+    fn branch_a_full_accept_takes_depth_4_bonus_from_row_3() {
+        let acc = accept_two_branch_tree_m6(&ROWS, &[11, 12, 13, 99, 7, 7]).unwrap();
+        assert_eq!(acc.emitted, vec![11, 12, 13, 99]);
+        assert_eq!(acc.drafts_accepted, 3);
+        assert_eq!(acc.depth_consumed, 4);
+        assert_eq!(acc.bonus_row, 3);
+        assert_eq!(acc.branch_b_accepted_rows, None);
+    }
+
+    #[test]
+    fn branch_a_partial_accept_stops_at_first_mismatch() {
+        let acc = accept_two_branch_tree_m6(&ROWS, &[11, 55, 13, 99, 7, 7]).unwrap();
+        assert_eq!(acc.emitted, vec![11, 55]);
+        assert_eq!(acc.drafts_accepted, 1);
+        assert_eq!(acc.depth_consumed, 2);
+        assert_eq!(acc.bonus_row, 1);
+        assert_eq!(acc.branch_b_accepted_rows, None);
+    }
+
+    #[test]
+    fn branch_b_sibling_only_accepts_c2_and_takes_row_4_bonus() {
+        let acc = accept_two_branch_tree_m6(&ROWS, &[21, 0, 0, 0, 77, 0]).unwrap();
+        assert_eq!(acc.emitted, vec![21, 77]);
+        assert_eq!(acc.drafts_accepted, 1);
+        assert_eq!(acc.depth_consumed, 2);
+        assert_eq!(acc.bonus_row, 4);
+        assert_eq!(acc.branch_b_accepted_rows, Some(1));
+    }
+
+    #[test]
+    fn branch_b_with_continuation_accepts_both_and_takes_row_5_bonus() {
+        let acc = accept_two_branch_tree_m6(&ROWS, &[21, 0, 0, 0, 22, 88]).unwrap();
+        assert_eq!(acc.emitted, vec![21, 22, 88]);
+        assert_eq!(acc.drafts_accepted, 2);
+        assert_eq!(acc.depth_consumed, 3);
+        assert_eq!(acc.bonus_row, 5);
+        assert_eq!(acc.branch_b_accepted_rows, Some(2));
+    }
+
+    #[test]
+    fn neither_branch_matches_emits_the_anchor_rows_bonus_alone() {
+        let acc = accept_two_branch_tree_m6(&ROWS, &[7, 11, 12, 13, 21, 22]).unwrap();
+        assert_eq!(acc.emitted, vec![7]);
+        assert_eq!(acc.drafts_accepted, 0);
+        assert_eq!(acc.depth_consumed, 1);
+        assert_eq!(acc.bonus_row, 0);
+        assert_eq!(acc.branch_b_accepted_rows, None);
+    }
+
+    #[test]
+    fn degenerate_equal_top1_top2_prefers_branch_a_whose_depth_reaches_further() {
+        let rows = [10u32, 11, 12, 13, 11, 22];
+        let acc = accept_two_branch_tree_m6(&rows, &[11, 12, 0, 0, 0, 0]).unwrap();
+        assert_eq!(acc.branch_b_accepted_rows, None);
+        assert_eq!(acc.emitted, vec![11, 12, 0]);
+        assert_eq!(acc.bonus_row, 2);
+    }
+
+    #[test]
+    fn emitted_stream_matches_the_chain_walk_on_every_greedy_pattern() {
+        for pat in 0u32..64 {
+            let greedy: Vec<u32> = (0..6)
+                .map(|i| if pat & (1 << i) != 0 { ROWS.get(i + 1).copied().unwrap_or(21) } else { 999 })
+                .collect();
+            let acc = accept_two_branch_tree_m6(&ROWS, &greedy).unwrap();
+            assert!(acc.depth_consumed == acc.drafts_accepted + 1);
+            assert_eq!(acc.emitted.len(), acc.drafts_accepted + 1);
+            assert!(acc.depth_consumed >= 1 && acc.depth_consumed <= 4);
+        }
+    }
+}

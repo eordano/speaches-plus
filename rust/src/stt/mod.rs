@@ -64,6 +64,61 @@ pub fn is_translate_unsupported(err: &anyhow::Error) -> bool {
     err.downcast_ref::<TranslateUnsupported>().is_some()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SttRequestOptions {
+    pub language: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+impl SttRequestOptions {
+    pub fn is_default(&self) -> bool {
+        self.language.is_none() && self.initial_prompt.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SttParamUnsupported {
+    pub param: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for SttParamUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SttParamUnsupported {}
+
+pub fn stt_param_unsupported(err: &anyhow::Error) -> Option<&SttParamUnsupported> {
+    err.downcast_ref::<SttParamUnsupported>()
+}
+
+pub const GENERIC_WHISPER_ALIASES_MATCH_ANY_WHISPER_BACKEND: [&str; 2] = ["whisper", "whisper1"];
+
+fn normalize_stt_model_id(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+pub const INITIAL_PROMPT_TAIL_TOKENS_HALF_WHISPER_TEXT_CTX_MINUS_ONE: usize = 223;
+
+pub const INITIAL_PROMPT_TAIL_CHARS_CAP_BOUNDS_TOKENIZE_COST: usize = 4_096;
+
+pub fn initial_prompt_tail(prompt: &str) -> String {
+    let cleaned: String = prompt.chars().filter(|c| *c != '\0').collect();
+    let n = cleaned.chars().count();
+    if n <= INITIAL_PROMPT_TAIL_CHARS_CAP_BOUNDS_TOKENIZE_COST {
+        return cleaned;
+    }
+    cleaned
+        .chars()
+        .skip(n - INITIAL_PROMPT_TAIL_CHARS_CAP_BOUNDS_TOKENIZE_COST)
+        .collect()
+}
+
 fn checkpoint_is_english_only(lower_id: &str) -> bool {
     let bytes = lower_id.as_bytes();
     let mut from = 0;
@@ -103,15 +158,45 @@ fn env_flag_enabled(name: &str) -> bool {
     }
 }
 
+fn ort_dylib_carries_the_cuda_ep() -> bool {
+    std::env::var_os("ORT_DYLIB_PATH")
+        .map(PathBuf::from)
+        .and_then(|p| {
+            p.parent()
+                .map(|d| d.join("libonnxruntime_providers_cuda.so"))
+        })
+        .is_some_and(|p| p.exists())
+}
+
+fn parakeet_checkpoint_present() -> bool {
+    parakeet::parakeet_dir().is_ok_and(|d| d.join("encoder-model.onnx").exists())
+}
+
 impl Backend {
     pub fn from_env() -> Self {
-        match std::env::var(super::defaults::env::STT_BACKEND)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        let unset_prefers_gpu_parakeet_because_cpu_whisper_cannot_dictate_live =
+            ort_dylib_carries_the_cuda_ep() && parakeet_checkpoint_present();
+        Self::from_value(
+            &std::env::var(super::defaults::env::STT_BACKEND)
+                .unwrap_or_default()
+                .to_ascii_lowercase(),
+            unset_prefers_gpu_parakeet_because_cpu_whisper_cannot_dictate_live,
+        )
+    }
+
+    fn from_value(value: &str, gpu_parakeet_ready: bool) -> Self {
+        match value {
             "ct2" | "ctranslate2" | "faster-whisper" => Backend::Ct2,
             "parakeet" | "parakeet-tdt" | "tdt" => Backend::Parakeet,
+            "" if gpu_parakeet_ready => {
+                tracing::info!(
+                    var = super::defaults::env::STT_BACKEND,
+                    "STT backend unset with a CUDA-capable onnxruntime and a parakeet \
+                     checkpoint present: selecting parakeet-tdt for GPU STT; set \
+                     STT_BACKEND=whisper-cpp to restore the CPU whisper default"
+                );
+                Backend::Parakeet
+            }
             "" | "whisper-cpp" | "whisper_cpp" | "whispercpp" | "cpp" | "ggml" => {
                 Backend::WhisperCpp
             }
@@ -197,7 +282,7 @@ impl WhisperEngine {
                     .unwrap_or_else(|| "parakeet-tdt-0.6b-v2".to_string());
                 let model = parakeet::ParakeetTdt::load(&dir)
                     .with_context(|| format!("load parakeet-tdt from {}", dir.display()))?;
-                tracing::info!(dir = %dir.display(), id, "parakeet-tdt backend loaded");
+                tracing::info!(dir = %dir.display(), id, ep = model.ep(), "parakeet-tdt backend loaded");
                 WhisperHandle::Parakeet {
                     inner: Arc::new(model),
                     id,
@@ -244,6 +329,31 @@ impl WhisperHandle {
             WhisperHandle::WhisperCpp { id, .. } => id,
             WhisperHandle::Parakeet { id, .. } => id,
         }
+    }
+
+    pub fn ep(&self) -> Option<&'static str> {
+        match self {
+            WhisperHandle::Ct2 { .. } => Some(if cfg!(feature = "cuda") { "cuda" } else { "cpu" }),
+            WhisperHandle::WhisperCpp { .. } => None,
+            WhisperHandle::Parakeet { inner, .. } => Some(inner.ep()),
+        }
+    }
+
+    pub fn matches_requested_model(&self, requested: &str) -> bool {
+        let req = normalize_stt_model_id(requested);
+        if req.is_empty() {
+            return true;
+        }
+        if GENERIC_WHISPER_ALIASES_MATCH_ANY_WHISPER_BACKEND.contains(&req.as_str()) {
+            return !matches!(self, WhisperHandle::Parakeet { .. });
+        }
+        if req.len() < 4 {
+            return false;
+        }
+        let loaded = self.model_id();
+        let full = normalize_stt_model_id(loaded);
+        let base = normalize_stt_model_id(loaded.rsplit('/').next().unwrap_or(loaded));
+        full.starts_with(&req) || base.starts_with(&req)
     }
 
     pub fn supports_translate(&self) -> bool {
@@ -352,10 +462,41 @@ impl WhisperHandle {
         audio_16k_mono: &[f32],
         task: WhisperTask,
     ) -> Result<TranscriptionResult> {
+        self.transcribe_full_with_opts(audio_16k_mono, task, &SttRequestOptions::default())
+    }
+
+    pub fn transcribe_full_with_opts(
+        &self,
+        audio_16k_mono: &[f32],
+        task: WhisperTask,
+        opts: &SttRequestOptions,
+    ) -> Result<TranscriptionResult> {
         if task == WhisperTask::Translate && !self.supports_translate() {
             return Err(anyhow::Error::new(TranslateUnsupported {
                 model_id: self.model_id().to_string(),
             }));
+        }
+        if let WhisperHandle::Parakeet { id, .. } = self {
+            if let Some(lang) = opts.language.as_deref() {
+                if lang != "en" {
+                    return Err(anyhow::Error::new(SttParamUnsupported {
+                        param: "language",
+                        message: format!(
+                            "language={lang:?} is not supported by the loaded STT model {id:?} \
+                             (parakeet-tdt is English-only); omit the field or send \"en\""
+                        ),
+                    }));
+                }
+            }
+            if opts.initial_prompt.is_some() {
+                return Err(anyhow::Error::new(SttParamUnsupported {
+                    param: "prompt",
+                    message: format!(
+                        "prompt is not supported by the loaded STT model {id:?} (parakeet-tdt \
+                         takes no decoder prompt); omit the field or load a whisper model"
+                    ),
+                }));
+            }
         }
         if peak_amplitude(audio_16k_mono) < SILENCE_PEAK_THRESHOLD {
             tracing::debug!(
@@ -369,9 +510,11 @@ impl WhisperHandle {
             });
         }
         match self {
-            WhisperHandle::Ct2 { inner, .. } => transcribe_ct2_long(inner, audio_16k_mono, task),
+            WhisperHandle::Ct2 { inner, .. } => {
+                transcribe_ct2_long(inner, audio_16k_mono, task, opts)
+            }
             WhisperHandle::WhisperCpp { inner, .. } => {
-                transcribe_whisper_cpp(inner, audio_16k_mono, task)
+                transcribe_whisper_cpp(inner, audio_16k_mono, task, opts)
             }
             WhisperHandle::Parakeet { inner, .. } => {
                 transcribe_parakeet(inner, audio_16k_mono, task)
@@ -429,9 +572,10 @@ fn transcribe_ct2_long(
     state: &Ct2State,
     audio: &[f32],
     task: WhisperTask,
+    opts: &SttRequestOptions,
 ) -> Result<TranscriptionResult> {
     if audio.len() <= CHUNK_SAMPLES {
-        return transcribe_ct2(state, audio, task);
+        return transcribe_ct2(state, audio, task, opts);
     }
     let mut all_segments: Vec<TimedSegment> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
@@ -452,7 +596,7 @@ fn transcribe_ct2_long(
             continue;
         }
 
-        let res = transcribe_ct2(state, chunk, task)?;
+        let res = transcribe_ct2(state, chunk, task, opts)?;
         let chunk_dur_ms = (chunk.len() as f64 * 1000.0) / 16_000.0;
 
         let trimmed = res.text.trim().to_string();
@@ -510,10 +654,96 @@ fn transcribe_ct2_long(
     })
 }
 
+const CT2_START_OF_PREV_TOKEN: &str = "<|startofprev|>";
+
+fn ct2_initial_prompt_tokens(state: &Ct2State, prompt: &str) -> Result<Vec<String>> {
+    if state.tokenizer.token_to_id(CT2_START_OF_PREV_TOKEN).is_none() {
+        return Err(anyhow::Error::new(SttParamUnsupported {
+            param: "prompt",
+            message: format!(
+                "prompt is not supported by this ct2 checkpoint: its tokenizer has no \
+                 {CT2_START_OF_PREV_TOKEN} token, so a decoder prompt cannot be encoded; omit \
+                 the field"
+            ),
+        }));
+    }
+    let mut toks = state
+        .tokenizer
+        .encode(&initial_prompt_tail(prompt))
+        .context("ct2 tokenizer encode initial prompt")?;
+    while toks
+        .last()
+        .is_some_and(|t| t.starts_with("<|") && t.ends_with("|>"))
+    {
+        toks.pop();
+    }
+    let keep = toks
+        .len()
+        .min(INITIAL_PROMPT_TAIL_TOKENS_HALF_WHISPER_TEXT_CTX_MINUS_ONE);
+    let tail = toks.split_off(toks.len() - keep);
+    let mut out = Vec::with_capacity(tail.len() + 1);
+    out.push(CT2_START_OF_PREV_TOKEN.to_string());
+    out.extend(tail);
+    Ok(out)
+}
+
+fn ct2_language_token(state: &Ct2State, lang: &str) -> Result<String> {
+    let tok = format!("<|{lang}|>");
+    if state.tokenizer.token_to_id(&tok).is_none() {
+        return Err(anyhow::Error::new(SttParamUnsupported {
+            param: "language",
+            message: format!(
+                "language={lang:?} is not supported by this ct2 checkpoint: its tokenizer has \
+                 no {tok} token; omit the field or send \"auto\""
+            ),
+        }));
+    }
+    Ok(tok)
+}
+
+fn is_non_timestamp_special(tok: &str) -> bool {
+    tok.starts_with("<|") && tok.ends_with("|>") && parse_timestamp_token(tok).is_none()
+}
+
+fn strip_echoed_prompt_context(
+    tokens: &mut Vec<String>,
+    token_ids: &mut Vec<usize>,
+    prompt_prefix: &[String],
+) {
+    let echoed_text: Vec<&String> = prompt_prefix
+        .iter()
+        .filter(|t| !is_non_timestamp_special(t))
+        .collect();
+    if echoed_text.is_empty() {
+        return;
+    }
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    while ti < tokens.len() && pi < echoed_text.len() {
+        if &tokens[ti] == echoed_text[pi] {
+            ti += 1;
+            pi += 1;
+        } else if is_non_timestamp_special(&tokens[ti]) {
+            ti += 1;
+        } else {
+            return;
+        }
+    }
+    if pi < echoed_text.len() {
+        return;
+    }
+    while ti < tokens.len() && is_non_timestamp_special(&tokens[ti]) {
+        ti += 1;
+    }
+    tokens.drain(..ti);
+    token_ids.drain(..ti.min(token_ids.len()));
+}
+
 fn transcribe_ct2(
     state: &Ct2State,
     audio: &[f32],
     task: WhisperTask,
+    opts: &SttRequestOptions,
 ) -> Result<TranscriptionResult> {
     let padded = mel::pad_or_truncate_to_30s(audio);
     let mut mel_data = state.mel.log_mel(&padded);
@@ -535,24 +765,32 @@ fn transcribe_ct2(
         WhisperTask::Transcribe => "<|transcribe|>",
         WhisperTask::Translate => "<|translate|>",
     };
-    let detected = state
-        .model
-        .detect_language(&encoded)
-        .context("ct2 whisper detect_language")?;
-    let language_token = detected
-        .into_iter()
-        .next()
-        .and_then(|batch| batch.into_iter().next())
-        .map(|d| {
-            tracing::debug!(language = %d.language, probability = d.probability, "ct2 language detection");
-            d.language
-        })
-        .unwrap_or_else(|| "<|en|>".to_string());
-    let prompts: Vec<Vec<&str>> = vec![vec![
-        "<|startoftranscript|>",
-        language_token.as_str(),
-        task_token,
-    ]];
+    let language_token = match opts.language.as_deref() {
+        Some(lang) => ct2_language_token(state, lang)?,
+        None => {
+            let detected = state
+                .model
+                .detect_language(&encoded)
+                .context("ct2 whisper detect_language")?;
+            detected
+                .into_iter()
+                .next()
+                .and_then(|batch| batch.into_iter().next())
+                .map(|d| {
+                    tracing::debug!(language = %d.language, probability = d.probability, "ct2 language detection");
+                    d.language
+                })
+                .unwrap_or_else(|| "<|en|>".to_string())
+        }
+    };
+    let prompt_prefix: Vec<String> = match opts.initial_prompt.as_deref() {
+        Some(p) if !p.trim().is_empty() => ct2_initial_prompt_tokens(state, p)?,
+        _ => Vec::new(),
+    };
+    let mut prompt_tokens: Vec<&str> = Vec::with_capacity(prompt_prefix.len() + 3);
+    prompt_tokens.extend(prompt_prefix.iter().map(|s| s.as_str()));
+    prompt_tokens.extend(["<|startoftranscript|>", language_token.as_str(), task_token]);
+    let prompts: Vec<Vec<&str>> = vec![prompt_tokens];
     let mut options = Ct2WhisperOptions {
         beam_size: stt_beam_size(),
         ..Default::default()
@@ -569,8 +807,9 @@ fn transcribe_ct2(
         .ok_or_else(|| anyhow!("ct2 whisper returned no generation results"))?;
     let no_speech_prob = Some(r.no_speech_prob);
     let avg_logprob = r.scores.first().copied();
-    let tokens = r.sequences.into_iter().next().unwrap_or_default();
-    let token_ids = r.sequences_ids.into_iter().next().unwrap_or_default();
+    let mut tokens = r.sequences.into_iter().next().unwrap_or_default();
+    let mut token_ids = r.sequences_ids.into_iter().next().unwrap_or_default();
+    strip_echoed_prompt_context(&mut tokens, &mut token_ids, &prompt_prefix);
 
     let real_audio_ms = (audio.len() as u64 * 1000 / 16_000).min(u32::MAX as u64) as u32;
     let segments = split_ct2_segments(&tokens, &token_ids, state.timestamp_begin_id, real_audio_ms);
@@ -758,18 +997,36 @@ fn transcribe_whisper_cpp(
     ctx: &CppContext,
     audio: &[f32],
     task: WhisperTask,
+    opts: &SttRequestOptions,
 ) -> Result<TranscriptionResult> {
     let mut state = ctx.create_state().context("create whisper state")?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    let language = opts.language.clone().unwrap_or_else(|| "auto".to_string());
+    let prompt_tokens: Vec<std::os::raw::c_int> = match opts.initial_prompt.as_deref() {
+        Some(p) if !p.trim().is_empty() => {
+            let tail = initial_prompt_tail(p);
+            let mut ids = ctx
+                .tokenize(&tail, tail.len().saturating_mul(4).max(64))
+                .context("whisper.cpp tokenize initial prompt")?;
+            let keep = ids
+                .len()
+                .min(INITIAL_PROMPT_TAIL_TOKENS_HALF_WHISPER_TEXT_CTX_MINUS_ONE);
+            ids.split_off(ids.len() - keep)
+        }
+        _ => Vec::new(),
+    };
     match task {
         WhisperTask::Transcribe => {
-            params.set_language(Some("auto"));
+            params.set_language(Some(language.as_str()));
             params.set_translate(false);
         }
         WhisperTask::Translate => {
-            params.set_language(Some("auto"));
+            params.set_language(Some(language.as_str()));
             params.set_translate(true);
         }
+    }
+    if !prompt_tokens.is_empty() {
+        params.set_tokens(&prompt_tokens);
     }
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -1306,20 +1563,72 @@ mod tests {
     }
 
     #[test]
-    fn backend_selection_via_env() {
-        let saved = std::env::var("STT_BACKEND").ok();
-        std::env::remove_var("STT_BACKEND");
-        assert_eq!(Backend::from_env(), Backend::WhisperCpp);
-        std::env::set_var("STT_BACKEND", "ct2");
-        assert_eq!(Backend::from_env(), Backend::Ct2);
-        std::env::set_var("STT_BACKEND", "parakeet");
-        assert_eq!(Backend::from_env(), Backend::Parakeet);
-        std::env::set_var("STT_BACKEND", "whisper-cpp");
-        assert_eq!(Backend::from_env(), Backend::WhisperCpp);
-        match saved {
-            Some(v) => std::env::set_var("STT_BACKEND", v),
-            None => std::env::remove_var("STT_BACKEND"),
+    fn backend_selection_explicit_values_ignore_gpu_readiness() {
+        for gpu_parakeet_ready in [false, true] {
+            assert_eq!(Backend::from_value("ct2", gpu_parakeet_ready), Backend::Ct2);
+            assert_eq!(
+                Backend::from_value("faster-whisper", gpu_parakeet_ready),
+                Backend::Ct2
+            );
+            assert_eq!(
+                Backend::from_value("parakeet", gpu_parakeet_ready),
+                Backend::Parakeet
+            );
+            assert_eq!(
+                Backend::from_value("tdt", gpu_parakeet_ready),
+                Backend::Parakeet
+            );
+            assert_eq!(
+                Backend::from_value("whisper-cpp", gpu_parakeet_ready),
+                Backend::WhisperCpp
+            );
+            assert_eq!(
+                Backend::from_value("ggml", gpu_parakeet_ready),
+                Backend::WhisperCpp
+            );
+            assert_eq!(
+                Backend::from_value("bogus", gpu_parakeet_ready),
+                Backend::WhisperCpp
+            );
         }
+    }
+
+    #[test]
+    fn backend_unset_selects_parakeet_only_when_gpu_stt_is_ready() {
+        assert_eq!(Backend::from_value("", false), Backend::WhisperCpp);
+        assert_eq!(Backend::from_value("", true), Backend::Parakeet);
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn echoed_prompt_context_is_stripped_with_interleaved_specials() {
+        let mut tokens = s(&[
+            "<|startofprev|>", "ĠYesterday", "Ġmuseum", "<|startoftranscript|>", "<|en|>",
+            "<|transcribe|>", "<|0.00|>", "ĠThe", "Ġfox", "<|1.00|>",
+        ]);
+        let mut ids: Vec<usize> = (0..tokens.len()).collect();
+        let prefix = s(&["<|startofprev|>", "ĠYesterday", "Ġmuseum"]);
+        strip_echoed_prompt_context(&mut tokens, &mut ids, &prefix);
+        assert_eq!(tokens, s(&["<|0.00|>", "ĠThe", "Ġfox", "<|1.00|>"]));
+        assert_eq!(ids, vec![6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn unechoed_sequences_are_left_intact() {
+        let mut tokens = s(&["ĠThe", "Ġfox"]);
+        let mut ids = vec![1usize, 2];
+        let prefix = s(&["<|startofprev|>", "ĠYesterday"]);
+        strip_echoed_prompt_context(&mut tokens, &mut ids, &prefix);
+        assert_eq!(tokens, s(&["ĠThe", "Ġfox"]));
+        assert_eq!(ids, vec![1, 2]);
+        let mut tokens2 = s(&["ĠThe", "Ġfox"]);
+        let mut ids2 = vec![1usize, 2];
+        strip_echoed_prompt_context(&mut tokens2, &mut ids2, &[]);
+        assert_eq!(tokens2.len(), 2);
+        assert_eq!(ids2.len(), 2);
     }
 
     fn transcribe_ct2_legacy(state: &Ct2State, audio: &[f32]) -> Result<String> {
@@ -1435,7 +1744,7 @@ mod tests {
             let _ = transcribe_ct2_legacy(&state, &audio).expect("legacy");
         });
         let m_new = bench("new (ts+split)", &|| {
-            let _ = transcribe_ct2(&state, &audio, WhisperTask::Transcribe).expect("new");
+            let _ = transcribe_ct2(&state, &audio, WhisperTask::Transcribe, &SttRequestOptions::default()).expect("new");
         });
 
         let delta_pct = (m_new as f64 - m_legacy as f64) / m_legacy as f64 * 100.0;
@@ -1492,7 +1801,7 @@ mod tests {
         };
 
         let legacy = transcribe_ct2_legacy(&state, &audio).expect("legacy decode");
-        let new = transcribe_ct2(&state, &audio, WhisperTask::Transcribe).expect("new decode");
+        let new = transcribe_ct2(&state, &audio, WhisperTask::Transcribe, &SttRequestOptions::default()).expect("new decode");
 
         eprintln!("legacy  : {:?}", legacy);
         eprintln!("new.text: {:?}", new.text);

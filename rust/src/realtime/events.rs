@@ -74,43 +74,51 @@ pub(super) async fn emit_response_brackets(
 ) {
     use super::wire::OutboundEvent::*;
     session
-        .emit(ResponseOutputAudioTranscriptDone {
-            response_id: response_id.into(),
-            item_id: item_id.into(),
-            output_index: 0,
-            content_index: 0,
-            transcript: transcript.to_string(),
-        })
+        .emit(ResponseOutputAudioTranscriptDone(
+            super::wire::ResponseOutputAudioTranscriptDoneEvent {
+                response_id: response_id.into(),
+                item_id: item_id.into(),
+                output_index: 0,
+                content_index: 0,
+                transcript: transcript.to_string(),
+            },
+        ))
         .await;
     session
-        .emit(ResponseOutputAudioDone {
-            response_id: response_id.into(),
-            item_id: item_id.into(),
-            output_index: 0,
-            content_index: 0,
-        })
+        .emit(ResponseOutputAudioDone(
+            super::wire::ResponseOutputAudioDoneEvent {
+                response_id: response_id.into(),
+                item_id: item_id.into(),
+                output_index: 0,
+                content_index: 0,
+            },
+        ))
         .await;
     session
-        .emit(ResponseContentPartDone {
-            response_id: response_id.into(),
-            item_id: item_id.into(),
-            output_index: 0,
-            content_index: 0,
-            part: json!({ "type": "audio", "transcript": transcript }),
-        })
+        .emit(ResponseContentPartDone(
+            super::wire::ResponseContentPartDoneEvent {
+                response_id: response_id.into(),
+                item_id: item_id.into(),
+                output_index: 0,
+                content_index: 0,
+                part: json!({ "type": "audio", "transcript": transcript }),
+            },
+        ))
         .await;
     session
-        .emit(ResponseOutputItemDone {
-            response_id: response_id.into(),
-            output_index: 0,
-            item: json!({
-                "id": item_id,
-                "type": "message",
-                "role": "assistant",
-                "status": item_status,
-                "content": [{ "type": "audio", "transcript": transcript }],
-            }),
-        })
+        .emit(ResponseOutputItemDone(
+            super::wire::ResponseOutputItemDoneEvent {
+                response_id: response_id.into(),
+                output_index: 0,
+                item: json!({
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "status": item_status,
+                    "content": [{ "type": "audio", "transcript": transcript }],
+                }),
+            },
+        ))
         .await;
 }
 
@@ -131,13 +139,15 @@ pub(super) async fn emit_audio_transcript_delta(
 ) {
     session
         .emit(
-            super::wire::OutboundEvent::ResponseOutputAudioTranscriptDelta {
-                response_id: response_id.into(),
-                item_id: item_id.into(),
-                output_index: 0,
-                content_index: 0,
-                delta: sentence.to_string(),
-            },
+            super::wire::OutboundEvent::ResponseOutputAudioTranscriptDelta(
+                super::wire::ResponseOutputAudioTranscriptDeltaEvent {
+                    response_id: response_id.into(),
+                    item_id: item_id.into(),
+                    output_index: 0,
+                    content_index: 0,
+                    delta: sentence.to_string(),
+                },
+            ),
         )
         .await;
 }
@@ -199,7 +209,7 @@ pub(super) async fn emit_response_done(
         status_details,
     };
     session
-        .emit(super::wire::OutboundEvent::ResponseDone { response: payload })
+        .emit(super::wire::OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent { response: payload }))
         .await;
 }
 
@@ -222,7 +232,7 @@ pub(super) async fn emit_error(
         param: param.map(|s| s.to_string()),
     };
     session
-        .emit(super::wire::OutboundEvent::Error { error: payload })
+        .emit(super::wire::OutboundEvent::Error(super::wire::ErrorEvent { error: payload }))
         .await;
 }
 
@@ -249,7 +259,7 @@ pub(super) async fn emit_incomplete_brackets(
         }),
     };
     session
-        .emit(super::wire::OutboundEvent::ResponseDone { response: payload })
+        .emit(super::wire::OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent { response: payload }))
         .await;
 }
 
@@ -289,7 +299,7 @@ pub(super) async fn emit_cancelled_brackets(
         }),
     };
     session
-        .emit(super::wire::OutboundEvent::ResponseDone { response: payload })
+        .emit(super::wire::OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent { response: payload }))
         .await;
 }
 

@@ -7,13 +7,10 @@ use nv_models::qwen3_5_moe::{Qwen3Moe, Qwen3_5DenseConfig};
 use nv_weights::{QuantizationConfig, WeightLoader};
 use ppl_common::{
     checkpoint_label_from_snapshot_dir, corpus_text_from_nv_ppl_corpus_env_failing_loudly,
-    deterministic_xorshift_fisher_yates_shuffle_fixed_seed_so_every_config_scores_the_same_control,
     first_n_corpus_tokens_after_tokenization,
-    print_machine_line_with_acc_and_assert_real_beats_shuffled,
     require_nv_ppl_test_gate_because_this_suite_must_never_silently_skip,
     TeacherForcedNllFp32SoftmaxF64Sum,
 };
-use std::path::PathBuf;
 use tokenizers::Tokenizer;
 mod common;
 use common::ig1_qwen35_9b_nvfp4_snapshot_dir_env_override_then_home_hub;
@@ -48,41 +45,18 @@ fn score_tail_via_serving_decode_stepping(
     ids: &[u32],
     score_start: usize,
 ) -> TeacherForcedNllFp32SoftmaxF64Sum {
-    let len = ids.len();
-    let mut cache = model.new_kv_cache(len + 8).expect("kv cache");
-    let mut acc = TeacherForcedNllFp32SoftmaxF64Sum::new();
-    let mut skipped_beyond_logit_width = 0usize;
-    for p in 0..len - 1 {
-        let tokens =
-            Tensor::from_vec(vec![ids[p]], (1usize, 1usize), device).expect("token");
-        let positions = Tensor::from_vec(vec![p as i32], 1usize, device).expect("position");
-        let logits = model
-            .forward_with_cache(&tokens, &positions, &mut cache)
-            .unwrap_or_else(|err| panic!("decode step {p}: {err:#}"));
-        if p + 1 < score_start {
-            continue;
-        }
-        let row: Vec<f32> = logits
-            .to_dtype(candle_core::DType::F32)
-            .expect("f32")
-            .flatten_all()
-            .expect("flatten")
-            .to_vec1()
-            .expect("host");
-        if ids[p + 1] as usize >= row.len() {
-            skipped_beyond_logit_width += 1;
-            continue;
-        }
-        acc.add_position_full_vocab_row(&row, ids[p + 1]);
-    }
-    if skipped_beyond_logit_width > 0 {
-        eprintln!(
-            "PPL-SKIPPED {skipped_beyond_logit_width} positions whose true token id exceeds the \
-             model's logit width (tokenizer vocab is padded past the lm head); scored positions \
-             exclude them on every config identically"
-        );
-    }
-    acc
+    let mut cache = model.new_kv_cache(ids.len() + 8).expect("kv cache");
+    ppl_common::score_tail_teacher_forced_decode_stepping_converting_only_scored_rows(
+        &mut |p, id| {
+            let tokens = Tensor::from_vec(vec![id], (1usize, 1usize), device).expect("token");
+            let positions = Tensor::from_vec(vec![p as i32], 1usize, device).expect("position");
+            model
+                .forward_with_cache(&tokens, &positions, &mut cache)
+                .unwrap_or_else(|err| panic!("decode step {p}: {err:#}"))
+        },
+        ids,
+        score_start,
+    )
 }
 
 #[test]
@@ -121,25 +95,11 @@ fn qwen35_dense_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode(
         ids.len() - score_start
     );
 
-    let real = score_tail_via_serving_decode_stepping(&model, &device, &ids, score_start);
-
-    let mut shuffled_ids = ids.clone();
-    deterministic_xorshift_fisher_yates_shuffle_fixed_seed_so_every_config_scores_the_same_control(
-        &mut shuffled_ids[score_start..],
-    );
-    let shuffled =
-        score_tail_via_serving_decode_stepping(&model, &device, &shuffled_ids, score_start);
-
-    assert_eq!(
-        real.scored_positions, shuffled.scored_positions,
-        "real and shuffled arms scored different position counts"
-    );
-    print_machine_line_with_acc_and_assert_real_beats_shuffled(
+    ppl_common::shuffle_tail_score_both_arms_assert_equal_positions_and_print_machine_line(
         "qwen35-chat",
         &label,
-        real.scored_positions,
-        real.perplexity_exp_of_mean_neg_ln_p(),
-        shuffled.perplexity_exp_of_mean_neg_ln_p(),
-        real.top1_accuracy(),
+        &ids,
+        score_start,
+        &mut |arm_ids| score_tail_via_serving_decode_stepping(&model, &device, arm_ids, score_start),
     );
 }

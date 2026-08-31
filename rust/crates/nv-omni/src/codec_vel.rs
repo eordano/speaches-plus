@@ -360,34 +360,15 @@ fn load_linear(
     in_features: usize,
     dtype: DType,
 ) -> Result<Linear> {
-    let w_name = format!("{base}.weight");
     let b_name = format!("{base}.bias");
-    let w = weights
-        .get(&w_name, dtype)
-        .with_context(|| format!("load weight {w_name}"))?;
-    let wd = w.dims();
-    if wd != [out_features, in_features] {
-        anyhow::bail!(
-            "load_linear({base}): expected [{out_features}, {in_features}], got {:?}",
-            wd
-        );
-    }
-    let bias = if weights.has(&b_name) {
-        let b = weights
-            .get(&b_name, dtype)
-            .with_context(|| format!("load bias {b_name}"))?;
-        let bd = b.dims();
-        if bd != [out_features] {
-            anyhow::bail!(
-                "load_linear({base}.bias): expected [{out_features}], got {:?}",
-                bd
-            );
-        }
-        Some(b)
-    } else {
-        None
-    };
-    Linear::new(w, bias)
+    nv_layers::weight_load::load_linear_with_bias_names(
+        weights,
+        &format!("{base}.weight"),
+        out_features,
+        in_features,
+        weights.has(&b_name).then_some(b_name.as_str()),
+        dtype,
+    )
 }
 
 fn load_conv1d(

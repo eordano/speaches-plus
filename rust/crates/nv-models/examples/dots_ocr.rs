@@ -29,6 +29,28 @@ fn load_rgb(path: &PathBuf) -> Result<RgbImage> {
     RgbImage::decode_file(path)
 }
 
+#[derive(serde::Deserialize)]
+struct RegionRow {
+    image: String,
+    bbox: Option<[f64; 4]>,
+}
+
+const ROWS_CROP_MATCHES_THE_DUMP_SO_EVAL_AND_TRAIN_SEE_THE_SAME_PIXELS: u32 = 8;
+
+fn crop_row(img: RgbImage, bbox: Option<[f64; 4]>) -> Result<RgbImage> {
+    let Some([x1, y1, x2, y2]) = bbox else {
+        return Ok(img);
+    };
+    let m = ROWS_CROP_MATCHES_THE_DUMP_SO_EVAL_AND_TRAIN_SEE_THE_SAME_PIXELS as f64;
+    let (w, h) = (img.w as f64, img.h as f64);
+    let cx1 = (x1 - m).max(0.0).min(w - 1.0) as usize;
+    let cy1 = (y1 - m).max(0.0).min(h - 1.0) as usize;
+    let cx2 = (x2 + m).max(0.0).min(w) as usize;
+    let cy2 = (y2 + m).max(0.0).min(h) as usize;
+    anyhow::ensure!(cx2 > cx1 && cy2 > cy1, "degenerate bbox {bbox:?}");
+    Ok(img.crop(cx1, cy1, cx2, cy2))
+}
+
 fn main() -> Result<()> {
     let mut images: Vec<PathBuf> = Vec::new();
     let mut mode = DotsMode::LayoutAll;
@@ -38,11 +60,15 @@ fn main() -> Result<()> {
     let mut out_dir: Option<PathBuf> = None;
     let mut max_pixels: Option<usize> = None;
     let mut style: Option<PromptStyle> = None;
+    let mut rows_path: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--layout-only" => mode = DotsMode::LayoutOnly,
             "--plain" => mode = DotsMode::PlainOcr,
+            "--rows" => {
+                rows_path = Some(PathBuf::from(args.next().context("--rows needs a path")?))
+            }
             "--cpu" => cpu = true,
             "--json" => emit_json = true,
             "--user-turn" => style = Some(PromptStyle::UserTurn),
@@ -66,8 +92,8 @@ fn main() -> Result<()> {
         }
     }
     anyhow::ensure!(
-        !images.is_empty(),
-        "usage: dots_ocr [--layout-only|--plain] [--cpu] [--json] [--max-new N] [--max-pixels N] [--out DIR] <image>..."
+        !images.is_empty() || rows_path.is_some(),
+        "usage: dots_ocr [--layout-only|--plain] [--cpu] [--json] [--max-new N] [--max-pixels N] [--out DIR] [--rows rows.jsonl] <image>..."
     );
 
     let dir = default_dir().context("dots.ocr snapshot not found; set NV_DOTS_DIR")?;
@@ -78,7 +104,11 @@ fn main() -> Result<()> {
         {
             Device::new_cuda(0)?
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            Device::new_metal(0)?
+        }
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         Device::Cpu
     };
     eprintln!("[dots] loading {} on {:?}", dir.display(), device);
@@ -107,6 +137,34 @@ fn main() -> Result<()> {
     if let Some(d) = &out_dir {
         std::fs::create_dir_all(d)?;
     }
+
+    if let Some(rows) = &rows_path {
+        let data = std::fs::read_to_string(rows)
+            .with_context(|| format!("read {}", rows.display()))?;
+        for (li, line) in data.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let row: RegionRow = serde_json::from_str(line)
+                .with_context(|| format!("parse rows line {}", li + 1))?;
+            let img = crop_row(load_rgb(&PathBuf::from(&row.image))?, row.bbox)
+                .with_context(|| format!("rows line {}", li + 1))?;
+            let t = Instant::now();
+            let res = pipe.recognize(&img, mode, &opts)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "i": li + 1,
+                    "text": res.text,
+                    "generated": res.generated_tokens,
+                    "looped": res.looped,
+                    "secs": t.elapsed().as_secs_f64(),
+                })
+            );
+        }
+    }
+
     for path in &images {
         let img = load_rgb(path)?;
         let t = Instant::now();

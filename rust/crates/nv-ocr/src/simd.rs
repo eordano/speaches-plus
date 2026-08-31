@@ -17,7 +17,7 @@ pub enum I8Isa {
 pub fn f32_isa() -> F32Isa {
     static ISA: OnceLock<F32Isa> = OnceLock::new();
     *ISA.get_or_init(|| {
-        if std::env::var_os("NV_OCR_NO_SIMD").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_OCR_NO_SIMD") {
             return F32Isa::Scalar;
         }
         #[cfg(target_arch = "x86_64")]
@@ -36,7 +36,7 @@ pub fn f32_isa() -> F32Isa {
 pub fn i8_isa() -> I8Isa {
     static ISA: OnceLock<I8Isa> = OnceLock::new();
     *ISA.get_or_init(|| {
-        if std::env::var_os("NV_OCR_NO_SIMD").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_OCR_NO_SIMD") {
             return I8Isa::Scalar;
         }
         #[cfg(target_arch = "x86_64")]

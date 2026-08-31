@@ -32,7 +32,7 @@ fn dump_every_timed_step_when_env_asks_because_medians_hide_graph_recapture_spik
 }
 
 #[test]
-#[ignore = "loads the ~22 GB Qwen3.6-35B NVFP4; set NV_QWEN36_SERVING_TEST=1 -- serving-class decode ms/token vs KV depth: chunked prefill primes the cache with the PLAIN dispatch and grouped MoE is installed only afterwards, because eager grouped prefill returns all-NaN logits (see graph_engine::THE_EAGER_ALL_NAN_IS_INSTALL_GROUPED_MOE_NOT_THIS_DISABLE_AND_NEEDS_A_HOST_STALL); then 64 graphed free-running decode steps are timed; the #95 degeneracy is deliberately not judged; run ONE depth per process via NV_CTX_TOKENS (the #96 residual race)"]
+#[ignore = "loads the ~22 GB Qwen3.6-35B NVFP4; set NV_QWEN36_SERVING_TEST=1 -- serving-class decode ms/token vs KV depth: chunked prefill primes the cache with the PLAIN dispatch and grouped MoE is installed only afterwards, because grouped multi-token prefill cost explodes with m (qwen3_5_mtp::PREFILL_ROUTES_HOST_BECAUSE_THE_GROUPED_MULTI_TOKEN_COST_EXPLODES_WITH_M); then 64 graphed free-running decode steps are timed; the #95 degeneracy is deliberately not judged; run ONE depth per process via NV_CTX_TOKENS (the #96 residual race)"]
 fn qwen36_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_grouped_moe_chunk_primed()
 {
     if std::env::var("NV_QWEN36_SERVING_TEST").ok().as_deref() != Some("1") {
@@ -122,6 +122,9 @@ fn qwen36_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_grouped
              blocker to stderr just above -- diagnose that blocker, do not relabel the \
              number as serving-class"
         );
+        if let Some(d) = eng.moe_dispatch_ref() {
+            d.dump_phase_ladder_after_replay_when_nv_q36_moe_events_1();
+        }
 
         let mut sorted = step_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -269,6 +272,9 @@ fn qwen36_cuda_serving_path_decode_ms_per_token_vs_context_depth_synthetic_cache
              blocker to stderr just above -- diagnose that blocker, do not relabel the \
              number as serving-class"
         );
+        if let Some(d) = eng.moe_dispatch_ref() {
+            d.dump_phase_ladder_after_replay_when_nv_q36_moe_events_1();
+        }
 
         let mut sorted = step_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());

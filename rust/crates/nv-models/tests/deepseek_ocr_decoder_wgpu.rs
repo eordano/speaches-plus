@@ -157,7 +157,12 @@ fn tiny_weight_map(c: &DeepseekOcrDecoderConfig) -> HashMap<String, Tensor> {
 }
 
 fn tiny_loader() -> (WeightLoader, DeepseekOcrDecoderConfig, tempdir::Guard) {
-    let c = tiny_config();
+    tiny_loader_for(tiny_config())
+}
+
+fn tiny_loader_for(
+    c: DeepseekOcrDecoderConfig,
+) -> (WeightLoader, DeepseekOcrDecoderConfig, tempdir::Guard) {
     let map = tiny_weight_map(&c);
     let dir = std::env::temp_dir().join(format!(
         "dsocr-decoder-wgpu-test-{}-{:?}",
@@ -224,6 +229,57 @@ fn wgpu_decoder_matches_cpu_reference_on_greedy_steps() {
     assert!(rel < 3e-2, "logits diverged: rel {rel} >= 3e-2");
 }
 
+fn tiny_loader_k16() -> (WeightLoader, DeepseekOcrDecoderConfig, tempdir::Guard) {
+    let mut cfg = tiny_config();
+    cfg.hidden_size = 32;
+    cfg.intermediate_size = 48;
+    cfg.moe_intermediate_size = 32;
+    tiny_loader_for(cfg)
+}
+
+#[test]
+fn wgpu_decoder_w8_tracks_the_cpu_reference_within_the_int8_band() {
+    if !adapter_available() {
+        return;
+    }
+    use nv_models::deepseek_ocr::WgpuDecQuant;
+    let (loader, cfg, _guard) = tiny_loader_k16();
+    let cpu =
+        DeepseekOcrDecoder::from_loader_with_dtype(cfg.clone(), &loader, &Device::Cpu, DType::F32)
+            .unwrap();
+    let mut wg =
+        DeepseekOcrDecoderWgpu::from_loader_mode(cfg.clone(), &loader, 16, WgpuDecQuant::I8)
+            .unwrap();
+
+    let tokens: Vec<u32> = vec![0, 5, 17, 42, 9];
+    let mut cache = cpu.new_kv_cache(16).unwrap();
+    let mut cpu_logits: Vec<f32> = Vec::new();
+    for &t in &tokens {
+        let l = cpu.forward_tokens(&[t], None, &mut cache).unwrap();
+        cpu_logits = l.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+    }
+    let wg_logits = wg.forward_tokens(&tokens).unwrap();
+    let scale = cpu_logits
+        .iter()
+        .fold(0f32, |a, &b| a.max(b.abs()))
+        .max(1e-6);
+    let mut max_abs = 0f32;
+    for (a, b) in cpu_logits.iter().zip(wg_logits.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    let rel = max_abs / scale;
+    let cpu_argmax = DeepseekOcrDecoderWgpu::greedy_token(&cpu_logits);
+    let wg_argmax = DeepseekOcrDecoderWgpu::greedy_token(&wg_logits);
+    eprintln!(
+        "w8 logit agreement: max_abs={max_abs:.5} scale={scale:.4} rel={rel:.5} argmax cpu={cpu_argmax} wgpu={wg_argmax}"
+    );
+    assert_eq!(
+        cpu_argmax, wg_argmax,
+        "w8 greedy token diverged (rel err {rel})"
+    );
+    assert!(rel < 8e-2, "w8 logits diverged: rel {rel} >= 8e-2");
+}
+
 fn real_checkpoint_dir() -> Option<std::path::PathBuf> {
     if let Ok(d) = std::env::var("NV_OCR_DEEPSEEK_DIR") {
         return Some(std::path::PathBuf::from(d));
@@ -260,8 +316,9 @@ fn real_checkpoint_one_token_forward_on_wgpu() {
     let t0 = std::time::Instant::now();
     let mut wg = DeepseekOcrDecoderWgpu::from_loader(cfg.clone(), &loader, 32).unwrap();
     eprintln!(
-        "loaded real decoder host-side in {:.1}s",
-        t0.elapsed().as_secs_f32()
+        "loaded real decoder host-side in {:.1}s ({} nvfp4 lins)",
+        t0.elapsed().as_secs_f32(),
+        wg.nvfp4_lin_count()
     );
     let t1 = std::time::Instant::now();
     let logits = wg.forward_token(cfg.bos_token_id).unwrap();
@@ -285,4 +342,74 @@ fn wgpu_decoder_reset_reproduces_logits() {
     wg.reset();
     let b = wg.forward_tokens(&[0, 7, 33]).unwrap();
     assert_eq!(a, b, "wgpu decode must be deterministic across reset");
+}
+
+const TINY_NVFP4_ELIGIBLE_LINS_ARE_THE_21_WITH_K_MULTIPLE_OF_16_DOWN40_EXPERT_DOWN24_LMHEAD_STAY_BF16:
+    usize = 21;
+
+const NVFP4_TINY_LOGIT_COSINE_FLOOR_FP4_E2M1_BLOCK16_W4A4_QUANT_NOISE_OVER_2_LAYERS: f32 = 0.97;
+
+#[test]
+fn wgpu_quant_env_parses_bf16_nvfp4_w8_and_rejects_garbage() {
+    use nv_models::deepseek_ocr::{
+        wgpu_quant_from_env_value, WgpuDecQuant,
+        DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED,
+    };
+    assert_eq!(wgpu_quant_from_env_value(None).unwrap(), WgpuDecQuant::Bf16);
+    assert_eq!(wgpu_quant_from_env_value(Some("")).unwrap(), WgpuDecQuant::Bf16);
+    assert_eq!(
+        wgpu_quant_from_env_value(Some("bf16")).unwrap(),
+        WgpuDecQuant::Bf16
+    );
+    assert_eq!(
+        wgpu_quant_from_env_value(Some("nvfp4")).unwrap(),
+        WgpuDecQuant::Nvfp4
+    );
+    assert_eq!(
+        wgpu_quant_from_env_value(Some("w8")).unwrap(),
+        WgpuDecQuant::I8
+    );
+    let err = wgpu_quant_from_env_value(Some("int4"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED),
+        "error must name the env var: {err}"
+    );
+}
+
+#[test]
+fn nvfp4_arm_quantizes_only_block_multiple_k_and_tracks_bf16_logits() {
+    if !adapter_available() {
+        return;
+    }
+    let (loader, cfg, _guard) = tiny_loader();
+    let mut bf =
+        DeepseekOcrDecoderWgpu::from_loader_quant(cfg.clone(), &loader, 16, false).unwrap();
+    let mut q4 = DeepseekOcrDecoderWgpu::from_loader_quant(cfg.clone(), &loader, 16, true).unwrap();
+    assert_eq!(bf.nvfp4_lin_count(), 0, "bf16 arm must hold zero nvfp4 lins");
+    assert_eq!(
+        q4.nvfp4_lin_count(),
+        TINY_NVFP4_ELIGIBLE_LINS_ARE_THE_21_WITH_K_MULTIPLE_OF_16_DOWN40_EXPERT_DOWN24_LMHEAD_STAY_BF16,
+        "tiny config: 8 qkvo + dense gate/up + 4 experts gate/up + shared gate/up/down"
+    );
+    let tokens: Vec<u32> = vec![0, 5, 17, 42, 9];
+    let a = bf.forward_tokens(&tokens).unwrap();
+    let b = q4.forward_tokens(&tokens).unwrap();
+    assert_eq!(a.len(), cfg.vocab_size);
+    assert_eq!(b.len(), cfg.vocab_size);
+    assert!(b.iter().all(|v| v.is_finite()), "non-finite nvfp4 logits");
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let cos = dot / (na * nb).max(1e-12);
+    eprintln!(
+        "nvfp4 vs bf16 wgpu logits: cosine={cos:.5} argmax bf16={} nvfp4={}",
+        DeepseekOcrDecoderWgpu::greedy_token(&a),
+        DeepseekOcrDecoderWgpu::greedy_token(&b)
+    );
+    assert!(
+        cos >= NVFP4_TINY_LOGIT_COSINE_FLOOR_FP4_E2M1_BLOCK16_W4A4_QUANT_NOISE_OVER_2_LAYERS,
+        "nvfp4 wgpu logits diverged from bf16 wgpu: cosine {cos}"
+    );
 }

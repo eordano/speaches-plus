@@ -16,7 +16,7 @@ const GATE_ENV: &str = "NV_Q38_MTP_INC2_TEST";
 const REPO_DIR: &str = "models--unsloth--Qwen3.8-27B-NVFP4";
 const MODEL_LABEL: &str = "unsloth/Qwen3.8-27B-NVFP4";
 const CORPUS_ENV: &str = "NV_PPL_CORPUS";
-const CORPUS_DEFAULT: &str = "/tmp/nv-corpus/wiki.txt";
+const CORPUS_DEFAULT: &str = "/home/user/tmp/wf/quant/corpus/wiki.txt";
 const CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING: usize = 64;
 const SCORED_POSITIONS_DEFAULT: usize = 128;
 const DECODE_TOKENS_256_THE_SCOREBOARD_CONTEXT: usize = 256;
@@ -137,6 +137,259 @@ fn measure(instrument: &str, tokens: usize, steps: usize, warmup: usize, value: 
 }
 
 #[test]
+#[ignore = "boots the 22.6 GB Qwen3.8-27B-NVFP4 wgpu decoder with NV_Q3D_VERIFY_M=32 so the \
+            dedicated 32-row verify graph records next to the 512-row prefill graph, then \
+            forwards the same k+1 chain through both from the same committed state; every \
+            returned logit must match bit-for-bit, proving the pad rows were dead weight; set \
+            NV_Q38_MTP_INC2_TEST=1"]
+fn real_qwen38_verify32_rows_bit_match_the_padded_512_graph() {
+    require_gate();
+    let dir = snapshot_dir();
+    std::env::set_var(
+        nv_models::qwen3_5_dense_wgpu::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+        "32",
+    );
+    let (mut m, tok) = boot(&dir, false);
+    std::env::remove_var(
+        nv_models::qwen3_5_dense_wgpu::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+    );
+    assert!(
+        m.verify_chain_rides_dedicated_graph(),
+        "NV_Q3D_VERIFY_M=32 must record the dedicated verify graph on the coop route; without \
+         it this A/B compares the padded graph to itself and proves nothing"
+    );
+    assert_eq!(m.verify_max_rows(), 32, "chain capacity must be the dedicated graph's rows");
+    assert_eq!(m.prefill_chunk_len(), 512, "the prefill graph must keep its serving-default M");
+    let k1 = mtp_chain_depth_from_env() + 1;
+    let rounds = 4usize;
+    let ids = corpus_ids(&tok, CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING + rounds * k1);
+    prefill(&mut m, &ids[..CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING]);
+    let mut off = CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING;
+    for round in 0..rounds {
+        let batch = ids[off..off + k1].to_vec();
+        let (a_tok, a_log) = m.verify_chain_logits(&batch).expect("dedicated-graph chain");
+        m.advance(0).expect("rollback the dedicated-graph forward");
+        let (b_tok, b_log) = m
+            .debug_verify_chain_logits_via_the_padded_prefill_graph_for_test(&batch)
+            .expect("padded-graph chain");
+        assert_eq!(a_log.len(), b_log.len(), "both arms must return live-rows x vocab logits");
+        let mut max_abs = 0f32;
+        let mut diff_bits = 0usize;
+        for (x, y) in a_log.iter().zip(&b_log) {
+            if x.to_bits() != y.to_bits() {
+                diff_bits += 1;
+                max_abs = max_abs.max((x - y).abs());
+            }
+        }
+        assert_eq!(
+            a_tok, b_tok,
+            "round {round}: verify argmax rows diverged between the 32-row dedicated graph and \
+             the 512-row padded graph"
+        );
+        assert_eq!(
+            diff_bits, 0,
+            "round {round}: {diff_bits} of {} logit values differ (max abs {max_abs:e}) between \
+             the 32-row dedicated verify graph and the 512-row padded graph; the coop gemm \
+             route table is asserted bit-equal across m_alloc bases and every other kernel is \
+             per-row, so a nonzero count here names a chunk-bracket-dependent kernel and drops \
+             this contract to the inc2 tolerance class \
+             ({Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN} abs pin)",
+            a_log.len()
+        );
+        eprintln!("[verify32-ab] round {round}: {} logits bit-identical across both graphs", a_log.len());
+        m.advance(batch.len()).expect("commit every verified row");
+        off += k1;
+    }
+    let timed_batch = ids[off - k1..off].to_vec();
+    let mut vf_ms: Vec<f64> = Vec::new();
+    let mut pad_ms: Vec<f64> = Vec::new();
+    for _ in 0..12 {
+        let t = Instant::now();
+        let _ = m.verify_chain_logits(&timed_batch).expect("dedicated timed");
+        vf_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        m.advance(0).expect("rollback");
+        let t = Instant::now();
+        let _ = m
+            .debug_verify_chain_logits_via_the_padded_prefill_graph_for_test(&timed_batch)
+            .expect("padded timed");
+        pad_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        m.advance(0).expect("rollback");
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("finite wall"));
+        v[v.len() / 2]
+    };
+    eprintln!(
+        "[verify32-ab] verify-only wall at pos {}: dedicated 32-row {:.1} ms vs padded 512-row \
+         {:.1} ms per k+1={k1} chain (logits readback included in both)",
+        m.current_pos(),
+        med(&mut vf_ms),
+        med(&mut pad_ms),
+    );
+}
+
+#[test]
+#[ignore = "boots the 22.6 GB Qwen3.8-27B-NVFP4 wgpu decoder with NV_Q3D_VERIFY_M=4 so the \
+            k+1-row verify chain rides the small-m legacy arms (nvfp4 m-row gemv, fp8 per-slot \
+            replay, slab attention) beside the coop 512-row prefill graph; gates: verify argmax \
+            rows equal the padded-512 graph's and logit drift stays under the inc2 empirical \
+            pin; also prints the verify-only wall A/B; set NV_Q38_MTP_INC2_TEST=1"]
+fn real_qwen38_verify4_legacy_rows_argmax_match_and_drift_pin_vs_padded_512() {
+    require_gate();
+    let dir = snapshot_dir();
+    std::env::set_var(
+        nv_models::qwen3_5_dense_wgpu::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+        "4",
+    );
+    let (mut m, tok) = boot(&dir, false);
+    std::env::remove_var(
+        nv_models::qwen3_5_dense_wgpu::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+    );
+    assert!(
+        m.verify_chain_rides_dedicated_graph(),
+        "NV_Q3D_VERIFY_M=4 must record the dedicated legacy verify graph"
+    );
+    assert_eq!(m.verify_max_rows(), 4, "chain capacity must be the dedicated graph's rows");
+    assert_eq!(m.prefill_chunk_len(), 512, "the prefill graph must keep its serving-default M");
+    let k1 = 4usize.min(mtp_chain_depth_from_env() + 1);
+    let rounds = 8usize;
+    let ids = corpus_ids(&tok, CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING + rounds * k1);
+    prefill(&mut m, &ids[..CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING]);
+    let mut off = CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING;
+    let mut max_abs_all = 0f32;
+    for round in 0..rounds {
+        let batch = ids[off..off + k1].to_vec();
+        let (a_tok, a_log) = m.verify_chain_logits(&batch).expect("dedicated-graph chain");
+        m.advance(0).expect("rollback the dedicated-graph forward");
+        let (b_tok, b_log) = m
+            .debug_verify_chain_logits_via_the_padded_prefill_graph_for_test(&batch)
+            .expect("padded-graph chain");
+        let mut max_abs = 0f32;
+        for (x, y) in a_log.iter().zip(&b_log) {
+            max_abs = max_abs.max((x - y).abs());
+        }
+        max_abs_all = max_abs_all.max(max_abs);
+        assert_eq!(
+            a_tok, b_tok,
+            "round {round}: verify argmax rows diverged between the 4-row legacy verify graph \
+             and the 512-row coop graph (max abs logit drift {max_abs:e}); a greedy stream \
+             committed off the legacy rows would diverge from the shipping stream here, so the \
+             legacy vf arm is not identity-safe on this checkpoint"
+        );
+        assert!(
+            max_abs <= Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN,
+            "round {round}: legacy-vs-coop verify logit drift {max_abs} exceeds the inc2 \
+             empirical pin {Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN}"
+        );
+        eprintln!(
+            "[verify4-ab] round {round}: argmax rows match, max abs logit drift {max_abs:e}"
+        );
+        m.advance(batch.len()).expect("commit every verified row");
+        off += k1;
+    }
+    let timed_batch = ids[off - k1..off].to_vec();
+    let mut vf_ms: Vec<f64> = Vec::new();
+    let mut pad_ms: Vec<f64> = Vec::new();
+    for _ in 0..12 {
+        let t = Instant::now();
+        let _ = m.verify_chain_logits(&timed_batch).expect("dedicated timed");
+        vf_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        m.advance(0).expect("rollback");
+        let t = Instant::now();
+        let _ = m
+            .debug_verify_chain_logits_via_the_padded_prefill_graph_for_test(&timed_batch)
+            .expect("padded timed");
+        pad_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        m.advance(0).expect("rollback");
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("finite wall"));
+        v[v.len() / 2]
+    };
+    eprintln!(
+        "[verify4-ab] verify-only wall at pos {}: dedicated legacy 4-row {:.1} ms vs padded \
+         512-row {:.1} ms per k+1={k1} chain (max abs drift over {rounds} rounds {max_abs_all:e})",
+        m.current_pos(),
+        med(&mut vf_ms),
+        med(&mut pad_ms),
+    );
+}
+
+#[test]
+#[ignore = "boots the 22.6 GB Qwen3.8-27B-NVFP4 wgpu decoder with NV_Q3D_VERIFY_M=4 and \
+            NV_Q3D_VF_ATTN_FLASH=loop so the k+1-row verify chain rides the per-row flash-loop \
+            attention over the fp8 KV cache instead of the slab; gates: verify argmax rows \
+            equal the padded-512 coop graph's and logit drift stays under the inc2 empirical \
+            pin -- the drift class the slab arm itself passes against the same reference; set \
+            NV_Q38_MTP_INC2_TEST=1"]
+fn real_qwen38_verify4_vflash_loop_argmax_match_and_drift_pin_vs_padded_512() {
+    require_gate();
+    let dir = snapshot_dir();
+    std::env::set_var(
+        nv_models::qwen3_5_dense_wgpu::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+        "4",
+    );
+    std::env::set_var(
+        nv_models::qwen3_5_dense_wgpu::VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM,
+        "loop",
+    );
+    let (mut m, tok) = boot(&dir, false);
+    std::env::remove_var(
+        nv_models::qwen3_5_dense_wgpu::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+    );
+    std::env::remove_var(
+        nv_models::qwen3_5_dense_wgpu::VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM,
+    );
+    assert!(
+        m.verify_chain_rides_dedicated_graph(),
+        "NV_Q3D_VERIFY_M=4 must record the dedicated legacy verify graph; without it the flash \
+         arm under test never records and this gate proves nothing"
+    );
+    assert_eq!(m.verify_max_rows(), 4, "chain capacity must be the dedicated graph's rows");
+    let k1 = 4usize.min(mtp_chain_depth_from_env() + 1);
+    let rounds = 8usize;
+    let ids = corpus_ids(&tok, CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING + rounds * k1);
+    prefill(&mut m, &ids[..CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING]);
+    let mut off = CTX_PREFILL_64_AMORTIZES_STATE_WARMUP_BEFORE_SCORING;
+    let mut max_abs_all = 0f32;
+    for round in 0..rounds {
+        let batch = ids[off..off + k1].to_vec();
+        let (a_tok, a_log) = m.verify_chain_logits(&batch).expect("vflash-loop chain");
+        m.advance(0).expect("rollback the vflash-loop forward");
+        let (b_tok, b_log) = m
+            .debug_verify_chain_logits_via_the_padded_prefill_graph_for_test(&batch)
+            .expect("padded-graph chain");
+        let mut max_abs = 0f32;
+        for (x, y) in a_log.iter().zip(&b_log) {
+            max_abs = max_abs.max((x - y).abs());
+        }
+        max_abs_all = max_abs_all.max(max_abs);
+        assert_eq!(
+            a_tok, b_tok,
+            "round {round}: verify argmax rows diverged between the vflash-loop 4-row verify \
+             graph and the 512-row coop graph (max abs logit drift {max_abs:e}); a greedy \
+             stream committed off the flash rows would diverge from the shipping stream here, \
+             so the loop arm is not drift-safe on this checkpoint"
+        );
+        assert!(
+            max_abs <= Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN,
+            "round {round}: vflash-loop-vs-coop verify logit drift {max_abs} exceeds the inc2 \
+             empirical pin {Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN}"
+        );
+        eprintln!(
+            "[verify4-vflash-ab] round {round}: argmax rows match, max abs logit drift {max_abs:e}"
+        );
+        m.advance(batch.len()).expect("commit every verified row");
+        off += k1;
+    }
+    eprintln!(
+        "[verify4-vflash-ab] {rounds} rounds at pos {}: argmax rows match throughout, max abs \
+         logit drift {max_abs_all:e} (pin {Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN})",
+        m.current_pos(),
+    );
+}
+
+#[test]
 #[ignore = "boots the 22.6 GB Qwen3.8-27B-NVFP4 wgpu decoder and teacher-forces the pinned \
             corpus through the k+1-row batched verify graph AND the M=1 decode path from the \
             same committed state per chunk; gates: ppl match to publication digits and the \
@@ -243,7 +496,7 @@ fn real_qwen38_inc2_teacher_forced_ppl_match_and_logit_drift_pin() {
         "max abs logit drift {max_drift} between the k+1-row batched verify and M=1 decode \
          exceeds the pin {Q38_WGPU_BATCHED_VERIFY_VS_M1_MAX_ABS_LOGIT_DRIFT_EMPIRICAL_PIN}. \
          This pin is an EMPIRICAL bound (measured 4.60 max over chunk 1/4 x rows 4/16 on \
-         Qwen3.8-27B-NVFP4, a Blackwell workstation GPU, 128 positions at ctx 64), not a theorem: \
+         Qwen3.8-27B-NVFP4, RTX PRO 6000 Blackwell, 128 positions at ctx 64), not a theorem: \
          if kernels changed intentionally, re-measure here and move the pin with the basis \
          recorded in the commit"
     );

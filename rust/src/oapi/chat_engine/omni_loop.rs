@@ -15,7 +15,8 @@ use crate::oapi::chat::{ChatEvent, ChatGenerateRequest};
 use crate::oapi::chat_engine::sampling::ChatSampler;
 use crate::oapi::chat_engine::spec_window::kv_window;
 use crate::oapi::chat_engine::stream::{
-    effective_max_new, push_event_async, push_event_blocking, sse_send_timeout, IncrementalDetok,
+    effective_max_new, push_event_async, push_event_blocking, sse_send_timeout,
+    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot, IncrementalDetok,
     StreamEmitter,
 };
 use crate::oapi::chat_engine::spec_env::acquire_chat_permit;
@@ -113,7 +114,7 @@ fn expand_media(model: &OmniShared, tokens: &[u32], req: &ChatGenerateRequest) -
             let (emb, deep) = model.vision.forward(&patches, grid)?;
             let n = emb.dim(0)?;
             let pos = out.len();
-            out.extend(std::iter::repeat(ids.image_pad).take(n));
+            out.extend(std::iter::repeat_n(ids.image_pad, n));
             for r in pos..pos + n {
                 ds_rows.push(r as u32);
             }
@@ -138,7 +139,7 @@ fn expand_media(model: &OmniShared, tokens: &[u32], req: &ChatGenerateRequest) -
                 anyhow::bail!("audio produced {n} tokens != output-length law");
             }
             let pos = out.len();
-            out.extend(std::iter::repeat(ids.audio_pad).take(n));
+            out.extend(std::iter::repeat_n(ids.audio_pad, n));
             audio_lens.push(n);
             splices.push(ModalitySplice { position: pos, embedding: emb });
         } else {
@@ -204,6 +205,7 @@ pub(crate) async fn run_sampling_omni(
     if tx.send(ChatEvent::Started { prompt_tokens }).await.is_err() {
         return Ok(());
     }
+    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
     if tokens.is_empty() {
         let _ = tx
             .send(ChatEvent::Done {

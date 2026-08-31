@@ -75,12 +75,32 @@ streamed deltas, carrying the `<think>`-fenced span split out of the model's own
 text, and `system_fingerprint` synthesised from the model id hashed with the
 crate version. One extra response header: `x-spec-decode`.
 
-`check_stt_params` rejects `language` (anything but empty or `auto`), any
-non-empty `prompt`, and any non-zero `temperature` on
-`/v1/audio/transcriptions` — the STT backend auto-detects language, takes no
-decoder prompt, and decodes greedily, so accepting those fields would be a lie.
-(That refusal breaks two shipped conformance fixtures; see 01.4-STATUS.md.) It
-adds a non-OpenAI `response_format=diarized_json`.
+**Reasoning tokens spend `max_tokens` first.** On a reasoning-on model (Qwen3.8
+thinks by default), everything the model emits inside its `<think>` fence counts
+against `max_tokens` before any visible text does, and it is returned as
+`reasoning_content`, not `content` — so a 350-token budget on a thinking model
+typically ends `finish_reason: "length"` with a long `reasoning_content` and a
+short or empty `content`. A client that wants N visible tokens from a thinking
+model budgets `max_tokens` for thinking plus answer (thinking spans of several
+hundred tokens are normal), or disables thinking for that request with
+`enable_thinking: false` (`chat_template_kwargs` reaches the template for
+finer control). `usage.completion_tokens` counts both spans; the split is
+visible only in the response body.
+
+`check_stt_params` on `/v1/audio/transcriptions` validates `language` against
+the whisper language table (unknown codes are a 400 naming the field) and
+forwards it — whisper-cpp receives it directly, ct2 skips detection and forces
+the matching language token, parakeet accepts only `en`. A non-empty `prompt`
+is forwarded as the decoder's initial prompt (whisper-cpp `prompt_tokens`, ct2
+`<|startofprev|>` prefix, truncated to the last
+`INITIAL_PROMPT_TAIL_TOKENS_HALF_WHISPER_TEXT_CTX_MINUS_ONE` tokens); a backend
+that cannot honour it (parakeet, a ct2 tokenizer without `<|startofprev|>`)
+answers 400 `unsupported_parameter` naming the field rather than dropping it.
+A multipart `model` field naming anything but the loaded STT model (generic
+`whisper`/`whisper-1` match any whisper-family backend) is a 404
+`model_not_found` naming what is served. Any non-zero `temperature` is still
+refused — decoding is greedy. It adds a non-OpenAI
+`response_format=diarized_json`.
 
 `oapi/audio_speech.rs` refuses an unknown `model` with `404 model_not_found`
 instead of rendering it with whichever engine happens to be loaded — the error
@@ -388,6 +408,18 @@ the one non-required entry, because a CustomVoice or VoiceDesign checkpoint
 legitimately has no speaker-encoder tensors. `/health` is a static `ok` and is
 not the readiness probe; before the readiness vector is populated
 `/health/ready` answers `503 starting`.
+
+That answer is reachable during the load, because the listener binds *before*
+any model is loaded. While loading, the socket serves a warming router: the
+four unauthenticated infrastructure routes — `/health`, `/health/ready`,
+`/metrics`, `/version`, the same set `auth_mw` exempts — answer for real, and
+every other path answers `503` with `Retry-After` and
+`code: model_load_in_progress`. Binding after the load instead would leave
+nothing listening for as long as the weights take, which a reverse proxy can
+only report as a refused connection — `502`, indistinguishable from a crashed
+server, and the reason a slow boot reads as an outage. `bind_listener` retries
+briefly so the handoff from the warming router to the real one survives the
+moment the first socket closes.
 
 Below the process level the same principle repeats per endpoint, and it is why
 there are two distinct failure shapes. **A route that cannot exist without its

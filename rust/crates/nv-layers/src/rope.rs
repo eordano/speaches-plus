@@ -496,6 +496,130 @@ impl Rope {
         .reshape(k_dims)?;
         Ok((q_t, k_t))
     }
+
+    pub fn apply_partial_oop_bf16_cuda_one_launch_replacing_slice_cast_rope_cast_concat(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions: &Tensor,
+        head_dim: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use half::bf16;
+        use nv_kernels::cuda as nvk;
+
+        let rotary_dim = self.cfg.head_dim;
+        anyhow::ensure!(
+            rotary_dim < head_dim && rotary_dim % 2 == 0,
+            "partial rope: rotary {rotary_dim} must be even and below head_dim {head_dim}"
+        );
+        anyhow::ensure!(
+            q.dtype() == DType::BF16 && k.dtype() == DType::BF16,
+            "partial rope kernel is bf16-only"
+        );
+        let q_dims = q.dims().to_vec();
+        let k_dims = k.dims().to_vec();
+        anyhow::ensure!(
+            *q_dims.last().unwrap() == head_dim && *k_dims.last().unwrap() == head_dim,
+            "partial rope: q/k last dim must be head_dim {head_dim}"
+        );
+        let n_heads = q_dims[q_dims.len() - 2];
+        let n_kv_heads = k_dims[k_dims.len() - 2];
+        let tokens: usize = q_dims[..q_dims.len() - 2].iter().product();
+        anyhow::ensure!(
+            k_dims[..k_dims.len() - 2].iter().product::<usize>() == tokens,
+            "partial rope: q/k token counts differ"
+        );
+
+        let q_in = q.contiguous()?.reshape((tokens, n_heads, head_dim))?;
+        let k_in = k.contiguous()?.reshape((tokens, n_kv_heads, head_dim))?;
+        let cos_c = self.cos.contiguous()?;
+        let sin_c = self.sin.contiguous()?;
+        let dev = match q_in.device() {
+            Device::Cuda(d) => d.clone(),
+            _ => anyhow::bail!("partial rope kernel needs CUDA"),
+        };
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let mut q_out: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(tokens * n_heads * head_dim)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let mut k_out: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(tokens * n_kv_heads * head_dim)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let pos_i32 = positions_to_i32_cuda(positions, q_in.device())?;
+        let rc = {
+            let (qs, ql) = q_in.storage_and_layout();
+            let (ks, kl) = k_in.storage_and_layout();
+            let (cs, _cl) = cos_c.storage_and_layout();
+            let (ss, _sl) = sin_c.storage_and_layout();
+            let (ps, _pl) = pos_i32.storage_and_layout();
+            let (q_cuda, k_cuda, c_cuda, s_cuda, p_cuda) = match (&*qs, &*ks, &*cs, &*ss, &*ps) {
+                (
+                    candle_core::Storage::Cuda(a),
+                    candle_core::Storage::Cuda(b),
+                    candle_core::Storage::Cuda(c),
+                    candle_core::Storage::Cuda(d),
+                    candle_core::Storage::Cuda(e),
+                ) => (a, b, c, d, e),
+                _ => anyhow::bail!("expected cuda storage"),
+            };
+            let q_view = q_cuda.as_cuda_slice::<bf16>()?.slice(ql.start_offset()..);
+            let k_view = k_cuda.as_cuda_slice::<bf16>()?.slice(kl.start_offset()..);
+            let c_slice = c_cuda.as_cuda_slice::<f32>()?;
+            let s_slice = s_cuda.as_cuda_slice::<f32>()?;
+            let p_slice = p_cuda.as_cuda_slice::<i32>()?;
+            let (pqi, _gqi) = q_view.device_ptr(&stream);
+            let (pki, _gki) = k_view.device_ptr(&stream);
+            let (pq, _gq) = q_out.device_ptr_mut(&stream);
+            let (pk, _gk) = k_out.device_ptr_mut(&stream);
+            let (pc, _gc) = c_slice.device_ptr(&stream);
+            let (psn, _gs) = s_slice.device_ptr(&stream);
+            let (pp, _gp) = p_slice.device_ptr(&stream);
+            unsafe {
+                nvk::rope_bf16_partial_oop(
+                    stream.cu_stream() as *mut _,
+                    pqi as *const u16,
+                    pki as *const u16,
+                    pq as *mut u16,
+                    pk as *mut u16,
+                    pc as *const f32,
+                    psn as *const f32,
+                    pp as *const i32,
+                    tokens,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    rotary_dim,
+                )
+            }
+        };
+        anyhow::ensure!(rc == 0, "rope_bf16_partial_oop kernel returned {rc}");
+        let q_storage = candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+            q_out,
+            dev.clone(),
+        ));
+        let k_storage =
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(k_out, dev));
+        let q_t = candle_core::Tensor::from_storage(
+            q_storage,
+            candle_core::Shape::from((tokens, n_heads, head_dim)),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+        .reshape(q_dims)?;
+        let k_t = candle_core::Tensor::from_storage(
+            k_storage,
+            candle_core::Shape::from((tokens, n_kv_heads, head_dim)),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+        .reshape(k_dims)?;
+        Ok((q_t, k_t))
+    }
 }
 
 pub fn apply_rope(

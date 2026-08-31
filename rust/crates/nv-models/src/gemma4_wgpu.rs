@@ -20,6 +20,79 @@ pub fn flash_splits() -> u32 {
     wk::flash_decode::splits_env() as u32
 }
 
+pub const DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN: &str =
+    "NV_G4_WGPU_DEPTH_STACK";
+
+pub fn depth_stack_enabled() -> bool {
+    match std::env::var(
+        DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN,
+    ) {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => true,
+    }
+}
+
+pub fn flash1_gqa_fold_for_full_attention_geometry(
+    n_q: usize,
+    n_kv_f: usize,
+    hd_max: usize,
+) -> u32 {
+    let eligible = n_kv_f > 0
+        && n_q.is_multiple_of(n_kv_f)
+        && hd_max.is_multiple_of(32)
+        && hd_max <= wk::flash_decode::MAX_HEAD_DIM;
+    if !eligible {
+        return 1;
+    }
+    let group = n_q / n_kv_f;
+    let f = if nv_config::env_arm_present_at_all_reread_every_call(wk::flash_decode::GQA_FOLD_ENV) {
+        wk::flash_decode::gqa_fold_env(group)
+    } else {
+        group.min(wk::flash_decode::MAX_GQA_FOLD)
+    };
+    if f > 1 && group.is_multiple_of(f) && n_q.is_multiple_of(f) {
+        f as u32
+    } else {
+        1
+    }
+}
+
+pub fn flash1_gqa_fold_when_depth_stack(n_q: usize, n_kv_f: usize, hd_max: usize) -> u32 {
+    if !depth_stack_enabled() {
+        return 1;
+    }
+    flash1_gqa_fold_for_full_attention_geometry(n_q, n_kv_f, hd_max)
+}
+
+pub const FLASH_TILE_ENV_0_UNTILED_2_TO_8_POSITIONS_PER_WARP_ROUND_SD_SG_ONLY: &str =
+    "NV_G4_WGPU_FLASH_TILE";
+
+pub const DEPTH_STACK_TILE_4_MEASURED_BEST_WITH_FOLD8_SPLITS32_AT_122880: u32 = 4;
+
+fn flash_tile_env() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var(FLASH_TILE_ENV_0_UNTILED_2_TO_8_POSITIONS_PER_WARP_ROUND_SD_SG_ONLY)
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|t| t.clamp(0, 8))
+            .unwrap_or(DEPTH_STACK_TILE_4_MEASURED_BEST_WITH_FOLD8_SPLITS32_AT_122880)
+    })
+}
+
+pub const DEPTH_STACK_SPLITS_32_BEATS_16_AND_64_ONCE_FOLDED_AND_HOLDS_THE_256_RUNG: u32 = 32;
+
+fn depth_stack_splits() -> u32 {
+    if nv_config::env_arm_present_at_all_reread_every_call(wk::flash_decode::SPLITS_ENV) {
+        flash_splits()
+    } else {
+        DEPTH_STACK_SPLITS_32_BEATS_16_AND_64_ONCE_FOLDED_AND_HOLDS_THE_256_RUNG
+    }
+}
+
 pub const FLASH_SD_DEFAULT_ON_SHIFT_TWIN_WINS_AT_DEPTH_AND_HOLDS_PPL: &str =
     "the exact e4m3_decode is ~12 ops/element in a decode-ALU bound regime; the shift twin \
      flash_splitk_stage1_fp8kv_sd decodes in 2 ops with the 2^120 carry folded into the \
@@ -29,8 +102,7 @@ pub const FLASH_SD_DEFAULT_ON_SHIFT_TWIN_WINS_AT_DEPTH_AND_HOLDS_PPL: &str =
      stage1";
 
 fn flash_sd_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_G4_FLASH_SD").ok().as_deref() != Some("0"))
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!("NV_G4_FLASH_SD")
 }
 
 fn flash1_stage1_entry() -> &'static str {
@@ -53,7 +125,7 @@ struct ChunkRowSplice<'a> {
 }
 
 pub fn preenc_enabled_default() -> bool {
-    std::env::var("NV_G4_WGPU_PREENC").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_G4_WGPU_PREENC")
 }
 
 fn uniform_probe_reps() -> usize {
@@ -859,7 +931,7 @@ fn par_bf16_bits(wf: &[f32], gi: f32) -> Vec<u16> {
 pub const W8_FFN_DEFAULT: &str = "all";
 
 fn gelu_fold_enabled() -> bool {
-    std::env::var("NV_G4_WGPU_GELU_FOLD").ok().as_deref() != Some("0")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_G4_WGPU_GELU_FOLD")
 }
 
 fn w8_ffn_mode() -> (bool, bool, usize) {
@@ -1952,6 +2024,7 @@ struct Pipelines {
     rope_f32: Arc<wgpu::ComputePipeline>,
     kvq: Arc<wgpu::ComputePipeline>,
     flash1: Arc<wgpu::ComputePipeline>,
+    flash1_fold: Option<(u32, Arc<wgpu::ComputePipeline>)>,
     flash2_pk: Arc<wgpu::ComputePipeline>,
     gemv_pk: Arc<wgpu::ComputePipeline>,
     gemv_pk3: Arc<wgpu::ComputePipeline>,
@@ -2395,7 +2468,14 @@ pub const PF_COOP_TN2_SG2_KU4_STAGES_4096_F16_WELL_UNDER_THE_24576_BUDGET: (u32,
 
 pub fn pf_coop_w4a16_ffn_opt_in_default_off_because_only_measured_on_this_blackwell_adapter(
 ) -> bool {
-    std::env::var("NV_G4_PF_COOP").ok().as_deref() == Some("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_G4_PF_COOP")
+}
+
+pub fn pf_coop_x_rows_round_up_to_a_whole_row_block_because_the_gemm_loads_every_row_of_its_last_block(
+    m: usize,
+    tm: u32,
+) -> usize {
+    m.next_multiple_of(16 * tm as usize)
 }
 
 pub const PF_FIXED_PASSES_PER_DENSE_LAYER_RMS8_ROPE2_KVQ2_GELU1: usize = 13;
@@ -2436,6 +2516,19 @@ pub fn sliding_kv_ring_rows_window_plus_prefill_chunk_plus_headroom(
     prefill_chunk: usize,
 ) -> usize {
     window + prefill_chunk.max(1) + SLIDING_KV_RING_HEADROOM_SLOTS_MATCHING_CUDA_KV_FP8_RING_SLOTS
+}
+
+fn flash1_arm_for_kind(
+    pl: &Pipelines,
+    n_q: usize,
+    gqa_group: usize,
+) -> (Arc<wgpu::ComputePipeline>, u32) {
+    match pl.flash1_fold.as_ref() {
+        Some((fold, p)) if gqa_group.is_multiple_of(*fold as usize) => {
+            (p.clone(), n_q as u32 / *fold)
+        }
+        _ => (pl.flash1.clone(), n_q as u32),
+    }
 }
 
 fn mk_pipeline(
@@ -2534,7 +2627,7 @@ fn nvfp4_shape_pick_enabled() -> bool {
 }
 
 fn nvfp4_variant(ctx: &WgpuContext) -> wk::gemv_nvfp4::GemvVariant {
-    if std::env::var("NV_WGPU_NVFP4_TREE").is_ok_and(|v| v != "0") {
+    if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_NVFP4_TREE") {
         wk::gemv_nvfp4::GemvVariant::Tree
     } else {
         wk::gemv_nvfp4::select_variant(ctx)
@@ -2548,7 +2641,7 @@ pub const ATTN_FP8_FMT_DEFAULT: wk::quant_gemv::QFormat = wk::quant_gemv::QForma
 pub const NVFP4_V2_DEFAULT_ON: bool = false;
 
 pub fn nvfp4_v2_enabled(ctx: &WgpuContext) -> bool {
-    if std::env::var("NV_WGPU_NVFP4_TREE").is_ok_and(|v| v != "0") {
+    if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_NVFP4_TREE") {
         return false;
     }
     if !wk::gemv_nvfp4_v2::subgroup32_ok(ctx) {
@@ -2674,7 +2767,7 @@ pub fn weight_format_boot_line() -> String {
             "checkpoint".to_string()
         }
     };
-    let lmhead = if std::env::var("NV_WGPU_LMHEAD_INT8").is_ok_and(|v| v != "0") {
+    let lmhead = if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_LMHEAD_INT8") {
         "int8"
     } else {
         "checkpoint"
@@ -2752,6 +2845,9 @@ fn build_pipelines(
     fp8: bool,
     fuse_hd_max: Option<usize>,
     mk_rows: usize,
+    splits: u32,
+    flash_fold: u32,
+    fold_hd_max: u32,
 ) -> Result<Pipelines> {
     let mk = |label: &str, source: &str, entry: &str| mk_pipeline(ctx, label, source, entry);
     let src_rs = compose(wk::residual_scale::WGSL);
@@ -2760,18 +2856,59 @@ fn build_pipelines(
     let src_rope = format!("{}\n{}", compose(wk::rope_bf16::WGSL), ROPE_F32_WGSL);
     let src_kv = compose(wk::kv_fp8::WGSL);
     let src_flash = format!("{}\n{}", compose(wk::flash_decode::WGSL), FLASH2_PK_WGSL);
-    let src_flash2_folded = {
-        let folded = src_flash.replacen(
-            "let splits = 16u;",
-            &format!("let splits = {}u;", flash_splits()),
-            1,
+    const FLASH2_UNROLLED_PK_SUMS_EXACTLY_16_SPLITS_SSC_REGISTERS_ARE_BAKED: u32 = 16;
+    let flash2_pk = if splits == FLASH2_UNROLLED_PK_SUMS_EXACTLY_16_SPLITS_SSC_REGISTERS_ARE_BAKED
+    {
+        mk_pipeline(ctx, "g4w-flash2-pk", &src_flash, FLASH2_PK_ENTRY)?
+    } else {
+        mk_pipeline(
+            ctx,
+            "g4w-flash2-pk-rt",
+            &compose(wk::flash_decode::WGSL),
+            wk::flash_decode::ENTRY_STAGE2_PK_RT,
+        )?
+    };
+    let fold_sg = ctx.caps.subgroup && ctx.subgroup_width() == Some(32);
+    if flash_fold > 1 && !fold_sg {
+        eprintln!(
+            "[gemma4_wgpu] depth stack fold disabled: no 32-lane subgroups; the barrier-tree \
+             fold reduce pays fold extra 256-thread trees per KV round and measured slower than \
+             the unfolded arm at every depth (runs.jsonl depth-stack fold2f/4f/8f)"
         );
-        anyhow::ensure!(
-            flash_splits() == 16 || folded != src_flash,
-            "flash2 split-count anchor `let splits = 16u;` missing from g4shared_flash2_pk; \
-             the folded stage2 would silently merge the wrong number of partials"
+    }
+    let flash1_fold = if flash_fold > 1 && fold_sg {
+        const FOLD_REDUCE_IS_SG_SHUFFLE_WB_TREES_LOSE_AT_EVERY_DEPTH_SG_DRIFTS_1ULP_AT_HD512: bool =
+            true;
+        let sg = FOLD_REDUCE_IS_SG_SHUFFLE_WB_TREES_LOSE_AT_EVERY_DEPTH_SG_DRIFTS_1ULP_AT_HD512;
+        let tile = if flash_sd_enabled() { flash_tile_env() } else { 0 };
+        let (entry, generated) = if flash_sd_enabled() && tile >= 2 {
+            (
+                wk::flash_decode::fold_stage1_entry_sd_tiled(fold_hd_max, flash_fold, tile),
+                wk::flash_decode::fold_stage1_source_sd_tiled(fold_hd_max, flash_fold, tile),
+            )
+        } else if flash_sd_enabled() {
+            (
+                wk::flash_decode::fold_stage1_entry_sd(fold_hd_max, sg, flash_fold),
+                wk::flash_decode::fold_stage1_source_sd(fold_hd_max, sg, flash_fold),
+            )
+        } else {
+            (
+                wk::flash_decode::fold_stage1_entry(fold_hd_max, sg, flash_fold),
+                wk::flash_decode::fold_stage1_source(fold_hd_max, sg, flash_fold),
+            )
+        };
+        let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), generated);
+        eprintln!(
+            "[gemma4_wgpu] depth stack: flash stage1 folds {flash_fold} query heads per \
+             workgroup (subgroup reduce, tile {tile}), splits {splits} ({})",
+            DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN
         );
-        folded
+        Some((
+            flash_fold,
+            mk_pipeline(ctx, &format!("g4w-flash1-fold{flash_fold}t{tile}"), &src, &entry)?,
+        ))
+    } else {
+        None
     };
     let src_gemvb = format!("{}\n{}", compose(wk::gemv_bf16::WGSL), GEMV_PK_WGSL);
     let src_gd = compose(wk::graph_decode::WGSL);
@@ -2797,7 +2934,8 @@ fn build_pipelines(
         rope_f32: mk("g4w-rope-f32", &src_rope, ROPE_F32_ENTRY)?,
         kvq: mk("g4w-kvq", &src_kv, wk::kv_fp8::QUANTIZE_ENTRY)?,
         flash1: mk("g4w-flash1", &src_flash, flash1_stage1_entry())?,
-        flash2_pk: mk("g4w-flash2-pk", &src_flash2_folded, FLASH2_PK_ENTRY)?,
+        flash1_fold,
+        flash2_pk,
         gemv_pk: mk("g4w-gemv8-pk", &src_gemvb, GEMV_PK_ENTRY)?,
         gemv_pk3: mk("g4w-gemv8-pk3", &src_gemvb, GEMV_PK3_ENTRY)?,
         rowquant_i8: mk("g4w-rowquant-i8", &src_gemvb, wk::gemv_bf16::ROWQUANT_ENTRY)?,
@@ -2957,7 +3095,7 @@ pub struct Gemma4Wgpu {
     uniform_probe: usize,
     w4_cap: Option<W4Capture>,
     kv_layers: Vec<GpuLayerKv>,
-    _keep: Vec<Box<dyn std::any::Any>>,
+    _keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 struct W4Capture {
@@ -2998,7 +3136,7 @@ struct Builder<'a> {
     bt_passes: Vec<Pass>,
     vf_passes: Vec<Pass>,
     dst: PassDst,
-    keep: Vec<Box<dyn std::any::Any>>,
+    keep: Vec<Box<dyn std::any::Any + Send>>,
     weight_bytes: u64,
     nvfp4_projs: usize,
     nvfp4_v2_routed: usize,
@@ -3088,7 +3226,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn uni<T: bytemuck::Pod + 'static>(&mut self, label: &str, value: T) -> wgpu::Buffer {
+    fn uni<T: bytemuck::Pod + Send + 'static>(&mut self, label: &str, value: T) -> wgpu::Buffer {
         let u = GpuUniform::new(self.ctx, label, &value);
         let raw = u.raw().clone();
         self.keep.push(Box::new(u));
@@ -3744,7 +3882,6 @@ struct PfCoopCtx {
     tm: u32,
     tn: u32,
     sg: u32,
-    ku: u32,
 }
 
 #[repr(C)]
@@ -4072,6 +4209,17 @@ impl Gemma4Wgpu {
         let q_dim_max = n_q * hd_max;
         let kv_dim_max = (nkv_s * hd_s).max(nkv_f * hd_f);
         anyhow::ensure!(hd_max <= wk::flash_decode::MAX_HEAD_DIM);
+        let splits = if depth_stack_enabled() {
+            depth_stack_splits()
+        } else {
+            flash_splits()
+        };
+        let flash_fold = flash1_gqa_fold_when_depth_stack(n_q, nkv_f, hd_max);
+        anyhow::ensure!(
+            flash_fold == 1 || n_q.is_multiple_of(flash_fold as usize),
+            "flash stage1 fold {flash_fold} must divide n_q {n_q}: the folded grid covers \
+             fold query heads per workgroup"
+        );
 
         let fuse = if hd_s.is_multiple_of(4) && hd_f.is_multiple_of(4) {
             fuse_mask(ctx, hd_max)
@@ -4183,6 +4331,9 @@ impl Gemma4Wgpu {
             any_q8,
             (fuse != 0).then_some(hd_max),
             mk_gemm_tile_rows_never_exceed_the_shader_unroll,
+            splits,
+            flash_fold,
+            hd_max as u32,
         )?;
         let pipelines_s = t_pl.elapsed().as_secs_f64();
         let mut b = Builder {
@@ -4200,7 +4351,7 @@ impl Gemma4Wgpu {
             mk4: None,
         };
 
-        let o_nvfp4 = std::env::var("NV_WGPU_O_NVFP4").is_ok_and(|v| v != "0");
+        let o_nvfp4 = nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_O_NVFP4");
         let quant_k_max = weights
             .layers
             .iter()
@@ -4237,7 +4388,7 @@ impl Gemma4Wgpu {
         ctx.poll_blocking().map_err(err)?;
         let final_norm = GpuTensor::upload(ctx, "g4w-final-norm", &pack_pairs(&weights.final_norm));
 
-        let lmhead_i8 = std::env::var("NV_WGPU_LMHEAD_INT8").is_ok_and(|v| v != "0");
+        let lmhead_i8 = nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_LMHEAD_INT8");
         let kv_slots = bt_slots.max(1);
         let lmhead_i8_bufs = if lmhead_i8 {
             anyhow::ensure!(
@@ -4347,7 +4498,7 @@ impl Gemma4Wgpu {
         let am_idx = GpuTensor::<i32>::zeroed(ctx, "g4w-am-idx", wk::graph_decode::ARGMAX_BLOCKS);
         let token_out = GpuTensor::<u32>::zeroed(ctx, "g4w-token-out", 1);
         let chain_out = GpuTensor::<u32>::zeroed(ctx, "g4w-chain-out", MAX_CHAIN);
-        let scratch_len = n_q * flash_splits() as usize * (hd_max + 2);
+        let scratch_len = n_q * splits as usize * (hd_max + 2);
         let scratch = GpuTensor::<f32>::zeroed(ctx, "g4w-flash-scratch", scratch_len);
 
         let tok_idx = GpuTensor::<i32>::upload(ctx, "g4w-tok-idx", &[0]);
@@ -4372,7 +4523,7 @@ impl Gemma4Wgpu {
             head_dim: config.head_dim_for(kind) as u32,
             total: 0,
             start: 0,
-            splits: flash_splits(),
+            splits,
             ring: ring_for(kind),
             out_bf16: 1,
             scaling: 1.0,
@@ -4798,8 +4949,10 @@ impl Gemma4Wgpu {
                 LayerType::SlidingAttention => fd_sliding.raw(),
                 LayerType::FullAttention => fd_full.raw(),
             };
+            let (flash1_pl, flash1_x) =
+                flash1_arm_for_kind(&pl, n_q, n_q / config.num_kv_heads_for(kind));
             b.push(
-                pl.flash1.clone(),
+                flash1_pl,
                 &[
                     (0, q_f32.raw()),
                     (4, fd),
@@ -4809,7 +4962,7 @@ impl Gemma4Wgpu {
                     (8, kv.k_scales.raw()),
                     (9, kv.v_scales.raw()),
                 ],
-                (n_q as u32, flash_splits(), 1),
+                (flash1_x, splits, 1),
             );
             b.push(
                 pl.flash2_pk.clone(),
@@ -5143,7 +5296,7 @@ impl Gemma4Wgpu {
             GpuTensor::<f32>::zeroed(
                 ctx,
                 "g4w-pf-flash-scratch",
-                n_q * pf_m * flash_splits() as usize * (hd_f + 2),
+                n_q * pf_m * splits as usize * (hd_f + 2),
             )
         });
         let pf_flash_pipes = if pf_flash_on {
@@ -5214,13 +5367,19 @@ impl Gemma4Wgpu {
                         PF_COOP_PACK_WGSL,
                         "g4w_pf_coop_alpha_pack_bf16",
                     )?,
-                    xf16: GpuTensor::<u32>::zeroed(ctx, "g4w-pf-coop-xf16", m * kmax / 2),
+                    xf16: GpuTensor::<u32>::zeroed(
+                        ctx,
+                        "g4w-pf-coop-xf16",
+                        pf_coop_x_rows_round_up_to_a_whole_row_block_because_the_gemm_loads_every_row_of_its_last_block
+                            (m, tm)
+                            * kmax
+                            / 2,
+                    ),
                     yf32: GpuTensor::<f32>::zeroed(ctx, "g4w-pf-coop-yf32", m * nmax),
                     zero: GpuTensor::<f32>::zeroed(ctx, "g4w-pf-coop-zero", 256),
                     tm,
                     tn,
                     sg,
-                    ku,
                 })
             } else {
                 None
@@ -5430,7 +5589,7 @@ impl Gemma4Wgpu {
                                 (8, kv.k_scales.raw()),
                                 (9, kv.v_scales.raw()),
                             ],
-                            (n_q as u32, flash_splits(), tiles as u32),
+                            (n_q as u32, splits, tiles as u32),
                         );
                         b.push(
                             f2.clone(),
@@ -5444,7 +5603,8 @@ impl Gemma4Wgpu {
                                 LayerType::SlidingAttention => pf_fd_s[t].raw(),
                                 LayerType::FullAttention => pf_fd_f[t].raw(),
                             };
-                            let flash1_pl = pl.flash1.clone();
+                            let (flash1_pl, flash1_x) =
+                                flash1_arm_for_kind(&pl, n_q, n_q / config.num_kv_heads_for(kind));
                             b.push_offsets(
                                 flash1_pl,
                                 &[
@@ -5456,7 +5616,7 @@ impl Gemma4Wgpu {
                                     (8, kv.k_scales.raw(), 0),
                                     (9, kv.v_scales.raw(), 0),
                                 ],
-                                (n_q as u32, flash_splits(), 1),
+                                (flash1_x, splits, 1),
                             );
                             let flash2_pl = pl.flash2_pk.clone();
                             b.push_offsets(
@@ -5751,7 +5911,8 @@ impl Gemma4Wgpu {
                         LayerType::SlidingAttention => bt_fd_s[j].raw(),
                         LayerType::FullAttention => bt_fd_f[j].raw(),
                     };
-                    let flash1_pl = pl.flash1.clone();
+                    let (flash1_pl, flash1_x) =
+                        flash1_arm_for_kind(&pl, n_q, n_q / config.num_kv_heads_for(kind));
                     b.push_offsets(
                         flash1_pl,
                         &[
@@ -5763,7 +5924,7 @@ impl Gemma4Wgpu {
                             (8, kv.k_scales.raw(), 0),
                             (9, kv.v_scales.raw(), 0),
                         ],
-                        (n_q as u32, flash_splits(), 1),
+                        (flash1_x, splits, 1),
                     );
                     let flash2_pl = pl.flash2_pk.clone();
                     b.push_offsets(

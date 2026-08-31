@@ -117,6 +117,83 @@ pub fn quantize_block_with_global(values: &[f32], stored_global: f32) -> (Vec<u8
     (packed, scale_byte)
 }
 
+pub const CLOSED_FORM_SCALE_STEPS_BELOW_NEAREST_BECAUSE_CLIPPING_THE_BLOCK_AMAX_BUYS_INTERIOR_RESOLUTION: i32 = 6;
+
+pub const CLOSED_FORM_SCALE_STEPS_ABOVE_NEAREST_BECAUSE_E2M1_STEPS_BY_HALF_BELOW_TWO_AND_BY_TWO_ABOVE_FOUR_SO_PARKING_THE_BLOCK_AMAX_ON_SIX_IS_THE_WORST_PLACE_FOR_IT: i32 = 10;
+
+pub const UE4M3_DECODE_IS_MONOTONIC_IN_THE_BYTE_SO_ONE_GRID_STEP_IS_PLUS_ONE_BYTE: (u8, u8) = (1, 0x7E);
+
+fn stored_global_or_one(stored_global: f32) -> f32 {
+    if stored_global == 0.0 || !stored_global.is_finite() {
+        1.0
+    } else {
+        stored_global
+    }
+}
+
+pub fn block_reconstruction_sq_error(values: &[f32], scale_byte: u8, stored_global: f32) -> f64 {
+    let stored = stored_global_or_one(stored_global);
+    let decoded = decode_ue4m3(scale_byte);
+    let inv = if decoded == 0.0 { 1.0 } else { stored / decoded };
+    let back = decoded / stored;
+    values
+        .iter()
+        .map(|v| {
+            let q = decode_e2m1(encode_e2m1((v * inv).clamp(-6.0, 6.0))) * back;
+            let d = (q - v) as f64;
+            d * d
+        })
+        .sum()
+}
+
+pub fn closed_form_scale_byte(values: &[f32], stored_global: f32) -> u8 {
+    let stored = stored_global_or_one(stored_global);
+    let amax = values.iter().fold(0f32, |a, b| a.max(b.abs()));
+    let local_scale = if amax == 0.0 { 1.0 } else { amax / 6.0 };
+    let nearest = encode_ue4m3(stored * local_scale) as i32;
+    if amax == 0.0 {
+        return nearest as u8;
+    }
+    let (lo_byte, hi_byte) = UE4M3_DECODE_IS_MONOTONIC_IN_THE_BYTE_SO_ONE_GRID_STEP_IS_PLUS_ONE_BYTE;
+    let mut best = nearest.clamp(lo_byte as i32, hi_byte as i32) as u8;
+    let mut best_err = f64::INFINITY;
+    for step in -CLOSED_FORM_SCALE_STEPS_BELOW_NEAREST_BECAUSE_CLIPPING_THE_BLOCK_AMAX_BUYS_INTERIOR_RESOLUTION
+        ..=CLOSED_FORM_SCALE_STEPS_ABOVE_NEAREST_BECAUSE_E2M1_STEPS_BY_HALF_BELOW_TWO_AND_BY_TWO_ABOVE_FOUR_SO_PARKING_THE_BLOCK_AMAX_ON_SIX_IS_THE_WORST_PLACE_FOR_IT
+    {
+        let byte = (nearest + step).clamp(lo_byte as i32, hi_byte as i32) as u8;
+        let err = block_reconstruction_sq_error(values, byte, stored);
+        if err < best_err {
+            best_err = err;
+            best = byte;
+        }
+    }
+    best
+}
+
+pub fn quantize_block_with_global_closed_form(
+    values: &[f32],
+    stored_global: f32,
+) -> (Vec<u8>, u8) {
+    assert_eq!(values.len(), BLOCK_SIZE);
+    let stored = stored_global_or_one(stored_global);
+    let scale_byte = closed_form_scale_byte(values, stored);
+    let scale_decoded = decode_ue4m3(scale_byte);
+    let inv = if scale_decoded == 0.0 {
+        1.0
+    } else {
+        stored / scale_decoded
+    };
+    let mut nibbles = Vec::with_capacity(BLOCK_SIZE);
+    for v in values {
+        nibbles.push(encode_e2m1((v * inv).clamp(-6.0, 6.0)));
+    }
+    let mut packed = Vec::with_capacity(BLOCK_SIZE / 2);
+    for chunk in nibbles.chunks(2) {
+        packed.push(pack_e2m1_pair(chunk[0], chunk[1]));
+    }
+    (packed, scale_byte)
+}
+
 pub fn dequantize_block(packed: &[u8], scale_byte: u8) -> Vec<f32> {
     let scale = decode_ue4m3(scale_byte);
     let mut out = Vec::with_capacity(BLOCK_SIZE);
@@ -153,6 +230,31 @@ impl Nvfp4Tensor {
         for row in rows {
             for block in row.chunks(BLOCK_SIZE) {
                 let (packed, scale) = quantize_block_with_global(block, stored_global);
+                data.extend_from_slice(&packed);
+                scales.push(scale);
+            }
+        }
+        Self {
+            data,
+            scales,
+            rows: rows_n,
+            cols,
+        }
+    }
+
+    pub fn quantize_rows_with_global_closed_form(rows: &[Vec<f32>], stored_global: f32) -> Self {
+        let rows_n = rows.len();
+        let cols = rows[0].len();
+        assert!(
+            cols.is_multiple_of(BLOCK_SIZE),
+            "cols must be a multiple of {BLOCK_SIZE}"
+        );
+        let blocks_per_row = cols / BLOCK_SIZE;
+        let mut data = Vec::with_capacity(rows_n * cols / 2);
+        let mut scales = Vec::with_capacity(rows_n * blocks_per_row);
+        for row in rows {
+            for block in row.chunks(BLOCK_SIZE) {
+                let (packed, scale) = quantize_block_with_global_closed_form(block, stored_global);
                 data.extend_from_slice(&packed);
                 scales.push(scale);
             }
@@ -440,6 +542,11 @@ mod cuda {
     fn k256_enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| super::k256_from(std::env::var("NV_NVFP4_K256").ok().as_deref()))
+    }
+
+    fn v192_12warp_cta_env_opt_in_never_default_until_certified() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("NV_NVFP4_V192").map_or(false, |v| v == "1"))
     }
 
     fn streamk_k256_enabled() -> bool {
@@ -820,6 +927,20 @@ mod cuda {
                     workspace_bytes,
                 )
             }
+        } else if k % 128 == 0 && v192_12warp_cta_env_opt_in_never_default_until_certified() {
+            nv_kernels::cuda::nvfp4_gemm_sm120_v192_bf16(
+                stream_raw,
+                a_ptr as *const c_void,
+                a_sf_ptr as *const c_void,
+                b_ptr as *const c_void,
+                b_sf_ptr as *const c_void,
+                gsf_ptr as *const f32,
+                d_ptr as *mut c_void,
+                m as i32,
+                n as i32,
+                k as i32,
+            )
+            .map(|()| 0usize)
         } else if k % 256 == 0 && k256_enabled() {
             nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
                 stream_raw,

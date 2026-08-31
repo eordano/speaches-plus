@@ -1,25 +1,25 @@
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
+
+use crate::oapi::send_sse_event as send_event;
 
 use crate::oapi::chat::{
     engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed,
     parse_model_tool_calls, rand_seed, render_chat_checked_kwargs,
     resolve_guided_think_close, resolve_tool_policy, split_thinking, template_required_for,
     ChatAppState, ChatEngine,
-    ChatEvent, ChatGenerateRequest, ChatMessageIn, ClientDeadline, EngineBusy, FunctionCall,
+    ChatEvent, ChatGenerateRequest, ChatMessageIn, ClientDeadline, FunctionCall,
     FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess, ThinkingStream, Tool, ToolCall,
-    ToolChoice, ToolPolicy, MAX_MAX_TOKENS, THINK_OPEN,
+    ToolChoice, ToolPolicy, THINK_OPEN,
 };
 
 pub mod akind {
@@ -61,6 +61,19 @@ fn overloaded(message: impl Into<String>) -> Response {
 
 fn invalid(message: impl Into<String>) -> Response {
     anthropic_error(StatusCode::BAD_REQUEST, akind::INVALID_REQUEST, message)
+}
+
+fn engine_or_anthropic_model_not_found(
+    state: &ChatAppState,
+    model: &str,
+) -> Result<Arc<dyn ChatEngine>, Response> {
+    state.registry.resolve(Some(model)).ok_or_else(|| {
+        anthropic_error(
+            StatusCode::NOT_FOUND,
+            akind::NOT_FOUND,
+            format!("model: {model}"),
+        )
+    })
 }
 
 fn with_request_id(mut resp: Response) -> Response {
@@ -547,28 +560,39 @@ fn engine_start_error(err: &anyhow::Error) -> Response {
 }
 
 fn engine_event_error(msg: String) -> Response {
-    engine_event_error_by_surface(msg, MESSAGES_SHED_NOTE, overloaded, |m| {
-        anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, akind::API, m)
-    })
+    engine_event_error_by_surface(
+        msg,
+        MESSAGES_SHED_NOTE,
+        |m| anthropic_error(StatusCode::BAD_REQUEST, akind::INVALID_REQUEST, m),
+        overloaded,
+        |m| anthropic_error(StatusCode::INTERNAL_SERVER_ERROR, akind::API, m),
+    )
 }
 
 async fn first_event(
     rx: &mut mpsc::Receiver<ChatEvent>,
     client: Option<ClientDeadline>,
 ) -> Result<Option<ChatEvent>, Response> {
-    let Some(client) = client else {
-        return Ok(None);
-    };
-    match tokio::time::timeout(client.budget, rx.recv()).await {
-        Ok(ev) => match ev {
-            Some(ChatEvent::Error(msg)) if is_busy_shed(&msg) => Err(engine_event_error(msg)),
-            other => Ok(other),
+    let ev = match client {
+        Some(client) => match tokio::time::timeout(client.budget, rx.recv()).await {
+            Ok(ev) => ev,
+            Err(_) => {
+                return Err(overloaded(format!(
+                    "generation did not start within the {} ms client budget ({})",
+                    client.budget_ms(),
+                    client.source
+                )))
+            }
         },
-        Err(_) => Err(overloaded(format!(
-            "generation did not start within the {} ms client budget ({})",
-            client.budget_ms(),
-            client.source
-        ))),
+        None => rx.recv().await,
+    };
+    match ev {
+        Some(ChatEvent::Error(msg))
+            if is_busy_shed(&msg) || crate::oapi::chat::is_prompt_overflow(&msg) =>
+        {
+            Err(engine_event_error(msg))
+        }
+        other => Ok(other),
     }
 }
 
@@ -591,15 +615,9 @@ pub async fn handle_messages(
         return invalid("messages: at least one message is required".to_string());
     }
 
-    let engine = match state.registry.resolve(Some(req.model.as_str())) {
-        Some(e) => e,
-        None => {
-            return anthropic_error(
-                StatusCode::NOT_FOUND,
-                akind::NOT_FOUND,
-                format!("model: {}", req.model),
-            )
-        }
+    let engine = match engine_or_anthropic_model_not_found(&state, &req.model) {
+        Ok(e) => e,
+        Err(resp) => return resp,
     };
 
     let tr = match translate(&req) {
@@ -642,7 +660,9 @@ pub async fn handle_messages(
 
     let gen = ChatGenerateRequest {
         prompt,
-        max_new_tokens: max_tokens.min(MAX_MAX_TOKENS as u64).max(1) as usize,
+        max_new_tokens: max_tokens
+            .min(crate::oapi::chat::max_max_tokens() as u64)
+            .max(1) as usize,
         stop: req.stop_sequences.clone().unwrap_or_default(),
         seed: Some(rand_seed()),
         temperature: req.temperature,
@@ -663,13 +683,36 @@ pub async fn handle_messages(
     };
 
     let client = ClientDeadline::from_request(None, &headers);
+    let traj_meta = crate::oapi::trajectory::TrajMeta::from_headers(&headers);
     let model_id = engine.model_id().to_string();
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
 
     if req.stream.unwrap_or(false) {
-        run_streaming(engine, gen, id, model_id, tools_active, force_name, think, client).await
+        run_streaming(
+            engine,
+            gen,
+            id,
+            model_id,
+            tools_active,
+            force_name,
+            think,
+            client,
+            traj_meta.clone(),
+        )
+        .await
     } else {
-        run_non_streaming(engine, gen, id, model_id, tools_active, force_name, think, client).await
+        run_non_streaming(
+            engine,
+            gen,
+            id,
+            model_id,
+            tools_active,
+            force_name,
+            think,
+            client,
+            traj_meta.clone(),
+        )
+        .await
     }
 }
 
@@ -683,7 +726,11 @@ async fn run_non_streaming(
     force_name: Option<String>,
     think: ThinkPostProcess,
     client: Option<ClientDeadline>,
+    traj_meta: crate::oapi::trajectory::TrajMeta,
 ) -> Response {
+    let traj_prompt = crate::oapi::trajectory::enabled().then(|| gen.prompt.clone());
+    let traj_seed = gen.seed.unwrap_or(0);
+    let traj_temp = gen.temperature;
     let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
     if let Err(err) = engine.generate(gen, tx).await {
         warn!(error = %err, "messages engine.generate failed to start");
@@ -699,7 +746,10 @@ async fn run_non_streaming(
     let mut cached: Option<u32> = None;
     let mut stop_seq: Option<String> = None;
     let mut finish = String::from("stop");
+    let mut saw_done = false;
     let mut text = String::new();
+    let mut traj_reasoning = String::new();
+    #[allow(clippy::while_let_loop)]
     loop {
         let Some(ev) = (match pre.take() {
             Some(ev) => Some(ev),
@@ -712,7 +762,11 @@ async fn run_non_streaming(
             ChatEvent::PromptCached { cached_tokens } => cached = Some(cached_tokens),
             ChatEvent::StoppedBy { stop_sequence } => stop_seq = Some(stop_sequence),
             ChatEvent::TextDelta(s) => text.push_str(&s),
-            ChatEvent::ReasoningDelta(_) => {}
+            ChatEvent::ReasoningDelta(s) => {
+                if traj_prompt.is_some() {
+                    traj_reasoning.push_str(&s);
+                }
+            }
             ChatEvent::Logprob(_) => {}
             ChatEvent::Done {
                 finish_reason,
@@ -720,9 +774,31 @@ async fn run_non_streaming(
             } => {
                 finish = finish_reason;
                 output_tokens = completion_tokens;
+                saw_done = true;
             }
             ChatEvent::Error(msg) => return engine_event_error(msg),
         }
+    }
+
+    if let Some(prompt) = traj_prompt.filter(|_| saw_done) {
+        crate::oapi::trajectory::append(crate::oapi::trajectory::TrajectoryRecord {
+            ts: crate::oapi::trajectory::TrajectoryRecord::now_secs(),
+            endpoint: "messages".into(),
+            id: id.clone(),
+            model: model.clone(),
+            prompt,
+            completion: text.clone(),
+            reasoning: (!traj_reasoning.is_empty()).then_some(traj_reasoning),
+            finish_reason: finish.clone(),
+            stopped_by: stop_seq.clone(),
+            multimodal: false,
+            label: traj_meta.label,
+            tag: traj_meta.tag,
+            prompt_tokens: input_tokens,
+            completion_tokens: output_tokens,
+            seed: traj_seed,
+            temperature: traj_temp,
+        });
     }
 
     let (reasoning, text) = match think.active {
@@ -768,17 +844,6 @@ async fn run_non_streaming(
         },
     });
     with_request_id((StatusCode::OK, Json(body)).into_response())
-}
-
-async fn send_event(
-    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
-    event: &str,
-    data: &Value,
-) -> Result<(), ()> {
-    let frame = format!("event: {event}\ndata: {data}\n\n");
-    tx.send(Ok(Bytes::from(frame.into_bytes())))
-        .await
-        .map_err(|_| ())
 }
 
 struct BlockWriter<'a> {
@@ -891,9 +956,15 @@ async fn run_streaming(
     force_name: Option<String>,
     think: ThinkPostProcess,
     client: Option<ClientDeadline>,
+    traj_meta: crate::oapi::trajectory::TrajMeta,
 ) -> Response {
     let (tx_bytes, rx_bytes) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
+    let traj_prompt = crate::oapi::trajectory::enabled().then(|| gen.prompt.clone());
+    let traj_seed = gen.seed.unwrap_or(0);
+    let traj_temp = gen.temperature;
+    let traj_id = id.clone();
+    let traj_model = model.clone();
     let (tx_ev, mut rx_ev) = mpsc::channel::<ChatEvent>(64);
     if let Err(err) = engine.generate(gen, tx_ev).await {
         warn!(error = %err, "messages engine.generate failed to start");
@@ -951,7 +1022,11 @@ async fn run_streaming(
         let mut stop_seq: Option<String> = None;
         let mut finish = String::from("stop");
         let mut buf = String::new();
+        let mut traj = String::new();
+        let mut traj_reasoning = String::new();
+        let mut saw_done = false;
         let mut splitter = ThinkingStream::new(think.opened);
+        #[allow(clippy::while_let_loop)]
         loop {
             let Some(ev) = (match pre.take() {
                 Some(ev) => Some(ev),
@@ -959,6 +1034,13 @@ async fn run_streaming(
             }) else {
                 break;
             };
+            if traj_prompt.is_some() {
+                match &ev {
+                    ChatEvent::TextDelta(s) => traj.push_str(s),
+                    ChatEvent::ReasoningDelta(s) => traj_reasoning.push_str(s),
+                    _ => {}
+                }
+            }
             match ev {
                 ChatEvent::Started { prompt_tokens } => input_tokens = prompt_tokens,
                 ChatEvent::PromptCached { cached_tokens } => cached = Some(cached_tokens),
@@ -983,6 +1065,7 @@ async fn run_streaming(
                 } => {
                     finish = finish_reason;
                     output_tokens = completion_tokens;
+                    saw_done = true;
                 }
                 ChatEvent::Error(msg) => {
                     let kind = if is_busy_shed(&msg) {
@@ -995,6 +1078,8 @@ async fn run_streaming(
                 }
             }
         }
+
+        let raw_finish_before_tool_parse = finish.clone();
 
         if tools_active {
             let mut reasoning: Option<String> = None;
@@ -1029,6 +1114,26 @@ async fn run_streaming(
                 return;
             }
         }
+        if let Some(prompt) = traj_prompt.filter(|_| saw_done) {
+            crate::oapi::trajectory::append(crate::oapi::trajectory::TrajectoryRecord {
+                ts: crate::oapi::trajectory::TrajectoryRecord::now_secs(),
+                endpoint: "messages".into(),
+                id: traj_id,
+                model: traj_model,
+                prompt,
+                completion: traj,
+                reasoning: (!traj_reasoning.is_empty()).then_some(traj_reasoning),
+                finish_reason: raw_finish_before_tool_parse,
+                stopped_by: stop_seq.clone(),
+                multimodal: false,
+                label: traj_meta.label,
+                tag: traj_meta.tag,
+                prompt_tokens: input_tokens,
+                completion_tokens: output_tokens,
+                seed: traj_seed,
+                temperature: traj_temp,
+            });
+        }
         if w.close().await.is_err() {
             return;
         }
@@ -1053,15 +1158,7 @@ async fn run_streaming(
         let _ = send_event(&tx_bytes, "message_stop", &json!({"type": "message_stop"})).await;
     });
 
-    let stream = ReceiverStream::new(rx_bytes);
-    with_request_id(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from_stream(stream))
-            .unwrap(),
-    )
+    with_request_id(crate::oapi::sse_response(rx_bytes))
 }
 
 fn tokenizer_for(model_id: &str) -> Option<Arc<tokenizers::Tokenizer>> {
@@ -1100,15 +1197,9 @@ pub async fn handle_count_tokens(
     if req.messages.is_empty() {
         return invalid("messages: at least one message is required".to_string());
     }
-    let engine = match state.registry.resolve(Some(req.model.as_str())) {
-        Some(e) => e,
-        None => {
-            return anthropic_error(
-                StatusCode::NOT_FOUND,
-                akind::NOT_FOUND,
-                format!("model: {}", req.model),
-            )
-        }
+    let engine = match engine_or_anthropic_model_not_found(&state, &req.model) {
+        Ok(e) => e,
+        Err(resp) => return resp,
     };
     let tr = match translate(&req) {
         Ok(t) => t,

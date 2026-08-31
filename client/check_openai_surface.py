@@ -1,10 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "httpx>=0.28",
-# ]
-# ///
 """
 Probe a target server against the speaches OpenAPI surface and report
 which endpoints are implemented, missing, or respond unexpectedly.

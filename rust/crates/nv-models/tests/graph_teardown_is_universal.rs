@@ -2,9 +2,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-const EXPECTED_ENGINES: usize = 13;
+const EXPECTED_ENGINES: usize = 14;
 
-const EXPECTED_ENGINE_DROPS: usize = 15;
+const EXPECTED_ENGINE_DROPS: usize = 16;
 
 const EXPECTED_CRATES_WITH_ENGINES: usize = 2;
 

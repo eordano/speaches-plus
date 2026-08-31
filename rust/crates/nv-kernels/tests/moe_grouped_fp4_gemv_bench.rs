@@ -255,8 +255,12 @@ fn time_arm<F: FnMut(usize)>(
 #[ignore]
 fn moe_grouped_fp4_gemv_m1_bench() {
     if std::env::var("NV_MOE_M1_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_MOE_M1_BENCH=1 to run moe_grouped_fp4_gemv_m1_bench");
-        return;
+        panic!(
+            "NV_MOE_M1_BENCH is not 1, so this bench executed nothing. It is already #[ignore]d, \
+             which makes --ignored the opt-in; a second env gate behind that can only make an \
+             --ignored run print `1 passed` for a bench that measured nothing. A suite whose \
+             precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = CudaContext::new(0).expect("no CUDA device 0");
     let stream = ctx.default_stream();

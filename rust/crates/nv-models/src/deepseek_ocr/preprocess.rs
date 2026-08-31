@@ -591,9 +591,7 @@ impl PreparedViews {
 }
 
 pub fn deskew_enabled() -> bool {
-    std::env::var("NV_DSOCR_DESKEW")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_DESKEW")
 }
 
 pub fn fast_res_override(requested: ResolutionMode) -> ResolutionMode {
@@ -619,7 +617,7 @@ pub fn prepare(img: &RgbImage, mode: ResolutionMode) -> Result<PreparedViews> {
     let img = if deskew_enabled() {
         let (deg, gain) = estimate_skew_deg(img);
         let apply = deg.abs() >= SKEW_DEAD_ZONE_DEG && gain >= SKEW_MIN_GAIN;
-        if std::env::var("NV_DSOCR_DESKEW_DEBUG").is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_DESKEW_DEBUG") {
             eprintln!("[dsocr] deskew {deg:+.2} deg gain={gain:.4} applied={apply}");
         }
         if apply {

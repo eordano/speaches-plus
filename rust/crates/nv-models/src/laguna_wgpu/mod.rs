@@ -2,6 +2,7 @@ pub mod attn;
 pub mod config;
 pub mod dense;
 pub mod gpu;
+pub mod lora;
 pub mod moe;
 pub mod weights;
 
@@ -16,6 +17,7 @@ pub use config::{
     MAX_TOPK, NVFP4_BLOCK,
 };
 pub use gpu::{VramReport, STEP_POS, STEP_SLIDING_START, STEP_TOKEN, STEP_TOTAL};
+pub use lora::{LagunaLora, LAGUNA_LORA_TARGETS};
 pub use weights::{
     bf16_bits, bf16_val, dequantize_nvfp4_host, quantize_nvfp4_host, HostAttention, HostBf16Lin,
     HostDenseMlp, HostExperts, HostFfn, HostLayer, HostLin, HostMoe, HostNvfp4Lin, HostWeights,
@@ -69,11 +71,22 @@ pub struct LagunaWgpu {
     pf_m: usize,
     v_tokens: Option<wgpu::Buffer>,
     pf_validated: bool,
+    lora_passes: usize,
+    _lora_keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 impl LagunaWgpu {
     pub fn new(config: LagunaConfig, weights: &HostWeights, max_seq_tokens: usize) -> Result<Self> {
-        Self::build(config, WeightSource::Host(weights), max_seq_tokens)
+        Self::build(config, WeightSource::Host(weights), max_seq_tokens, None)
+    }
+
+    pub fn new_with_lora(
+        config: LagunaConfig,
+        weights: &HostWeights,
+        max_seq_tokens: usize,
+        lora: Option<&lora::LagunaLora>,
+    ) -> Result<Self> {
+        Self::build(config, WeightSource::Host(weights), max_seq_tokens, lora)
     }
 
     pub fn from_loader(
@@ -81,7 +94,20 @@ impl LagunaWgpu {
         weights: &nv_weights::WeightLoader,
         max_seq_tokens: usize,
     ) -> Result<Self> {
-        Self::build(config, WeightSource::Loader(weights), max_seq_tokens)
+        Self::build(config, WeightSource::Loader(weights), max_seq_tokens, None)
+    }
+
+    pub fn from_loader_with_lora(
+        config: LagunaConfig,
+        weights: &nv_weights::WeightLoader,
+        max_seq_tokens: usize,
+        lora: Option<&lora::LagunaLora>,
+    ) -> Result<Self> {
+        Self::build(config, WeightSource::Loader(weights), max_seq_tokens, lora)
+    }
+
+    pub fn lora_passes(&self) -> usize {
+        self.lora_passes
     }
 
     pub fn config(&self) -> &LagunaConfig {
@@ -121,10 +147,36 @@ impl LagunaWgpu {
         Ok(())
     }
 
-    fn build(config: LagunaConfig, src: WeightSource<'_>, max_seq_tokens: usize) -> Result<Self> {
+    fn build(
+        config: LagunaConfig,
+        src: WeightSource<'_>,
+        max_seq_tokens: usize,
+        lora: Option<&lora::LagunaLora>,
+    ) -> Result<Self> {
         let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
         let shapes = LagunaShapes::derive(&config, max_seq_tokens)?;
         let s = Sources::new();
+        if let Some(l) = lora {
+            anyhow::ensure!(
+                l.layer_count() == shapes.num_layers,
+                "lora adapter carries {} layers for {} config layers",
+                l.layer_count(),
+                shapes.num_layers
+            );
+            eprintln!(
+                "[laguna_wgpu] lora: rank {} matched {} modules over {} layers, +{} passes/token",
+                l.rank(),
+                l.matched_modules(),
+                l.layer_count(),
+                l.total_pass_count()
+            );
+        }
+        let lora_pl = match lora {
+            Some(_) => Some(crate::wgpu_lora::build_lora_pipelines(ctx)?),
+            None => None,
+        };
+        let lora_keep: std::cell::RefCell<Vec<Box<dyn std::any::Any + Send>>> =
+            std::cell::RefCell::new(Vec::new());
 
         let hidden = shapes.hidden_size;
         let hidden_words = shapes.hidden_words();
@@ -198,6 +250,14 @@ impl LagunaWgpu {
                 let ln_w = b.upload_u32("lgw-ln", &pack_pairs(&hl.input_ln));
                 push_rmsnorm(&mut b, &s, "lgw-rms0", &res, &ln_w, &normed, hidden, eps)?;
             }
+            let lctx = match (lora, lora_pl.as_ref()) {
+                (Some(l), Some(pl)) => Some(lora::LoraSiteCtx {
+                    pl,
+                    keep: &lora_keep,
+                    layer: lora::upload_laguna_lora_layer(ctx, &l.layers[li])?,
+                }),
+                _ => None,
+            };
 
             let rope = if layer_shape.is_sliding() {
                 &rope_sliding
@@ -214,6 +274,7 @@ impl LagunaWgpu {
                 &attn_out,
                 &step,
                 rope,
+                lctx.as_ref(),
             )?;
 
             let post_w = b.upload_u32("lgw-post-ln", &pack_pairs(&hl.post_attn_ln));
@@ -238,6 +299,7 @@ impl LagunaWgpu {
                     d,
                     &normed_post,
                     &ffn_out,
+                    lctx.as_ref(),
                 )?,
                 HostFfn::Moe(m) => moe::build_moe_layer(
                     &mut b,
@@ -248,6 +310,9 @@ impl LagunaWgpu {
                     &normed_post,
                     &ffn_out,
                 )?,
+            }
+            if let Some(lc) = lctx {
+                lora_keep.borrow_mut().push(Box::new(lc.layer));
             }
 
             if li + 1 < shapes.num_layers {
@@ -376,6 +441,8 @@ impl LagunaWgpu {
             ..
         } = b;
         let buffers = core.buffers;
+        let mut lora_keep = lora_keep.into_inner();
+        lora_keep.push(Box::new(lora_pl));
 
         Ok(Self {
             ctx,
@@ -398,6 +465,8 @@ impl LagunaWgpu {
             pf_m,
             v_tokens,
             pf_validated: false,
+            lora_passes: lora.map(|l| l.total_pass_count()).unwrap_or(0),
+            _lora_keep: lora_keep,
         })
     }
 

@@ -1,0 +1,53 @@
+{
+ "ladder": "q36-graph-deep",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "q36 graph-deep",
+  "model": "qwen3.6-35b-a3b-nvfp4",
+  "backend": "cuda",
+  "pkg": "nv-models",
+  "features": "cuda",
+  "suite": "qwen36_serving_ctx",
+  "exact": "qwen36_cuda_serving_path_decode_ms_per_token_vs_context_depth_synthetic_cache_fill_graphed_grouped_moe",
+  "parse": "ctx-scaling",
+  "timeout": "3600"
+ },
+ "base_env": {
+  "NV_QWEN36_SERVING_TEST": "1"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  256,
+  8192,
+  200704
+ ],
+ "depths_per_run": false,
+ "notes": "#277 r3: gated-lite = the 7 confidently-named perf arms of the 13-arm GATED stack (armbytes lists 6 more under scattered prefixes); labeled as lite, NOT a reproduction of the standing's 6.689ms config -- it bounds how much of the 62.9-vs-149 gap the known arms close",
+ "rationale": "Coverage audit 2026-08-29: RedHatAI/Qwen3.6-35B-A3B-NVFP4 has 256/8k bands only; a store query confirms no row above 100k under any q36 build_name, while the round-85 MBU standing quotes 6.689 ms at 200704 from FLOOR-TABLE lane logs -- a number that never became a row was never measured (08.4). Single-arm spec, so no null pair owed; the repeated shallow rungs double as continuity checks against the existing shallow rows. 250W cells per #278; entry state recorded per #268. The rival deep leg (Qwen3.6-35B-A3B-UD-Q4_K_M.gguf) needs the GGUF re-fetched -- tracked in #277, not this spec.",
+ "baseline_arm": "bare-defaults",
+ "arms": [
+  {
+   "name": "bare-defaults",
+   "env": {}
+  },
+  {
+   "name": "decode-fix",
+   "env": {
+    "NV_Q36_GRAPHED_DECODE_FIX": "1"
+   }
+  },
+  {
+   "name": "gated-lite",
+   "env": {
+    "NV_Q36_GRAPHED_DECODE_FIX": "1",
+    "NV_Q36_GDN_FP8": "1",
+    "NV_Q36_LM_HEAD_FP8": "1",
+    "NV_Q36_ATTN_DEPTHGATE": "1",
+    "NV_Q36_MOE_FUSED_CHAIN": "1",
+    "NV_Q36_MOE_SHARED_FOLD": "1",
+    "NV_Q36_MOE_ROUTER_GEMV": "1"
+   }
+  }
+ ],
+ "null_pair_waived_because": "coverage fill, not an adjudication: both arms land as labeled rows and no margin is quoted from this spec -- the bare-defaults collapse is recorded as a fact about the unarmed path, not read against a floor"
+}

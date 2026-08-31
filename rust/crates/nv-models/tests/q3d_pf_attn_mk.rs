@@ -169,6 +169,7 @@ fn tiny_weights(cfg: &Qwen3_5DenseConfig, seed: u64) -> q3d::HostDenseWeights {
                     o: bf16_lin(&mut r, hidden, cfg.num_attention_heads * hd, 0.12).into(),
                     q_norm: norm_vec(&mut r, hd),
                     k_norm: norm_vec(&mut r, hd),
+                    qkv_bias_bf16: vec![],
                 }))
             }
         };

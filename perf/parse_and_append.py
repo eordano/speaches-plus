@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import argparse
 import fcntl
-import hashlib
 import json
 import math
 import re
@@ -12,8 +11,8 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 
 STATUS_ENUM = {"ok", "refused", "oom", "crashed", "skipped"}
-ENGINE_ENUM = {"ours", "llama.cpp", "vllm"}
-BACKEND_ENUM = {"wgpu-vulkan", "cuda", "vulkan"}
+ENGINE_ENUM = {"ours", "llama.cpp", "vllm", "mlx"}
+BACKEND_ENUM = {"wgpu-vulkan", "cuda", "vulkan", "wgpu-metal", "metal"}
 
 REQUIRED_ALWAYS = [
     "run_id", "schema_version", "started_at", "status", "commit_hash", "commit_date",
@@ -37,7 +36,8 @@ REQUIRED_PPL = ["instrument", "source_file", "corpus_path", "corpus_sha256", "to
 
 MEASURE_LINE_RE = re.compile(
     r"^\s*(NV-MEASURE v1|CTX-SCALING|CTX-PREFILL|GEN-ARM|PPL|PPL-SHUFFLED-CONTROL|"
-    r"QWEN38-WGPU-PREFILL|QWEN38-WGPU-DECODE)\b.*"
+    r"QWEN38-WGPU-PREFILL|QWEN38-CUDA-PREFILL|QWEN38-WGPU-DECODE|"
+    r"E4B-CUDA-PREFILL)\b.*"
 )
 
 KV_RE = re.compile(r"(\w[\w.]*)=([^\s\"]+|\"[^\"]*\")")
@@ -89,6 +89,12 @@ def validate(row):
         v = row.get(k)
         if v is not None and (not isinstance(v, (int, float)) or not math.isfinite(v)):
             fail(f"{k}={v!r} is not a finite number")
+    if str(row["log_path"]).startswith(("/tmp", "/var/tmp", "/run")):
+        fail(
+            f"log_path {row['log_path']!r} lives on a volatile filesystem: rows outlive "
+            f"reboots but /tmp does not (36 rows lost their logs to the 2026-08-27 "
+            f"scratchpad reap); write the log under ~/.cache/perfroom/logs first"
+        )
     return row
 
 
@@ -170,22 +176,31 @@ def rows_ctx_scaling(lines, meta):
 def rows_prefill(lines, meta):
     rows = []
     for ln in lines:
-        if not ln.startswith("QWEN38-WGPU-PREFILL"):
+        if not (
+            ln.startswith("QWEN38-WGPU-PREFILL")
+            or ln.startswith("QWEN38-CUDA-PREFILL")
+            or ln.startswith("E4B-CUDA-PREFILL")
+        ):
             continue
         kv = parse_kv(ln)
         n = fint(kv, "prompt_tokens")
         s = fnum(kv, "prefill_s")
+        dec_median = fnum(kv, "decode_median_ms_tok")
+        dec_tok_s = fnum(kv, "decode_tok_s")
+        if dec_tok_s is None and dec_median:
+            dec_tok_s = 1000.0 / dec_median
+        dec_steps = fint(kv, "decode_steps")
         rows.append({
             "prefill_tokens": n,
-            "generated_tokens": 1,
-            "steps": None,
-            "warmup_steps": None,
-            "decode_ms_per_tok_median": None,
-            "decode_tok_s": None,
+            "generated_tokens": dec_steps if dec_median is not None else 1,
+            "steps": dec_steps,
+            "warmup_steps": fint(kv, "decode_warmup_steps"),
+            "decode_ms_per_tok_median": dec_median,
+            "decode_tok_s": dec_tok_s,
             "ttft_s": s,
             "prefill_tok_s_avg": fnum(kv, "tok_s"),
             "prefill_tok_s_last_256": None,
-            "timing_basis": "single_prefill_wall",
+            "timing_basis": "median" if dec_median is not None else "single_prefill_wall",
             "measure_lines": [ln],
         })
     return rows
@@ -350,11 +365,39 @@ def rows_vllm_bench(log_text, meta):
     return rows
 
 
+def rows_mlx_gen(log_text, meta):
+    prompt_tps = gen_tps = None
+    prompt_tokens = gen_tokens = None
+    for ln in log_text.splitlines():
+        m = re.search(r"Prompt:\s+(\d+) tokens?, ([0-9.]+) tokens-per-sec", ln)
+        if m:
+            prompt_tokens, prompt_tps = int(m.group(1)), float(m.group(2))
+        m = re.search(r"Generation:\s+(\d+) tokens?, ([0-9.]+) tokens-per-sec", ln)
+        if m:
+            gen_tokens, gen_tps = int(m.group(1)), float(m.group(2))
+    if gen_tps is None and prompt_tps is None:
+        fail("mlx-gen: no 'Prompt:'/'Generation:' tokens-per-sec lines found")
+    return [{
+        "timing_basis": "mlx_lm.generate self-reported prompt/generation tokens-per-sec",
+        "prefill_tokens": prompt_tokens,
+        "generated_tokens": gen_tokens,
+        "prefill_tok_s_avg": prompt_tps,
+        "prefill_tok_s_last_256": None,
+        "decode_tok_s": gen_tps,
+        "decode_ms_per_tok_median": (1000.0 / gen_tps) if gen_tps else None,
+        "ttft_s": None,
+        "max_seq_allocated": None,
+        "steps": gen_tokens,
+        "warmup_steps": None,
+    }]
+
+
 PARSERS = {
     "ctx-scaling": rows_ctx_scaling,
     "prefill": rows_prefill,
     "gen-arm": rows_gen_arm,
     "ppl": rows_ppl,
+    "mlx-gen": rows_mlx_gen,
 }
 
 
@@ -382,7 +425,9 @@ def main():
     log_text = Path(args.log).read_text(errors="replace")
     lines = extract_measure_lines(log_text)
 
-    if args.mode == "llama-bench":
+    if args.mode == "mlx-gen":
+        parsed = rows_mlx_gen(log_text, meta)
+    elif args.mode == "llama-bench":
         parsed = rows_llama_bench(log_text, meta)
     elif args.mode == "vllm-bench":
         parsed = rows_vllm_bench(log_text, meta)

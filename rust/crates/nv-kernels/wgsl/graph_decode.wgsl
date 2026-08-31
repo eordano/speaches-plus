@@ -516,7 +516,8 @@ fn argmax_bf16_stage1(
     var i = i32(wg.x * GD_BLOCK + lid);
     while (i < n) {
         let v = bf16_decode(gd_am_logits[u32(i)]);
-        if (v > best || (v == best && i < bidx)) {
+        let finite = (v == v) && (abs(v) != gd_pos_inf());
+        if (finite && (v > best || (v == best && i < bidx))) {
             best = v;
             bidx = i;
         }
@@ -565,7 +566,7 @@ fn argmax_bf16_stage2(@builtin(local_invocation_id) tid: vec3<u32>) {
         workgroupBarrier();
     }
     if (lid == 0u) {
-        let t = u32(gd_am_idx[0]);
+        let t = select(u32(gd_am_idx[0]), 0u, gd_am_idx[0] == 2147483647);
         gd_am_token[0] = t;
         if (gd_am_p.has_ring != 0u) {
             gd_am_ring[u32((gd_am_pos[0] - 1) & gd_am_p.ring_mask)] = t;

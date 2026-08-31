@@ -58,10 +58,6 @@
     flex-wrap: nowrap;
   }
   .topbar .spacer { flex: 1 1 auto; }
-  /* tb-hide is the class my JS toggles for live-mode-only groups; the
-     existing JS path (startPlayback / stopPlayback) instead toggles
-     `style.display` directly on #audioChannelsWrap and #btnReplayStop,
-     so we deliberately do NOT collide with that. */
   .topbar .tb-hide { display: none; }
   .topbar .group-label {
     font-family: var(--font-mono);
@@ -222,10 +218,6 @@
     border-bottom: 1px solid var(--hair);
     overflow: hidden;
     cursor: text;
-    /* Reserve 168px on the left so the ruler canvas content box aligns
-       with the lane content (the 168px lane gutter). Without this the
-       ruler's "0s" tick sits above the lane labels rather than above
-       where bands actually start. */
     padding-left: 168px;
     box-sizing: border-box;
   }

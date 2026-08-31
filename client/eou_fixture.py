@@ -1,12 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "httpx>=0.28",
-#   "numpy>=2.0",
-#   "soundfile>=0.13",
-# ]
-# ///
 """eou_fixture -- render the canonical EOU stress fixtures by hitting a
 speaches-plus binary's /v1/audio/speech endpoint, then concatenating the
 returned audio with calibrated silence gaps.

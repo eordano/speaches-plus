@@ -1,15 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "aiortc>=1.13.0,<1.14",
-#   "httpx>=0.28",
-#   "numpy>=2.0",
-#   "soundfile>=0.13",
-#   "av>=14.0,<14.3",
-#   "websockets>=13",
-# ]
-# ///
 """eou_matrix -- drive a speaches-plus binary (Go OR Rust) through the
 realtime API against a fixture x EOU_KIND x fusion-rule matrix and
 collect the per-session inspector ndjson + audio sidecars.
@@ -36,7 +25,6 @@ import argparse
 import asyncio
 import base64
 import contextlib
-import io
 import json
 import logging
 import os

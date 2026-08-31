@@ -17,19 +17,54 @@ const STAGING_FLUSH_BYTES: u64 = 256 << 20;
 
 const GEMV_BF16_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16.wgsl");
 
+const GEMV_BF16_RPNORM_SGLAT_WGSL: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_rpnorm_sglat.wgsl");
+
+const GEMV_BF16_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_sglat.wgsl");
+
+const GEMV_BF16_V2_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_v2.wgsl");
+
+const GEMV_BF16_DNRP_SGLAT_WGSL: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_dnrp_sglat.wgsl");
+
+const GEMV_W4E_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_w4e_sglat.wgsl");
+
+const GEMV_W4E_SGLAT_XV4_WGSL: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_gemv_w4e_sglat_xv4.wgsl");
+
 const GEMV_BF16_LEGACY_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_legacy.wgsl");
+
+const GEMV_BF16_TAILFOLD_WGSL: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_tailfold.wgsl");
 
 const GEMV_I8_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_i8.wgsl");
 
 const GEMV_I8_V4_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_i8_v4.wgsl");
 
+const GEMV_I8_G16_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_i8_g16.wgsl");
+
 const GEMV_W4E_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_w4e.wgsl");
 
 const ATTN_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_attn.wgsl");
 
+const ATTN_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_attn_sglat.wgsl");
+
 const FLASH_DECODE_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_flash_decode.wgsl");
 
+const FLASH_REDUCE_WB_ELEVEN_WORKGROUP_BARRIERS_AND_TEN_LDS_ROUND_TRIPS_PER_KV_ROW_BATCH: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_flash_reduce_wb.wgsl");
+
+const FLASH_REDUCE_SG_SHUFFLE_XOR_CHAIN_16_8_4_2_1_IS_BIT_IDENTICAL_TO_THE_LDS_BUTTERFLY_SAME_OPERAND_ORDER: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_flash_reduce_sg.wgsl");
+
+const FLASH_QKVFOLD_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_flash_qkvfold.wgsl");
+
 const PROP_NORM_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_prop_norm.wgsl");
+
+const PROP_NORM_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_prop_norm_sglat.wgsl");
+
+const PROP_NORM_X2_TOPK_SGLAT_WGSL: &str =
+    include_str!("../../nv-kernels/wgsl/g4m_prop_norm_x2_topk_sglat.wgsl");
 
 const MOE_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_moe.wgsl");
 
@@ -477,6 +512,19 @@ struct RouterParams {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct RouterChainParams {
+    n_experts: u32,
+    k: u32,
+    words: u32,
+    hidden: u32,
+    eps: f32,
+    alpha: f32,
+    pad0: u32,
+    pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct WordsParams {
     n_words: u32,
     pad0: u32,
@@ -495,6 +543,10 @@ struct GemvW4Params {
     x_slot_stride_words: u32,
     y_slot_stride_words: u32,
     k_top: u32,
+    n_experts: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 #[repr(C)]
@@ -631,12 +683,13 @@ pub struct HostI8Mat {
 }
 
 pub fn quantize_i8_host(w: &[u16], n: usize, k: usize) -> HostI8Mat {
-    assert!(
-        k.is_multiple_of(I8_GS),
-        "k={k} is not a multiple of {I8_GS}"
-    );
+    quantize_i8_host_group(w, n, k, I8_GS)
+}
+
+pub fn quantize_i8_host_group(w: &[u16], n: usize, k: usize, gs: usize) -> HostI8Mat {
+    assert!(k.is_multiple_of(gs), "k={k} is not a multiple of {gs}");
     assert_eq!(w.len(), n * k, "quantize_i8_host: w is not n*k");
-    let groups = k / I8_GS;
+    let groups = k / gs;
     let mut q = vec![0u32; n * k / 4];
     let mut scales = vec![0u16; n * groups];
     let threads = std::thread::available_parallelism()
@@ -658,9 +711,9 @@ pub fn quantize_i8_host(w: &[u16], n: usize, k: usize) -> HostI8Mat {
             sc.spawn(move || {
                 for rr in 0..rows {
                     for g in 0..groups {
-                        let base = rr * k + g * I8_GS;
+                        let base = rr * k + g * gs;
                         let mut amax = 0f32;
-                        for j in 0..I8_GS {
+                        for j in 0..gs {
                             let v = f32::from_bits((w_chunk[base + j] as u32) << 16).abs();
                             if v > amax {
                                 amax = v;
@@ -674,10 +727,10 @@ pub fn quantize_i8_host(w: &[u16], n: usize, k: usize) -> HostI8Mat {
                         let scale_b = half::bf16::from_f32(scale);
                         s_chunk[rr * groups + g] = scale_b.to_bits();
                         let inv = 1.0 / scale_b.to_f32();
-                        for j in 0..I8_GS {
+                        for j in 0..gs {
                             let v = f32::from_bits((w_chunk[base + j] as u32) << 16);
                             let qi = (v * inv).round().clamp(-127.0, 127.0) as i32;
-                            let elem = g * I8_GS + j;
+                            let elem = g * gs + j;
                             q_chunk[rr * (k / 4) + elem / 4] |=
                                 ((qi as u8) as u32) << (8 * (elem % 4));
                         }
@@ -1094,6 +1147,64 @@ struct Pass {
     grid: (u32, u32, u32),
     label: String,
     bind_bytes: u64,
+    storage_binds_are_what_wgpu_tracks_for_hazards_uniforms_never_transition: Vec<(u32, bool)>,
+}
+
+fn wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
+    source: &str,
+    binding: u32,
+) -> bool {
+    let needle = format!("@binding({binding})");
+    source
+        .match_indices(&needle)
+        .filter_map(|(i, _)| source[i..].split(';').next())
+        .find(|decl| decl.contains("var<"))
+        .is_none_or(|decl| decl.contains("read_write"))
+}
+
+pub fn barrier_cause_raw_waw_is_a_true_dependency_war_alone_can_be_an_artifact_of_a_wide_binding_access_mode(
+    storage_bind_sets: &[Vec<(u32, bool)>],
+) -> Vec<Option<bool>> {
+    let mut read_since: std::collections::BTreeSet<u32> = Default::default();
+    let mut written_since: std::collections::BTreeSet<u32> = Default::default();
+    let mut cause_at: Vec<Option<bool>> = Vec::with_capacity(storage_bind_sets.len());
+    for set in storage_bind_sets {
+        let raw_or_waw = set.iter().any(|(id, _)| written_since.contains(id));
+        let war = set
+            .iter()
+            .any(|(id, w)| *w && (read_since.contains(id) || written_since.contains(id)));
+        let cause = if raw_or_waw {
+            Some(true)
+        } else if war {
+            Some(false)
+        } else {
+            None
+        };
+        cause_at.push(cause);
+        if cause.is_some() {
+            read_since.clear();
+            written_since.clear();
+        }
+        for (id, w) in set {
+            if *w {
+                written_since.insert(*id);
+            } else {
+                read_since.insert(*id);
+            }
+        }
+    }
+    cause_at
+}
+
+pub fn a_pass_is_a_wgpu_barrier_iff_it_reads_or_writes_a_buffer_written_since_the_last_barrier_or_writes_one_read_since(
+    storage_bind_sets: &[Vec<(u32, bool)>],
+) -> Vec<bool> {
+    barrier_cause_raw_waw_is_a_true_dependency_war_alone_can_be_an_artifact_of_a_wide_binding_access_mode(
+        storage_bind_sets,
+    )
+    .into_iter()
+    .map(|c| c.is_some())
+    .collect()
 }
 
 fn vram_class(label: &str) -> &str {
@@ -1105,7 +1216,8 @@ fn per_token_weight_share(class: &str, expert_share: f64) -> f64 {
         "moe-eg" | "moe-eu" | "moe-ed" | "moe-eg-sf" | "moe-eu-sf" | "moe-ed-sf" => expert_share,
         "embed" | "ln" | "final-ln" | "at-qw" | "at-kw" | "at-vw" | "at-ow" | "at-qn" | "at-kn"
         | "at-vn" | "mlp-gw" | "mlp-uw" | "mlp-dw" | "moe-router" | "moe-rscale" | "moe-pes"
-        | "moe-ones" | "lmhead-i8" | "lmhead-i8-sf" => 1.0,
+        | "moe-ones" | "lmhead-i8" | "lmhead-i8-sf" | "at-qkv-i8" | "at-qkv-i8-sf" | "at-o-i8"
+        | "at-o-i8-sf" => 1.0,
         _ => 0.0,
     }
 }
@@ -1137,6 +1249,10 @@ pub fn moe_weight_classes() -> &'static [&'static str] {
         "moe-ones",
         "lmhead-i8",
         "lmhead-i8-sf",
+        "at-qkv-i8",
+        "at-qkv-i8-sf",
+        "at-o-i8",
+        "at-o-i8-sf",
     ]
 }
 
@@ -1153,6 +1269,15 @@ struct Builder {
     weight_bpt: f64,
     wide_gemvs: usize,
     narrow_gemvs: usize,
+    depthgate_flash1_pass_indices_full_attention_the_band_is_keyed_on_the_whole_context:
+        Vec<usize>,
+    depthgate_flash1_pass_indices_sliding_the_window_caps_the_scan_so_the_band_is_keyed_on_min_total_window:
+        Vec<usize>,
+    foldgate_alt_flash1_passes_one_deep_twin_per_full_attention_flash1_in_the_same_order: Vec<Pass>,
+    storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds: Vec<wgpu::Buffer>,
+    flash_scratch_bytes_per_full_attention_layer_sized_at_its_own_split_count: Vec<u64>,
+    flash_scratch_bytes_per_sliding_layer_sized_at_its_own_split_count_not_the_max_of_the_two:
+        Vec<u64>,
 }
 
 impl Builder {
@@ -1236,6 +1361,39 @@ impl Builder {
         self.store(label, b)
     }
 
+    fn built_pass(
+        &mut self,
+        label: &str,
+        source: &str,
+        entry: &str,
+        binds: &[(u32, &wgpu::Buffer)],
+        grid: (u32, u32, u32),
+    ) -> Result<Pass> {
+        let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
+            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+        let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
+        let mut storage_ids: Vec<(u32, bool)> = binds
+            .iter()
+            .filter(|(_, buf)| buf.usage().contains(wgpu::BufferUsages::STORAGE))
+            .map(|(slot, buf)| {
+                let w = wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
+                    source, *slot,
+                );
+                (self.intern_storage_buffer(buf), w)
+            })
+            .collect();
+        storage_ids.sort_unstable();
+        storage_ids.dedup();
+        Ok(Pass {
+            pipeline,
+            bind,
+            grid,
+            label: format!("{label}:{entry}"),
+            bind_bytes: binds.iter().map(|(_, b)| b.size()).sum(),
+            storage_binds_are_what_wgpu_tracks_for_hazards_uniforms_never_transition: storage_ids,
+        })
+    }
+
     fn push(
         &mut self,
         label: &str,
@@ -1244,22 +1402,26 @@ impl Builder {
         binds: &[(u32, &wgpu::Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
-        let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
-        let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
+        let pass = self.built_pass(label, source, entry, binds, grid)?;
         let sink = if self.to_prefill {
             &mut self.prefill_passes
         } else {
             &mut self.passes
         };
-        sink.push(Pass {
-            pipeline,
-            bind,
-            grid,
-            label: format!("{label}:{entry}"),
-            bind_bytes: binds.iter().map(|(_, b)| b.size()).sum(),
-        });
+        sink.push(pass);
         Ok(())
+    }
+
+    fn intern_storage_buffer(&mut self, buf: &wgpu::Buffer) -> u32 {
+        let reg =
+            &mut self.storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds;
+        match reg.iter().position(|b| b == buf) {
+            Some(i) => i as u32,
+            None => {
+                reg.push(buf.clone());
+                (reg.len() - 1) as u32
+            }
+        }
     }
 
     fn grid1(&self, invocations: u64, wg: u32) -> (u32, u32, u32) {
@@ -1298,11 +1460,26 @@ impl Builder {
 
 struct Sources {
     gemv_bf16: String,
+    gemv_i8_v4: String,
+    gemv_i8_g16: String,
+    gemv_bf16_tailfold: String,
+    gemv_bf16_rpnorm_sglat: String,
+    gemv_bf16_dnrp_sglat: String,
+    gemv_bf16_sglat: String,
+    gemv_bf16_v2: String,
+    prop_norm_x2_topk_sglat: String,
     gemv_w4: String,
+    gemv_w4_sglat: String,
+    gemv_w4_sglat_xv4: String,
     attn: String,
+    attn_sglat: String,
     flash: String,
+    flash_qkvfold: String,
+    flash_fold_entry: Option<String>,
+    flash_foldgate_deep_source_and_entry: Option<(String, String)>,
     moe: String,
     prop: String,
+    prop_sglat: String,
     resscale: String,
     prefill: String,
     kv_fp8: String,
@@ -1320,14 +1497,54 @@ pub fn nozi_audit_sources() -> Vec<(&'static str, String)> {
 }
 
 impl Sources {
-    fn new(prefill_m: usize) -> Self {
+    fn new(prefill_m: usize, flash_sg: bool, sacc_chunk: u32, fold: u32, foldgate: bool) -> Self {
+        let flash_reduce = if flash_sg {
+            FLASH_REDUCE_SG_SHUFFLE_XOR_CHAIN_16_8_4_2_1_IS_BIT_IDENTICAL_TO_THE_LDS_BUTTERFLY_SAME_OPERAND_ORDER
+        } else {
+            FLASH_REDUCE_WB_ELEVEN_WORKGROUP_BARRIERS_AND_TEN_LDS_ROUND_TRIPS_PER_KV_ROW_BATCH
+        };
+        let fold_src = (fold > 1).then(|| flash_stage1_fold_source(fold));
         Self {
+            flash_fold_entry: fold_src
+                .as_ref()
+                .map(|_| flash_stage1_fold_entry(fold)),
+            flash_foldgate_deep_source_and_entry: foldgate.then(|| {
+                let fg_fold =
+                    FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC;
+                (
+                    compose(&format!(
+                        "{FLASH_DECODE_WGSL}\n{flash_reduce}\n{}\n{}",
+                        flash_stage1_tail_source(
+                            FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS
+                        ),
+                        flash_stage1_fold_source(fg_fold)
+                    )),
+                    flash_stage1_fold_entry(fg_fold),
+                )
+            }),
             gemv_bf16: compose(GEMV_BF16_WGSL),
+            gemv_i8_v4: compose(GEMV_I8_V4_WGSL),
+            gemv_i8_g16: compose(GEMV_I8_G16_WGSL),
+            gemv_bf16_tailfold: compose(GEMV_BF16_TAILFOLD_WGSL),
+            gemv_bf16_rpnorm_sglat: compose(GEMV_BF16_RPNORM_SGLAT_WGSL),
+            gemv_bf16_dnrp_sglat: compose(GEMV_BF16_DNRP_SGLAT_WGSL),
+            gemv_bf16_sglat: compose(GEMV_BF16_SGLAT_WGSL),
+            gemv_bf16_v2: compose(GEMV_BF16_V2_WGSL),
+            prop_norm_x2_topk_sglat: compose(PROP_NORM_X2_TOPK_SGLAT_WGSL),
             gemv_w4: compose(GEMV_W4E_WGSL),
+            gemv_w4_sglat: compose(GEMV_W4E_SGLAT_WGSL),
+            gemv_w4_sglat_xv4: compose(GEMV_W4E_SGLAT_XV4_WGSL),
             attn: compose(ATTN_WGSL),
-            flash: compose(FLASH_DECODE_WGSL),
+            attn_sglat: compose(ATTN_SGLAT_WGSL),
+            flash: compose(&format!(
+                "{FLASH_DECODE_WGSL}\n{flash_reduce}\n{}\n{}",
+                flash_stage1_tail_source(sacc_chunk),
+                fold_src.clone().unwrap_or_default()
+            )),
+            flash_qkvfold: compose(FLASH_QKVFOLD_WGSL),
             moe: compose(MOE_WGSL),
             prop: compose(PROP_NORM_WGSL),
+            prop_sglat: compose(PROP_NORM_SGLAT_WGSL),
             resscale: compose(wk::residual_scale::WGSL),
             prefill: if prefill_m > 0 {
                 compose(&format!(
@@ -1399,6 +1616,7 @@ fn push_gemv_w4(
             x_slot_stride_words: if x_per_slot { (e.k / 2) as u32 } else { 0 },
             y_slot_stride_words: (e.n / 2) as u32,
             k_top: 0,
+            ..Default::default()
         },
     );
     b.push(
@@ -1461,9 +1679,26 @@ fn push_gemv_bf16_alpha(
     alpha: f32,
     load: GemvLoad,
 ) -> Result<()> {
-    let pairs = w.n.div_ceil(2);
-    let grid = b.grid1(pairs as u64, 1);
-    let wide = b.wide_flag(label, load, w.k, 0, &w.w, x);
+    let mut wide = b.wide_flag(label, load, w.k, 0, &w.w, x);
+    let v2 = gemv_v2_active_implies_the_vec4_wide_layout(b.ctx, label, load, w.k, 0);
+    if v2 {
+        wide = 1;
+    }
+    let r8 = bf16_r8_enabled() && wide == 1 && w.n.is_multiple_of(8);
+    let (entry, grid) = if v2 {
+        (GEMV_BF16_V2_ENTRY, b.grid1(w.n.div_ceil(8) as u64, 1))
+    } else if r8 {
+        ("g4m_gemv_bf16_r8", b.grid1((w.n / 8) as u64, 1))
+    } else if wide == 1 && bf16_acc4_enabled() {
+        (
+            "g4m_gemv_bf16_acc4_ilp_reorders_the_wide_dot_sum",
+            b.grid1(w.n.div_ceil(2) as u64, 1),
+        )
+    } else if gemv_sglat_active(b.ctx, label) {
+        ("g4m_gemv_bf16_sglat", b.grid1(w.n.div_ceil(2) as u64, 1))
+    } else {
+        ("g4m_gemv_bf16", b.grid1(w.n.div_ceil(2) as u64, 1))
+    };
     let p = b.uni(
         "g4m-gemvb-p",
         GemvBf16Params {
@@ -1479,13 +1714,14 @@ fn push_gemv_bf16_alpha(
             ..Default::default()
         },
     );
-    b.push(
-        label,
-        &s.gemv_bf16,
-        "g4m_gemv_bf16",
-        &[(0, &w.w), (1, x), (2, &p), (3, y)],
-        grid,
-    )
+    let src = if entry == "g4m_gemv_bf16_sglat" {
+        &s.gemv_bf16_sglat
+    } else if entry == GEMV_BF16_V2_ENTRY {
+        &s.gemv_bf16_v2
+    } else {
+        &s.gemv_bf16
+    };
+    b.push(label, src, entry, &[(0, &w.w), (1, x), (2, &p), (3, y)], grid)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1510,6 +1746,81 @@ fn push_gemv_bf16(
         y_off_words,
         1.0,
         GemvLoad::Wide,
+    )
+}
+
+struct AttnI8Gpu {
+    q: wgpu::Buffer,
+    scales: wgpu::Buffer,
+    n: usize,
+    k: usize,
+    gs: usize,
+}
+
+fn upload_attn_i8(
+    b: &mut Builder,
+    label_q: &str,
+    label_s: &str,
+    w: &[u16],
+    n: usize,
+    k: usize,
+) -> AttnI8Gpu {
+    let gs = attn_i8_group_elems();
+    let m = quantize_i8_host_group(w, n, k, gs);
+    AttnI8Gpu {
+        q: b.upload_u32(label_q, &m.q),
+        scales: b.upload_u32(label_s, &pack_pairs(&m.scales)),
+        n,
+        k,
+        gs,
+    }
+}
+
+fn push_gemv_attn_i8(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    w: &AttnI8Gpu,
+    x: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+) -> Result<()> {
+    anyhow::ensure!(
+        w.k.is_multiple_of(16),
+        "g4m_gemv_i8_v4 reads one vec4 of 16 int8 elems per k-word, so k={} must be a \
+         multiple of 16",
+        w.k
+    );
+    let grid = b.grid1(w.n.div_ceil(2) as u64, 1);
+    let kw = w.k / 16;
+    let p = b.uni(
+        "g4m-gemvi8-p",
+        GemvI8Params {
+            n_rows: w.n as u32,
+            k_words: kw as u32,
+            groups_x: grid.0,
+            out_f32: 0,
+            w_row_words: kw as u32,
+            x_off_words: 0,
+            y_off_words: 0,
+            s_row_elems: (w.k / w.gs) as u32,
+            alpha: 1.0,
+            ..Default::default()
+        },
+    );
+    let (src, entry) = if w.gs == 16 {
+        (
+            &s.gemv_i8_g16,
+            "g4m_gemv_i8_v4_g16_one_scale_per_vec4_word_halves_the_group_of_the_shared_i8_entry",
+        )
+    } else {
+        (&s.gemv_i8_v4, "g4m_gemv_i8_v4")
+    };
+    b.push(
+        label,
+        src,
+        entry,
+        &[(0, &w.q), (1, x), (2, &p), (3, y), (4, &w.scales)],
+        grid,
     )
 }
 
@@ -1557,10 +1868,17 @@ fn push_gemv_bf16_gu_gelu(
             ..Default::default()
         },
     );
+    let (src, entry) = if mlpgu_fusedx_enabled() {
+        (&s.gemv_bf16, "g4m_gemv_bf16_gu_gelu_fusedx")
+    } else if gemv_sglat_active(b.ctx, label) {
+        (&s.gemv_bf16_sglat, "g4m_gemv_bf16_gu_gelu_sglat")
+    } else {
+        (&s.gemv_bf16, "g4m_gemv_bf16_gu_gelu")
+    };
     b.push(
         label,
-        &s.gemv_bf16,
-        "g4m_gemv_bf16_gu_gelu",
+        src,
+        entry,
         &[(0, &wg.w), (1, x), (2, &p), (3, act), (4, &wu.w)],
         grid,
     )
@@ -1577,6 +1895,7 @@ fn push_gemv_w4_gu_gelu(
     act: &wgpu::Buffer,
     sel: &wgpu::Buffer,
     slots: usize,
+    rank: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
 ) -> Result<()> {
     anyhow::ensure!(
         eg.n == eu.n && eg.k == eu.k,
@@ -1588,8 +1907,28 @@ fn push_gemv_w4_gu_gelu(
     );
     let groups = eg.k / W4_GS;
     let base_entry = w4_gemv_entry(groups, eg.n);
-    let (entry, rows_per_wg) = if base_entry == "g4m_gemv_w4_r8" {
+    let coal = rank.is_none()
+        && w4_coal_enabled()
+        && base_entry != "g4m_gemv_w4_r8"
+        && groups * 16 <= W4_COAL_XBUF_WORDS_3072_BOUNDS_THE_PRELOADED_ACTIVATION_SLOTS;
+    let (entry, rows_per_wg) = if let Some(_) = rank {
+        if base_entry == "g4m_gemv_w4_r8" {
+            ("g4m_gemv_w4_r8_gu_gelu_rank", 8)
+        } else {
+            ("g4m_gemv_w4_gu_gelu_rank", 2)
+        }
+    } else if coal {
+        ("g4m_gemv_w4_gu_gelu_coal", 2)
+    } else if base_entry == "g4m_gemv_w4_r8" {
         ("g4m_gemv_w4_r8_gu_gelu", 8)
+    } else if gu_fusedx_enabled() {
+        if gemv_sglat_active(b.ctx, label) && w4_xv4_enabled() {
+            ("g4m_gemv_w4_gu_gelu_fusedx_sglat_xv4", 2)
+        } else if gemv_sglat_active(b.ctx, label) {
+            ("g4m_gemv_w4_gu_gelu_fusedx_sglat", 2)
+        } else {
+            ("g4m_gemv_w4_gu_gelu_fusedx", 2)
+        }
     } else {
         ("g4m_gemv_w4_gu_gelu", 2)
     };
@@ -1604,25 +1943,32 @@ fn push_gemv_w4_gu_gelu(
             s_e_stride_elems: (eg.n * groups) as u32,
             x_slot_stride_words: 0,
             y_slot_stride_words: (eg.n / 2) as u32,
-            k_top: 0,
+            k_top: if rank.is_some() { slots as u32 } else { 0 },
+            n_experts: rank.map(|(_, _, ne)| ne as u32).unwrap_or(0),
+            ..Default::default()
         },
     );
-    b.push(
-        label,
-        &s.gemv_w4,
-        entry,
-        &[
-            (10, &eg.w),
-            (11, &eg.scales),
-            (12, x),
-            (14, &p),
-            (15, act),
-            (16, sel),
-            (17, &eu.w),
-            (18, &eu.scales),
-        ],
-        (grid.0, grid.1, slots as u32),
-    )
+    let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+        (10, &eg.w),
+        (11, &eg.scales),
+        (12, x),
+        (14, &p),
+        (15, act),
+        (17, &eu.w),
+        (18, &eu.scales),
+    ];
+    match rank {
+        Some((logits, _, _)) => binds.push((20, logits)),
+        None => binds.push((16, sel)),
+    }
+    let src = if entry.ends_with("_sglat_xv4") {
+        &s.gemv_w4_sglat_xv4
+    } else if entry.ends_with("_sglat") {
+        &s.gemv_w4_sglat
+    } else {
+        &s.gemv_w4
+    };
+    b.push(label, src, entry, &binds, (grid.0, grid.1, slots as u32))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1636,6 +1982,7 @@ fn push_gemv_w4_down_combine(
     sel: &wgpu::Buffer,
     wts: &wgpu::Buffer,
     k_top: usize,
+    rank: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
 ) -> Result<()> {
     let groups = ed.k / W4_GS;
     anyhow::ensure!(
@@ -1643,7 +1990,26 @@ fn push_gemv_w4_down_combine(
         "g4m_gemv_w4_r8_down_combine mirrors the r8 row walk only; the caller must fall \
          back to the unfused down+combine pair for the pair-entry shape"
     );
-    let grid = b.grid1(ed.n.div_ceil(8) as u64, 1);
+    let coal = rank.is_none()
+        && w4_coal_enabled()
+        && k_top * (ed.k / 2) <= W4_COAL_XBUF_WORDS_3072_BOUNDS_THE_PRELOADED_ACTIVATION_SLOTS;
+    let expar = rank.is_none() && !coal && down_expar_enabled();
+    let (entry, rows_per_wg) = if rank.is_some() {
+        ("g4m_gemv_w4_r8_down_combine_rank", 8)
+    } else if coal {
+        ("g4m_gemv_w4_r8_down_combine_coal", 8)
+    } else if expar {
+        if gemv_sglat_active(b.ctx, label) && w4_xv4_enabled() {
+            ("g4m_gemv_w4_down_combine_expar_sglat_xv4", 2)
+        } else if gemv_sglat_active(b.ctx, label) {
+            ("g4m_gemv_w4_down_combine_expar_sglat", 2)
+        } else {
+            ("g4m_gemv_w4_down_combine_expar", 2)
+        }
+    } else {
+        ("g4m_gemv_w4_r8_down_combine", 8)
+    };
+    let grid = b.grid1(ed.n.div_ceil(rows_per_wg) as u64, 1);
     let p = b.uni(
         "g4m-gemvw4-p",
         GemvW4Params {
@@ -1655,25 +2021,37 @@ fn push_gemv_w4_down_combine(
             x_slot_stride_words: (ed.k / 2) as u32,
             y_slot_stride_words: (ed.n / 2) as u32,
             k_top: k_top as u32,
+            n_experts: rank.map(|(_, _, ne)| ne as u32).unwrap_or(0),
+            ..Default::default()
         },
     );
-    b.push(
-        label,
-        &s.gemv_w4,
-        "g4m_gemv_w4_r8_down_combine",
-        &[
-            (10, &ed.w),
-            (11, &ed.scales),
-            (12, act),
-            (14, &p),
-            (15, out),
-            (16, sel),
-            (17, &ed.w),
-            (18, &ed.scales),
-            (19, wts),
-        ],
-        (grid.0, grid.1, 1),
-    )
+    let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+        (10, &ed.w),
+        (11, &ed.scales),
+        (12, act),
+        (14, &p),
+        (15, out),
+        (17, &ed.w),
+        (18, &ed.scales),
+    ];
+    match rank {
+        Some((logits, pes, _)) => {
+            binds.push((20, logits));
+            binds.push((21, pes));
+        }
+        None => {
+            binds.push((16, sel));
+            binds.push((19, wts));
+        }
+    }
+    let src = if entry.ends_with("_sglat_xv4") {
+        &s.gemv_w4_sglat_xv4
+    } else if entry.ends_with("_sglat") {
+        &s.gemv_w4_sglat
+    } else {
+        &s.gemv_w4
+    };
+    b.push(label, src, entry, &binds, (grid.0, grid.1, 1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1773,7 +2151,7 @@ pub fn prefill_m() -> usize {
     }
 }
 
-pub const G4MOE_SLIDING_KV_RING_DEFAULT_ON: bool = false;
+pub const G4MOE_SLIDING_KV_RING_DEFAULT_ON: bool = true;
 
 pub fn sliding_kv_ring_enabled() -> bool {
     match std::env::var("NV_G4MOE_KV_RING") {
@@ -1787,9 +2165,9 @@ pub fn sliding_kv_ring_enabled() -> bool {
 
 pub use crate::gemma4_wgpu::sliding_kv_ring_rows_window_plus_prefill_chunk_plus_headroom;
 
-pub const G4MOE_FLASH_DECODE_DEFAULT_ON: bool = false;
+pub const G4MOE_FLASH_DECODE_DEFAULT_ON: bool = true;
 
-pub const G4MOE_FLASH_SPLITS_16_MIRRORS_GEMMA4_WGPU_FLASH_SPLITS: u32 = 16;
+pub const G4MOE_FLASH_SPLITS_32_IS_THE_MEASURED_KNEE_AT_DEPTH: u32 = 32;
 
 pub const G4MOE_FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH: u32 = 256;
 
@@ -1807,12 +2185,181 @@ pub fn flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build() -
             );
             n
         }
-        Err(_) => G4MOE_FLASH_SPLITS_16_MIRRORS_GEMMA4_WGPU_FLASH_SPLITS,
+        Err(_) => G4MOE_FLASH_SPLITS_32_IS_THE_MEASURED_KNEE_AT_DEPTH,
+    }
+}
+
+pub const G4MOE_FLASH_SLIDING_SPLITS_ENV: &str = "NV_G4MOE_FLASH_SPLITS_SLIDING";
+
+pub const FLASH_SLIDING_SPLITS_UNSET_TRACKS_THE_FULL_ATTENTION_COUNT_SO_ADDING_THIS_KNOB_CHANGES_NO_EXISTING_ARM: &str =
+    "NV_G4MOE_FLASH_SPLITS sizes the stage1 grid.y, the g4m-at-fscr scratch rows and the stage2 \
+     serial scan for BOTH layer kinds, but the two kinds do not want the same number. Full \
+     attention scans the whole context, so pairing NV_G4MOE_FLASH_FOLD=F with 32*F splits is what \
+     holds its 512-workgroup grid while the fold halves its KV load requests. The sliding kind is \
+     ring-capped at sliding_window+chunk+headroom rows (1160 on the 26B-A4B), which at 32 splits \
+     is already ceil(1160/256)=5 rounds per workgroup: extra splits add no stage1 parallelism it \
+     can use and are paid in full by g4m_flash_stage2_pk, whose scan over splits is serial and \
+     lands on 25 sliding layers against 5 full-attention ones. Unset, this env returns the \
+     full-attention count, so every arm measured before it existed reproduces byte for byte.";
+
+pub fn flash_sliding_splits_the_ring_capped_scan_gains_no_stage1_rows_from_extra_splits_and_pays_every_one_in_stage2(
+    full_attention_splits: u32,
+) -> u32 {
+    let Ok(v) = std::env::var(G4MOE_FLASH_SLIDING_SPLITS_ENV) else {
+        return full_attention_splits;
+    };
+    let t = v.trim();
+    if t.is_empty() {
+        return full_attention_splits;
+    }
+    let n: u32 = t.parse().unwrap_or_else(|_| {
+        panic!("{G4MOE_FLASH_SLIDING_SPLITS_ENV}={t}: expected an integer split count")
+    });
+    assert!(
+        n >= 1 && n <= G4MOE_FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH,
+        "{G4MOE_FLASH_SLIDING_SPLITS_ENV}={n} out of 1..={}. {}",
+        G4MOE_FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH,
+        FLASH_SLIDING_SPLITS_UNSET_TRACKS_THE_FULL_ATTENTION_COUNT_SO_ADDING_THIS_KNOB_CHANGES_NO_EXISTING_ARM
+    );
+    n
+}
+
+pub fn flash_splits_for_layer_kind_full_attention_holds_the_folded_grid_sliding_holds_the_stage2_scan(
+    kind: LayerType,
+    full_attention_splits: u32,
+) -> u32 {
+    match kind {
+        LayerType::FullAttention => full_attention_splits,
+        LayerType::SlidingAttention => {
+            flash_sliding_splits_the_ring_capped_scan_gains_no_stage1_rows_from_extra_splits_and_pays_every_one_in_stage2(
+                full_attention_splits,
+            )
+        }
+    }
+}
+
+pub const G4MOE_FLASH_DEPTHGATE_ENV: &str = "NV_G4MOE_FLASH_DEPTHGATE";
+
+pub const G4MOE_FLASH_DEPTHGATE_SPLITS_ENV: &str = "NV_G4MOE_FLASH_DEPTHGATE_SPLITS";
+
+pub const FLASH_DEPTHGATE_KNEE_TOKENS_512_IS_WHERE_12_FIRST_BEATS_THE_SHALLOW_PIN_AND_BELOW_IT_8_WINS:
+    u32 = 512;
+
+pub const FLASH_DEPTHGATE_BAND1_SPLITS_12_IS_192_WORKGROUPS_ONE_PER_SM_AT_16_Q_HEADS_ON_188_SMS:
+    u32 = 12;
+
+pub const FLASH_DEPTHGATE_KNEE2_TOKENS_768_IS_WHERE_24_OVERTAKES_12_ON_THE_SAME_LADDER: u32 = 768;
+
+pub const FLASH_DEPTHGATE_BAND2_SPLITS_24_IS_384_WORKGROUPS_TWO_PER_SM_AT_16_Q_HEADS_ON_188_SMS:
+    u32 = 24;
+
+pub const FLASH_DEPTHGATE_KNEE3_TOKENS_1024_IS_WHERE_32_OVERTAKES_24_AND_WINS_EVERY_DEPTH_BEYOND:
+    u32 = 1024;
+
+pub const FLASH_DEPTHGATE_BAND3_SPLITS_32_IS_512_WORKGROUPS_THE_MEASURED_RESIDENCY_CEILING_AND_47_AND_64_LOSE_ABOVE_IT:
+    u32 = G4MOE_FLASH_SPLITS_32_IS_THE_MEASURED_KNEE_AT_DEPTH;
+
+pub fn flash_depthgate_enabled_a_shallow_tuned_split_pin_starves_the_grid_at_depth() -> bool {
+    matches!(std::env::var(G4MOE_FLASH_DEPTHGATE_ENV).as_deref(), Ok("1"))
+}
+
+fn flash_depthgate_forced_deep_splits_env_overrides_the_band_above_the_knee() -> Option<u32> {
+    let v = std::env::var(G4MOE_FLASH_DEPTHGATE_SPLITS_ENV).ok()?;
+    let n: u32 = v.trim().parse().unwrap_or_else(|_| {
+        panic!("{G4MOE_FLASH_DEPTHGATE_SPLITS_ENV}={v}: expected an integer split count")
+    });
+    assert!(
+        n >= 1 && n <= G4MOE_FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH,
+        "{G4MOE_FLASH_DEPTHGATE_SPLITS_ENV}={n} out of 1..={}",
+        G4MOE_FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH
+    );
+    Some(n)
+}
+
+pub fn flash_depthgate_splits_for_context_tokens(tokens: u32, shallow_splits: u32) -> u32 {
+    if tokens
+        < FLASH_DEPTHGATE_KNEE_TOKENS_512_IS_WHERE_12_FIRST_BEATS_THE_SHALLOW_PIN_AND_BELOW_IT_8_WINS
+    {
+        return shallow_splits;
+    }
+    if let Some(forced) = flash_depthgate_forced_deep_splits_env_overrides_the_band_above_the_knee()
+    {
+        return forced;
+    }
+    if tokens < FLASH_DEPTHGATE_KNEE2_TOKENS_768_IS_WHERE_24_OVERTAKES_12_ON_THE_SAME_LADDER {
+        FLASH_DEPTHGATE_BAND1_SPLITS_12_IS_192_WORKGROUPS_ONE_PER_SM_AT_16_Q_HEADS_ON_188_SMS
+    } else if tokens
+        < FLASH_DEPTHGATE_KNEE3_TOKENS_1024_IS_WHERE_32_OVERTAKES_24_AND_WINS_EVERY_DEPTH_BEYOND
+    {
+        FLASH_DEPTHGATE_BAND2_SPLITS_24_IS_384_WORKGROUPS_TWO_PER_SM_AT_16_Q_HEADS_ON_188_SMS
+    } else {
+        FLASH_DEPTHGATE_BAND3_SPLITS_32_IS_512_WORKGROUPS_THE_MEASURED_RESIDENCY_CEILING_AND_47_AND_64_LOSE_ABOVE_IT
+    }
+}
+
+pub fn flash_depthgate_scratch_splits_must_cover_every_band_the_gate_can_pick(
+    shallow_splits: u32,
+) -> u32 {
+    if !flash_depthgate_enabled_a_shallow_tuned_split_pin_starves_the_grid_at_depth() {
+        return shallow_splits;
+    }
+    match flash_depthgate_forced_deep_splits_env_overrides_the_band_above_the_knee() {
+        Some(forced) => shallow_splits.max(forced),
+        None => shallow_splits
+            .max(FLASH_DEPTHGATE_BAND1_SPLITS_12_IS_192_WORKGROUPS_ONE_PER_SM_AT_16_Q_HEADS_ON_188_SMS)
+            .max(FLASH_DEPTHGATE_BAND2_SPLITS_24_IS_384_WORKGROUPS_TWO_PER_SM_AT_16_Q_HEADS_ON_188_SMS)
+            .max(FLASH_DEPTHGATE_BAND3_SPLITS_32_IS_512_WORKGROUPS_THE_MEASURED_RESIDENCY_CEILING_AND_47_AND_64_LOSE_ABOVE_IT),
+    }
+}
+
+pub const G4MOE_FLASH_FOLDGATE_ENV: &str = "NV_G4MOE_FLASH_FOLDGATE";
+
+pub const FOLDGATE_KNEE_TOKENS_10240_IS_THE_MEASURED_SIGN_CROSS_EVERY_FOLD_ARM_LOSS_SITS_SHALLOWER_AND_BOTH_STANDING_TARGETS_16K_AND_196K_SIT_DEEPER:
+    u32 = 10240;
+
+pub const FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC: u32 = 2;
+
+pub const FOLDGATE_DEEP_SPLITS_64_RESTORES_512_WORKGROUPS_UNDER_FOLD_2_AND_IS_A_MEASURED_RUNG_THE_LADDER_HAS_A_REPRODUCED_POTHOLE_AT_40_47_48_SO_NEVER_INTERPOLATE:
+    u32 = 64;
+
+pub const FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS:
+    u32 = 128;
+
+pub const FOLDGATE_SWAPS_ONLY_FULL_ATTENTION_BECAUSE_SPELLING_THE_FOLD_THROUGH_THE_SHARED_DEPTHGATE_SPLITS_ENV_TAXES_SLIDING: &str =
+    "NV_G4MOE_FLASH_FOLDGATE=1 swaps the FULL-ATTENTION flash1 passes to the fold-2 / splits-64 \
+     / sacc-128 arm once the whole-context depth reaches the knee, and leaves every sliding pass \
+     on its own shallow pin or depthgate band; forcing the fold's 64 splits onto both kinds via \
+     NV_G4MOE_FLASH_DEPTHGATE_SPLITS was measured +7.2% on the sliding kind at 1024, and at 256 \
+     the sliding split override alone was two thirds of the fold arm's whole control-band loss";
+
+pub fn flash_foldgate_enabled_full_attention_swaps_to_the_fold2_arm_at_depth_while_sliding_keeps_its_own_band(
+) -> bool {
+    matches!(std::env::var(G4MOE_FLASH_FOLDGATE_ENV).as_deref(), Ok("1"))
+}
+
+pub fn foldgate_deep_at_these_whole_context_tokens(tokens: u32) -> bool {
+    tokens
+        >= FOLDGATE_KNEE_TOKENS_10240_IS_THE_MEASURED_SIGN_CROSS_EVERY_FOLD_ARM_LOSS_SITS_SHALLOWER_AND_BOTH_STANDING_TARGETS_16K_AND_196K_SIT_DEEPER
+}
+
+pub fn foldgate_scratch_splits_full_attention_only_must_also_cover_the_deep_arm_rows(
+    covered_splits: u32,
+) -> u32 {
+    if flash_foldgate_enabled_full_attention_swaps_to_the_fold2_arm_at_depth_while_sliding_keeps_its_own_band()
+    {
+        covered_splits.max(
+            FOLDGATE_DEEP_SPLITS_64_RESTORES_512_WORKGROUPS_UNDER_FOLD_2_AND_IS_A_MEASURED_RUNG_THE_LADDER_HAS_A_REPRODUCED_POTHOLE_AT_40_47_48_SO_NEVER_INTERPOLATE,
+        )
+    } else {
+        covered_splits
     }
 }
 
 const FLASH_WORKGROUP_BYTES_QSH512_RED256_SM8_SL8_SACC4096_F32: u32 =
     (512 + 256 + 8 + 8 + 4096) * 4;
+
+const FLASH_QKVFOLD_WORKGROUP_BYTES_ADDS_BUF512_KCUR256_VCUR256_U32: u32 =
+    FLASH_WORKGROUP_BYTES_QSH512_RED256_SM8_SL8_SACC4096_F32 + (512 + 256 + 256) * 4;
 
 pub fn flash_decode_enabled() -> bool {
     match std::env::var("NV_G4MOE_FLASH_DECODE") {
@@ -1824,7 +2371,427 @@ pub fn flash_decode_enabled() -> bool {
     }
 }
 
-pub const G4MOE_FLASH_SLIDING_DEFAULT_ON: bool = false;
+pub const G4MOE_FLASH_SG_DEFAULT_OFF_UNTIL_A_ROUND_PUBLISHES_ITS_LADDER: bool = false;
+
+pub fn flash_sg_reduce_enabled() -> bool {
+    match std::env::var("NV_G4MOE_FLASH_SG") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_FLASH_SG_DEFAULT_OFF_UNTIL_A_ROUND_PUBLISHES_ITS_LADDER,
+    }
+}
+
+pub const FLASH_SACC_CHUNK_ENV: &str = "NV_G4MOE_FLASH_SACC";
+
+pub const FLASH_SACC_CHUNK_512_IS_THE_SHIPPED_WHOLE_HEAD_DIM_STAGING_AT_16KB_PER_WORKGROUP: u32 =
+    512;
+
+pub fn flash_sacc_chunk_head_dim_slice_staged_per_warp_read_once_at_build() -> u32 {
+    let hd_max = MAX_HEAD_DIM as u32;
+    match std::env::var(FLASH_SACC_CHUNK_ENV) {
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                return FLASH_SACC_CHUNK_512_IS_THE_SHIPPED_WHOLE_HEAD_DIM_STAGING_AT_16KB_PER_WORKGROUP;
+            }
+            let n: u32 = t.parse().unwrap_or_else(|_| {
+                panic!("{FLASH_SACC_CHUNK_ENV}={t}: expected a head-dim slice width in elements")
+            });
+            assert!(
+                n >= 32 && n <= hd_max && n.is_multiple_of(32) && hd_max.is_multiple_of(n),
+                "{FLASH_SACC_CHUNK_ENV}={n}: the stage1 tail stages one 32-lane accumulator strip \
+                 at a time, so the slice must be a multiple of 32 that divides {hd_max}"
+            );
+            n
+        }
+        Err(_) => FLASH_SACC_CHUNK_512_IS_THE_SHIPPED_WHOLE_HEAD_DIM_STAGING_AT_16KB_PER_WORKGROUP,
+    }
+}
+
+pub fn flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
+    flash_sg: bool,
+    sacc_chunk: u32,
+    fold: u32,
+) -> u32 {
+    (512 * fold + if flash_sg { 0 } else { 256 } + 8 + 8 + 8 * sacc_chunk) * 4
+}
+
+pub fn flash_stage1_tail_source(sacc_chunk: u32) -> String {
+    use std::fmt::Write;
+    let hd_max = MAX_HEAD_DIM as u32;
+    assert!(
+        sacc_chunk >= 32
+            && sacc_chunk <= hd_max
+            && sacc_chunk.is_multiple_of(32)
+            && hd_max.is_multiple_of(sacc_chunk),
+        "flash stage1 tail slice {sacc_chunk} must be a multiple of 32 dividing {hd_max}"
+    );
+    let strips_per_chunk = sacc_chunk / 32;
+    let chunks = hd_max / sacc_chunk;
+    let mut b = String::with_capacity(8192);
+    writeln!(
+        b,
+        "var<workgroup> gf_sacc: array<f32, {}>;\n",
+        8 * sacc_chunk
+    )
+    .unwrap();
+    b.push_str("fn gf_stage1_tail(lid: u32, lane: u32, warp: u32, hd: u32, slot: u32, m: f32, l: f32");
+    for i in 0..(hd_max / 32) {
+        write!(b, ", a{i}: f32").unwrap();
+    }
+    b.push_str(
+        ") {
+    workgroupBarrier();
+    if (lane == 0u) {
+        gf_sm[warp] = m;
+        gf_sl[warp] = l;
+    }
+    workgroupBarrier();
+    if (warp == 0u) {
+        var m_hd = gf_neg_inf();
+        for (var w = 0u; w < GF_WARPS; w = w + 1u) {
+            m_hd = max(m_hd, gf_sm[w]);
+        }
+        var l_hd = 0.0;
+        for (var w = 0u; w < GF_WARPS; w = w + 1u) {
+            if (gf_sm[w] > gf_neg_inf()) {
+                l_hd = l_hd + gf_sl[w] * gf_exp(gf_sm[w] - m_hd);
+            }
+        }
+        if (lane == 0u) {
+            gf_scratch[slot] = m_hd;
+            gf_scratch[slot + 1u] = l_hd;
+        }
+    }
+    var m_blk = gf_neg_inf();
+    for (var w = 0u; w < GF_WARPS; w = w + 1u) {
+        m_blk = max(m_blk, gf_sm[w]);
+    }
+",
+    );
+    for c in 0..chunks {
+        b.push_str("    workgroupBarrier();\n");
+        for k in 0..strips_per_chunk {
+            let i = c * strips_per_chunk + k;
+            writeln!(
+                b,
+                "    {{
+        let d = lane + {i}u * GF_LANES;
+        if (d < hd) {{
+            gf_sacc[warp * {sacc_chunk}u + lane + {k}u * GF_LANES] = a{i};
+        }}
+    }}"
+            )
+            .unwrap();
+        }
+        b.push_str("    workgroupBarrier();\n");
+        writeln!(
+            b,
+            "    for (var dl = lid; dl < {sacc_chunk}u; dl = dl + GF_BLOCK) {{
+        let d = dl + {}u;
+        if (d < hd) {{
+            var a = 0.0;
+            for (var w = 0u; w < GF_WARPS; w = w + 1u) {{
+                if (gf_sm[w] > gf_neg_inf()) {{
+                    a = a + gf_sacc[w * {sacc_chunk}u + dl] * gf_exp(gf_sm[w] - m_blk);
+                }}
+            }}
+            gf_scratch[slot + 2u + d] = a;
+        }}
+    }}",
+            c * sacc_chunk
+        )
+        .unwrap();
+    }
+    b.push_str("}\n");
+    b
+}
+
+pub const FLASH_GQA_FOLD_ENV: &str = "NV_G4MOE_FLASH_FOLD";
+
+pub const FLASH_GQA_FOLD_1_IS_THE_SHIPPED_ONE_WORKGROUP_PER_QUERY_HEAD_DISPATCH: u32 = 1;
+
+pub const FLASH_GQA_FOLD_MAX_8_IS_THE_FULL_ATTENTION_GROUP_AND_128_ACCUMULATORS_PER_THREAD: u32 = 8;
+
+pub fn flash_gqa_fold_query_heads_per_workgroup_read_once_at_build() -> u32 {
+    match std::env::var(FLASH_GQA_FOLD_ENV) {
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                return FLASH_GQA_FOLD_1_IS_THE_SHIPPED_ONE_WORKGROUP_PER_QUERY_HEAD_DISPATCH;
+            }
+            let n: u32 = t.parse().unwrap_or_else(|_| {
+                panic!("{FLASH_GQA_FOLD_ENV}={t}: expected a query-head fold count")
+            });
+            assert!(
+                n >= 1
+                    && n <= FLASH_GQA_FOLD_MAX_8_IS_THE_FULL_ATTENTION_GROUP_AND_128_ACCUMULATORS_PER_THREAD
+                    && n.is_power_of_two(),
+                "{FLASH_GQA_FOLD_ENV}={n}: a folded workgroup carries head_dim/32 more live \
+                 accumulators per thread for every extra query head, so the fold must be a power \
+                 of two in 1..={}",
+                FLASH_GQA_FOLD_MAX_8_IS_THE_FULL_ATTENTION_GROUP_AND_128_ACCUMULATORS_PER_THREAD
+            );
+            n
+        }
+        Err(_) => FLASH_GQA_FOLD_1_IS_THE_SHIPPED_ONE_WORKGROUP_PER_QUERY_HEAD_DISPATCH,
+    }
+}
+
+pub const FLASH_GQA_FOLD_DIVIDES_THE_GRID_SO_IT_ONLY_PAYS_PAIRED_WITH_SPLITS_TIMES_FOLD_AND_A_SACC_SLICE: &str =
+    "NV_G4MOE_FLASH_FOLD=F puts F query heads of one KV group in a workgroup, so each K and V \
+     element is loaded once instead of F times -- and it divides the full-attention stage1 grid \
+     by F. At the shipped NV_G4MOE_FLASH_SPLITS=32 that grid is 16x32=512 workgroups on 188 SMs, \
+     and every fold rung alone loses: +10.9% at F=2, +15.5% at F=4, +50.3% at F=8 on \
+     g4m-at-flash1-full at 196608. Pair the fold with NV_G4MOE_FLASH_SPLITS=32*F to hold the grid \
+     at 512, and with NV_G4MOE_FLASH_SACC<=256 so the folded workgroup (which adds gf_qshf at \
+     512*F floats) stays under 49152/3 bytes and three blocks place per SM: fold 2 / splits 64 / \
+     slice 128 measures -25.8% on the pass and -16.1% on the token at 196608. It is a slope fix, \
+     not an offset fix -- at 16384 the same arm is +4.1%, because the doubled split count is paid \
+     back in g4m_flash_stage2_pk's serial scan over splits, which is depth-independent and lands \
+     on all 30 layers while the fold only helps the 5 full-attention ones";
+
+pub const G4MOE_FLASH_SLIDING_FOLD_ENV: &str = "NV_G4MOE_FLASH_FOLD_SLIDING";
+
+pub const FLASH_SLIDING_FOLD_HALVES_A_GRID_THE_RING_IS_TOO_SHORT_TO_REFILL_AND_IS_WHAT_FORCES_THE_SLIDING_SPLIT_TAX: &str =
+    "flash_gqa_fold_fits_this_layer accepts the sliding layers too -- their GQA group is even -- so \
+     a global NV_G4MOE_FLASH_FOLD folds all 30 layers. On full attention that trade is the whole \
+     win: the scan is the entire context, so halving the KV load requests per query head pays for \
+     the halved grid many times over once NV_G4MOE_FLASH_SPLITS restores it. On sliding it is a \
+     pure loss twice over. The ring caps the scan at sliding_window+chunk+headroom rows (1160 on \
+     the 26B-A4B), so a 16x32 grid already runs only about five rounds per workgroup and there is \
+     nothing for the reuse to amortise against: measured at EQUAL grid, folding sliding costs +8.3% \
+     on g4m-at-flash1-sliding at 16384. And it is the fold that forces the doubled split count, \
+     whose serial g4m_flash_stage2_pk scan lands on 25 sliding layers against 5 full-attention \
+     ones. Unset, this env returns the full-attention fold, so every arm measured before it \
+     existed reproduces exactly.";
+
+pub fn flash_sliding_fold_the_ring_is_too_short_for_kv_reuse_to_pay_for_the_grid_it_deletes(
+    full_attention_fold: u32,
+) -> u32 {
+    let Ok(v) = std::env::var(G4MOE_FLASH_SLIDING_FOLD_ENV) else {
+        return full_attention_fold;
+    };
+    let t = v.trim();
+    if t.is_empty() {
+        return full_attention_fold;
+    }
+    let n: u32 = t.parse().unwrap_or_else(|_| {
+        panic!("{G4MOE_FLASH_SLIDING_FOLD_ENV}={t}: expected a query-head fold count")
+    });
+    assert!(
+        n == 1 || n == full_attention_fold,
+        "{G4MOE_FLASH_SLIDING_FOLD_ENV}={n}: Sources::new generates exactly one folded stage1 \
+         entry, at the full-attention fold {full_attention_fold}, so the sliding kind may only \
+         take that entry or the unfolded one. {}",
+        FLASH_SLIDING_FOLD_HALVES_A_GRID_THE_RING_IS_TOO_SHORT_TO_REFILL_AND_IS_WHAT_FORCES_THE_SLIDING_SPLIT_TAX
+    );
+    n
+}
+
+pub fn flash_gqa_fold_for_layer_kind_only_full_attention_scans_enough_rows_to_amortise_a_halved_grid(
+    kind: LayerType,
+    full_attention_fold: u32,
+) -> u32 {
+    match kind {
+        LayerType::FullAttention => full_attention_fold,
+        LayerType::SlidingAttention => {
+            flash_sliding_fold_the_ring_is_too_short_for_kv_reuse_to_pay_for_the_grid_it_deletes(
+                full_attention_fold,
+            )
+        }
+    }
+}
+
+pub fn flash_stage1_fold_entry(fold: u32) -> String {
+    format!("g4m_flash_stage1_bf16_fold{fold}")
+}
+
+pub fn flash_gqa_fold_fits_this_layer(fold: u32, n_q: usize, n_kv: usize) -> bool {
+    fold > 1
+        && n_kv > 0
+        && n_q.is_multiple_of(n_kv)
+        && n_q.is_multiple_of(fold as usize)
+        && (n_q / n_kv).is_multiple_of(fold as usize)
+}
+
+pub fn flash_stage1_fold_source(fold: u32) -> String {
+    use std::fmt::Write;
+    let hd_max = MAX_HEAD_DIM as u32;
+    let accs = hd_max / 32;
+    let entry = flash_stage1_fold_entry(fold);
+    let mut b = String::with_capacity(32768);
+    writeln!(
+        b,
+        "var<workgroup> gf_qshf{fold}: array<f32, {}>;\n",
+        hd_max * fold
+    )
+    .unwrap();
+    writeln!(b, "@compute @workgroup_size(256)").unwrap();
+    writeln!(b, "fn {entry}(").unwrap();
+    b.push_str(
+        "    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) tid: vec3<u32>
+) {
+",
+    );
+    writeln!(b, "    let h0 = wg.x * {fold}u;").unwrap();
+    b.push_str(
+        "    let split = wg.y;
+    if (h0 >= gf_p.n_heads) {
+        return;
+    }
+    let hd = gf_p.head_dim;
+    let nkv = gf_p.n_kv;
+    let group = gf_p.n_heads / nkv;
+    let kvh = h0 / group;
+    let lid = tid.x;
+    let lane = lid & 31u;
+    let warp = lid >> 5u;
+
+",
+    );
+    writeln!(
+        b,
+        "    for (var d = lid; d < hd * {fold}u; d = d + GF_BLOCK) {{
+        let qi = h0 * hd + d;
+        gf_qshf{fold}[d] = bf16_decode(u16_at(gf_q[qi >> 1u], qi));
+    }}
+    workgroupBarrier();
+"
+    )
+    .unwrap();
+    for j in 0..fold {
+        writeln!(b, "    var m{j} = gf_neg_inf();").unwrap();
+        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        for i in 0..accs {
+            writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
+        }
+    }
+    b.push_str(
+        "
+    let total = gf_p.total;
+    let base = gf_p.start + split * GF_WARPS;
+    let stride = gf_p.splits * GF_WARPS;
+    var rounds = 0u;
+    if (total > base) {
+        rounds = (total - base + stride - 1u) / stride;
+    }
+    let use_vec8 = (hd & 7u) == 0u;
+
+    for (var r = 0u; r < rounds; r = r + 1u) {
+        let p = base + warp + r * stride;
+        let live = p < total;
+        var sp = p;
+        if (gf_p.ring > 0u) {
+            sp = p % gf_p.ring;
+        }
+",
+    );
+    for j in 0..fold {
+        writeln!(b, "        var pt{j} = 0.0;").unwrap();
+    }
+    b.push_str(
+        "        if (live) {
+            let kbase = (sp * nkv + kvh) * hd;
+            if (use_vec8) {
+                let n8 = hd >> 3u;
+                for (var jv = lane; jv < n8; jv = jv + GF_LANES) {
+                    let qb = jv * 8u;
+                    let kb = kbase + qb;
+                    for (var t = 0u; t < 4u; t = t + 1u) {
+                        let kx = gf_k_bf16(kb + 2u * t);
+                        let ky = gf_k_bf16(kb + 2u * t + 1u);
+",
+    );
+    for j in 0..fold {
+        writeln!(
+            b,
+            "                        pt{j} = pt{j} + fma(kx, gf_qshf{fold}[{j}u * hd + qb + 2u * t], ky \
+             * gf_qshf{fold}[{j}u * hd + qb + 2u * t + 1u]);"
+        )
+        .unwrap();
+    }
+    b.push_str(
+        "                    }
+                }
+            } else {
+                for (var d = lane; d < hd; d = d + GF_LANES) {
+                    let kx = gf_k_bf16(kbase + d);
+",
+    );
+    for j in 0..fold {
+        writeln!(
+            b,
+            "                    pt{j} = fma(gf_qshf{fold}[{j}u * hd + d], kx, pt{j});"
+        )
+        .unwrap();
+    }
+    b.push_str(
+        "                }
+            }
+        }
+",
+    );
+    for j in 0..fold {
+        writeln!(
+            b,
+            "        let sc{j} = gf_warp_sum(lid, pt{j}) * gf_p.scale;"
+        )
+        .unwrap();
+    }
+    b.push_str(
+        "        if (live) {
+            let vbase = (sp * nkv + kvh) * hd;
+",
+    );
+    for j in 0..fold {
+        writeln!(b, "            let mn{j} = max(m{j}, sc{j});").unwrap();
+        writeln!(b, "            let cr{j} = gf_exp(m{j} - mn{j});").unwrap();
+        writeln!(b, "            let wt{j} = gf_exp(sc{j} - mn{j});").unwrap();
+        writeln!(b, "            l{j} = fma(l{j}, cr{j}, wt{j});").unwrap();
+    }
+    for i in 0..accs {
+        writeln!(b, "            {{").unwrap();
+        writeln!(b, "                let d = lane + {i}u * GF_LANES;").unwrap();
+        writeln!(b, "                if (d < hd) {{").unwrap();
+        writeln!(b, "                    let vx = gf_v_bf16(vbase + d);").unwrap();
+        for j in 0..fold {
+            writeln!(
+                b,
+                "                    a{j}_{i} = fma(a{j}_{i}, cr{j}, wt{j} * vx);"
+            )
+            .unwrap();
+        }
+        writeln!(b, "                }}").unwrap();
+        writeln!(b, "            }}").unwrap();
+    }
+    for j in 0..fold {
+        writeln!(b, "            m{j} = mn{j};").unwrap();
+    }
+    b.push_str(
+        "        }
+    }
+
+",
+    );
+    for j in 0..fold {
+        writeln!(
+            b,
+            "    gf_stage1_tail(lid, lane, warp, hd, ((h0 + {j}u) * gf_p.splits + split) * (hd + \
+             2u), m{j}, l{j},"
+        )
+        .unwrap();
+        let args: Vec<String> = (0..accs).map(|i| format!("a{j}_{i}")).collect();
+        writeln!(b, "        {});", args.join(", ")).unwrap();
+    }
+    b.push_str("}\n");
+    b
+}
+
+pub const G4MOE_FLASH_SLIDING_DEFAULT_ON: bool = true;
 
 pub fn flash_sliding_enabled() -> bool {
     if !flash_decode_enabled() {
@@ -1839,17 +2806,397 @@ pub fn flash_sliding_enabled() -> bool {
     }
 }
 
-pub const G4MOE_GROUPED_GEMV_DEFAULT_ON: bool = false;
+pub const G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON:
+    bool = true;
+
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|v| {
+        let t = v.trim();
+        !t.is_empty() && t != "0"
+    })
+}
+
+fn champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(
+    ctx: &WgpuContext,
+) -> bool {
+    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON
+        && ctx.caps.subgroup
+        && ctx.subgroup_width() == Some(32)
+}
+
+pub const G4MOE_GROUPED_GEMV_DEFAULT_ON: bool =
+    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
 
 pub const GROUPED_NORM_CHAIN_MAX_HIDDEN_WORDS_PN_BUF: usize = 2048;
 
 pub fn grouped_gemv_enabled() -> bool {
-    match std::env::var("NV_G4MOE_GROUPED_GEMV") {
+    env_flag("NV_G4MOE_GROUPED_GEMV").unwrap_or(G4MOE_GROUPED_GEMV_DEFAULT_ON)
+}
+
+fn grouped_gemv_active(ctx: &WgpuContext) -> bool {
+    env_flag("NV_G4MOE_GROUPED_GEMV")
+        .unwrap_or_else(|| champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx))
+}
+
+pub const G4MOE_TOPK_FOLD_DEFAULT_ON: bool = false;
+
+pub fn topk_fold_enabled() -> bool {
+    match std::env::var("NV_G4MOE_TOPK_FOLD") {
         Ok(v) => {
             let t = v.trim();
             !t.is_empty() && t != "0"
         }
-        Err(_) => G4MOE_GROUPED_GEMV_DEFAULT_ON,
+        Err(_) => G4MOE_TOPK_FOLD_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_HEAD_ONE_SHARD_LETS_THE_EMBED_TABLE_BIND_WHOLE_INSTEAD_OF_AT_A_1_GIB_CEILING_DEFAULT_ON:
+    bool = false;
+
+pub fn head_one_shard_enabled() -> bool {
+    match std::env::var("NV_G4MOE_HEAD_ONE_SHARD") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => {
+            G4MOE_HEAD_ONE_SHARD_LETS_THE_EMBED_TABLE_BIND_WHOLE_INSTEAD_OF_AT_A_1_GIB_CEILING_DEFAULT_ON
+        }
+    }
+}
+
+pub const G4MOE_LMHEAD_TIGHT_GRID_SEPARATES_THE_IDLE_WORKGROUP_LEVER_FROM_THE_BARRIER_LEVER_DEFAULT_ON:
+    bool = false;
+
+pub fn lmhead_tight_grid_enabled() -> bool {
+    match std::env::var("NV_G4MOE_LMHEAD_TIGHT_GRID") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => {
+            G4MOE_LMHEAD_TIGHT_GRID_SEPARATES_THE_IDLE_WORKGROUP_LEVER_FROM_THE_BARRIER_LEVER_DEFAULT_ON
+        }
+    }
+}
+
+pub const G4MOE_RPNORM_DEFAULT_ON: bool =
+    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
+
+pub fn rpnorm_enabled() -> bool {
+    env_flag("NV_G4MOE_RPNORM").unwrap_or(G4MOE_RPNORM_DEFAULT_ON)
+}
+
+fn rpnorm_active(ctx: &WgpuContext) -> bool {
+    env_flag("NV_G4MOE_RPNORM").unwrap_or_else(|| {
+        champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
+            && grouped_gemv_active(ctx)
+            && !router_chain_enabled()
+    })
+}
+
+pub const G4MOE_RPFUSE_RIDES_THE_ROUTER_NORM_GEMV_ON_THE_MLP_DOWN_DISPATCH_DEFAULT_ON: bool =
+    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
+
+pub fn rpfuse_enabled() -> bool {
+    env_flag("NV_G4MOE_RPFUSE")
+        .unwrap_or(G4MOE_RPFUSE_RIDES_THE_ROUTER_NORM_GEMV_ON_THE_MLP_DOWN_DISPATCH_DEFAULT_ON)
+}
+
+fn rpfuse_active(ctx: &WgpuContext) -> bool {
+    env_flag("NV_G4MOE_RPFUSE").unwrap_or_else(|| {
+        champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
+            && grouped_gemv_active(ctx)
+            && rpnorm_active(ctx)
+            && !router_chain_enabled()
+            && !topk_fold_enabled()
+    })
+}
+
+pub const G4MOE_TOPK_NX2_RIDES_THE_ROUTER_TOPK_ON_THE_NORMX2_DISPATCH_DEFAULT_ON: bool =
+    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
+
+pub const TOPK_PAR_TIE_RULE_HIGHER_LOGIT_OUTRANKS_AND_EQUAL_LOGITS_RANK_BY_LOWER_EXPERT_INDEX:
+    &str = "w > v || (w == v && j < lid)";
+
+pub fn topk_nx2_enabled() -> bool {
+    env_flag("NV_G4MOE_TOPK_NX2")
+        .unwrap_or(G4MOE_TOPK_NX2_RIDES_THE_ROUTER_TOPK_ON_THE_NORMX2_DISPATCH_DEFAULT_ON)
+}
+
+fn topk_nx2_active(ctx: &WgpuContext, n_experts: usize, top_k: usize) -> bool {
+    env_flag("NV_G4MOE_TOPK_NX2").unwrap_or_else(|| {
+        rpfuse_active(ctx) && router_topk_entry(n_experts, top_k) == "g4m_router_topk_par"
+    })
+}
+
+pub const G4MOE_BF16_R8_DEFAULT_ON: bool = false;
+
+pub fn bf16_r8_enabled() -> bool {
+    match std::env::var("NV_G4MOE_BF16_R8") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_BF16_R8_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_BF16_ACC4_MEASURED_NO_WALL_CHANGE_DEFAULT_OFF: bool = false;
+
+pub fn bf16_acc4_enabled() -> bool {
+    match std::env::var("NV_G4MOE_BF16_ACC4") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_BF16_ACC4_MEASURED_NO_WALL_CHANGE_DEFAULT_OFF,
+    }
+}
+
+pub const G4MOE_MLPGU_FUSEDX_MEASURED_NEGATIVE_BF16_TWO_MAT_STREAMS_DEFAULT_OFF: bool = false;
+
+pub fn mlpgu_fusedx_enabled() -> bool {
+    match std::env::var("NV_G4MOE_MLPGU_FUSEDX") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_MLPGU_FUSEDX_MEASURED_NEGATIVE_BF16_TWO_MAT_STREAMS_DEFAULT_OFF,
+    }
+}
+
+pub const G4MOE_GU_FUSEDX_DEFAULT_ON: bool = false;
+
+pub fn gu_fusedx_enabled() -> bool {
+    match std::env::var("NV_G4MOE_GU_FUSEDX") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_GU_FUSEDX_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_DOWN_EXPAR_DEFAULT_ON: bool = false;
+
+pub fn down_expar_enabled() -> bool {
+    match std::env::var("NV_G4MOE_DOWN_EXPAR") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_DOWN_EXPAR_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_NORM_LAT_DEFAULT_ON: bool = false;
+
+pub fn norm_lat_enabled() -> bool {
+    match std::env::var("NV_G4MOE_NORM_LAT") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_NORM_LAT_DEFAULT_ON,
+    }
+}
+
+fn norm_lat_active(ctx: &WgpuContext) -> bool {
+    norm_lat_enabled() && ctx.caps.subgroup && ctx.subgroup_width() == Some(32)
+}
+
+pub const G4MOE_W4_XV4_STACKS_ON_GEMV_SGLAT_DEFAULT_ON: bool = false;
+
+pub fn w4_xv4_enabled() -> bool {
+    match std::env::var("NV_G4MOE_W4_XV4") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_W4_XV4_STACKS_ON_GEMV_SGLAT_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_ATTN_I8_DEFAULT_ON: bool = false;
+
+pub const ATTN_I8_GROUP_32_IS_THE_GOW_RECIPE_G16_HALVES_THE_QUANT_STEP_AT_DOUBLE_THE_SCALE_STREAM:
+    usize = I8_GS;
+
+pub const ATTN_I8_G16_TOKEN: &str = "g16";
+
+pub fn attn_i8_group_elems() -> usize {
+    match std::env::var("NV_G4MOE_ATTN_I8") {
+        Ok(v) if v.split(',').any(|c| c == ATTN_I8_G16_TOKEN) => 16,
+        _ => ATTN_I8_GROUP_32_IS_THE_GOW_RECIPE_G16_HALVES_THE_QUANT_STEP_AT_DOUBLE_THE_SCALE_STREAM,
+    }
+}
+
+pub fn attn_i8_site_enabled(label: &str) -> bool {
+    match std::env::var("NV_G4MOE_ATTN_I8") {
+        Err(_) => G4MOE_ATTN_I8_DEFAULT_ON,
+        Ok(v) if v.is_empty() || v == "0" => false,
+        Ok(v) => {
+            let mut sites = v
+                .split(',')
+                .filter(|c| !c.is_empty() && *c != ATTN_I8_G16_TOKEN)
+                .peekable();
+            match sites.peek() {
+                None => true,
+                Some(_) => sites.any(|c| c == "1" || label.contains(c)),
+            }
+        }
+    }
+}
+
+pub fn attn_i8_enabled() -> bool {
+    attn_i8_site_enabled("g4m-at-qkvproj") || attn_i8_site_enabled("g4m-at-oproj")
+}
+
+pub fn attn_i8_caps_verify_rows_to_zero_because_int8_decode_vs_bf16_prefill_breaks_the_argmax_contract(
+) -> bool {
+    attn_i8_enabled()
+}
+
+pub const G4MOE_GEMV_SGLAT_UNSET_ROUTES_AT_OPROJ_ONLY_ROW_R3_111_1_TOK_S_BROADER_LABEL_SETS_DILUTE:
+    &str = "at-oproj";
+
+pub fn gemv_sglat_enabled(label: &str) -> bool {
+    match std::env::var("NV_G4MOE_GEMV_SGLAT") {
+        Err(_) => {
+            G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON
+                && label.contains(
+                    G4MOE_GEMV_SGLAT_UNSET_ROUTES_AT_OPROJ_ONLY_ROW_R3_111_1_TOK_S_BROADER_LABEL_SETS_DILUTE,
+                )
+        }
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() || t == "0" {
+                false
+            } else if t == "1" {
+                true
+            } else {
+                t.split(',').any(|c| !c.is_empty() && label.contains(c))
+            }
+        }
+    }
+}
+
+fn gemv_sglat_active(ctx: &WgpuContext, label: &str) -> bool {
+    gemv_sglat_enabled(label) && ctx.caps.subgroup && ctx.subgroup_width() == Some(32)
+}
+
+pub const G4MOE_GEMV_V2_OPT_IN_ONLY_ROW_PER_SUBGROUP_REASSOCIATES_THE_DOT_SO_ADOPTION_NEEDS_A_TF_PPL_ROW:
+    bool = false;
+
+pub fn gemv_v2_enabled(label: &str) -> bool {
+    match std::env::var("NV_G4MOE_GEMV_V2") {
+        Err(_) => {
+            G4MOE_GEMV_V2_OPT_IN_ONLY_ROW_PER_SUBGROUP_REASSOCIATES_THE_DOT_SO_ADOPTION_NEEDS_A_TF_PPL_ROW
+        }
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() || t == "0" {
+                false
+            } else if t == "1" {
+                true
+            } else {
+                t.split(',').any(|c| !c.is_empty() && label.contains(c))
+            }
+        }
+    }
+}
+
+fn gemv_v2_active_implies_the_vec4_wide_layout(
+    ctx: &WgpuContext,
+    label: &str,
+    load: GemvLoad,
+    k: usize,
+    x_off_words: usize,
+) -> bool {
+    gemv_v2_enabled(label)
+        && ctx.caps.subgroup
+        && ctx.subgroup_width() == Some(32)
+        && load == GemvLoad::Wide
+        && k.is_multiple_of(8)
+        && x_off_words.is_multiple_of(4)
+}
+
+const GEMV_BF16_V2_ENTRY: &str = "g4m_gemv_bf16_v2_row_per_sg32_dual_vec4_zero_barrier_reduce";
+
+pub const G4MOE_PREENC_DEFAULT_ON: bool = false;
+
+pub fn preenc_enabled() -> bool {
+    match std::env::var("NV_G4MOE_PREENC") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_PREENC_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_W4_COAL_DEFAULT_ON: bool = false;
+
+pub const W4_COAL_XBUF_WORDS_3072_BOUNDS_THE_PRELOADED_ACTIVATION_SLOTS: usize = 3072;
+
+pub fn w4_coal_enabled() -> bool {
+    match std::env::var("NV_G4MOE_W4_COAL") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_W4_COAL_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_FOLD_CHAIN_DEFAULT_ON: bool = false;
+
+pub fn fold_chain_enabled() -> bool {
+    match std::env::var("NV_G4MOE_FOLD_CHAIN") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_FOLD_CHAIN_DEFAULT_ON,
+    }
+}
+
+pub const G4MOE_TAILFOLD_MEASURED_NEGATIVE_PROLOGUE_REDUNDANCY_SCALES_WITH_3072_QKVPROJ_WGS_DEFAULT_OFF:
+    bool = false;
+
+pub fn tailfold_enabled() -> bool {
+    match std::env::var("NV_G4MOE_TAILFOLD") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_TAILFOLD_MEASURED_NEGATIVE_PROLOGUE_REDUNDANCY_SCALES_WITH_3072_QKVPROJ_WGS_DEFAULT_OFF,
+    }
+}
+
+pub const G4MOE_QKVFOLD_MEASURED_NEGATIVE_SERIAL_TREE_PROLOGUE_DOUBLES_STAGE1_DEFAULT_OFF: bool =
+    false;
+
+pub fn qkvfold_enabled() -> bool {
+    match std::env::var("NV_G4MOE_QKVFOLD") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_QKVFOLD_MEASURED_NEGATIVE_SERIAL_TREE_PROLOGUE_DOUBLES_STAGE1_DEFAULT_OFF,
+    }
+}
+
+pub const G4MOE_ROUTER_CHAIN_DEFAULT_ON: bool = false;
+
+pub fn router_chain_enabled() -> bool {
+    match std::env::var("NV_G4MOE_ROUTER_CHAIN") {
+        Ok(v) => {
+            let t = v.trim();
+            !t.is_empty() && t != "0"
+        }
+        Err(_) => G4MOE_ROUTER_CHAIN_DEFAULT_ON,
     }
 }
 
@@ -2038,7 +3385,13 @@ fn push_lmhead_row(
     hidden: usize,
 ) -> Result<()> {
     let pairs = c.n_rows.div_ceil(2);
-    let grid = b.grid1(pairs as u64, 1);
+    let grid = if head_one_shard_enabled() || lmhead_tight_grid_enabled() {
+        square_up_the_2d_tiling_a_65535_wide_row_leaves_65533_workgroups_idle_at_one_shard(
+            b.ctx, pairs as u64,
+        )
+    } else {
+        b.grid1(pairs as u64, 1)
+    };
     let alpha = 1.0;
     if let (Some(entry), Some((qb, sb))) = (lmhead_i8, c.i8) {
         assert!(
@@ -2078,6 +3431,22 @@ fn push_lmhead_row(
             grid,
         );
     }
+    let v2 = gemv_v2_active_implies_the_vec4_wide_layout(
+        b.ctx,
+        "g4m-lmhead",
+        GemvLoad::Wide,
+        hidden,
+        x_off_words,
+    );
+    let (entry, src, grid) = if v2 {
+        (
+            GEMV_BF16_V2_ENTRY,
+            &s.gemv_bf16_v2,
+            b.grid1(c.n_rows.div_ceil(8) as u64, 1),
+        )
+    } else {
+        ("g4m_gemv_bf16", &s.gemv_bf16, grid)
+    };
     let p = b.uni(
         "g4m-lmhead-p",
         GemvBf16Params {
@@ -2088,15 +3457,15 @@ fn push_lmhead_row(
             w_row_words: (hidden / 2) as u32,
             x_off_words: x_off_words as u32,
             y_off_words: y_off_words as u32,
-            wide: c.wide,
+            wide: if v2 { 1 } else { c.wide },
             alpha,
             ..Default::default()
         },
     );
     b.push(
         "g4m-lmhead",
-        &s.gemv_bf16,
-        "g4m_gemv_bf16",
+        src,
+        entry,
         &[(0, c.w), (1, x), (2, &p), (3, y)],
         grid,
     )
@@ -2208,11 +3577,24 @@ pub struct Gemma4MoeWgpu {
     prefill: Option<PfState>,
     verify: Option<VerifyState>,
     head_start: usize,
+    preenc: bool,
+    pending_cb: Option<(PendingCbBandKey, wgpu::CommandBuffer)>,
+    preenc_replays: usize,
+    preenc_band_discards: usize,
     _buffers: Vec<wgpu::Buffer>,
     tok_buf: wgpu::Buffer,
     pos_buf: wgpu::Buffer,
     flash_fd: Option<(wgpu::Buffer, FlashDecodeParams)>,
     flash_sl: Option<(wgpu::Buffer, FlashDecodeParams, u32)>,
+    depthgate_flash1_passes: Vec<usize>,
+    depthgate_flash1_sliding_passes: Vec<usize>,
+    depthgate_on: bool,
+    depthgate_shallow_splits: u32,
+    depthgate_shallow_splits_sliding: u32,
+    foldgate_alt_flash1: Vec<Pass>,
+    foldgate_deep_active: bool,
+    flash_scratch_bytes_full: Vec<u64>,
+    flash_scratch_bytes_sliding: Vec<u64>,
     token_out: wgpu::Buffer,
     logits: wgpu::Buffer,
     state_buffers: Vec<(wgpu::Buffer, u64)>,
@@ -2221,7 +3603,48 @@ pub struct Gemma4MoeWgpu {
     load: LoadReport,
     weight_bytes: u64,
     dense_gemv_wide: (usize, usize),
+    assistant_taps: AssistantTaps,
 }
+
+type PendingCbBandKey = (usize, u32, u32, bool);
+
+#[derive(Clone, Copy, Debug)]
+pub struct AssistantKvTapGeometry {
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub cache_rows: usize,
+    pub ring: bool,
+}
+
+struct AssistantKvTap {
+    kc: wgpu::Buffer,
+    vc: wgpu::Buffer,
+    fp8: bool,
+    geom: AssistantKvTapGeometry,
+}
+
+struct AssistantTaps {
+    sliding_layer: Option<usize>,
+    full_layer: Option<usize>,
+    sliding: Option<AssistantKvTap>,
+    full: Option<AssistantKvTap>,
+    decode_prenorm_hidden: wgpu::Buffer,
+    verify_prenorm_hidden: Option<wgpu::Buffer>,
+}
+
+fn unpack_bf16_pairs_to_f32(words: &[u32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(words.len() * 2);
+    for &w in words {
+        out.push(f32::from_bits((w & 0xffff) << 16));
+        out.push(f32::from_bits(w & 0xffff_0000));
+    }
+    out
+}
+
+pub const ASSISTANT_RING_PAD_CLOBBER_SLOTS_ARE_THE_PREFILL_M_ROWS_VERIFY_PADS_PAST_THE_COMMITTED_POS: &str =
+    "verify_chain runs the full m-row prefill graph, so its pad rows write ring slots belonging \
+     to positions cache_rows-m back; a reader must stay at least prefill_m positions clear of \
+     the ring tail";
 
 pub fn synthetic_state_bytes_0x30_to_0x3e_finite_small_under_fp8_bf16_and_f32_views_so_no_nan_and_moe_routing_stays_nondegenerate(
     len: usize,
@@ -2264,6 +3687,18 @@ impl Gemma4MoeWgpu {
 
     pub fn dense_gemv_wide_counts(&self) -> (usize, usize) {
         self.dense_gemv_wide
+    }
+
+    pub fn decode_pass_storage_binding_sets_a_shared_id_between_two_passes_is_a_wgpu_hazard(
+        &self,
+    ) -> Vec<Vec<(u32, bool)>> {
+        self.passes
+            .iter()
+            .map(|p| {
+                p.storage_binds_are_what_wgpu_tracks_for_hazards_uniforms_never_transition
+                    .clone()
+            })
+            .collect()
     }
 
     pub fn pass_rows(&self) -> Vec<(String, String, (u32, u32, u32), u64)> {
@@ -2342,6 +3777,7 @@ impl Gemma4MoeWgpu {
 
     pub fn reset(&mut self) -> Result<()> {
         self.pos = 0;
+        self.pending_cb = None;
         for (buf, bytes) in &self.state_buffers {
             let zeros = vec![0u8; *bytes as usize];
             self.ctx.queue.write_buffer(buf, 0, &zeros);
@@ -2390,7 +3826,77 @@ impl Gemma4MoeWgpu {
         if pf_m > max_seq {
             pf_m = 0;
         }
-        let s = Sources::new(pf_m);
+        let flash_sg = flash_sg_reduce_enabled();
+        anyhow::ensure!(
+            !flash_sg || (ctx.caps.subgroup && ctx.subgroup_width() == Some(32)),
+            "NV_G4MOE_FLASH_SG=1 replaces the flash stage1 LDS butterfly with a \
+             subgroupShuffleXor chain over lanes 16/8/4/2/1, which is bit-identical only at \
+             subgroup width 32; this adapter reports subgroup={} width={:?}",
+            ctx.caps.subgroup,
+            ctx.subgroup_width()
+        );
+        let sacc_chunk = flash_sacc_chunk_head_dim_slice_staged_per_warp_read_once_at_build();
+        let flash_fold = flash_gqa_fold_query_heads_per_workgroup_read_once_at_build();
+        anyhow::ensure!(
+            flash_fold == 1 || (ctx.caps.subgroup && ctx.subgroup_width() == Some(32)),
+            "NV_G4MOE_FLASH_FOLD={flash_fold} calls the stage1 row reduction once per folded \
+             query head, which only pays with the subgroup chain; this adapter reports \
+             subgroup={} width={:?}. {}",
+            ctx.caps.subgroup,
+            ctx.subgroup_width(),
+            FLASH_GQA_FOLD_DIVIDES_THE_GRID_SO_IT_ONLY_PAYS_PAIRED_WITH_SPLITS_TIMES_FOLD_AND_A_SACC_SLICE
+        );
+        let foldgate =
+            flash_foldgate_enabled_full_attention_swaps_to_the_fold2_arm_at_depth_while_sliding_keeps_its_own_band();
+        anyhow::ensure!(
+            !foldgate || (ctx.caps.subgroup && ctx.subgroup_width() == Some(32)),
+            "NV_G4MOE_FLASH_FOLDGATE=1 swaps in a fold-2 stage1 whose row reduction runs once per \
+             folded query head, which only pays with the subgroup chain; this adapter reports \
+             subgroup={} width={:?}",
+            ctx.caps.subgroup,
+            ctx.subgroup_width()
+        );
+        anyhow::ensure!(
+            !foldgate || !qkvfold_enabled(),
+            "NV_G4MOE_FLASH_FOLDGATE=1 swaps the plain bf16 flash1 pass; the qkvfold entry fuses \
+             the qkv norm into stage1 and has no fold-2 twin -- unset NV_G4MOE_QKVFOLD"
+        );
+        anyhow::ensure!(
+            !foldgate || !kv_fp8_enabled(),
+            "NV_G4MOE_FLASH_FOLDGATE=1 has no fp8 fold-2 stage1 entry -- unset NV_G4MOE_KV_FP8"
+        );
+        anyhow::ensure!(
+            !foldgate
+                || ctx.caps.workgroup_storage_fits(
+                    flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
+                        flash_sg,
+                        FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS,
+                        FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC,
+                    )
+                ),
+            "NV_G4MOE_FLASH_FOLDGATE=1: the fold-2 sacc-128 deep workgroup does not fit this \
+             device's workgroup storage of {} bytes",
+            ctx.caps.max_compute_workgroup_storage_size
+        );
+        let full_splits = flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build();
+        eprintln!(
+            "[g4m-wgpu] flash stage1: reduce={} sacc slice {sacc_chunk} gqa fold full {flash_fold} \
+             sliding {} splits full {full_splits} sliding {} -> {} workgroup bytes, foldgate={}",
+            if flash_sg { "sg" } else { "wb" },
+            flash_gqa_fold_for_layer_kind_only_full_attention_scans_enough_rows_to_amortise_a_halved_grid(
+                LayerType::SlidingAttention,
+                flash_fold,
+            ),
+            flash_splits_for_layer_kind_full_attention_holds_the_folded_grid_sliding_holds_the_stage2_scan(
+                LayerType::SlidingAttention,
+                full_splits,
+            ),
+            flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
+                flash_sg, sacc_chunk, flash_fold
+            ),
+            if foldgate { "armed" } else { "off" }
+        );
+        let s = Sources::new(pf_m, flash_sg, sacc_chunk, flash_fold, foldgate);
         let base = &config.base;
         let sliding_ring_rows: Option<usize> = if sliding_kv_ring_enabled() {
             let rows = sliding_kv_ring_rows_window_plus_prefill_chunk_plus_headroom(
@@ -2479,6 +3985,16 @@ impl Gemma4MoeWgpu {
             weight_bpt: 0.0,
             wide_gemvs: 0,
             narrow_gemvs: 0,
+            depthgate_flash1_pass_indices_full_attention_the_band_is_keyed_on_the_whole_context:
+                Vec::new(),
+            depthgate_flash1_pass_indices_sliding_the_window_caps_the_scan_so_the_band_is_keyed_on_min_total_window:
+                Vec::new(),
+            foldgate_alt_flash1_passes_one_deep_twin_per_full_attention_flash1_in_the_same_order:
+                Vec::new(),
+            storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds: Vec::new(),
+            flash_scratch_bytes_per_full_attention_layer_sized_at_its_own_split_count: Vec::new(),
+            flash_scratch_bytes_per_sliding_layer_sized_at_its_own_split_count_not_the_max_of_the_two:
+                Vec::new(),
         };
 
         let tok_buf = b.upload_u32("g4m-tok", &[0u32]);
@@ -2506,7 +4022,10 @@ impl Gemma4MoeWgpu {
                 n_heads: base.num_attention_heads as u32,
                 n_kv: base.num_kv_heads_for(LayerType::SlidingAttention) as u32,
                 head_dim: base.head_dim_for(LayerType::SlidingAttention) as u32,
-                splits: flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+                splits: flash_splits_for_layer_kind_full_attention_holds_the_folded_grid_sliding_holds_the_stage2_scan(
+                    LayerType::SlidingAttention,
+                    flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+                ),
                 total: 0,
                 start: 0,
                 ring,
@@ -2596,6 +4115,17 @@ impl Gemma4MoeWgpu {
             off += rows;
         }
         drop(embed);
+        anyhow::ensure!(
+            !head_one_shard_enabled() || embed_chunks.len() == 1,
+            "NV_G4MOE_HEAD_ONE_SHARD=1 must leave the {} B embed/lm-head table in ONE shard so \
+             g4m-gather and g4m-lmhead are one dispatch each; it split into {} because this \
+             adapter binds at most {} B of storage in one binding (max_buffer_size {} B). The \
+             arm removes two wgpu barriers or it removes none -- it must never half-apply",
+            (vocab * hidden * 2),
+            embed_chunks.len(),
+            ctx.caps.max_storage_buffer_binding_size,
+            ctx.caps.max_buffer_size
+        );
 
         if let Some(sc) = &pf {
             let sp = b.uni(
@@ -2625,12 +4155,97 @@ impl Gemma4MoeWgpu {
         let mut state_buffers: Vec<(wgpu::Buffer, u64)> = Vec::new();
         let mut rope_cache: RopeTableCache = RopeTableCache::new();
 
-        let grouped = grouped_gemv_enabled();
+        let grouped = grouped_gemv_active(ctx);
         anyhow::ensure!(
             !grouped || hidden_words <= GROUPED_NORM_CHAIN_MAX_HIDDEN_WORDS_PN_BUF,
             "NV_G4MOE_GROUPED_GEMV=1: the fused norm chain stages {hidden_words} hidden words \
              in a {GROUPED_NORM_CHAIN_MAX_HIDDEN_WORDS_PN_BUF}-word workgroup array"
         );
+        let fold = fold_chain_enabled();
+        anyhow::ensure!(
+            !fold || grouped,
+            "NV_G4MOE_FOLD_CHAIN=1 extends the grouped tailnorm entry; set NV_G4MOE_GROUPED_GEMV=1 too"
+        );
+        let rpfuse = rpfuse_active(ctx);
+        let topk_nx2 = topk_nx2_active(ctx, config.num_experts, config.top_k_experts);
+        anyhow::ensure!(
+            !rpfuse
+                || (grouped
+                    && rpnorm_active(ctx)
+                    && !router_chain_enabled()
+                    && !topk_fold_enabled()
+                    && ctx.caps.subgroup
+                    && ctx.subgroup_width() == Some(32)),
+            "NV_G4MOE_RPFUSE=1 rides the rpnorm router gemv on the mlp-down dispatch: it needs \
+             NV_G4MOE_GROUPED_GEMV=1 + NV_G4MOE_RPNORM=1, no router-chain/topk-fold, and its \
+             subgroupShuffleXor reductions need subgroup width 32"
+        );
+        anyhow::ensure!(
+            !topk_nx2 || rpfuse,
+            "NV_G4MOE_TOPK_NX2=1 needs the router logits written before the normx2 dispatch, \
+             which only NV_G4MOE_RPFUSE=1 provides"
+        );
+        anyhow::ensure!(
+            !topk_nx2
+                || router_topk_entry(config.num_experts, config.top_k_experts)
+                    == "g4m_router_topk_par",
+            "NV_G4MOE_TOPK_NX2=1 inlines the parallel-rank topk (tie rule \
+             {TOPK_PAR_TIE_RULE_HIGHER_LOGIT_OUTRANKS_AND_EQUAL_LOGITS_RANK_BY_LOWER_EXPERT_INDEX}) \
+             into the normx2 entry; {} experts / top-{} must route g4m_router_topk_par and \
+             NV_G4MOE_ROUTER_TOPK must not force serial",
+            config.num_experts,
+            config.top_k_experts
+        );
+        let mut pending_tail: Option<TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded> =
+            None;
+        let push_tail_normnext =
+            |b: &mut Builder,
+             pt: TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded,
+             next_norm_w: &wgpu::Buffer,
+             normed_out: &wgpu::Buffer|
+             -> Result<()> {
+                let p = b.uni(
+                    "g4m-pn-p",
+                    NormParams {
+                        hidden: hidden as u32,
+                        words: hidden_words as u32,
+                        eps,
+                        scale: pt.layer_scalar,
+                    },
+                );
+                let (src, entry) = if norm_lat_active(b.ctx) {
+                    (&s.prop_sglat, "g4m_norm_add_norm_resout_normnext_sglat")
+                } else {
+                    (&s.prop, "g4m_norm_add_norm_resout_normnext")
+                };
+                b.push(
+                    "g4m-tailnorm-nn",
+                    src,
+                    entry,
+                    &[
+                        (0, &pt.moe_out),
+                        (1, &pt.post_ffw2_w),
+                        (2, &pt.r_out),
+                        (3, &p),
+                        (4, &pt.r_in),
+                        (5, &pt.post_ffw_w),
+                        (6, &pt.h1),
+                        (7, normed_out),
+                        (8, next_norm_w),
+                    ],
+                    (1, 1, 1),
+                )
+            };
+        let tap_layer_of = |want: LayerType| -> Option<usize> {
+            (0..base.num_hidden_layers)
+                .filter(|&i| base.kv_source_layer(i).is_none() && base.layer_kind(i) == want)
+                .next_back()
+        };
+        let tap_sliding_layer = tap_layer_of(LayerType::SlidingAttention);
+        let tap_full_layer = tap_layer_of(LayerType::FullAttention);
+        let mut tap_sliding_kv: Option<AssistantKvTap> = None;
+        let mut tap_full_kv: Option<AssistantKvTap> = None;
+
         for li in 0..base.num_hidden_layers {
             let t_layer = std::time::Instant::now();
             let layer = host_layer_from_loader(&config, weights, li)?;
@@ -2642,7 +4257,22 @@ impl Gemma4MoeWgpu {
             };
 
             let in_w = b.upload_u32("g4m-ln", &pack_pairs(&layer.input_ln));
-            push_norm(&mut b, &s, "g4m-rms-in", r_in, &in_w, &normed, hidden, eps)?;
+            let tailfold = tailfold_enabled()
+                && fold
+                && !kv_fp8_enabled()
+                && gemv_wide_enabled("g4m-at-qkvproj")
+                && hidden.is_multiple_of(8);
+            let deferred_tail = match pending_tail.take() {
+                Some(pt) if tailfold => Some(pt),
+                Some(pt) => {
+                    push_tail_normnext(&mut b, pt, &in_w, &normed)?;
+                    None
+                }
+                None => {
+                    push_norm(&mut b, &s, "g4m-rms-in", r_in, &in_w, &normed, hidden, eps)?;
+                    None
+                }
+            };
 
             let attn_out = b.zeros("g4m-attn-out", (hidden_words * 4) as u64);
             let ag = build_attn(
@@ -2659,7 +4289,30 @@ impl Gemma4MoeWgpu {
                 flash_sl.as_ref().map(|(buf, _, _)| buf),
                 &mut rope_cache,
                 &mut state_buffers,
+                deferred_tail.as_ref().map(|pt| (pt, &in_w)),
             )?;
+            for (want_li, slot) in [
+                (tap_sliding_layer, &mut tap_sliding_kv),
+                (tap_full_layer, &mut tap_full_kv),
+            ] {
+                if want_li == Some(li) {
+                    *slot = Some(AssistantKvTap {
+                        kc: ag.kc.clone(),
+                        vc: ag.vc.clone(),
+                        fp8: ag.kv_scales.is_some(),
+                        geom: AssistantKvTapGeometry {
+                            n_kv: ag.n_kv,
+                            head_dim: ag.hd,
+                            cache_rows: if ag.ring > 0 {
+                                ag.ring as usize
+                            } else {
+                                max_seq
+                            },
+                            ring: ag.ring > 0,
+                        },
+                    });
+                }
+            }
 
             let attn_post = b.zeros("g4m-attn-post", (hidden_words * 4) as u64);
             let post_attn_w = b.upload_u32("g4m-ln", &pack_pairs(&layer.post_attn_ln));
@@ -2675,10 +4328,15 @@ impl Gemma4MoeWgpu {
                         scale: 0.0,
                     },
                 );
+                let (src, entry) = if norm_lat_active(b.ctx) {
+                    (&s.prop_sglat, "g4m_norm_norm_residual_sglat")
+                } else {
+                    (&s.prop, "g4m_norm_norm_residual")
+                };
                 b.push(
                     "g4m-nnres",
-                    &s.prop,
-                    "g4m_norm_norm_residual",
+                    src,
+                    entry,
                     &[
                         (0, &attn_out),
                         (1, &post_attn_w),
@@ -2714,7 +4372,16 @@ impl Gemma4MoeWgpu {
             }
 
             let dense_out = b.zeros("g4m-dense-out", (hidden_words * 4) as u64);
-            let mg = build_mlp(&mut b, &s, &config, &layer, &normed_mlp, &dense_out)?;
+            let rp_pre = rpfuse.then(|| upload_router_pre(&mut b, &config, &layer));
+            let mg = build_mlp(
+                &mut b,
+                &s,
+                &config,
+                &layer,
+                &normed_mlp,
+                &dense_out,
+                rp_pre.as_ref().map(|p| (p, r_in as &wgpu::Buffer)),
+            )?;
             let h1 = b.zeros("g4m-h1", (hidden_words * 4) as u64);
             let post_ffw1_w = b.upload_u32("g4m-ln", &pack_pairs(&layer.post_ffw_ln_1));
             let moe_in = b.zeros("g4m-moe-in", (hidden_words * 4) as u64);
@@ -2729,21 +4396,60 @@ impl Gemma4MoeWgpu {
                         scale: 0.0,
                     },
                 );
-                b.push(
-                    "g4m-normx2",
-                    &s.prop,
-                    "g4m_norm_x2",
-                    &[
-                        (0, &dense_out),
-                        (1, &post_ffw1_w),
-                        (2, &h1),
-                        (3, &p),
-                        (4, r_in),
-                        (5, &pre_ffw2_w),
-                        (7, &moe_in),
-                    ],
-                    (2, 1, 1),
-                )?;
+                match (topk_nx2, &rp_pre) {
+                    (true, Some(pre)) => {
+                        let tp = b.uni(
+                            "g4m-moe-topk-p",
+                            RouterParams {
+                                n_experts: config.num_experts as u32,
+                                k: config.top_k_experts as u32,
+                                ..Default::default()
+                            },
+                        );
+                        b.push(
+                            "g4m-normx2-topk",
+                            &s.prop_norm_x2_topk_sglat,
+                            "g4m_norm_x2_topk_sglat",
+                            &[
+                                (0, &dense_out),
+                                (1, &post_ffw1_w),
+                                (2, &h1),
+                                (3, &p),
+                                (4, r_in),
+                                (5, &pre_ffw2_w),
+                                (7, &moe_in),
+                                (10, &pre.rlogits),
+                                (11, &pre.ids),
+                                (12, &pre.wts),
+                                (13, &tp),
+                                (14, &pre.pes),
+                            ],
+                            (3, 1, 1),
+                        )?;
+                    }
+                    _ => {
+                        let (src, entry) = if norm_lat_active(b.ctx) {
+                            (&s.prop_sglat, "g4m_norm_x2_sglat")
+                        } else {
+                            (&s.prop, "g4m_norm_x2")
+                        };
+                        b.push(
+                            "g4m-normx2",
+                            src,
+                            entry,
+                            &[
+                                (0, &dense_out),
+                                (1, &post_ffw1_w),
+                                (2, &h1),
+                                (3, &p),
+                                (4, r_in),
+                                (5, &pre_ffw2_w),
+                                (7, &moe_in),
+                            ],
+                            (2, 1, 1),
+                        )?;
+                    }
+                }
             } else {
                 push_norm(
                     &mut b,
@@ -2768,10 +4474,30 @@ impl Gemma4MoeWgpu {
             }
 
             let moe_out = b.zeros("g4m-moe-out", (hidden_words * 4) as u64);
-            let moeg = build_moe(&mut b, &s, &config, &layer, r_in, &moe_in, &moe_out)?;
+            let moeg = build_moe(
+                &mut b,
+                &s,
+                &config,
+                &layer,
+                r_in,
+                &moe_in,
+                &moe_out,
+                rp_pre.as_ref(),
+                topk_nx2,
+            )?;
             let post_ffw2_w = b.upload_u32("g4m-ln", &pack_pairs(&layer.post_ffw_ln_2));
             let post_ffw_w = b.upload_u32("g4m-ln", &pack_pairs(&layer.post_ffw_ln));
-            if grouped {
+            if fold {
+                pending_tail = Some(TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded {
+                    moe_out: moe_out.clone(),
+                    post_ffw2_w: post_ffw2_w.clone(),
+                    r_out: r_out.clone(),
+                    r_in: r_in.clone(),
+                    post_ffw_w: post_ffw_w.clone(),
+                    h1: h1.clone(),
+                    layer_scalar: layer.layer_scalar,
+                });
+            } else if grouped {
                 let p = b.uni(
                     "g4m-pn-p",
                     NormParams {
@@ -3001,6 +4727,20 @@ impl Gemma4MoeWgpu {
         } else {
             &res_b
         };
+        let assistant_taps = AssistantTaps {
+            sliding_layer: tap_sliding_layer,
+            full_layer: tap_full_layer,
+            sliding: tap_sliding_kv,
+            full: tap_full_kv,
+            decode_prenorm_hidden: r_last.clone(),
+            verify_prenorm_hidden: pf.as_ref().map(|sc| {
+                if base.num_hidden_layers.is_multiple_of(2) {
+                    sc.res_a.clone()
+                } else {
+                    sc.res_b.clone()
+                }
+            }),
+        };
         let final_w = b.upload_u32(
             "g4m-final-ln",
             &pack_pairs(&load_bf16(
@@ -3010,16 +4750,19 @@ impl Gemma4MoeWgpu {
             )?),
         );
         let final_x = b.zeros("g4m-final-x", (hidden_words * 4) as u64);
-        push_norm(
-            &mut b,
-            &s,
-            "g4m-final-rms",
-            r_last,
-            &final_w,
-            &final_x,
-            hidden,
-            eps,
-        )?;
+        match pending_tail.take() {
+            Some(pt) => push_tail_normnext(&mut b, pt, &final_w, &final_x)?,
+            None => push_norm(
+                &mut b,
+                &s,
+                "g4m-final-rms",
+                r_last,
+                &final_w,
+                &final_x,
+                hidden,
+                eps,
+            )?,
+        }
 
         let head_start = b.passes.len();
         let logits_bf16 = b.zeros("g4m-logits-bf16", (vocab * 2) as u64);
@@ -3112,7 +4855,11 @@ impl Gemma4MoeWgpu {
         )?;
 
         let verify = match &pf {
-            Some(sc) if lmhead_i8.is_none() && hidden_words.is_multiple_of(4) => {
+            Some(sc)
+                if lmhead_i8.is_none()
+                    && !attn_i8_caps_verify_rows_to_zero_because_int8_decode_vs_bf16_prefill_breaks_the_argmax_contract()
+                    && hidden_words.is_multiple_of(4) =>
+            {
                 let vrows = sc.m.min(VERIFY_ROWS_MAX_IS_THE_LONGEST_CHAIN_THE_SPEC_LOOP_SUBMITS);
                 let pf_last = if base.num_hidden_layers.is_multiple_of(2) {
                     &sc.res_a
@@ -3228,6 +4975,16 @@ impl Gemma4MoeWgpu {
             weight_bpt,
             wide_gemvs,
             narrow_gemvs,
+            depthgate_flash1_pass_indices_full_attention_the_band_is_keyed_on_the_whole_context:
+                depthgate_flash1_passes,
+            depthgate_flash1_pass_indices_sliding_the_window_caps_the_scan_so_the_band_is_keyed_on_min_total_window:
+                depthgate_flash1_sliding_passes,
+            foldgate_alt_flash1_passes_one_deep_twin_per_full_attention_flash1_in_the_same_order:
+                foldgate_alt_flash1,
+            flash_scratch_bytes_per_full_attention_layer_sized_at_its_own_split_count:
+                flash_scratch_bytes_full,
+            flash_scratch_bytes_per_sliding_layer_sized_at_its_own_split_count_not_the_max_of_the_two:
+                flash_scratch_bytes_sliding,
             ..
         } = b;
         let dense_gemv_wide = (wide_gemvs, narrow_gemvs);
@@ -3269,11 +5026,30 @@ impl Gemma4MoeWgpu {
             prefill,
             verify,
             head_start,
+            preenc: preenc_enabled(),
+            pending_cb: None,
+            preenc_replays: 0,
+            preenc_band_discards: 0,
             _buffers: buffers,
             tok_buf,
             pos_buf,
             flash_fd,
             flash_sl,
+            depthgate_flash1_passes,
+            depthgate_flash1_sliding_passes,
+            depthgate_on:
+                flash_depthgate_enabled_a_shallow_tuned_split_pin_starves_the_grid_at_depth(),
+            depthgate_shallow_splits:
+                flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+            depthgate_shallow_splits_sliding:
+                flash_splits_for_layer_kind_full_attention_holds_the_folded_grid_sliding_holds_the_stage2_scan(
+                    LayerType::SlidingAttention,
+                    flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+                ),
+            foldgate_alt_flash1,
+            foldgate_deep_active: false,
+            flash_scratch_bytes_full,
+            flash_scratch_bytes_sliding,
             token_out,
             logits,
             state_buffers,
@@ -3282,7 +5058,16 @@ impl Gemma4MoeWgpu {
             load,
             weight_bytes: weight_bpt.round() as u64,
             dense_gemv_wide,
+            assistant_taps,
         };
+        anyhow::ensure!(
+            model.foldgate_alt_flash1.is_empty()
+                || model.foldgate_alt_flash1.len() == model.depthgate_flash1_passes.len(),
+            "the foldgate built {} deep twins for {} full-attention flash1 passes; a mismatched \
+             slot order would swap the wrong pass at the knee",
+            model.foldgate_alt_flash1.len(),
+            model.depthgate_flash1_passes.len()
+        );
         let t_warm = std::time::Instant::now();
         let warm_m = model.prefill_chunk_len();
         if warm_m > 0 && warm_m <= max_seq {
@@ -3297,16 +5082,144 @@ impl Gemma4MoeWgpu {
         Ok(model)
     }
 
-    fn write_flash_total_uniform_mirroring_gemma4_wgpu_write_pos_uniforms(&self) {
+    fn depthgate_splits_for_this_step(&self) -> Option<u32> {
+        (self.depthgate_on && !self.depthgate_flash1_passes.is_empty()).then(|| {
+            flash_depthgate_splits_for_context_tokens(
+                (self.pos + 1) as u32,
+                self.depthgate_shallow_splits,
+            )
+        })
+    }
+
+    fn depthgate_sliding_splits_for_this_step(&self) -> Option<u32> {
+        let window = self.flash_sl.as_ref().map(|(_, _, w)| *w)?;
+        (self.depthgate_on && !self.depthgate_flash1_sliding_passes.is_empty()).then(|| {
+            flash_depthgate_splits_for_context_tokens(
+                ((self.pos + 1) as u32).min(window),
+                self.depthgate_shallow_splits_sliding,
+            )
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn flash_scratch_bytes_by_layer_kind_full_then_sliding(&self) -> (Vec<u64>, Vec<u64>) {
+        (
+            self.flash_scratch_bytes_full.clone(),
+            self.flash_scratch_bytes_sliding.clone(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn depthgate_full_attention_flash1_grid_y_as_last_encoded(&self) -> Option<u32> {
+        self.depthgate_flash1_passes
+            .first()
+            .map(|&i| self.passes[i].grid.1)
+    }
+
+    #[doc(hidden)]
+    pub fn depthgate_sliding_flash1_grid_y_as_last_encoded(&self) -> Option<u32> {
+        self.depthgate_flash1_sliding_passes
+            .first()
+            .map(|&i| self.passes[i].grid.1)
+    }
+
+    #[doc(hidden)]
+    pub fn foldgate_full_attention_flash1_grid_xy_as_last_encoded(&self) -> Option<(u32, u32)> {
+        self.depthgate_flash1_passes
+            .first()
+            .map(|&i| (self.passes[i].grid.0, self.passes[i].grid.1))
+    }
+
+    #[doc(hidden)]
+    pub fn foldgate_deep_arm_swapped_in_as_of_last_step(&self) -> bool {
+        self.foldgate_deep_active
+    }
+
+    #[doc(hidden)]
+    pub fn preenc_replay_and_band_discard_counts(&self) -> (usize, usize) {
+        (self.preenc_replays, self.preenc_band_discards)
+    }
+
+    fn pending_cb_band_key_a_cb_encoded_under_one_gate_band_must_never_be_submitted_under_another(
+        &self,
+        full: bool,
+    ) -> PendingCbBandKey {
+        (
+            if full {
+                self.passes.len()
+            } else {
+                self.head_start
+            },
+            self.depthgate_flash1_passes
+                .first()
+                .map(|&i| self.passes[i].grid.1)
+                .unwrap_or(0),
+            self.depthgate_flash1_sliding_passes
+                .first()
+                .map(|&i| self.passes[i].grid.1)
+                .unwrap_or(0),
+            self.foldgate_deep_active,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn full_attention_flash1_pass_labels(&self) -> Vec<String> {
+        self.depthgate_flash1_passes
+            .iter()
+            .map(|&i| self.passes[i].label.clone())
+            .collect()
+    }
+
+    fn foldgate_swap_full_attention_passes_at_the_knee_then_report_the_deep_split_override(
+        &mut self,
+    ) -> Option<u32> {
+        if self.foldgate_alt_flash1.is_empty() {
+            return None;
+        }
+        let want_deep = foldgate_deep_at_these_whole_context_tokens((self.pos + 1) as u32);
+        if want_deep != self.foldgate_deep_active {
+            for (slot, i) in self.depthgate_flash1_passes.iter().enumerate() {
+                std::mem::swap(&mut self.passes[*i], &mut self.foldgate_alt_flash1[slot]);
+            }
+            self.foldgate_deep_active = want_deep;
+        }
+        self.foldgate_deep_active.then_some(
+            FOLDGATE_DEEP_SPLITS_64_RESTORES_512_WORKGROUPS_UNDER_FOLD_2_AND_IS_A_MEASURED_RUNG_THE_LADDER_HAS_A_REPRODUCED_POTHOLE_AT_40_47_48_SO_NEVER_INTERPOLATE,
+        )
+    }
+
+    fn write_flash_total_uniform_mirroring_gemma4_wgpu_write_pos_uniforms(&mut self) {
+        let foldgate_deep_splits =
+            self.foldgate_swap_full_attention_passes_at_the_knee_then_report_the_deep_split_override();
+        let full_splits = foldgate_deep_splits.or_else(|| self.depthgate_splits_for_this_step());
+        let depthgate_sliding_splits = self.depthgate_sliding_splits_for_this_step();
+        if let Some(sp) = full_splits {
+            for i in 0..self.depthgate_flash1_passes.len() {
+                let pass = self.depthgate_flash1_passes[i];
+                self.passes[pass].grid.1 = sp;
+            }
+        }
+        if let Some(sp) = depthgate_sliding_splits {
+            for i in 0..self.depthgate_flash1_sliding_passes.len() {
+                let pass = self.depthgate_flash1_sliding_passes[i];
+                self.passes[pass].grid.1 = sp;
+            }
+        }
         if let Some((buf, base)) = &self.flash_fd {
             let mut p = *base;
             p.total = (self.pos + 1) as u32;
+            if let Some(sp) = full_splits {
+                p.splits = sp;
+            }
             self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
         }
         if let Some((buf, base, window)) = &self.flash_sl {
             let mut p = *base;
             p.total = (self.pos + 1) as u32;
             p.start = if p.total > *window { p.total - *window } else { 0 };
+            if let Some(sp) = depthgate_sliding_splits {
+                p.splits = sp;
+            }
             self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
         }
     }
@@ -3341,6 +5254,10 @@ impl Gemma4MoeWgpu {
         } else {
             None
         };
+        let band_key = self
+            .pending_cb_band_key_a_cb_encoded_under_one_gate_band_must_never_be_submitted_under_another(
+                full,
+            );
         let passes = if full {
             &self.passes[..]
         } else {
@@ -3355,16 +5272,33 @@ impl Gemma4MoeWgpu {
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
                 .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
         } else {
-            let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                for p in passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+            let ready = match self.pending_cb.take() {
+                Some((k, cb)) if k == band_key => Some(cb),
+                Some(_) => {
+                    self.preenc_band_discards += 1;
+                    None
                 }
+                None => None,
+            };
+            match ready {
+                Some(cb) => {
+                    self.preenc_replays += 1;
+                    self.ctx.queue.submit([cb]);
+                }
+                None => dispatch::submit_pass_list(
+                    self.ctx,
+                    passes.iter().map(|p| (p.pipeline.as_ref(), &p.bind, p.grid)),
+                ),
             }
-            self.ctx.queue.submit([enc.finish()]);
+            if self.preenc {
+                self.pending_cb = Some((
+                    band_key,
+                    dispatch::encode_pass_list(
+                        self.ctx,
+                        passes.iter().map(|p| (p.pipeline.as_ref(), &p.bind, p.grid)),
+                    ),
+                ));
+            }
         }
         if let Some(scope) = scope {
             if let Some(e) = pollster::block_on(scope.pop()) {
@@ -3507,6 +5441,13 @@ impl Gemma4MoeWgpu {
     }
 
     pub fn verify_chain(&mut self, batch: &[u32]) -> Result<Vec<u32>> {
+        anyhow::ensure!(
+            !flash_decode_enabled(),
+            "verify_chain's m-row pm_attn rows argmax-mismatch the flash decode stream on real \
+             weights at final_logit_softcapping near-ties, so the verify surface refuses the \
+             flash default; set NV_G4MOE_FLASH_DECODE=0 for any spec/verify consumer until the \
+             m-row graph grows a flash-consistent arm"
+        );
         let rows = self.verify_max_rows();
         anyhow::ensure!(
             rows > 0,
@@ -3571,6 +5512,121 @@ impl Gemma4MoeWgpu {
         let all: Vec<f32> = dispatch::read_back(self.ctx, &vs.logits, vs.rows * self.vocab)
             .map_err(|e| anyhow::anyhow!("verify logits read back: {e}"))?;
         Ok(all[row * self.vocab..(row + 1) * self.vocab].to_vec())
+    }
+
+    pub fn assistant_shared_kv_layers_last_kv_writing_sliding_then_full(
+        &self,
+    ) -> (Option<usize>, Option<usize>) {
+        (
+            self.assistant_taps.sliding_layer,
+            self.assistant_taps.full_layer,
+        )
+    }
+
+    fn assistant_kv_tap(&self, kind: LayerType) -> Result<&AssistantKvTap> {
+        let tap = match kind {
+            LayerType::SlidingAttention => self.assistant_taps.sliding.as_ref(),
+            LayerType::FullAttention => self.assistant_taps.full.as_ref(),
+        };
+        let tap = tap.context("assistant kv tap missing for this layer kind")?;
+        anyhow::ensure!(
+            !tap.fp8,
+            "assistant kv tap reads the bf16 cache layout; NV_G4MOE_KV_FP8=1 stores e4m3 bytes \
+             plus scales -- unset it for assistant drafting"
+        );
+        Ok(tap)
+    }
+
+    pub fn assistant_kv_geometry(&self, kind: LayerType) -> Result<AssistantKvTapGeometry> {
+        Ok(self.assistant_kv_tap(kind)?.geom)
+    }
+
+    pub fn assistant_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
+        &self,
+        kind: LayerType,
+        start: usize,
+        len: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let tap = self.assistant_kv_tap(kind)?;
+        let g = tap.geom;
+        anyhow::ensure!(len > 0, "empty assistant kv row read");
+        anyhow::ensure!(
+            start + len <= self.pos,
+            "assistant kv rows {start}+{len} beyond committed {}",
+            self.pos
+        );
+        if g.ring {
+            let pad = self.prefill_chunk_len();
+            anyhow::ensure!(
+                start + g.cache_rows >= self.pos + pad,
+                "{ASSISTANT_RING_PAD_CLOBBER_SLOTS_ARE_THE_PREFILL_M_ROWS_VERIFY_PADS_PAST_THE_COMMITTED_POS}: \
+                 start {start} with ring {} pad {pad} cannot serve committed {}",
+                g.cache_rows,
+                self.pos
+            );
+        }
+        let words_per_row = g.n_kv * g.head_dim / 2;
+        let mut k_words: Vec<u32> = Vec::with_capacity(len * words_per_row);
+        let mut v_words: Vec<u32> = Vec::with_capacity(len * words_per_row);
+        let mut i = 0usize;
+        while i < len {
+            let slot = if g.ring {
+                (start + i) % g.cache_rows
+            } else {
+                start + i
+            };
+            let span = if g.ring {
+                (len - i).min(g.cache_rows - slot)
+            } else {
+                len - i
+            };
+            for (buf, out) in [(&tap.kc, &mut k_words), (&tap.vc, &mut v_words)] {
+                out.extend(
+                    dispatch::read_back_at::<u32>(
+                        self.ctx,
+                        buf,
+                        slot * words_per_row,
+                        span * words_per_row,
+                    )
+                    .map_err(|e| anyhow::anyhow!("assistant kv read back: {e}"))?,
+                );
+            }
+            i += span;
+        }
+        Ok((
+            unpack_bf16_pairs_to_f32(&k_words),
+            unpack_bf16_pairs_to_f32(&v_words),
+        ))
+    }
+
+    pub fn decode_prenorm_hidden_row_the_gemma4_assistant_drafter_consumes(
+        &self,
+    ) -> Result<Vec<f32>> {
+        let words: Vec<u32> = dispatch::read_back(
+            self.ctx,
+            &self.assistant_taps.decode_prenorm_hidden,
+            self.config.base.hidden_size / 2,
+        )
+        .map_err(|e| anyhow::anyhow!("decode prenorm hidden read back: {e}"))?;
+        Ok(unpack_bf16_pairs_to_f32(&words))
+    }
+
+    pub fn verify_prenorm_hidden_row_the_gemma4_assistant_drafter_consumes(
+        &self,
+        row: usize,
+    ) -> Result<Vec<f32>> {
+        let rows = self.verify_max_rows().min(self.prefill_chunk_len());
+        anyhow::ensure!(row < rows, "verify prenorm hidden row {row} out of 0..{rows}");
+        let buf = self
+            .assistant_taps
+            .verify_prenorm_hidden
+            .as_ref()
+            .context("verify prenorm hidden needs the m-row prefill graph")?;
+        let hidden_words = self.config.base.hidden_size / 2;
+        let words: Vec<u32> =
+            dispatch::read_back_at(self.ctx, buf, row * hidden_words, hidden_words)
+                .map_err(|e| anyhow::anyhow!("verify prenorm hidden read back: {e}"))?;
+        Ok(unpack_bf16_pairs_to_f32(&words))
     }
 
     pub fn prefill_tokens_with_embed_rows(
@@ -3673,18 +5729,36 @@ fn run_pass_list(ctx: &'static WgpuContext, passes: &[Pass]) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
         return Ok(());
     }
-    let mut enc = ctx.device.create_command_encoder(&Default::default());
-    {
-        let mut pass = enc.begin_compute_pass(&Default::default());
-        for p in passes {
-            pass.set_pipeline(&p.pipeline);
-            pass.set_bind_group(0, &p.bind, &[]);
-            pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-        }
-    }
-    ctx.queue.submit([enc.finish()]);
+    dispatch::submit_pass_list(
+        ctx,
+        passes.iter().map(|p| (p.pipeline.as_ref(), &p.bind, p.grid)),
+    );
     Ok(())
 }
+
+fn square_up_the_2d_tiling_a_65535_wide_row_leaves_65533_workgroups_idle_at_one_shard(
+    ctx: &WgpuContext,
+    groups: u64,
+) -> (u32, u32, u32) {
+    let limit = ctx.caps.max_compute_workgroups_per_dimension.max(1) as u64;
+    if groups <= limit {
+        return (groups as u32, 1, 1);
+    }
+    let y = groups.div_ceil(limit);
+    let x = groups.div_ceil(y);
+    assert!(
+        x * y >= groups && x <= limit,
+        "a {x} x {y} tiling must cover all {groups} workgroups and keep x within the device's \
+         {limit} per-dimension limit, or the lm-head silently drops rows"
+    );
+    (x as u32, y as u32, 1)
+}
+
+const EMBED_SHARD_CEILING_BYTES_IS_A_HARD_1_GIB_NOT_A_DEVICE_LIMIT_AND_SPLITS_A_1_476_GB_TABLE_IN_TWO:
+    u64 = 1u64 << 30;
+
+const EMBED_SHARD_CEILING_BYTES: u64 =
+    EMBED_SHARD_CEILING_BYTES_IS_A_HARD_1_GIB_NOT_A_DEVICE_LIMIT_AND_SPLITS_A_1_476_GB_TABLE_IN_TWO;
 
 fn row_chunk(ctx: &WgpuContext, hidden: usize) -> usize {
     if let Some(rows) = std::env::var("NV_G4MOE_ROW_CHUNK")
@@ -3694,15 +5768,30 @@ fn row_chunk(ctx: &WgpuContext, hidden: usize) -> usize {
     {
         return rows & !1usize;
     }
+    let ceiling = if head_one_shard_enabled() {
+        ctx.caps.max_buffer_size.max(EMBED_SHARD_CEILING_BYTES)
+    } else {
+        EMBED_SHARD_CEILING_BYTES
+    };
     let limit = ctx
         .caps
         .max_storage_buffer_binding_size
-        .clamp(1 << 20, 1u64 << 30);
+        .clamp(1 << 20, ceiling);
     let per_row = (hidden * 2) as u64;
     ((limit / per_row) as usize).max(2) & !1usize
 }
 
 type RopeTableCache = std::collections::HashMap<(usize, u32, u32), (wgpu::Buffer, wgpu::Buffer)>;
+
+struct TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded {
+    moe_out: wgpu::Buffer,
+    post_ffw2_w: wgpu::Buffer,
+    r_out: wgpu::Buffer,
+    r_in: wgpu::Buffer,
+    post_ffw_w: wgpu::Buffer,
+    h1: wgpu::Buffer,
+    layer_scalar: f32,
+}
 
 struct AttnGpu {
     wq: Bf16Gpu,
@@ -3741,6 +5830,108 @@ struct MoeGpu {
     ed: ExpertGpu,
 }
 
+struct RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv {
+    rsw: wgpu::Buffer,
+    router: Bf16Gpu,
+    pes: wgpu::Buffer,
+    rlogits: wgpu::Buffer,
+    ids: wgpu::Buffer,
+    wts: wgpu::Buffer,
+}
+
+fn upload_router_pre(
+    b: &mut Builder,
+    cfg: &Gemma4MoeConfig,
+    layer: &HostLayer,
+) -> RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv {
+    RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv {
+        rsw: b.upload_u32("g4m-moe-rscale", &pack_pairs(&layer.router_scale)),
+        router: upload_bf16(b, "g4m-moe-router", &layer.router),
+        pes: b.upload_f32("g4m-moe-pes", &layer.per_expert_scale),
+        rlogits: b.zeros("g4m-moe-rlogits", (cfg.num_experts * 4) as u64),
+        ids: b.zeros("g4m-moe-ids", (cfg.top_k_experts * 4) as u64),
+        wts: b.zeros("g4m-moe-wts", (cfg.top_k_experts * 4) as u64),
+    }
+}
+
+fn push_gemv_bf16_down_rpnorm(
+    b: &mut Builder,
+    s: &Sources,
+    cfg: &Gemma4MoeConfig,
+    wd: &Bf16Gpu,
+    x: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    pre: &RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv,
+    x_router: &wgpu::Buffer,
+) -> Result<()> {
+    let hidden = cfg.base.hidden_size;
+    let hidden_words = hidden / 2;
+    let eps = cfg.base.rms_norm_eps as f32;
+    let n_e = cfg.num_experts;
+    anyhow::ensure!(
+        !bf16_r8_enabled() && !bf16_acc4_enabled(),
+        "NV_G4MOE_RPFUSE=1 copies the sglat mlp-down body verbatim; the r8/acc4 down \
+         entries have no fused twin"
+    );
+    let wide = b.wide_flag("g4m-mlp-down", GemvLoad::Wide, wd.k, 0, &wd.w, x);
+    let dn_grid = b.grid1(wd.n.div_ceil(2) as u64, 1);
+    anyhow::ensure!(
+        dn_grid.1 == 1 && dn_grid.2 == 1,
+        "NV_G4MOE_RPFUSE=1 appends the router workgroups on grid x, so the down grid must \
+         stay one-dimensional; got {dn_grid:?}"
+    );
+    let rp_groups = n_e.div_ceil(2) as u32;
+    let dn_p = b.uni(
+        "g4m-gemvb-p",
+        GemvBf16Params {
+            n_rows: wd.n as u32,
+            k_words: (wd.k / 2) as u32,
+            groups_x: dn_grid.0,
+            out_f32: 0,
+            w_row_words: (wd.k / 2) as u32,
+            x_off_words: 0,
+            y_off_words: 0,
+            wide,
+            alpha: 1.0,
+            ..Default::default()
+        },
+    );
+    let rp_p = b.uni(
+        "g4m-gemvb-p",
+        GemvBf16Params {
+            n_rows: n_e as u32,
+            k_words: hidden_words as u32,
+            groups_x: rp_groups,
+            out_f32: 1,
+            w_row_words: hidden_words as u32,
+            x_off_words: 0,
+            y_off_words: 0,
+            wide: 0,
+            alpha: 1.0 / (hidden as f32).sqrt(),
+            pad1: hidden as u32,
+            pad2: eps.to_bits(),
+            ..Default::default()
+        },
+    );
+    b.push(
+        "g4m-mlp-down-rp",
+        &s.gemv_bf16_dnrp_sglat,
+        "g4m_gemv_bf16_down_rpnorm_sglat",
+        &[
+            (0, &wd.w),
+            (1, x),
+            (2, &dn_p),
+            (3, y),
+            (4, &pre.router.w),
+            (5, &pre.rsw),
+            (6, x_router),
+            (7, &rp_p),
+            (8, &pre.rlogits),
+        ],
+        (dn_grid.0 + rp_groups, 1, 1),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_attn(
     b: &mut Builder,
@@ -3756,6 +5947,10 @@ fn build_attn(
     flash_sl: Option<&wgpu::Buffer>,
     rope_tables_shared_across_layers_because_per_layer_copies_cost_gib_at_196k: &mut RopeTableCache,
     states: &mut Vec<(wgpu::Buffer, u64)>,
+    tail_fold: Option<(
+        &TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded,
+        &wgpu::Buffer,
+    )>,
 ) -> Result<AttnGpu> {
     let base = &cfg.base;
     let kind = layer.kind;
@@ -3771,15 +5966,44 @@ fn build_attn(
     let eps = base.rms_norm_eps as f32;
 
     let fp8 = kv_fp8_enabled();
-    let grouped_attn = grouped_gemv_enabled() && !fp8;
+    let grouped_attn = grouped_gemv_active(b.ctx) && !fp8;
+    anyhow::ensure!(
+        tail_fold.is_none() || grouped_attn,
+        "NV_G4MOE_TAILFOLD=1 folds the deferred tailnorm into the grouped qkvproj gemv; \
+         dropping the bundle on the non-grouped path would skip the tailnorm entirely"
+    );
+    let attn_i8_qkv = attn_i8_site_enabled("g4m-at-qkvproj");
+    let attn_i8_o = attn_i8_site_enabled("g4m-at-oproj");
+    let attn_i8 = attn_i8_qkv || attn_i8_o;
+    anyhow::ensure!(
+        !attn_i8 || grouped_attn,
+        "NV_G4MOE_ATTN_I8=1 quantizes the stacked qkvproj and the oproj decode gemvs; the \
+         non-grouped q/k/v split path has no int8 route -- set NV_G4MOE_GROUPED_GEMV=1"
+    );
+    anyhow::ensure!(
+        tail_fold.is_none() || !attn_i8,
+        "NV_G4MOE_ATTN_I8=1 has no int8 tailfold qkvproj entry and NV_G4MOE_TAILFOLD is a \
+         banked negative -- unset one of the two"
+    );
+    let (ql, kl, vl) = if attn_i8_qkv {
+        (
+            "g4m-at-qw-prefill-only",
+            "g4m-at-kw-prefill-only",
+            "g4m-at-vw-prefill-only",
+        )
+    } else {
+        ("g4m-at-qw", "g4m-at-kw", "g4m-at-vw")
+    };
+    let ol = if attn_i8_o {
+        "g4m-at-ow-prefill-only"
+    } else {
+        "g4m-at-ow"
+    };
 
-    let wq = upload_bf16(b, "g4m-at-qw", &layer.q);
-    let wk_ = upload_bf16(b, "g4m-at-kw", &layer.k);
-    let wo = upload_bf16(b, "g4m-at-ow", &layer.o);
-    let wv = layer
-        .v
-        .as_ref()
-        .map(|vlin| upload_bf16(b, "g4m-at-vw", vlin));
+    let wq = upload_bf16(b, ql, &layer.q);
+    let wk_ = upload_bf16(b, kl, &layer.k);
+    let wo = upload_bf16(b, ol, &layer.o);
+    let wv = layer.v.as_ref().map(|vlin| upload_bf16(b, vl, vlin));
 
     let (q_raw, k_raw, v_raw) = if grouped_attn {
         let zero = b.zeros("g4m-at-qraw", 16);
@@ -3818,6 +6042,26 @@ fn build_attn(
     let ones: Vec<u16> = vec![bf16_bits(1.0); hd];
     let vn = b.upload_u32("g4m-at-vn", &pack_pairs(&ones));
 
+    let ring_rows = match (kind, sliding_ring_rows) {
+        (LayerType::SlidingAttention, Some(rows)) => Some(rows),
+        _ => None,
+    };
+    let ring = ring_rows.map(|r| r as u32).unwrap_or(0);
+    let cache_rows = ring_rows.unwrap_or(max_seq);
+    let fold_kv = fold_chain_enabled() && grouped_attn;
+    let use_flash = match kind {
+        LayerType::FullAttention => flash_decode_enabled(),
+        LayerType::SlidingAttention => flash_sliding_enabled(),
+    };
+    let qkvfold = qkvfold_enabled() && fold_kv && use_flash;
+    let mut caches_written_by_the_fused_qkvnorm: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
+    let mut qkvnorm_deferred_into_flash_stage1: Option<(
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+        wgpu::Buffer,
+    )> = None;
+
     let (q, k, v) = if grouped_attn {
         let has_v = wv.is_some();
         let n_stack = wq.n + wk_.n + wv.as_ref().map(|w| w.n).unwrap_or(0);
@@ -3833,9 +6077,69 @@ fn build_attn(
             n: n_stack,
             k: wq.k,
         };
+        let qkv_i8 = attn_i8_qkv
+            .then(|| upload_attn_i8(b, "g4m-at-qkv-i8", "g4m-at-qkv-i8-sf", &stacked, n_stack, wq.k));
         drop(stacked);
         let qkv_raw = b.zeros("g4m-at-qkvraw", (n_stack * 2) as u64);
-        push_gemv_bf16(b, s, "g4m-at-qkvproj", &wqkv, x, &qkv_raw, false, 0)?;
+        match tail_fold {
+            Some((pt, next_w)) => {
+                let wide = b.wide_flag("g4m-at-qkvproj", GemvLoad::Wide, wqkv.k, 0, &wqkv.w, x);
+                anyhow::ensure!(
+                    wide == 1,
+                    "NV_G4MOE_TAILFOLD=1 stages the folded normnext vector for the vec4 wide \
+                     dot, so the qkvproj gemv must qualify for wide loads"
+                );
+                let grid = b.grid1(n_stack.div_ceil(2) as u64, 1);
+                let gp = b.uni(
+                    "g4m-gemvb-p",
+                    GemvBf16Params {
+                        n_rows: n_stack as u32,
+                        k_words: (wqkv.k / 2) as u32,
+                        groups_x: grid.0,
+                        out_f32: 0,
+                        w_row_words: (wqkv.k / 2) as u32,
+                        x_off_words: 0,
+                        y_off_words: 0,
+                        wide,
+                        alpha: 1.0,
+                        ..Default::default()
+                    },
+                );
+                let np = b.uni(
+                    "g4m-pn-p",
+                    NormParams {
+                        hidden: wqkv.k as u32,
+                        words: (wqkv.k / 2) as u32,
+                        eps,
+                        scale: pt.layer_scalar,
+                    },
+                );
+                b.push(
+                    "g4m-at-qkvproj",
+                    &s.gemv_bf16_tailfold,
+                    "g4m_gemv_bf16_tailfold",
+                    &[
+                        (0, &wqkv.w),
+                        (1, &gp),
+                        (2, &qkv_raw),
+                        (3, &np),
+                        (4, &pt.moe_out),
+                        (5, &pt.post_ffw2_w),
+                        (6, &pt.r_out),
+                        (7, &pt.r_in),
+                        (8, &pt.post_ffw_w),
+                        (9, &pt.h1),
+                        (10, x),
+                        (11, next_w),
+                    ],
+                    grid,
+                )?;
+            }
+            None => match &qkv_i8 {
+                Some(qi8) => push_gemv_attn_i8(b, s, "g4m-at-qkvproj", qi8, x, &qkv_raw)?,
+                None => push_gemv_bf16(b, s, "g4m-at-qkvproj", &wqkv, x, &qkv_raw, false, 0)?,
+            },
+        }
 
         let mut wcat: Vec<u16> = Vec::with_capacity(3 * hd);
         wcat.extend_from_slice(&layer.q_norm);
@@ -3856,21 +6160,68 @@ fn build_attn(
                 eps,
             },
         );
-        b.push(
-            "g4m-at-qkvnorm",
-            &s.attn,
-            "g4m_attn_norm_rope_qkv",
-            &[
-                (0, &qkv_raw),
-                (1, &wcat_b),
-                (2, &cosb),
-                (3, &sinb),
-                (4, pos_buf),
-                (5, &qkv),
-                (6, &p),
-            ],
-            ((n_q + 2 * n_kv) as u32, 1, 1),
-        )?;
+        if fold_kv {
+            let kv_words = n_kv * hd / 2;
+            let cache_bytes = (cache_rows * kv_words * 4) as u64;
+            let kc = b.zeros("g4m-at-kc", cache_bytes);
+            let vc = b.zeros("g4m-at-vc", cache_bytes);
+            states.push((kc.clone(), cache_bytes));
+            states.push((vc.clone(), cache_bytes));
+            let kvp = b.uni(
+                "g4m-at-kv-p",
+                KvWriteParams {
+                    words: kv_words as u32,
+                    ring,
+                    k_off_words: 0,
+                    ..Default::default()
+                },
+            );
+            if qkvfold {
+                qkvnorm_deferred_into_flash_stage1 =
+                    Some((qkv_raw.clone(), wcat_b.clone(), p.clone(), kvp.clone()));
+            } else {
+                let (src, entry) = if norm_lat_active(b.ctx) {
+                    (&s.attn_sglat, "g4m_attn_norm_rope_qkv_kvwrite_sglat")
+                } else {
+                    (&s.attn, "g4m_attn_norm_rope_qkv_kvwrite")
+                };
+                b.push(
+                    "g4m-at-qkvnorm",
+                    src,
+                    entry,
+                    &[
+                        (0, &qkv_raw),
+                        (1, &wcat_b),
+                        (2, &cosb),
+                        (3, &sinb),
+                        (4, pos_buf),
+                        (5, &qkv),
+                        (6, &p),
+                        (7, &kc),
+                        (8, &vc),
+                        (9, &kvp),
+                    ],
+                    ((n_q + 2 * n_kv) as u32, 1, 1),
+                )?;
+            }
+            caches_written_by_the_fused_qkvnorm = Some((kc, vc));
+        } else {
+            b.push(
+                "g4m-at-qkvnorm",
+                &s.attn,
+                "g4m_attn_norm_rope_qkv",
+                &[
+                    (0, &qkv_raw),
+                    (1, &wcat_b),
+                    (2, &cosb),
+                    (3, &sinb),
+                    (4, pos_buf),
+                    (5, &qkv),
+                    (6, &p),
+                ],
+                ((n_q + 2 * n_kv) as u32, 1, 1),
+            )?;
+        }
         (qkv.clone(), qkv.clone(), qkv)
     } else {
         let q = b.zeros("g4m-at-q", (n_q * hd * 2) as u64);
@@ -3921,13 +6272,9 @@ fn build_attn(
         norm_rope("g4m-at-vnorm", &v_raw, &vn, &v, n_kv, false, b)?;
     }
 
-    let ring_rows = match (kind, sliding_ring_rows) {
-        (LayerType::SlidingAttention, Some(rows)) => Some(rows),
-        _ => None,
-    };
-    let ring = ring_rows.map(|r| r as u32).unwrap_or(0);
-    let cache_rows = ring_rows.unwrap_or(max_seq);
-    let (kc, vc, kv_scales) = if fp8 {
+    let (kc, vc, kv_scales) = if let Some((kc, vc)) = caches_written_by_the_fused_qkvnorm.take() {
+        (kc, vc, None)
+    } else if fp8 {
         anyhow::ensure!(
             hd.is_multiple_of(4),
             "NV_G4MOE_KV_FP8=1: quantize_kv_fp8 packs 4 e4m3 bytes per u32 word, so head_dim \
@@ -4022,10 +6369,6 @@ fn build_attn(
         ""
     };
     let attn_bf16 = b.zeros("g4m-at-obf16", (n_q * hd * 2) as u64);
-    let use_flash = match kind {
-        LayerType::FullAttention => flash_decode_enabled(),
-        LayerType::SlidingAttention => flash_sliding_enabled(),
-    };
     if use_flash {
         let fp = match kind {
             LayerType::FullAttention => flash_fd.expect(
@@ -4047,41 +6390,153 @@ fn build_attn(
             "the shared flash uniform carries start=0 and ring=0, which is only correct for \
              full-attention layers (window {window}, ring {ring})"
         );
+        let flash_wg_bytes =
+            flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
+                flash_sg_reduce_enabled(),
+                flash_sacc_chunk_head_dim_slice_staged_per_warp_read_once_at_build(),
+                flash_gqa_fold_query_heads_per_workgroup_read_once_at_build(),
+            );
         anyhow::ensure!(
             b.ctx.caps.max_compute_invocations_per_workgroup >= 256
                 && b.ctx.caps.max_compute_workgroup_size_x >= 256
-                && b
-                    .ctx
-                    .caps
-                    .workgroup_storage_fits(FLASH_WORKGROUP_BYTES_QSH512_RED256_SM8_SL8_SACC4096_F32),
-            "NV_G4MOE_FLASH_DECODE=1 needs a 256-invocation workgroup and {} workgroup bytes; \
-             device allows {} invocations / {} bytes -- unset the env to keep the serial arm",
-            FLASH_WORKGROUP_BYTES_QSH512_RED256_SM8_SL8_SACC4096_F32,
+                && b.ctx.caps.workgroup_storage_fits(flash_wg_bytes),
+            "NV_G4MOE_FLASH_DECODE=1 needs a 256-invocation workgroup and {flash_wg_bytes} \
+             workgroup bytes; device allows {} invocations / {} bytes -- unset the env to keep \
+             the serial arm",
             b.ctx.caps.max_compute_invocations_per_workgroup,
             b.ctx.caps.max_compute_workgroup_storage_size
         );
-        let splits = flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build();
-        let scratch = b.zeros(
-            "g4m-at-fscr",
-            (n_q * splits as usize * (hd + 2) * 4) as u64,
-        );
-        let mut flash1_binds: Vec<(u32, &wgpu::Buffer)> =
-            vec![(0, &q), (1, &kc), (2, &vc), (3, &scratch), (6, fp)];
-        let flash1_entry = match &kv_scales {
-            Some((ksc, vsc)) => {
-                flash1_binds.push((7, ksc));
-                flash1_binds.push((8, vsc));
-                "g4m_flash_stage1_fp8"
+        let splits =
+            flash_splits_for_layer_kind_full_attention_holds_the_folded_grid_sliding_holds_the_stage2_scan(
+                kind,
+                flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+            );
+        let scratch_splits =
+            flash_depthgate_scratch_splits_must_cover_every_band_the_gate_can_pick(splits);
+        let scratch_splits = match kind {
+            LayerType::FullAttention => {
+                foldgate_scratch_splits_full_attention_only_must_also_cover_the_deep_arm_rows(
+                    scratch_splits,
+                )
             }
-            None => "g4m_flash_stage1_bf16",
+            LayerType::SlidingAttention => scratch_splits,
         };
-        b.push(
-            &format!("g4m-at-flash1{kind_suffix}"),
-            &s.flash,
-            flash1_entry,
-            &flash1_binds,
-            (n_q as u32, splits, 1),
-        )?;
+        let scratch_bytes = (n_q * scratch_splits as usize * (hd + 2) * 4) as u64;
+        let scratch = b.zeros("g4m-at-fscr", scratch_bytes);
+        match kind {
+            LayerType::FullAttention => b
+                .flash_scratch_bytes_per_full_attention_layer_sized_at_its_own_split_count
+                .push(scratch_bytes),
+            LayerType::SlidingAttention => b
+                .flash_scratch_bytes_per_sliding_layer_sized_at_its_own_split_count_not_the_max_of_the_two
+                .push(scratch_bytes),
+        }
+        if !b.to_prefill {
+            let flash1_pass_index = b.passes.len();
+            match kind {
+                LayerType::FullAttention => b
+                    .depthgate_flash1_pass_indices_full_attention_the_band_is_keyed_on_the_whole_context
+                    .push(flash1_pass_index),
+                LayerType::SlidingAttention => b
+                    .depthgate_flash1_pass_indices_sliding_the_window_caps_the_scan_so_the_band_is_keyed_on_min_total_window
+                    .push(flash1_pass_index),
+            }
+        }
+        if let Some((qkv_raw_b, wcat_b, nr_p, kvp)) = &qkvnorm_deferred_into_flash_stage1 {
+            anyhow::ensure!(
+                b.ctx
+                    .caps
+                    .workgroup_storage_fits(FLASH_QKVFOLD_WORKGROUP_BYTES_ADDS_BUF512_KCUR256_VCUR256_U32),
+                "NV_G4MOE_QKVFOLD=1 stages the recomputed q/k/v head rows in {} workgroup \
+                 bytes; device allows {} -- unset the env to keep the standalone qkvnorm",
+                FLASH_QKVFOLD_WORKGROUP_BYTES_ADDS_BUF512_KCUR256_VCUR256_U32,
+                b.ctx.caps.max_compute_workgroup_storage_size
+            );
+            b.push(
+                &format!("g4m-at-flash1{kind_suffix}"),
+                &s.flash_qkvfold,
+                "g4m_flash_stage1_bf16_qkvfold",
+                &[
+                    (0, qkv_raw_b),
+                    (1, &kc),
+                    (2, &vc),
+                    (3, &scratch),
+                    (4, wcat_b),
+                    (5, &cosb),
+                    (6, fp),
+                    (7, &sinb),
+                    (8, nr_p),
+                    (9, kvp),
+                ],
+                (n_q as u32, splits, 1),
+            )?;
+        } else {
+            let mut flash1_binds: Vec<(u32, &wgpu::Buffer)> =
+                vec![(0, &q), (1, &kc), (2, &vc), (3, &scratch), (6, fp)];
+            let fold =
+                flash_gqa_fold_for_layer_kind_only_full_attention_scans_enough_rows_to_amortise_a_halved_grid(
+                    kind,
+                    flash_gqa_fold_query_heads_per_workgroup_read_once_at_build(),
+                );
+            let folded = kv_scales.is_none()
+                && s.flash_fold_entry.is_some()
+                && flash_gqa_fold_fits_this_layer(fold, n_q, n_kv);
+            let flash1_entry = match &kv_scales {
+                Some((ksc, vsc)) => {
+                    flash1_binds.push((7, ksc));
+                    flash1_binds.push((8, vsc));
+                    "g4m_flash_stage1_fp8"
+                }
+                None if folded => s
+                    .flash_fold_entry
+                    .as_deref()
+                    .expect("folded implies a generated fold entry"),
+                None => "g4m_flash_stage1_bf16",
+            };
+            let flash1_grid_x = if folded {
+                (n_q / fold as usize) as u32
+            } else {
+                n_q as u32
+            };
+            b.push(
+                &format!("g4m-at-flash1{kind_suffix}"),
+                &s.flash,
+                flash1_entry,
+                &flash1_binds,
+                (flash1_grid_x, splits, 1),
+            )?;
+            if kind == LayerType::FullAttention && !b.to_prefill {
+                if let Some((fg_src, fg_entry)) = &s.flash_foldgate_deep_source_and_entry {
+                    let fg_fold =
+                        FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC;
+                    anyhow::ensure!(
+                        kv_scales.is_none(),
+                        "NV_G4MOE_FLASH_FOLDGATE=1 has no fp8 fold-2 stage1 entry; unset it or \
+                         NV_G4MOE_KV_FP8. {}",
+                        FOLDGATE_SWAPS_ONLY_FULL_ATTENTION_BECAUSE_SPELLING_THE_FOLD_THROUGH_THE_SHARED_DEPTHGATE_SPLITS_ENV_TAXES_SLIDING
+                    );
+                    anyhow::ensure!(
+                        flash_gqa_fold_fits_this_layer(fg_fold, n_q, n_kv),
+                        "NV_G4MOE_FLASH_FOLDGATE=1 folds {fg_fold} query heads of one KV group \
+                         per workgroup but this full-attention layer has n_q {n_q} / n_kv {n_kv}, \
+                         which the fold does not divide -- unset the env"
+                    );
+                    let alt = b.built_pass(
+                        &format!("g4m-at-flash1{kind_suffix}-deep"),
+                        fg_src,
+                        fg_entry,
+                        &flash1_binds,
+                        (
+                            n_q as u32 / fg_fold,
+                            FOLDGATE_DEEP_SPLITS_64_RESTORES_512_WORKGROUPS_UNDER_FOLD_2_AND_IS_A_MEASURED_RUNG_THE_LADDER_HAS_A_REPRODUCED_POTHOLE_AT_40_47_48_SO_NEVER_INTERPOLATE,
+                            1,
+                        ),
+                    )?;
+                    b.foldgate_alt_flash1_passes_one_deep_twin_per_full_attention_flash1_in_the_same_order
+                        .push(alt);
+                }
+            }
+        }
         b.push(
             &format!("g4m-at-flash2{kind_suffix}"),
             &s.flash,
@@ -4147,7 +6602,12 @@ fn build_attn(
         )?;
     }
 
-    push_gemv_bf16(b, s, "g4m-at-oproj", &wo, &attn_bf16, out, false, 0)?;
+    if attn_i8_o {
+        let o_i8 = upload_attn_i8(b, "g4m-at-o-i8", "g4m-at-o-i8-sf", &layer.o.w, wo.n, wo.k);
+        push_gemv_attn_i8(b, s, "g4m-at-oproj", &o_i8, &attn_bf16, out)?;
+    } else {
+        push_gemv_bf16(b, s, "g4m-at-oproj", &wo, &attn_bf16, out, false, 0)?;
+    }
 
     Ok(AttnGpu {
         wq,
@@ -4410,13 +6870,17 @@ fn build_mlp(
     layer: &HostLayer,
     x: &wgpu::Buffer,
     out: &wgpu::Buffer,
+    rp: Option<(
+        &RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv,
+        &wgpu::Buffer,
+    )>,
 ) -> Result<MlpGpu> {
     let inter = cfg.base.intermediate_size;
     let wg = upload_bf16(b, "g4m-mlp-gw", &layer.mlp_gate);
     let wu = upload_bf16(b, "g4m-mlp-uw", &layer.mlp_up);
     let wd = upload_bf16(b, "g4m-mlp-dw", &layer.mlp_down);
     let act = b.zeros("g4m-mlp-act", (inter * 2) as u64);
-    if grouped_gemv_enabled() {
+    if grouped_gemv_active(b.ctx) {
         push_gemv_bf16_gu_gelu(b, s, "g4m-mlp-gu", &wg, &wu, x, &act, "g4m-mlp-gate")?;
     } else {
         let g = b.zeros("g4m-mlp-g", (inter * 2) as u64);
@@ -4439,7 +6903,12 @@ fn build_mlp(
             grid,
         )?;
     }
-    push_gemv_bf16(b, s, "g4m-mlp-down", &wd, &act, out, false, 0)?;
+    match rp {
+        Some((pre, x_router)) => {
+            push_gemv_bf16_down_rpnorm(b, s, cfg, &wd, &act, out, pre, x_router)?
+        }
+        None => push_gemv_bf16(b, s, "g4m-mlp-down", &wd, &act, out, false, 0)?,
+    }
     Ok(MlpGpu { wg, wu, wd })
 }
 
@@ -4514,6 +6983,7 @@ fn build_mlp_prefill(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn build_moe(
     b: &mut Builder,
     s: &Sources,
@@ -4522,6 +6992,8 @@ fn build_moe(
     x_router: &wgpu::Buffer,
     x: &wgpu::Buffer,
     out: &wgpu::Buffer,
+    pre: Option<&RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv>,
+    topk_prefused: bool,
 ) -> Result<MoeGpu> {
     let hidden = cfg.base.hidden_size;
     let hidden_words = hidden / 2;
@@ -4536,12 +7008,34 @@ fn build_moe(
         2 * W4_GS
     );
 
-    let grouped = grouped_gemv_enabled();
+    let grouped = grouped_gemv_active(b.ctx);
+    let chain = router_chain_enabled();
+    let rpnorm = rpnorm_active(b.ctx);
+    anyhow::ensure!(
+        !rpnorm || (grouped && !chain && hidden_words <= 2048),
+        "NV_G4MOE_RPNORM=1 replays the grouped norm-mul inside every rproj workgroup and \
+         stages {hidden_words} hidden words in a 2048-word workgroup array"
+    );
+    anyhow::ensure!(
+        pre.is_none() || (grouped && rpnorm && !chain),
+        "the pre-uploaded router bundle exists only for the NV_G4MOE_RPFUSE shape \
+         (grouped + rpnorm, no router-chain)"
+    );
     let ones: Vec<u16> = vec![bf16_bits(1.0); hidden];
     let ones_w = b.upload_u32("g4m-moe-ones", &pack_pairs(&ones));
     let router_in = b.zeros("g4m-moe-rin", (hidden_words * 4) as u64);
-    let rsw = b.upload_u32("g4m-moe-rscale", &pack_pairs(&layer.router_scale));
-    if grouped {
+    let rsw = match pre {
+        Some(p) => p.rsw.clone(),
+        None => b.upload_u32("g4m-moe-rscale", &pack_pairs(&layer.router_scale)),
+    };
+    if chain {
+        anyhow::ensure!(
+            2 * n_e <= 256 && k_top <= 16 && hidden_words <= 2048 && hidden_words.is_multiple_of(2),
+            "NV_G4MOE_ROUTER_CHAIN=1: the single-workgroup chain dots 2 lanes per expert row \
+             ({n_e} experts), stages {hidden_words} hidden words, and holds {k_top} choices"
+        );
+    } else if rpnorm {
+    } else if grouped {
         let p = b.uni(
             "g4m-pn-p",
             NormParams {
@@ -4587,39 +7081,131 @@ fn build_moe(
         )?;
     }
 
-    let router = upload_bf16(b, "g4m-moe-router", &layer.router);
-    let rlogits = b.zeros("g4m-moe-rlogits", (n_e * 4) as u64);
-    push_gemv_bf16_alpha(
-        b,
-        s,
-        "g4m-moe-rproj",
-        &router,
-        &router_in,
-        &rlogits,
-        true,
-        0,
-        1.0 / (hidden as f32).sqrt(),
-        GemvLoad::Scalar,
-    )?;
-
-    let ids = b.zeros("g4m-moe-ids", (k_top * 4) as u64);
-    let wts = b.zeros("g4m-moe-wts", (k_top * 4) as u64);
-    let pes = b.upload_f32("g4m-moe-pes", &layer.per_expert_scale);
-    let rp = b.uni(
-        "g4m-moe-topk-p",
-        RouterParams {
-            n_experts: n_e as u32,
-            k: k_top as u32,
-            ..Default::default()
-        },
+    let (router, ids, wts, pes, rlogits) = match pre {
+        Some(p) => (
+            Bf16Gpu {
+                w: p.router.w.clone(),
+                n: p.router.n,
+                k: p.router.k,
+            },
+            p.ids.clone(),
+            p.wts.clone(),
+            p.pes.clone(),
+            p.rlogits.clone(),
+        ),
+        None => (
+            upload_bf16(b, "g4m-moe-router", &layer.router),
+            b.zeros("g4m-moe-ids", (k_top * 4) as u64),
+            b.zeros("g4m-moe-wts", (k_top * 4) as u64),
+            b.upload_f32("g4m-moe-pes", &layer.per_expert_scale),
+            b.zeros("g4m-moe-rlogits", (n_e * 4) as u64),
+        ),
+    };
+    let topk_fold = topk_fold_enabled();
+    anyhow::ensure!(
+        !topk_fold || (grouped && !chain && n_e <= 256 && k_top <= 16),
+        "NV_G4MOE_TOPK_FOLD=1 replays the parallel-rank topk inside every expert gemv          workgroup; it rides the grouped fused gu/down entries ({n_e} experts, top-{k_top})"
     );
-    b.push(
-        "g4m-moe-topk",
-        &s.moe,
-        router_topk_entry(n_e, k_top),
-        &[(0, &rlogits), (1, &ids), (2, &wts), (3, &rp), (4, &pes)],
-        (1, 1, 1),
-    )?;
+    if chain {
+        let cp = b.uni(
+            "g4m-rc-p",
+            RouterChainParams {
+                n_experts: n_e as u32,
+                k: k_top as u32,
+                words: hidden_words as u32,
+                hidden: hidden as u32,
+                eps,
+                alpha: 1.0 / (hidden as f32).sqrt(),
+                ..Default::default()
+            },
+        );
+        b.push(
+            "g4m-moe-routerchain",
+            &s.moe,
+            "g4m_router_chain",
+            &[
+                (70, x_router),
+                (71, &rsw),
+                (72, &router.w),
+                (73, &pes),
+                (74, &ids),
+                (75, &wts),
+                (76, &cp),
+            ],
+            (1, 1, 1),
+        )?;
+    } else {
+        if pre.is_some() {
+        } else if rpnorm {
+            let grid = b.grid1(n_e.div_ceil(2) as u64, 1);
+            let p = b.uni(
+                "g4m-gemvb-p",
+                GemvBf16Params {
+                    n_rows: n_e as u32,
+                    k_words: hidden_words as u32,
+                    groups_x: grid.0,
+                    out_f32: 1,
+                    w_row_words: hidden_words as u32,
+                    x_off_words: 0,
+                    y_off_words: 0,
+                    wide: 0,
+                    alpha: 1.0 / (hidden as f32).sqrt(),
+                    pad1: hidden as u32,
+                    pad2: eps.to_bits(),
+                    ..Default::default()
+                },
+            );
+            let (src, entry) = if norm_lat_active(b.ctx) {
+                (&s.gemv_bf16_rpnorm_sglat, "g4m_gemv_bf16_rpnorm_sglat")
+            } else {
+                (&s.gemv_bf16, "g4m_gemv_bf16_rpnorm")
+            };
+            b.push(
+                "g4m-moe-rpnorm",
+                src,
+                entry,
+                &[
+                    (0, &router.w),
+                    (1, x_router),
+                    (2, &p),
+                    (3, &rlogits),
+                    (5, &rsw),
+                ],
+                grid,
+            )?;
+        } else {
+            push_gemv_bf16_alpha(
+                b,
+                s,
+                "g4m-moe-rproj",
+                &router,
+                &router_in,
+                &rlogits,
+                true,
+                0,
+                1.0 / (hidden as f32).sqrt(),
+                GemvLoad::Scalar,
+            )?;
+        }
+        if !topk_fold && !(topk_prefused && pre.is_some()) {
+            let rp = b.uni(
+                "g4m-moe-topk-p",
+                RouterParams {
+                    n_experts: n_e as u32,
+                    k: k_top as u32,
+                    ..Default::default()
+                },
+            );
+            b.push(
+                "g4m-moe-topk",
+                &s.moe,
+                router_topk_entry(n_e, k_top),
+                &[(0, &rlogits), (1, &ids), (2, &wts), (3, &rp), (4, &pes)],
+                (1, 1, 1),
+            )?;
+        }
+    }
+    let rank_src = topk_fold.then_some((&rlogits, &pes, n_e));
 
     let eg = upload_experts(b, "g4m-moe-eg", &layer.experts_gate);
     let eu = upload_experts(b, "g4m-moe-eu", &layer.experts_up);
@@ -4628,8 +7214,24 @@ fn build_moe(
     let act = b.zeros("g4m-moe-act", (k_top * inter * 2) as u64);
     let down_groups = ed.k / W4_GS;
     let fused_down = grouped && w4_gemv_entry(down_groups, ed.n) == "g4m_gemv_w4_r8";
+    anyhow::ensure!(
+        !topk_fold || fused_down,
+        "NV_G4MOE_TOPK_FOLD=1 has no unfused down+combine surface; the down shape must \
+         route g4m_gemv_w4_r8"
+    );
     if grouped {
-        push_gemv_w4_gu_gelu(b, s, "g4m-moe-gu", &eg, &eu, x, &act, &ids, k_top)?;
+        push_gemv_w4_gu_gelu(
+            b,
+            s,
+            "g4m-moe-gu",
+            &eg,
+            &eu,
+            x,
+            &act,
+            &ids,
+            k_top,
+            rank_src.map(|(l, p, ne)| (l as &wgpu::Buffer, p as &wgpu::Buffer, ne)),
+        )?;
     } else {
         let y_gate = b.zeros("g4m-moe-ygate", (k_top * inter * 2) as u64);
         let y_up = b.zeros("g4m-moe-yup", (k_top * inter * 2) as u64);
@@ -4663,6 +7265,7 @@ fn build_moe(
             &ids,
             &wts,
             k_top,
+            rank_src.map(|(l, p, ne)| (l as &wgpu::Buffer, p as &wgpu::Buffer, ne)),
         )?;
     } else {
         let y_down = b.zeros("g4m-moe-ydown", (k_top * hidden * 2) as u64);

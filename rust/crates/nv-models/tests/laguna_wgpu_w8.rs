@@ -336,12 +336,12 @@ fn dense_mlp_int8_tracks_nvfp4_and_deletes_its_activation_quant_dispatches() {
     let want = ref_dense_mlp(&shapes, &layer, &twin_mlp(mlp), &x).unwrap();
 
     let base = build_and_run(ctx, shapes.hidden_size, |b, s, xb, out| {
-        build_dense_mlp(b, s, &shapes, &layer, mlp, xb, out).unwrap();
+        build_dense_mlp(b, s, &shapes, &layer, mlp, xb, out, None).unwrap();
     });
     let w8 = {
         let _e = W8Env::set("ffn", W8_GROUP);
         build_and_run(ctx, shapes.hidden_size, |b, s, xb, out| {
-            build_dense_mlp(b, s, &shapes, &layer, mlp, xb, out).unwrap();
+            build_dense_mlp(b, s, &shapes, &layer, mlp, xb, out, None).unwrap();
         })
     };
 
@@ -558,7 +558,7 @@ fn bf16_projections_are_left_alone_even_with_the_flag_on() {
     );
     let _e = W8Env::set("all", W8_GROUP);
     let got = build_and_run(ctx, shapes.hidden_size, |b, s, xb, out| {
-        build_dense_mlp(b, s, &shapes, &layer, mlp, xb, out).unwrap();
+        build_dense_mlp(b, s, &shapes, &layer, mlp, xb, out, None).unwrap();
     });
     assert_eq!(
         got.i8, 0,

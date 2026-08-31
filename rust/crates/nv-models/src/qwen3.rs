@@ -5,6 +5,9 @@ use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
+use nv_layers::weight_load::{
+    load_linear_resolving, load_rmsnorm_resolving, resolve_stripping_model_prefix,
+};
 use nv_weights::WeightLoader;
 #[cfg(feature = "cuda")]
 use nv_weights::{QuantScheme, QuantizationConfig};
@@ -249,82 +252,93 @@ impl Qwen3Layer {
         let kvd = config.num_key_value_heads * config.head_dim;
         let inter = config.intermediate_size;
         let eps = config.rms_norm_eps;
-        let pre_attn_norm = load_rmsnorm(
+        let pre_attn_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.input_layernorm.weight"),
             hidden,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let pre_mlp_norm = load_rmsnorm(
+        let pre_mlp_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.post_attention_layernorm.weight"),
             hidden,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let q_proj = load_linear(
+        let q_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.self_attn.q_proj.weight"),
             qd,
             hidden,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let k_proj = load_linear(
+        let k_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.self_attn.k_proj.weight"),
             kvd,
             hidden,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let v_proj = load_linear(
+        let v_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.self_attn.v_proj.weight"),
             kvd,
             hidden,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let o_proj = load_linear(
+        let o_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.self_attn.o_proj.weight"),
             hidden,
             qd,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let q_norm = load_rmsnorm(
+        let q_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.self_attn.q_norm.weight"),
             config.head_dim,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let k_norm = load_rmsnorm(
+        let k_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.self_attn.k_norm.weight"),
             config.head_dim,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let gate_proj = load_linear(
+        let gate_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.mlp.gate_proj.weight"),
             inter,
             hidden,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let up_proj = load_linear(
+        let up_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.mlp.up_proj.weight"),
             inter,
             hidden,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let down_proj = load_linear(
+        let down_proj = load_linear_resolving(
             weights,
             &format!("{prefix}.mlp.down_proj.weight"),
             hidden,
             inter,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
         let mlp = Mlp::new(gate_proj, up_proj, down_proj)?;
         Ok(Self {
@@ -356,19 +370,21 @@ impl Qwen3Layer {
         let kvd = config.num_key_value_heads * config.head_dim;
         let inter = config.intermediate_size;
         let eps = config.rms_norm_eps;
-        let pre_attn_norm = load_rmsnorm(
+        let pre_attn_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.input_layernorm.weight"),
             hidden,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let pre_mlp_norm = load_rmsnorm(
+        let pre_mlp_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.post_attention_layernorm.weight"),
             hidden,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
         let q_proj = load_linear_quant(
             weights,
@@ -410,19 +426,21 @@ impl Qwen3Layer {
             runners,
             device,
         )?;
-        let q_norm = load_rmsnorm(
+        let q_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.self_attn.q_norm.weight"),
             config.head_dim,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
-        let k_norm = load_rmsnorm(
+        let k_norm = load_rmsnorm_resolving(
             weights,
             &format!("{prefix}.self_attn.k_norm.weight"),
             config.head_dim,
             eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
         let gate_proj = load_linear_quant(
             weights,
@@ -532,7 +550,7 @@ impl Qwen3 {
         device: &Device,
     ) -> Result<Self> {
         let dtype = DType::BF16;
-        let embed_name = resolve_name(weights, "model.embed_tokens.weight")
+        let embed_name = resolve_stripping_model_prefix(weights, "model.embed_tokens.weight")
             .context("locate model.embed_tokens.weight")?;
         let embed_weight = weights
             .get(&embed_name, dtype)
@@ -553,18 +571,19 @@ impl Qwen3 {
         for i in 0..config.num_hidden_layers {
             layers.push(Qwen3Layer::from_loader(&config, i, weights, dtype)?);
         }
-        let final_norm = load_rmsnorm(
+        let final_norm = load_rmsnorm_resolving(
             weights,
             "model.norm.weight",
             config.hidden_size,
             config.rms_norm_eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
         let lm_head_weight = if config.tie_word_embeddings {
             embed_weight.clone()
         } else {
-            let lm_name =
-                resolve_name(weights, "lm_head.weight").context("locate lm_head.weight")?;
+            let lm_name = resolve_stripping_model_prefix(weights, "lm_head.weight")
+                .context("locate lm_head.weight")?;
             weights
                 .get(&lm_name, dtype)
                 .with_context(|| format!("load {lm_name}"))?
@@ -603,7 +622,7 @@ impl Qwen3 {
             return Self::from_loader(config, weights, device);
         }
         let runners = QuantRunners::new(device, qconfig.scheme)?;
-        let embed_name = resolve_name(weights, "model.embed_tokens.weight")
+        let embed_name = resolve_stripping_model_prefix(weights, "model.embed_tokens.weight")
             .context("locate model.embed_tokens.weight")?;
         let embed_weight = weights
             .get(&embed_name, dtype)
@@ -626,18 +645,19 @@ impl Qwen3 {
                 &config, i, weights, dtype, qconfig, &runners, device,
             )?);
         }
-        let final_norm = load_rmsnorm(
+        let final_norm = load_rmsnorm_resolving(
             weights,
             "model.norm.weight",
             config.hidden_size,
             config.rms_norm_eps,
             dtype,
+            resolve_stripping_model_prefix,
         )?;
         let lm_head_weight = if config.tie_word_embeddings {
             embed_weight.clone()
         } else {
-            let lm_name =
-                resolve_name(weights, "lm_head.weight").context("locate lm_head.weight")?;
+            let lm_name = resolve_stripping_model_prefix(weights, "lm_head.weight")
+                .context("locate lm_head.weight")?;
             weights
                 .get(&lm_name, dtype)
                 .with_context(|| format!("load {lm_name}"))?
@@ -851,59 +871,6 @@ impl CausalLm for Qwen3 {
     }
 }
 
-fn resolve_name(weights: &WeightLoader, name: &str) -> Result<String> {
-    if weights.has(name) {
-        return Ok(name.to_string());
-    }
-    if let Some(stripped) = name.strip_prefix("model.") {
-        if weights.has(stripped) {
-            return Ok(stripped.to_string());
-        }
-    }
-    anyhow::bail!("tensor not found (tried {name} and stripped variant)")
-}
-
-fn load_rmsnorm(
-    weights: &WeightLoader,
-    name: &str,
-    dim: usize,
-    eps: f64,
-    dtype: DType,
-) -> Result<RmsNorm> {
-    let resolved = resolve_name(weights, name)?;
-    let w = weights
-        .get(&resolved, dtype)
-        .with_context(|| format!("load {resolved}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("rmsnorm {resolved}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(RmsNorm::new(w, eps))
-}
-
-fn load_linear(
-    weights: &WeightLoader,
-    name: &str,
-    out_features: usize,
-    in_features: usize,
-    dtype: DType,
-) -> Result<Linear> {
-    let resolved = resolve_name(weights, name)?;
-    let w = weights
-        .get(&resolved, dtype)
-        .with_context(|| format!("load {resolved}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
-            "linear {resolved}: expected [{}, {}], got {:?}",
-            out_features,
-            in_features,
-            d
-        );
-    }
-    Linear::new(w, None)
-}
-
 #[cfg(feature = "cuda")]
 fn load_linear_quant(
     weights: &WeightLoader,
@@ -915,13 +882,20 @@ fn load_linear_quant(
     runners: &QuantRunners,
     device: &Device,
 ) -> Result<Linear> {
-    let resolved = resolve_name(weights, name)?;
+    let resolved = resolve_stripping_model_prefix(weights, name)?;
     let module_name = strip_dot_weight(&resolved);
     let is_ignored = qconfig.is_module_ignored(&module_name)
         || qconfig.is_module_ignored(&format!("model.{module_name}"))
         || qconfig.is_module_ignored(&resolved);
     if is_ignored || matches!(qconfig.scheme, QuantScheme::None) {
-        return load_linear(weights, name, out_features, in_features, dtype);
+        return load_linear_resolving(
+            weights,
+            name,
+            out_features,
+            in_features,
+            dtype,
+            resolve_stripping_model_prefix,
+        );
     }
 
     let w = weights
@@ -947,7 +921,14 @@ fn load_linear_quant(
         }
         QuantScheme::Nvfp4 => {
             if in_features < nv_quant::nvfp4::MIN_TILE || out_features < nv_quant::nvfp4::MIN_TILE {
-                return load_linear(weights, name, out_features, in_features, dtype);
+                return load_linear_resolving(
+                    weights,
+                    name,
+                    out_features,
+                    in_features,
+                    dtype,
+                    resolve_stripping_model_prefix,
+                );
             }
             let runner = runners
                 .nvfp4
@@ -957,6 +938,9 @@ fn load_linear_quant(
             Linear::from_bf16_quantized_nvfp4(&w, None, device, runner)
         }
         QuantScheme::None => unreachable!(),
+        nv_weights::QuantScheme::MlxAffineW4 => anyhow::bail!(
+            "MlxAffineW4 checkpoints have no cuda Linear path yet: the scheme landed for the              darwin/mlx line and this loader has not grown an arm for it; load a bf16/nvfp4              sibling snapshot or add the arm in the mlx line's session"
+        ),
     }
 }
 
@@ -965,7 +949,12 @@ fn strip_dot_weight(name: &str) -> String {
     name.strip_suffix(".weight").unwrap_or(name).to_string()
 }
 
-pub(crate) fn host_tile_positions(positions: &Tensor, b: usize, t: usize, device: &Device) -> Result<Tensor> {
+pub(crate) fn host_tile_positions(
+    positions: &Tensor,
+    b: usize,
+    t: usize,
+    device: &Device,
+) -> Result<Tensor> {
     let n = positions.elem_count();
     if n != t {
         anyhow::bail!("positions length {} != seq {}", n, t);

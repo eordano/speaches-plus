@@ -130,6 +130,11 @@ fn real_config_is_supported_by_the_wgpu_module() {
         .is_multiple_of(cfg.base.num_global_key_value_heads.unwrap()));
 }
 
+fn pin_attn_i8_off_for_this_scope_because_the_candle_oracle_asserts_bf16_value_identity(
+) -> common::EnvPins {
+    common::EnvPins::pin(&[("NV_G4MOE_ATTN_I8", Some("0"))])
+}
+
 fn compare_gpu_vs_oracle(
     cfg: &Gemma4MoeConfig,
     seed: u64,
@@ -137,6 +142,8 @@ fn compare_gpu_vs_oracle(
     tokens: &[u32],
     max_rel: f32,
 ) {
+    let _attn_i8_pin =
+        pin_attn_i8_off_for_this_scope_because_the_candle_oracle_asserts_bf16_value_identity();
     let dir = temp_dir(tag);
     let st_a = dir.0.join("model.safetensors");
     let st_b = dir.0.join("oracle.safetensors");
@@ -432,6 +439,8 @@ fn hand_attn_only_logits(cfg: &Gemma4MoeConfig, loader: &WeightLoader, tok: u32)
 #[test]
 #[ignore = "loads 2 real layers on CPU and GPU; set NV_GEMMA4_MOE_WGPU_TEST=1"]
 fn real_truncated_two_layers_gpu_matches_oracle() {
+    let _attn_i8_pin =
+        pin_attn_i8_off_for_this_scope_because_the_candle_oracle_asserts_bf16_value_identity();
     if std::env::var("NV_GEMMA4_MOE_WGPU_TEST").as_deref() != Ok("1") {
         eprintln!("[skip] NV_GEMMA4_MOE_WGPU_TEST not set");
         return;

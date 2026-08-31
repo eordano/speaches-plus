@@ -167,7 +167,7 @@ mod gated {
             }]
         })
         .to_string();
-        let r = post_body(&engine, img_body, "image");
+        let r = post_body(&engine, img_body.clone(), "image");
         eprintln!(
             "[qwen38-mm image] model={model} prompt_tokens={} completion_tokens={} wall={:.2}s content={:?}",
             r.prompt_tokens, r.completion_tokens, r.wall_s, r.content
@@ -176,6 +176,16 @@ mod gated {
             r.content.to_lowercase().contains("red"),
             "grounded color answer expected, got {:?}",
             r.content
+        );
+        let warm = post_body(&engine, img_body, "image-warm");
+        eprintln!(
+            "[qwen38-mm image-warm] wall={:.2}s (first-request wall minus this is one-time \
+             tower/cuda init) content={:?}",
+            warm.wall_s, warm.content
+        );
+        assert_eq!(
+            r.content, warm.content,
+            "the same greedy image request must answer identically across two in-session posts"
         );
 
         let t1 = post_body(&engine, capital_text_body(&model), "text-1");

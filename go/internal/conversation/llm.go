@@ -34,10 +34,10 @@ type Delta struct {
 }
 
 func (l *LLM) Stream(ctx context.Context, model, userText string) (<-chan Delta, error) {
-	return l.StreamWithInstructions(ctx, model, "", userText)
+	return l.StreamWithInstructions(ctx, model, "", userText, "")
 }
 
-func (l *LLM) StreamWithInstructions(ctx context.Context, model, instructions, userText string) (<-chan Delta, error) {
+func (l *LLM) StreamWithInstructions(ctx context.Context, model, instructions, userText, trajectoryTag string) (<-chan Delta, error) {
 	if !l.Configured() {
 		return nil, fmt.Errorf("llm: CHAT_COMPLETION_BASE_URL not set")
 	}
@@ -65,6 +65,9 @@ func (l *LLM) StreamWithInstructions(ctx context.Context, model, instructions, u
 	req.Header.Set("Accept", "text/event-stream")
 	if l.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+l.apiKey)
+	}
+	if tag := strings.TrimSpace(trajectoryTag); tag != "" {
+		req.Header.Set("x-trajectory-tag", tag)
 	}
 
 	resp, err := l.http.Do(req)

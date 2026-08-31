@@ -324,3 +324,112 @@ fn g4m_argmax_stage2(@builtin(local_invocation_id) lid: vec3<u32>) {
         am_out[0] = am_i[0];
     }
 }
+
+struct G4rcParams {
+    n_experts: u32,
+    k: u32,
+    words: u32,
+    hidden: u32,
+    eps: f32,
+    alpha: f32,
+    pad0: u32,
+    pad1: u32,
+};
+
+@group(0) @binding(70) var<storage, read> rc_x: array<u32>;
+@group(0) @binding(71) var<storage, read> rc_rsw: array<u32>;
+@group(0) @binding(72) var<storage, read> rc_rw: array<u32>;
+@group(0) @binding(73) var<storage, read> rc_pes: array<f32>;
+@group(0) @binding(74) var<storage, read_write> rc_ids: array<u32>;
+@group(0) @binding(75) var<storage, read_write> rc_wts: array<f32>;
+@group(0) @binding(76) var<uniform> rc_p: G4rcParams;
+
+var<workgroup> rc_buf: array<u32, 2048>;
+var<workgroup> rc_red: array<f32, 256>;
+var<workgroup> rc_s: f32;
+var<workgroup> rc_log: array<f32, 256>;
+var<workgroup> rc_ch: array<f32, 16>;
+var<workgroup> rc_id: array<u32, 16>;
+
+@compute @workgroup_size(256)
+fn g4m_router_chain(@builtin(local_invocation_id) lid3: vec3<u32>) {
+    let lid = lid3.x;
+    var local = 0.0;
+    for (var w = lid; w < rc_p.words; w = w + 256u) {
+        let xw = rc_x[w];
+        let x0 = bf16_lo(xw);
+        let x1 = bf16_hi(xw);
+        local = local + x0 * x0 + x1 * x1;
+    }
+    rc_red[lid] = local;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lid < s) {
+            rc_red[lid] = rc_red[lid] + rc_red[lid + s];
+        }
+        workgroupBarrier();
+    }
+    if (lid == 0u) {
+        rc_s = inverseSqrt(rc_red[0] / f32(rc_p.hidden) + rc_p.eps);
+    }
+    workgroupBarrier();
+    let s = rc_s;
+    for (var w = lid; w < rc_p.words; w = w + 256u) {
+        let xw = rc_x[w];
+        let ww = rc_rsw[w];
+        let t = bf16_pack(bf16_lo(xw) * s, bf16_hi(xw) * s);
+        rc_buf[w] = bf16_pack(bf16_lo(t) * bf16_lo(ww), bf16_hi(t) * bf16_hi(ww));
+    }
+    workgroupBarrier();
+    let row = lid >> 1u;
+    let half = lid & 1u;
+    let hw = rc_p.words >> 1u;
+    var acc = 0.0;
+    if (row < rc_p.n_experts) {
+        let wbase = row * rc_p.words + half * hw;
+        let xbase = half * hw;
+        for (var w = 0u; w < hw; w = w + 1u) {
+            let ww = rc_rw[wbase + w];
+            let xw = rc_buf[xbase + w];
+            acc = fma(bf16_lo(ww), bf16_lo(xw), acc);
+            acc = fma(bf16_hi(ww), bf16_hi(xw), acc);
+        }
+    }
+    rc_red[lid] = acc;
+    workgroupBarrier();
+    if (lid < rc_p.n_experts) {
+        rc_log[lid] = (rc_red[2u * lid] + rc_red[2u * lid + 1u]) * rc_p.alpha;
+    }
+    workgroupBarrier();
+    if (lid < rc_p.n_experts) {
+        let v = rc_log[lid];
+        var r = 0u;
+        for (var j = 0u; j < rc_p.n_experts; j = j + 1u) {
+            let w = rc_log[j];
+            if (w > v || (w == v && j < lid)) {
+                r = r + 1u;
+            }
+        }
+        if (r < rc_p.k) {
+            rc_id[r] = lid;
+            rc_ch[r] = v;
+            rc_ids[r] = lid;
+        }
+    }
+    workgroupBarrier();
+    if (lid == 0u) {
+        var m = rc_ch[0];
+        for (var j = 1u; j < rc_p.k; j = j + 1u) {
+            m = max(m, rc_ch[j]);
+        }
+        var ssum = 0.0;
+        for (var j = 0u; j < rc_p.k; j = j + 1u) {
+            let e = exp(rc_ch[j] - m);
+            rc_ch[j] = e;
+            ssum = ssum + e;
+        }
+        for (var j = 0u; j < rc_p.k; j = j + 1u) {
+            rc_wts[j] = rc_ch[j] / ssum * rc_pes[rc_id[j]];
+        }
+    }
+}

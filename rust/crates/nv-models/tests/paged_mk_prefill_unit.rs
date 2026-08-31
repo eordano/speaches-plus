@@ -290,7 +290,7 @@ fn tiles_match_at(window: Option<usize>) {
 
 #[test]
 #[ignore]
-fn the_mk_launcher_refuses_a_head_dim_past_what_its_kernel_holds() {
+fn the_fp8_mk_launcher_accepts_512_which_is_its_own_bound_and_refuses_only_past_it() {
     if std::env::var("NV_PAGED_MK_UNIT").as_deref() != Ok("1") {
         panic!("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: set NV_PAGED_MK_UNIT=1");
     }
@@ -302,7 +302,8 @@ fn the_mk_launcher_refuses_a_head_dim_past_what_its_kernel_holds() {
         _ => unreachable!(),
     };
     let stream = nv_layers::cuda_stream::current_stream(&candle_dev);
-    let over = 512i32;
+    let at_the_fp8_bound = 512i32;
+    let past_the_fp8_bound = 1024i32;
     let mut scratch = stream.alloc_zeros::<f32>(1 << 16).expect("scratch");
     let mut fan_in = stream.alloc_zeros::<u32>(N_Q).expect("fan_in");
     let junk_u8 = stream.alloc_zeros::<u8>(1 << 12).expect("u8");
@@ -336,7 +337,39 @@ fn the_mk_launcher_refuses_a_head_dim_past_what_its_kernel_holds() {
             fi as *mut u32,
             N_Q as i32,
             N_KV as i32,
-            over,
+            at_the_fp8_bound,
+            0,
+            0,
+            1.0,
+            tp as *const i32,
+            BLOCK_SIZE as i32,
+        )
+    };
+    assert_eq!(
+        rc, 0,
+        "the fp8 paged mk launcher REFUSED head_dim {at_the_fp8_bound}, which is its own bound \
+         kMaxHDmkFp8 and is reachable from served models. kMaxHDmk = 256 is the BF16 launcher's \
+         cap, not this one's: flash_splitk_fused_fp8_mk_kernel sizes qsh, sacc, kAccT and kCh4T \
+         from MAXHD and the fp8 path instantiates the MH=512 family via NV_MK_FP8_SWITCH512, \
+         chunking M by NV_MK512_CHUNK. Refusing here would break a working served configuration"
+    );
+    let rc_past = unsafe {
+        nv_kernels::cuda::flash_decode_fused_fp8kv_mk_paged(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            q as *const u16,
+            k as *const u8,
+            k as *const u8,
+            sc as *const f32,
+            sc as *const f32,
+            op as *mut u16,
+            ntp as *const i32,
+            0,
+            1,
+            scr as *mut f32,
+            fi as *mut u32,
+            N_Q as i32,
+            N_KV as i32,
+            past_the_fp8_bound,
             0,
             0,
             1.0,
@@ -345,9 +378,9 @@ fn the_mk_launcher_refuses_a_head_dim_past_what_its_kernel_holds() {
         )
     };
     assert_ne!(
-        rc, 0,
-        "the paged mk launcher accepted head_dim {over} when splitk_mk holds only \
-         kMaxHDmk = 256, so it would overrun shared qsh and the acc array instead of \
+        rc_past, 0,
+        "the fp8 paged mk launcher accepted head_dim {past_the_fp8_bound}, past its own \
+         kMaxHDmkFp8 = 512 bound, so it would overrun shared qsh and the acc array instead of \
          declining the launch"
     );
 }

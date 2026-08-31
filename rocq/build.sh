@@ -18,16 +18,9 @@ fi
 export ROCQPATH
 echo "== toolchain: COQBIN=$COQBIN"
 
-# Order is load-bearing: KvBudget needs WindowClamp, StreamK needs Roofline,
-# GenRoofline needs Roofline + GenTraffic. Do not sort or glob this list.
-MODS="WindowClamp KvBudget KvBudgetMerged AcceptSoundness Roofline StreamK ChunkedPrefill RoPE PdlOrder GenPdl PdlKernels LaunchGeometry GenLaunch GenClaims"
+MODS="WindowClamp KvBudget KvBudgetMerged AcceptSoundness Roofline StreamK ChunkedPrefill RoPE PdlOrder GenPdl PdlKernels LaunchGeometry GenLaunch GenClaims TrainBackward LoraSlices Nvfp4Semantics TrainStepSpec TrainLoss CheckpointEquiv"
 if [ -f GenTraffic.v ]; then MODS="$MODS GenTraffic GenRoofline"; fi
 
-# A build list that cannot notice a new module is a gate that silently shrinks.
-# RoPE.v sat in the tree from 2026-08-10 with a .vo built by hand and was never
-# re-checked here, because it was absent from this list; PdlOrder.v hit the same
-# hole on 2026-08-11 and reported rc=0 having compiled nothing. Fail loudly
-# instead.
 missing=""
 for f in *.v; do
   case " $MODS " in

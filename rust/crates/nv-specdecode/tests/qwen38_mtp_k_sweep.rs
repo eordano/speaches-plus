@@ -6,8 +6,9 @@ use candle_core::Device;
 use minijinja::{context, Environment, Value as JinjaValue};
 use nv_models::qwen3_5_moe::{Qwen3Moe, Qwen3_5DenseConfig};
 use nv_specdecode::qwen38_mtp::{
-    mtp_draft_dir_override_from_env, mtp_drafter_fp8_resident_from_env, Qwen38DenseMtpHead,
-    Qwen38MtpGraphedDecodeSession, Qwen38MtpSelfSpecEngine, MTP_WEIGHTS_FILE_NAME,
+    mtp_draft_dir_override_from_env, mtp_drafter_fp8_resident_from_env,
+    Qwen38DenseMtpHead, Qwen38MtpGraphedDecodeSession, Qwen38MtpSelfSpecEngine,
+    MTP_WEIGHTS_FILE_NAME,
 };
 use nv_weights::{QuantizationConfig, WeightLoader};
 use std::path::Path;
@@ -154,6 +155,9 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
         u8::from(nv_specdecode::qwen38_mtp::mtp_draft_lm_head_nvfp4_twin_from_env());
     let reanchor_flag =
         u8::from(nv_specdecode::qwen38_mtp::mtp_reanchor_post_norm_selected_from_env());
+    let p_min_flag = nv_specdecode::qwen38_mtp::mtp_draft_p_min_from_env()
+        .map(|p| format!("{p:.2}"))
+        .unwrap_or_else(|| "off".into());
     let daemon_mib = speaches_daemon_resident_mib_recorded_because_cotenancy_shifts_timings();
     let max_new = SWEEP_MAX_NEW_64_MATCHES_THE_V3_RECORD_HARNESS;
     let warm_new = SWEEP_WARM_TOKENS_16_UNTIMED_BECAUSE_A_COLD_CLOCK_READS_2X_SLOW;
@@ -243,6 +247,11 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
         let mut bracket_accepted: std::collections::BTreeMap<&str, usize> = Default::default();
         let mut bracket_rounds: std::collections::BTreeMap<&str, usize> = Default::default();
         let mut bracket_emitted: std::collections::BTreeMap<&str, usize> = Default::default();
+        let mut k_submitted_len_hist: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut bracket_draft_top_probs_by_position: std::collections::BTreeMap<
+            &str,
+            Vec<Vec<f32>>,
+        > = Default::default();
 
         for &(pi, bracket, question, min_content, raw_continuation) in &prompts {
             let prompt_text = if raw_continuation {
@@ -269,11 +278,17 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
                 &stop,
                 Some(SWEEP_JUNK_DRAFT_TOKEN_ANY_POLICY_MUST_EMIT_THE_SAME_STREAM),
             );
-            assert_eq!(
-                spec.ids, junk.ids,
-                "draft-policy invariance broken at k={k} prompt={pi} through the GRAPHED verify: \
-                 every emitted token is the batched verify's own greedy continuation of the \
-                 committed prefix; a mismatch is a rollback/reanchor/lin-ckpt/graph-replay bug"
+            common::assert_draft_policy_invariance_exact_when_fixed_k_or_tie_class_when_the_p_min_cut_varies_the_verify_shape(
+                &mut engine,
+                &mtp,
+                k,
+                &prompt,
+                max_new,
+                &stop,
+                &tok,
+                &spec,
+                &junk,
+                &format!("k={k} prompt={pi}"),
             );
             eprintln!(
                 "[q38-mtp-ksweep] arm=graphed-IDS k={k} prompt={pi} bracket={bracket} \
@@ -315,8 +330,28 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
                 .iter()
                 .map(|(len, n)| format!("{len}:{n}"))
                 .collect();
+            let submitted_hist: Vec<String> = spec
+                .submitted_draft_len_hist
+                .iter()
+                .map(|(len, n)| format!("{len}:{n}"))
+                .collect();
+            for (len, n) in &spec.submitted_draft_len_hist {
+                *k_submitted_len_hist.entry(*len).or_default() += n;
+            }
+            if !spec.draft_top_prob_rounds.is_empty() {
+                let per_pos = bracket_draft_top_probs_by_position.entry(bracket).or_default();
+                for round_probs in &spec.draft_top_prob_rounds {
+                    for (j, p) in round_probs.iter().enumerate() {
+                        if per_pos.len() <= j {
+                            per_pos.resize(j + 1, Vec::new());
+                        }
+                        per_pos[j].push(*p);
+                    }
+                }
+            }
             eprintln!(
-                "[q38-mtp-ksweep] arm=graphed k={k} prompt={pi} bracket={bracket} \
+                "[q38-mtp-ksweep] arm=graphed k={k} p_min={p_min_flag} prompt={pi} bracket={bracket} \
+                 submitted_draft_len_hist={} \
                  prompt_toks={} new_toks={new_toks} content={content} rounds={} \
                  accept={:.3} pos0={:.3} tokens_per_round={:.2} steady_ms_tok={steady_ms_tok:.2} \
                  incl_commit_ms_tok={incl_commit_ms_tok:.2} hot_ms_tok={hot_ms_tok:.2} \
@@ -325,6 +360,7 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
                  commit_ms_per_round={:.2} accept_len_hist={} wall_s={spec_s:.2} \
                  fp8_drafter={} lmhead4_drafter={lmhead4_drafter} reanchor={reanchor_flag} \
                  daemon_resident_mib={daemon_mib} invariance=held",
+                submitted_hist.join(","),
                 prompt.len(),
                 stats.rounds,
                 stats.accept_rate(),
@@ -391,16 +427,44 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
                 emitted as f64 / rounds.max(1) as f64,
             );
         }
+        for (bracket, per_pos) in &bracket_draft_top_probs_by_position {
+            let cols: Vec<String> = per_pos
+                .iter()
+                .enumerate()
+                .map(|(j, v)| {
+                    let mut s = v.clone();
+                    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let n = s.len();
+                    format!(
+                        "pos{j}:n={n},p10={:.3},p50={:.3},mean={:.3}",
+                        s[n / 10],
+                        s[n / 2],
+                        v.iter().sum::<f32>() / n as f32
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[q38-mtp-ksweep] arm=graphed-DRAFT-CONF k={k} p_min={p_min_flag} \
+                 bracket={bracket} drafter_top_prob_by_position {}",
+                cols.join(" ")
+            );
+        }
+        let k_submitted: Vec<String> = k_submitted_len_hist
+            .iter()
+            .map(|(len, n)| format!("{len}:{n}"))
+            .collect();
         eprintln!(
-            "[q38-mtp-ksweep] arm=graphed-AGGREGATE k={k} prompts={} new_toks={k_new_toks} \
+            "[q38-mtp-ksweep] arm=graphed-AGGREGATE k={k} p_min={p_min_flag} prompts={} \
+             new_toks={k_new_toks} \
              rounds={k_rounds} accept={:.3} tokens_per_round={:.2} steady_ms_tok={:.2} \
              incl_commit_ms_tok={:.2} hot_ms_tok={:.2} draft_ms_per_round={:.2} \
              verify_ms_per_round={:.2} commit_ms_per_round={:.2} draft_share_of_steady={:.3} \
+             submitted_draft_len_hist={} \
              fp8_drafter={} lmhead4_drafter={lmhead4_drafter} reanchor={reanchor_flag} \
              daemon_resident_mib={daemon_mib} \
              basis=(model=unsloth/Qwen3.8-27B-NVFP4 commit-harness=k-sweep max_new={max_new} \
              warm={warm_new} template=official-no-thinking-chat-plus-raw-wikitext greedy \
-             graphed m=k+1 verify)",
+             graphed rows-keyed verify m<=k+1)",
             prompts.len(),
             k_accepted as f64 / k_drafted.max(1) as f64,
             k_new_toks as f64 / k_rounds.max(1) as f64,
@@ -411,6 +475,7 @@ fn qwen38_mtp_k_sweep_accept_economics_on_the_graphed_v3_path() {
             k_verify_ms / k_rounds.max(1) as f64,
             k_commit_ms / k_rounds.max(1) as f64,
             k_draft_ms / (k_draft_ms + k_verify_ms).max(1e-9),
+            k_submitted.join(","),
             u8::from(fp8_drafter),
         );
     }

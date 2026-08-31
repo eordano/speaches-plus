@@ -1,22 +1,20 @@
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
 use crate::oapi::chat::json_ext::OaiJson;
 use crate::oapi::chat::{
     now_unix_secs, resolve_guided_fields, send_sse_json, send_sse_raw, system_fingerprint,
     ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, LogprobEntry, StopField,
-    StreamOptions, Usage, DEFAULT_MAX_TOKENS, GUIDED_FORCE_THINK_OFF_ENV, MAX_MAX_TOKENS,
+    StreamOptions, Usage, GUIDED_FORCE_THINK_OFF_ENV,
 };
 use crate::oapi::{kind, openai_error};
 
@@ -276,10 +274,11 @@ async fn completions_impl(state: ChatAppState, req: CompletionRequest) -> Respon
     let _ = &req.stop_token_ids;
     stop.retain(|s| !s.is_empty());
 
-    let max_new_tokens = req
-        .max_tokens
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-        .clamp(1, MAX_MAX_TOKENS);
+    let max_new_tokens = crate::oapi::chat::resolve_max_new_tokens(
+        req.max_tokens,
+        crate::oapi::chat::default_max_tokens(),
+        crate::oapi::chat::max_max_tokens(),
+    );
 
     let echo_prefix = if req.echo.unwrap_or(false) {
         prompt.clone()
@@ -408,12 +407,7 @@ async fn run_non_streaming(
             finish_reason: Some(finish_reason),
             logprobs,
         }],
-        usage: Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            prompt_tokens_details: None,
-        },
+        usage: Usage::totaled(prompt_tokens, completion_tokens, None),
     };
     (StatusCode::OK, Json(resp)).into_response()
 }
@@ -553,33 +547,20 @@ async fn run_streaming(
                 finish_reason: Some(finish_reason.unwrap_or_else(|| "stop".into())),
                 logprobs: None,
             }],
-            usage: if include_usage {
-                Some(Usage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    prompt_tokens_details: None,
-                })
-            } else {
-                None
-            },
+            usage: include_usage.then(|| Usage::totaled(prompt_tokens, completion_tokens, None)),
             system_fingerprint: None,
         };
         let _ = send_sse_json(&tx_bytes, &last).await;
         let _ = send_sse_raw(&tx_bytes, "[DONE]").await;
     });
 
-    let stream = ReceiverStream::new(rx_bytes);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .unwrap()
+    crate::oapi::sse_response(rx_bytes)
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::body::Body;
+
     use super::*;
 
     const THINKING_TEMPLATE: &str = "{% for m in messages %}<|im_start|>{{ m['role'] }}\n{{ \

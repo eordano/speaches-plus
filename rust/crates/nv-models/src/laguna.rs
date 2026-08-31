@@ -4,11 +4,11 @@ use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
+use nv_layers::weight_load::load_rmsnorm;
 #[cfg(feature = "cuda")]
 use nv_weights::QuantScheme;
 use nv_weights::QuantizationConfig;
 use nv_weights::WeightLoader;
-use crate::gemma4::load_rmsnorm;
 use serde::Deserialize;
 
 #[cfg(feature = "cuda")]
@@ -339,130 +339,6 @@ pub(crate) struct LagunaAttnW8 {
 }
 
 #[cfg(feature = "cuda")]
-fn rowquant_e4m3_dev(
-    w: &Tensor,
-) -> Result<(
-    cudarc::driver::CudaSlice<u8>,
-    cudarc::driver::CudaSlice<f32>,
-)> {
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-    use half::bf16;
-    let dev = match w.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("rowquant_e4m3 requires cuda"),
-    };
-    let (n, k) = w.dims2()?;
-    let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut wq: cudarc::driver::CudaSlice<u8> =
-        unsafe { stream.alloc::<u8>(n * k).map_err(|e| anyhow::anyhow!(e))? };
-    let mut rs: cudarc::driver::CudaSlice<f32> =
-        unsafe { stream.alloc::<f32>(n).map_err(|e| anyhow::anyhow!(e))? };
-    let rc = {
-        let (ws, wl) = w.storage_and_layout();
-        let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rowquant_e4m3: weight not cuda"),
-        };
-        let wsl = wc.as_cuda_slice::<bf16>()?;
-        let wview = wsl.slice(wl.start_offset()..);
-        let (wp, _gw) = wview.device_ptr(&stream);
-        let (qp, _gq) = wq.device_ptr_mut(&stream);
-        let (sp, _gs) = rs.device_ptr_mut(&stream);
-        unsafe {
-            nv_kernels::cuda::rowquant_e4m3(
-                stream.cu_stream() as *mut _,
-                wp as *const u16,
-                qp as *mut u8,
-                sp as *mut f32,
-                n as i32,
-                k as i32,
-            )
-        }
-    };
-    anyhow::ensure!(rc == 0, "rowquant_e4m3 returned {rc}");
-    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
-    Ok((wq, rs))
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn e4m3_mk_h_op(
-    wq: &cudarc::driver::CudaSlice<u8>,
-    row_scale: &cudarc::driver::CudaSlice<f32>,
-    x: &Tensor,
-    w_norm: &Tensor,
-    rstd: &Tensor,
-    m: usize,
-    dev: &candle_core::CudaDevice,
-) -> Result<Tensor> {
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
-    use half::bf16;
-    let hidden = x.elem_count() / m;
-    let n_rows = wq.len() / hidden;
-    anyhow::ensure!(rstd.elem_count() == m, "e4m3_mk_h: rstd rows mismatch");
-    let x_c = x.reshape((m, hidden))?.contiguous()?;
-    let stream = nv_layers::cuda_stream::current_stream(dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * n_rows)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let rc = {
-        let (xs, xl) = x_c.storage_and_layout();
-        let (x0, x1) = xl
-            .contiguous_offsets()
-            .ok_or_else(|| anyhow::anyhow!("e4m3_mk_h: x not dense"))?;
-        let (ws, _wl) = w_norm.storage_and_layout();
-        let (rs2, _rl) = rstd.storage_and_layout();
-        let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
-        };
-        let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w_norm not cuda"),
-        };
-        let rcu = match &*rs2 {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rstd not cuda"),
-        };
-        let xsl = xc.as_cuda_slice::<bf16>()?;
-        let xview = xsl.slice(x0..x1);
-        let wsl = wc.as_cuda_slice::<bf16>()?;
-        let rsl = rcu.as_cuda_slice::<f32>()?;
-        let (qp, _gq) = wq.device_ptr(&stream);
-        let (scp, _gsc) = row_scale.device_ptr(&stream);
-        let (xp, _gx) = xview.device_ptr(&stream);
-        let (wp, _gw) = wsl.device_ptr(&stream);
-        let (rp, _gr) = rsl.device_ptr(&stream);
-        let (yp, _gy) = y_dev.device_ptr_mut(&stream);
-        unsafe {
-            nv_kernels::cuda::gemv_e4m3_mk_h(
-                stream.cu_stream() as *mut _,
-                qp as *const u8,
-                scp as *const f32,
-                xp as *const u16,
-                wp as *const u16,
-                rp as *const f32,
-                yp as *mut u16,
-                n_rows as i32,
-                hidden as i32,
-                m as i32,
-            )
-        }
-    };
-    anyhow::ensure!(rc == 0, "gemv_e4m3_mk_h returned {rc}");
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev.clone());
-    let storage = candle_core::Storage::Cuda(storage);
-    Ok(Tensor::from_storage(
-        storage,
-        (m, n_rows),
-        candle_core::op::BackpropOp::none(),
-        false,
-    ))
-}
-
-#[cfg(feature = "cuda")]
 impl LagunaAttnW8 {
     fn quantize_proj(lin: &Linear, device: &Device, fp8: bool) -> Result<Option<LagunaProjW8>> {
         let _ = device;
@@ -479,10 +355,10 @@ impl LagunaAttnW8 {
             return Ok(None);
         }
         let (wq, row_scale) = if fp8 {
-            let (wq, rs) = rowquant_e4m3_dev(w)?;
+            let (wq, rs) = nv_layers::lm_head_resident_quant::rowquant_e4m3_dev(w)?;
             (LagunaProjBytes::E4m3(wq), rs)
         } else {
-            let (wq, rs) = crate::gemma4_e4b::quantize_lm_head_i8(w)?;
+            let (wq, rs) = nv_layers::lm_head_resident_quant::rowquant_i8_dev(w)?;
             (LagunaProjBytes::I8(wq), rs)
         };
         Ok(Some(LagunaProjW8 {
@@ -560,10 +436,24 @@ impl LagunaAttnW8 {
         let wn = self.ones_wn.narrow(0, 0, p.k)?;
         let rstd = self.ones_rstd.narrow(0, 0, m)?;
         let y = match &p.wq {
-            LagunaProjBytes::I8(wq) => {
-                crate::gemma4_e4b::i8_mk_h_op(wq, &p.row_scale, x, &wn, &rstd, m, &dev)?
-            }
-            LagunaProjBytes::E4m3(wq) => e4m3_mk_h_op(wq, &p.row_scale, x, &wn, &rstd, m, &dev)?,
+            LagunaProjBytes::I8(wq) => nv_layers::lm_head_resident_quant::i8_mk_h_op(
+                wq,
+                &p.row_scale,
+                x,
+                &wn,
+                &rstd,
+                m,
+                &dev,
+            )?,
+            LagunaProjBytes::E4m3(wq) => nv_layers::lm_head_resident_quant::e4m3_mk_h_op(
+                wq,
+                &p.row_scale,
+                x,
+                &wn,
+                &rstd,
+                m,
+                &dev,
+            )?,
         };
         Ok(Some(y.reshape((1usize, m, p.n))?))
     }
@@ -694,7 +584,7 @@ impl LagunaMoe {
             logits = scaled.tanh()?.affine(self.softcap as f64, 0.0)?;
         }
         let scores = candle_nn::ops::sigmoid(&logits)?;
-        if std::env::var_os("NV_LAGUNA_ROUTE_HOST_GPU_SORT").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ROUTE_HOST_GPU_SORT") {
             let selection = scores.broadcast_add(&self.selection_bias)?;
             let (_, sorted_idx) = selection.sort_last_dim(false)?;
             let top_idx = sorted_idx.narrow(1, 0, self.top_k)?.contiguous()?;
@@ -870,12 +760,12 @@ pub struct Laguna {
 }
 
 fn host_moe_env() -> bool {
-    std::env::var_os("NV_LAGUNA_HOST_MOE").is_some()
+    nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_HOST_MOE")
 }
 
 #[cfg(feature = "cuda")]
 fn ck_profile_enabled() -> bool {
-    std::env::var_os("NV_SPEC_CK_PROFILE").is_some()
+    nv_config::env_arm_present_at_all_reread_every_call("NV_SPEC_CK_PROFILE")
 }
 
 pub const ATTN_W8_Q: u8 = 1;
@@ -946,9 +836,27 @@ fn attn_w8_shape_env() -> bool {
     attn_w8_spec_env().shape
 }
 
+pub fn laguna_arm_key_explicitly_off(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref(),
+        Some("0") | Some("off") | Some("false") | Some("no")
+    )
+}
+
+pub fn attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_default() -> bool {
+    nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ATTN_W8")
+        && !laguna_arm_key_explicitly_off("NV_LAGUNA_ATTN_W8")
+}
+
+pub fn attn_fp8_default_on_since_round_82_set_the_key_to_0_for_the_pre_round_82_bf16_projections(
+) -> bool {
+    !laguna_arm_key_explicitly_off("NV_LAGUNA_ATTN_FP8")
+        && !attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_default()
+}
+
 pub fn attn_quant_gate_check() -> Result<()> {
-    if std::env::var_os("NV_LAGUNA_ATTN_W8").is_some()
-        && std::env::var_os("NV_LAGUNA_ATTN_FP8").is_some()
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ATTN_W8")
+        && nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ATTN_FP8")
     {
         anyhow::bail!("NV_LAGUNA_ATTN_W8 and NV_LAGUNA_ATTN_FP8 are mutually exclusive; unset one");
     }
@@ -1139,7 +1047,7 @@ impl Laguna {
         };
         let hflat = hidden.reshape((t, self.config.hidden_size))?;
         let rstd = crate::gemma4_e4b::rstd_op(&hflat, self.config.rms_norm_eps as f32)?;
-        let raw = crate::gemma4_e4b::lm_head_i8_normed_mk_op(
+        let raw = nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
             &h8.wq,
             &h8.row_scale,
             &hflat,
@@ -1165,7 +1073,7 @@ impl Laguna {
         };
         let hflat = hidden.reshape((t, self.config.hidden_size))?;
         let rstd = crate::gemma4_e4b::rstd_op(&hflat, self.config.rms_norm_eps as f32)?;
-        let raw = e4m3_mk_h_op(
+        let raw = nv_layers::lm_head_resident_quant::e4m3_mk_h_op(
             &h8.wq,
             &h8.row_scale,
             &hflat,
@@ -1305,7 +1213,8 @@ impl Laguna {
         let lm_head_i8 = if std::env::var_os("NV_LAGUNA_LMHEAD_INT8").is_some()
             && matches!(device, Device::Cuda(_))
         {
-            let (wq, row_scale) = crate::gemma4_e4b::quantize_lm_head_i8(&lm_head_weight)?;
+            let (wq, row_scale) =
+                nv_layers::lm_head_resident_quant::rowquant_i8_dev(&lm_head_weight)?;
             let max_m = nv_kernels::cuda::gemv_i8_normed_mk_max_m(config.hidden_size as i32).max(0)
                 as usize;
             anyhow::ensure!(max_m >= 1, "int8 lm_head: unsupported hidden size");
@@ -1322,7 +1231,8 @@ impl Laguna {
             && lmhead_fp8_mode() != LmHeadFp8Mode::ForceOff
             && matches!(device, Device::Cuda(_))
         {
-            let (wq, row_scale) = rowquant_e4m3_dev(&lm_head_weight)?;
+            let (wq, row_scale) =
+                nv_layers::lm_head_resident_quant::rowquant_e4m3_dev(&lm_head_weight)?;
             let max_m = nv_kernels::cuda::gemv_i8_normed_mk_max_m(config.hidden_size as i32).max(0)
                 as usize;
             anyhow::ensure!(max_m >= 1, "fp8 lm_head: unsupported hidden size");
@@ -1519,7 +1429,8 @@ impl Laguna {
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
 
-        let prof = seq == 1 && std::env::var_os("NV_MOE_DECODE_PROF").is_some();
+        let prof =
+            seq == 1 && nv_config::env_arm_present_at_all_reread_every_call("NV_MOE_DECODE_PROF");
         let sync = |label: &str, t: &mut std::time::Instant| {
             if prof {
                 #[cfg(feature = "cuda")]
@@ -1616,7 +1527,7 @@ impl Laguna {
             } else {
                 if n_tokens <= MAX_VERIFY_MOE_TOKENS
                     && self.device_verify_routing()
-                    && std::env::var_os("NV_LAGUNA_HOST_VERIFY").is_none()
+                    && !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_HOST_VERIFY")
                 {
                     match self.moe_forward_verify_grouped(layer_idx, moe, x_flat, n_tokens) {
                         Ok(Some(out)) => return Ok(out),
@@ -1696,7 +1607,7 @@ impl Laguna {
             moe.routed_scaling,
             &self.device,
         )?;
-        if std::env::var_os("NV_LAGUNA_ROUTE_AB_PROBE").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ROUTE_AB_PROBE") {
             self.route_ab_probe_report_device_vs_host_choices_on_identical_input(
                 layer_idx, moe, x_flat, ctx, n_tokens, &dev,
             )?;
@@ -2031,7 +1942,7 @@ impl Laguna {
         let ctx = ctx_slot.as_mut().unwrap();
         let _ = layer_idx;
 
-        let prof = std::env::var_os("NV_MOE_DECODE_PROF").is_some();
+        let prof = nv_config::env_arm_present_at_all_reread_every_call("NV_MOE_DECODE_PROF");
         let sync = |label: &str, t: &mut std::time::Instant| {
             if prof {
                 let _ = dev.cuda_stream().synchronize();
@@ -2236,13 +2147,17 @@ impl Laguna {
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
         let normed = layer.input_layernorm.forward(x)?;
-        let attn_out =
-            self.attention_forward_decode_batched(idx, &normed, positions, caches, b)?;
+        let attn_out = self.attention_forward_decode_batched(idx, &normed, positions, caches, b)?;
         let after_attn = x.add(&attn_out.to_dtype(x.dtype())?)?;
         self.ffn_forward_decode_batched(idx, &after_attn, b)
     }
 
-    fn ffn_forward_decode_batched(&self, idx: usize, after_attn: &Tensor, b: usize) -> Result<Tensor> {
+    fn ffn_forward_decode_batched(
+        &self,
+        idx: usize,
+        after_attn: &Tensor,
+        b: usize,
+    ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if b > 1
             && b <= MAX_VERIFY_MOE_TOKENS
@@ -2472,8 +2387,9 @@ impl LagunaLayer {
 
         #[cfg(feature = "cuda")]
         let w8 = {
-            let fp8 = std::env::var_os("NV_LAGUNA_ATTN_FP8").is_some();
-            if (fp8 || std::env::var_os("NV_LAGUNA_ATTN_W8").is_some())
+            let fp8 =
+                attn_fp8_default_on_since_round_82_set_the_key_to_0_for_the_pre_round_82_bf16_projections();
+            if (fp8 || attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_default())
                 && matches!(device, Device::Cuda(_))
                 && dtype == DType::BF16
             {
@@ -2711,7 +2627,7 @@ impl LagunaKvCache {
         let ring = cfg!(feature = "cuda")
             && matches!(device, Device::Cuda(_))
             && dtype == DType::BF16
-            && std::env::var_os("NV_LAGUNA_HOST_KV").is_none();
+            && !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_HOST_KV");
         Self::new_with_mode(config, max_seq_len, device, dtype, ring)
     }
 
@@ -2783,7 +2699,9 @@ impl LagunaKvCache {
                 full_stored: 0,
                 s_cap,
                 s_window,
-                ring_attn: std::env::var_os("NV_LAGUNA_RING_ATTN").is_some(),
+                ring_attn: nv_config::env_arm_present_at_all_reread_every_call(
+                    "NV_LAGUNA_RING_ATTN",
+                ),
             })
         } else {
             None
@@ -2989,9 +2907,7 @@ pub(crate) fn ring_prepare_decode_meta(
             *s_stored = keep;
         }
         if *s_stored + n_new > s_cap {
-            anyhow::bail!(
-                "{ring_name}: write of {n_new} tokens exceeds sliding capacity {s_cap}"
-            );
+            anyhow::bail!("{ring_name}: write of {n_new} tokens exceeds sliding capacity {s_cap}");
         }
         slot = *s_stored;
         *s_stored += n_new;

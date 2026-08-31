@@ -200,6 +200,7 @@ fn parse_xml_call(text: &str) -> Option<(ToolCall, usize)> {
     ))
 }
 
+#[allow(clippy::cmp_owned)]
 fn xml_param_value(raw: &str) -> serde_json::Value {
     let structural = raw.starts_with('{') || raw.starts_with('[');
     let scalar = matches!(raw, "true" | "false" | "null");
@@ -209,7 +210,6 @@ fn xml_param_value(raw: &str) -> serde_json::Value {
         }
     }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-
         if v.is_number() && v.to_string() == raw {
             return v;
         }

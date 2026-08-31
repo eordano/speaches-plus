@@ -579,6 +579,53 @@ fn gfd_split_scale(base: u32, stride: u32, s: u32, m_glob: f32) -> f32 {
     return sc;
 }
 
+var<workgroup> gfd_scc_scale: array<f32, 256>;
+var<workgroup> gfd_scc_l: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn gow_flash_stage2_sink_pk_scc(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) tid: vec3<u32>
+) {
+    let h = wg.x;
+    if (h >= gfd_p.n_heads) {
+        return;
+    }
+    let hd = gfd_p.head_dim;
+    let splits = gfd_p.splits;
+    let stride = hd + 2u;
+    let base = h * splits * stride;
+    let sink = gfd_sinks[h];
+
+    var m_glob = sink;
+    for (var s = 0u; s < splits; s = s + 1u) {
+        m_glob = max(m_glob, gfd_scratch[base + s * stride]);
+    }
+    for (var s = tid.x; s < splits; s = s + GFD_BLOCK) {
+        gfd_scc_scale[s] = gfd_split_scale(base, stride, s, m_glob);
+        gfd_scc_l[s] = gfd_scratch[base + s * stride + 1u];
+    }
+    workgroupBarrier();
+    var l_glob = gfd_exp(sink - m_glob);
+    for (var s = 0u; s < splits; s = s + 1u) {
+        l_glob = fma(gfd_scc_l[s], gfd_scc_scale[s], l_glob);
+    }
+    let inv_l = gfd_recip(l_glob);
+    let hw = hd >> 1u;
+    for (var w2 = tid.x; w2 < hw; w2 = w2 + GFD_BLOCK) {
+        let d0 = w2 * 2u;
+        var a0 = 0.0;
+        for (var s = 0u; s < splits; s = s + 1u) {
+            a0 = fma(gfd_scratch[base + s * stride + 2u + d0], gfd_scc_scale[s], a0);
+        }
+        var a1 = 0.0;
+        for (var s = 0u; s < splits; s = s + 1u) {
+            a1 = fma(gfd_scratch[base + s * stride + 2u + d0 + 1u], gfd_scc_scale[s], a1);
+        }
+        gfd_out[h * hw + w2] = bf16_pack(a0 * inv_l, a1 * inv_l);
+    }
+}
+
 @compute @workgroup_size(256)
 fn gow_flash_stage2_sink_pk(
     @builtin(workgroup_id) wg: vec3<u32>,
@@ -616,6 +663,95 @@ fn gow_flash_stage2_sink_pk(
         for (var s = 0u; s < splits; s = s + 1u) {
             let sc = gfd_split_scale(base, stride, s, m_glob);
             a1 = fma(gfd_scratch[base + s * stride + 2u + d0 + 1u], sc, a1);
+        }
+        gfd_out[h * hw + w2] = bf16_pack(a0 * inv_l, a1 * inv_l);
+    }
+}
+
+const GFD_PAR_SPLIT_CACHE_512_COVERS_EIGHT_TIMES_THE_DEEPEST_SHIPPED_BAND: u32 = 512u;
+
+var<workgroup> gfd_par_scale: array<f32, GFD_PAR_SPLIT_CACHE_512_COVERS_EIGHT_TIMES_THE_DEEPEST_SHIPPED_BAND>;
+var<workgroup> gfd_par_l: array<f32, GFD_PAR_SPLIT_CACHE_512_COVERS_EIGHT_TIMES_THE_DEEPEST_SHIPPED_BAND>;
+var<workgroup> gfd_par_red: array<f32, 256>;
+var<workgroup> gfd_par_acc: array<f32, 2048>;
+
+@compute @workgroup_size(256)
+fn gow_flash_stage2_sink_pk_par(
+    @builtin(workgroup_id) wg: vec3<u32>,
+    @builtin(local_invocation_id) tid: vec3<u32>
+) {
+    let h = wg.x;
+    if (h >= gfd_p.n_heads) {
+        return;
+    }
+    let hd = gfd_p.head_dim;
+    let splits = gfd_p.splits;
+    let stride = hd + 2u;
+    let base = h * splits * stride;
+    let sink = gfd_sinks[h];
+    let lane = tid.x & 31u;
+    let warp = tid.x >> 5u;
+
+    var mp = gfd_neg_inf();
+    for (var s = tid.x; s < splits; s = s + GFD_BLOCK) {
+        mp = max(mp, gfd_scratch[base + s * stride]);
+    }
+    gfd_par_red[tid.x] = mp;
+    workgroupBarrier();
+    for (var o = 128u; o > 0u; o = o >> 1u) {
+        if (tid.x < o) {
+            gfd_par_red[tid.x] = max(gfd_par_red[tid.x], gfd_par_red[tid.x + o]);
+        }
+        workgroupBarrier();
+    }
+    let m_glob = max(sink, gfd_par_red[0]);
+    workgroupBarrier();
+
+    for (var s = tid.x; s < splits; s = s + GFD_BLOCK) {
+        gfd_par_scale[s] = gfd_split_scale(base, stride, s, m_glob);
+        gfd_par_l[s] = gfd_scratch[base + s * stride + 1u];
+    }
+    workgroupBarrier();
+
+    let chunk = (splits + GFD_WARPS - 1u) / GFD_WARPS;
+    let s0 = min(warp * chunk, splits);
+    let s1 = min(s0 + chunk, splits);
+
+    var lp = 0.0;
+    if (lane == 0u) {
+        for (var s = s0; s < s1; s = s + 1u) {
+            lp = fma(gfd_par_l[s], gfd_par_scale[s], lp);
+        }
+    }
+    gfd_par_red[tid.x] = lp;
+    workgroupBarrier();
+    var l_glob = gfd_exp(sink - m_glob);
+    for (var w = 0u; w < GFD_WARPS; w = w + 1u) {
+        l_glob = l_glob + gfd_par_red[w * GFD_LANES];
+    }
+    let inv_l = gfd_recip(l_glob);
+
+    let hw = hd >> 1u;
+    for (var w2 = lane; w2 < hw; w2 = w2 + GFD_LANES) {
+        let d0 = w2 * 2u;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        for (var s = s0; s < s1; s = s + 1u) {
+            let sc = gfd_par_scale[s];
+            a0 = fma(gfd_scratch[base + s * stride + 2u + d0], sc, a0);
+            a1 = fma(gfd_scratch[base + s * stride + 2u + d0 + 1u], sc, a1);
+        }
+        gfd_par_acc[warp * hd + d0] = a0;
+        gfd_par_acc[warp * hd + d0 + 1u] = a1;
+    }
+    workgroupBarrier();
+    for (var w2 = tid.x; w2 < hw; w2 = w2 + GFD_BLOCK) {
+        let d0 = w2 * 2u;
+        var a0 = 0.0;
+        var a1 = 0.0;
+        for (var w = 0u; w < GFD_WARPS; w = w + 1u) {
+            a0 = a0 + gfd_par_acc[w * hd + d0];
+            a1 = a1 + gfd_par_acc[w * hd + d0 + 1u];
         }
         gfd_out[h * hw + w2] = bf16_pack(a0 * inv_l, a1 * inv_l);
     }

@@ -9,6 +9,7 @@ links = "nv_kernels"
 anyhow = { workspace = true }
 cudarc = { workspace = true, optional = true }
 half = { workspace = true }
+nv-config = { workspace = true }
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"], optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { workspace = true, optional = true }

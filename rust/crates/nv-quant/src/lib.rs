@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod algo_pin;
 pub mod fp8;
 pub mod matmul;
+pub mod mlx_affine;
 pub mod mxfp4;
 pub mod nvfp4;
 
@@ -60,6 +61,8 @@ pub enum QuantScheme {
     AwqInt4,
     GptqInt4,
     Marlin,
+    GgmlQ4k,
+    GgmlQ8_0,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +71,8 @@ pub enum LinearKind {
     Fp8E4m3 { a_scale: f32, b_scale: f32 },
     Nvfp4,
     Mxfp4,
+    GgmlQ4k,
+    GgmlQ8_0,
 }
 
 impl LinearKind {
@@ -77,6 +82,8 @@ impl LinearKind {
             LinearKind::Fp8E4m3 { .. } => QuantScheme::Fp8E4m3,
             LinearKind::Nvfp4 => QuantScheme::Nvfp4,
             LinearKind::Mxfp4 => QuantScheme::Mxfp4,
+            LinearKind::GgmlQ4k => QuantScheme::GgmlQ4k,
+            LinearKind::GgmlQ8_0 => QuantScheme::GgmlQ8_0,
         }
     }
 }

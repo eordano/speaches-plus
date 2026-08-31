@@ -15,7 +15,7 @@ nv-weights = { workspace = true }
 nv-tokenizer = { workspace = true }
 
 [dev-dependencies]
-tokenizers = "0.22"
+tokenizers = { workspace = true }
 hound = "3"
 
 [features]

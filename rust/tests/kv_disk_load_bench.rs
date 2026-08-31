@@ -13,7 +13,7 @@ use tower::ServiceExt;
 use speaches_plus::oapi::chat::{handle_chat_completions, ChatAppState, ChatEngine};
 use speaches_plus::oapi::chat_engine::ChatRegistry;
 use speaches_plus::oapi::chat_engine_wgpu::persist::KV_CACHE_DIR_ENV;
-use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, PREFIX_REUSE_ENV};
+use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM};
 
 const SIZES: [usize; 4] = [8192, 16384, 49152, 131072];
 
@@ -126,7 +126,7 @@ fn kv_disk_save_and_restore_across_context_capacities() {
         .with_env_filter("speaches_plus=info")
         .with_writer(std::io::stderr)
         .try_init();
-    std::env::set_var(PREFIX_REUSE_ENV, "1");
+    std::env::set_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM, "1");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -210,7 +210,7 @@ fn kv_disk_save_and_restore_across_context_capacities() {
             cached_reload,
         });
     }
-    std::env::remove_var(PREFIX_REUSE_ENV);
+    std::env::remove_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM);
 
     eprintln!("[kv-bench] model dir: {}", dir.display());
     eprintln!(

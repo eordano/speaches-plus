@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::conversation::llm::ChatMessage;
 use crate::eou::EouConfig;
 
 use super::inspector::InspectorEvent;
@@ -41,24 +40,19 @@ pub(super) async fn try_eager_dispatch(
         &session.cancel,
         whisper.clone(),
         crate::types::MonoF32At16k::new(audio),
+        session.stt_language(),
     );
     let llm_runner_opt = if session.intent == Intent::Conversation {
         if let Some(llm_cfg) = session.llm_config.clone() {
             let instructions = session.instructions().await;
-            let mut messages = session.build_chat_messages(instructions.as_deref()).await;
-            let placeholder = format!(
-                "[predicted-end-of-turn p={:.2}; partial transcription pending]",
-                score
-            );
-            messages.push(ChatMessage {
-                role: "user".into(),
-                content: placeholder,
-            });
-            Some(super::eou_predicted::spawn_predicted_llm(
+            let messages = session.build_chat_messages(instructions.as_deref()).await;
+            Some(super::eou_predicted::spawn_predicted_llm_after_stt(
                 &session.cancel,
                 llm_cfg,
                 messages,
+                stt_runner.shared.clone(),
                 cfg.predicted_token_buffer_cap,
+                Some(predicted_id.as_str().to_string()),
             ))
         } else {
             None

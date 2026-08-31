@@ -245,9 +245,9 @@ mod tests {
             "a 3600 s caller must outlast the 5 s server default"
         );
 
-        let busy = tokio::time::timeout(Duration::from_secs(120), &mut long)
+        let busy = tokio::time::timeout(Duration::from_secs(660), &mut long)
             .await
-            .expect("must have shed by the 120 s server maximum, not waited 3600 s")
+            .expect("must have shed by the 600 s server maximum, not waited 3600 s")
             .expect("join")
             .expect_err("shed, not admitted");
         assert_eq!(

@@ -34,6 +34,30 @@ func TestLLM_StreamSSE_Basic(t *testing.T) {
 	}
 }
 
+func TestLLM_TrajectoryTagHeaderRidesWhenSetAndAbsentWhenEmpty(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("x-trajectory-tag"))
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := NewLLM(srv.URL+"/v1", "")
+	for _, tag := range []string{"resp_tag_1", ""} {
+		stream, err := c.StreamWithInstructions(context.Background(), "any", "", "hi", tag)
+		if err != nil {
+			t.Fatalf("StreamWithInstructions(tag=%q): %v", tag, err)
+		}
+		for range stream {
+		}
+	}
+	if len(seen) != 2 || seen[0] != "resp_tag_1" || seen[1] != "" {
+		t.Fatalf("x-trajectory-tag per call: got %v want [resp_tag_1 \"\"]", seen)
+	}
+}
+
 func TestLLM_StreamSSE_DeltasObservable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

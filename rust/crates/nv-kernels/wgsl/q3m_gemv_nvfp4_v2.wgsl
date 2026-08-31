@@ -114,6 +114,21 @@ fn q3w_gemv_nvfp4_fmlut(
     }
 }
 
+fn q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
+    wv: vec4<u32>,
+    xm0: u32, xm1: u32, xm2: u32, xm3: u32,
+    xm4: u32, xm5: u32, xm6: u32, xm7: u32) -> vec2<i32> {
+    let e0 = dot4I8Packed(nv2_i8map(wv.x), xm0);
+    let e1 = dot4I8Packed(nv2_i8map(wv.x >> 4u), xm1);
+    let e2 = dot4I8Packed(nv2_i8map(wv.y), xm2);
+    let e3 = dot4I8Packed(nv2_i8map(wv.y >> 4u), xm3);
+    let e4 = dot4I8Packed(nv2_i8map(wv.z), xm4);
+    let e5 = dot4I8Packed(nv2_i8map(wv.z >> 4u), xm5);
+    let e6 = dot4I8Packed(nv2_i8map(wv.w), xm6);
+    let e7 = dot4I8Packed(nv2_i8map(wv.w >> 4u), xm7);
+    return vec2<i32>(((e0 + e1) + e2) + e3, ((e4 + e5) + e6) + e7);
+}
+
 @compute @workgroup_size(NV2_WG)
 fn q3w_gemv_nvfp4_mrow(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -162,14 +177,10 @@ fn q3w_gemv_nvfp4_mrow(
             let wv = q34_w4[wbase[m] + p];
             let wsi = sfbase + nvfp4_scale_byte_index(srow[m], b0, q34_p.k_tiles);
             let wsw = q34_ws[wsi >> 2u];
-            let d0 = dot4I8Packed(nv2_i8map(wv.x), xm0)
-                + dot4I8Packed(nv2_i8map(wv.x >> 4u), xm1)
-                + dot4I8Packed(nv2_i8map(wv.y), xm2)
-                + dot4I8Packed(nv2_i8map(wv.y >> 4u), xm3);
-            let d1 = dot4I8Packed(nv2_i8map(wv.z), xm4)
-                + dot4I8Packed(nv2_i8map(wv.z >> 4u), xm5)
-                + dot4I8Packed(nv2_i8map(wv.w), xm6)
-                + dot4I8Packed(nv2_i8map(wv.w >> 4u), xm7);
+            let dd = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
+                wv, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
+            let d0 = dd.x;
+            let d1 = dd.y;
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi)) * xs0, f32(d0) * 0.25, acc[m]);
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)) * xs1, f32(d1) * 0.25, acc[m]);
         }
@@ -235,28 +246,20 @@ fn q3w_gemv_nvfp4_mrow2(
         let wv0 = q34_w4[wb0 + p];
         let wsi0 = sfbase + nvfp4_scale_byte_index(sr0, b0, q34_p.k_tiles);
         let wsw0 = q34_ws[wsi0 >> 2u];
-        let a0 = dot4I8Packed(nv2_i8map(wv0.x), xm0)
-            + dot4I8Packed(nv2_i8map(wv0.x >> 4u), xm1)
-            + dot4I8Packed(nv2_i8map(wv0.y), xm2)
-            + dot4I8Packed(nv2_i8map(wv0.y >> 4u), xm3);
-        let a1 = dot4I8Packed(nv2_i8map(wv0.z), xm4)
-            + dot4I8Packed(nv2_i8map(wv0.z >> 4u), xm5)
-            + dot4I8Packed(nv2_i8map(wv0.w), xm6)
-            + dot4I8Packed(nv2_i8map(wv0.w >> 4u), xm7);
+        let dd_wv0 = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
+            wv0, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
+        let a0 = dd_wv0.x;
+        let a1 = dd_wv0.y;
         acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0)) * xs0, f32(a0) * 0.25, acc0);
         acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0 + 1u)) * xs1, f32(a1) * 0.25, acc0);
 
         let wv1 = q34_w4[wb1 + p];
         let wsi1 = sfbase + nvfp4_scale_byte_index(sr1, b0, q34_p.k_tiles);
         let wsw1 = q34_ws[wsi1 >> 2u];
-        let b0d = dot4I8Packed(nv2_i8map(wv1.x), xm0)
-            + dot4I8Packed(nv2_i8map(wv1.x >> 4u), xm1)
-            + dot4I8Packed(nv2_i8map(wv1.y), xm2)
-            + dot4I8Packed(nv2_i8map(wv1.y >> 4u), xm3);
-        let b1d = dot4I8Packed(nv2_i8map(wv1.z), xm4)
-            + dot4I8Packed(nv2_i8map(wv1.z >> 4u), xm5)
-            + dot4I8Packed(nv2_i8map(wv1.w), xm6)
-            + dot4I8Packed(nv2_i8map(wv1.w >> 4u), xm7);
+        let dd_wv1 = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
+            wv1, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
+        let b0d = dd_wv1.x;
+        let b1d = dd_wv1.y;
         acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1)) * xs0, f32(b0d) * 0.25, acc1);
         acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1 + 1u)) * xs1, f32(b1d) * 0.25, acc1);
     }
@@ -332,25 +335,17 @@ fn q3w_gemv_nvfp4_mrow2_2w(
             wv1 = q34_w4[wb1 + p];
             wsw1 = q34_ws[wsi1 >> 2u];
         }
-        let a0 = dot4I8Packed(nv2_i8map(wv0.x), xm0)
-            + dot4I8Packed(nv2_i8map(wv0.x >> 4u), xm1)
-            + dot4I8Packed(nv2_i8map(wv0.y), xm2)
-            + dot4I8Packed(nv2_i8map(wv0.y >> 4u), xm3);
-        let a1 = dot4I8Packed(nv2_i8map(wv0.z), xm4)
-            + dot4I8Packed(nv2_i8map(wv0.z >> 4u), xm5)
-            + dot4I8Packed(nv2_i8map(wv0.w), xm6)
-            + dot4I8Packed(nv2_i8map(wv0.w >> 4u), xm7);
+        let dd_wv0 = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
+            wv0, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
+        let a0 = dd_wv0.x;
+        let a1 = dd_wv0.y;
         acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0)) * xs0, f32(a0) * 0.25, acc0);
         acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0 + 1u)) * xs1, f32(a1) * 0.25, acc0);
 
-        let b0d = dot4I8Packed(nv2_i8map(wv1.x), xm0)
-            + dot4I8Packed(nv2_i8map(wv1.x >> 4u), xm1)
-            + dot4I8Packed(nv2_i8map(wv1.y), xm2)
-            + dot4I8Packed(nv2_i8map(wv1.y >> 4u), xm3);
-        let b1d = dot4I8Packed(nv2_i8map(wv1.z), xm4)
-            + dot4I8Packed(nv2_i8map(wv1.z >> 4u), xm5)
-            + dot4I8Packed(nv2_i8map(wv1.w), xm6)
-            + dot4I8Packed(nv2_i8map(wv1.w >> 4u), xm7);
+        let dd_wv1 = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
+            wv1, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
+        let b0d = dd_wv1.x;
+        let b1d = dd_wv1.y;
         acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1)) * xs0, f32(b0d) * 0.25, acc1);
         acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1 + 1u)) * xs1, f32(b1d) * 0.25, acc1);
     }

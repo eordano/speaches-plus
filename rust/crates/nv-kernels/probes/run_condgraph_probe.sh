@@ -4,7 +4,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CACHE="${NVK_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/cargo-tmp}"
 ENVFILE="$CACHE/devenv-__cuda.sh"
-OUTDIR="${TMPDIR:-$HOME/.cache/nvk-tmp}"
+OUTDIR="${TMPDIR:-$HOME/.cache/claude-tmp}"
 mkdir -p "$OUTDIR"
 OUT="$OUTDIR/condgraph_probe"
 

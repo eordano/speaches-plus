@@ -289,7 +289,10 @@ pub(crate) const EAGLE3_K_MIN: usize = 2;
 pub(crate) const EAGLE3_K_MAX: usize = 64;
 pub(crate) const EAGLE3_K_DEFAULT: usize = 3;
 pub(crate) const EAGLE3_K_SHORT_DEFAULT: usize = 4;
-pub(crate) const EAGLE3_K_CTX_GATE: usize = 8192;
+pub(crate) const EAGLE3_K_CTX_GATE_8192_SAME_SESSION_G4_SWEEP_K4_DECODE_SLOWER_THAN_K3_BY_6PCT_AT_8K_16PCT_AT_32K_33PCT_AT_96K: usize =
+    8192;
+pub(crate) const EAGLE3_K_CTX_GATE: usize =
+    EAGLE3_K_CTX_GATE_8192_SAME_SESSION_G4_SWEEP_K4_DECODE_SLOWER_THAN_K3_BY_6PCT_AT_8K_16PCT_AT_32K_33PCT_AT_96K;
 pub(crate) const SPEC_VERIFY_HEADROOM: usize = 16;
 
 pub(crate) const SPEC_PREFILL_CHUNK_MIN: usize = 16;

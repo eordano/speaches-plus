@@ -174,6 +174,64 @@ fn require_the_checkpoint_and_the_opt_in() -> PathBuf {
     dir
 }
 
+const SERVING_ARM_ESCAPE_ENV: &str = "NV_QWEN35_DENSE_ARM";
+
+const THE_ELEVEN_KEYS_THE_OPT_IN_PATH_ARMS_FOR_THIS_TRUNK: [&str; 11] = [
+    "NV_Q36_GRAPHED_DECODE_FIX",
+    "NV_Q36_GDN_FP8",
+    "NV_Q36_LM_HEAD_FP8",
+    "NV_Q38_FP4_MLP",
+    "NV_Q38_GDN_SPLIT",
+    "NV_Q38_MLP_W4A8",
+    "NV_Q38_W4A8_MK",
+    "NV_Q38_SILUQ_SPLIT",
+    "NV_Q38_NORM_QUANT_FOLD",
+    "NV_Q38_NORM_WRITEOUT",
+    "NV_NVFP4_M1_GEMV",
+];
+
+const A_RUNG_MUST_SAY_WHICH_OF_THE_TWO_PATHS_IT_JUDGES: &str =
+    "taking the qwen3.5-dense cuda opt-in now also arms the eleven-arm stack this checkpoint's \
+     speed-of-light round measured (12.514/79.629 -> 5.425/5.900 ms/tok at 256/8k, ppl 4.833 \
+     against a 4.862 basis, peak VRAM 15877 -> 9183 MiB). Byte equality with the wgpu oracle is a \
+     property of the UNARMED cuda trunk -- the stack changes GDN and lm_head weight dtype, the \
+     MLP activation dtype and the m=1 nvfp4 route, so it is a quantization-class change and its \
+     contract against the oracle is the one the long trace already uses: the answer both backends \
+     arrive at, with the first-divergence index reported. Each rung therefore names its path and \
+     asserts the arm state it got, because the keys are read through first-read-wins caches and a \
+     rung that inherits another rung's arming measures neither path.";
+
+fn arm_state() -> Vec<(&'static str, String)> {
+    THE_ELEVEN_KEYS_THE_OPT_IN_PATH_ARMS_FOR_THIS_TRUNK
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (*k, v)))
+        .collect()
+}
+
+fn hold_the_escape_because_this_rung_judges_the_unarmed_trunk() {
+    assert!(
+        arm_state().is_empty(),
+        "one of the eleven arm keys is already set in this process, so this rung cannot judge the \
+         unarmed trunk: {:?}. Run it in its own process. {A_RUNG_MUST_SAY_WHICH_OF_THE_TWO_PATHS_IT_JUDGES}",
+        arm_state()
+    );
+    std::env::set_var(SERVING_ARM_ESCAPE_ENV, "0");
+}
+
+fn assert_the_whole_stack_is_armed(label: &str) {
+    let got: Vec<&str> = arm_state().iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        got,
+        THE_ELEVEN_KEYS_THE_OPT_IN_PATH_ARMS_FOR_THIS_TRUNK.to_vec(),
+        "[{label}] taking the opt-in must arm all eleven measured keys, not a subset: a subset is \
+         a configuration nothing measured. {A_RUNG_MUST_SAY_WHICH_OF_THE_TWO_PATHS_IT_JUDGES}"
+    );
+    for (k, v) in arm_state() {
+        assert_eq!(v, "1", "[{label}] {k} armed to {v} instead of 1");
+    }
+    eprintln!("[{label}] serving arm ON: all eleven keys, escape {SERVING_ARM_ESCAPE_ENV}=0");
+}
+
 fn load_cuda(dir: &std::path::Path, label: &str) -> Arc<dyn ChatEngine> {
     let t = std::time::Instant::now();
     let engine = NvEngineChat::try_load(dir).unwrap_or_else(|e| {
@@ -200,6 +258,7 @@ fn qwen35_dense_cuda_serving_loads_and_decodes_and_repeats_itself() {
         .try_init();
 
     let a = load_cuda(&dir, "cuda-a");
+    assert_the_whole_stack_is_armed("cuda-a");
     let r1 = run_prompt(
         &a,
         "cuda-a-run1",
@@ -263,12 +322,18 @@ fn qwen35_dense_cuda_answers_what_the_wgpu_oracle_answers() {
     use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, WgpuModelKind};
 
     let dir = require_the_checkpoint_and_the_opt_in();
+    hold_the_escape_because_this_rung_judges_the_unarmed_trunk();
     let _ = tracing_subscriber::fmt()
         .with_env_filter("speaches_plus=info")
         .with_writer(std::io::stderr)
         .try_init();
 
     let cuda = load_cuda(&dir, "cuda");
+    assert!(
+        arm_state().is_empty(),
+        "{SERVING_ARM_ESCAPE_ENV}=0 must leave every one of the eleven keys unset; it armed {:?}",
+        arm_state()
+    );
     let cu_short = run_prompt(
         &cuda,
         "cuda-short",
@@ -369,6 +434,151 @@ fn qwen35_dense_cuda_answers_what_the_wgpu_oracle_answers() {
          stops writing about the same subject as the oracle -- it reuses only {shared} of {} \
          distinct content words. That is what serving garbage looks like on a checkpoint whose \
          short answers still match. cuda {:?} vs wgpu {:?}",
+        oracle_content_words.len(),
+        cu_long.stream(),
+        or_long.stream()
+    );
+}
+
+#[cfg(feature = "wgpu")]
+#[test]
+#[ignore = "loads the same checkpoint twice, once per backend, with the serving stack armed; set NV_QWEN35_DENSE_CUDA_SERVE_TEST=1"]
+fn qwen35_dense_cuda_armed_serving_stack_answers_the_oracles_answer() {
+    use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, WgpuModelKind};
+
+    let dir = require_the_checkpoint_and_the_opt_in();
+    assert!(
+        arm_state().is_empty(),
+        "an arm key is already set in this process, so this rung would judge the caller's \
+         configuration rather than the serving default: {:?}",
+        arm_state()
+    );
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("speaches_plus=info")
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    let cuda = load_cuda(&dir, "cuda-armed");
+    assert_the_whole_stack_is_armed("cuda-armed");
+    let cu_short = run_prompt(
+        &cuda,
+        "cuda-armed-short",
+        FACTUAL_PROMPT_WHOSE_ANSWER_IS_ONE_WORD,
+        64,
+    );
+    let cu_short_again = run_prompt(
+        &cuda,
+        "cuda-armed-short-again",
+        FACTUAL_PROMPT_WHOSE_ANSWER_IS_ONE_WORD,
+        64,
+    );
+    let cu_long = run_prompt_thinking(
+        &cuda,
+        "cuda-armed-long",
+        REASONING_PROMPT_LONG_ENOUGH_TO_SEPARATE_TWO_BACKENDS,
+        512,
+        true,
+    );
+    drop(cuda);
+
+    let engine = WgpuChatEngine::load_with(&dir, 1024, None).expect("wgpu oracle did not load");
+    assert_eq!(engine.kind(), WgpuModelKind::Qwen3_5Dense);
+    let wg: Arc<dyn ChatEngine> = Arc::new(engine);
+    let or_short = run_prompt(
+        &wg,
+        "wgpu-short",
+        FACTUAL_PROMPT_WHOSE_ANSWER_IS_ONE_WORD,
+        64,
+    );
+    let or_long = run_prompt_thinking(
+        &wg,
+        "wgpu-long",
+        REASONING_PROMPT_LONG_ENOUGH_TO_SEPARATE_TWO_BACKENDS,
+        512,
+        true,
+    );
+    drop(wg);
+
+    eprintln!("[ab-armed] {A_RUNG_MUST_SAY_WHICH_OF_THE_TWO_PATHS_IT_JUDGES}");
+    for (label, cu, ora) in [
+        ("short", &cu_short, &or_short),
+        ("long", &cu_long, &or_long),
+    ] {
+        eprintln!(
+            "[ab-armed-{label}] cuda {} chars / {} tok / {} vs wgpu {} chars / {} tok / {}; first \
+             divergence at char {:?}",
+            cu.stream().chars().count(),
+            cu.completion_tokens,
+            cu.finish_reason,
+            ora.stream().chars().count(),
+            ora.completion_tokens,
+            ora.finish_reason,
+            first_divergence(&cu.stream(), &ora.stream()),
+        );
+        assert_eq!(
+            cu.prompt_tokens, ora.prompt_tokens,
+            "[{label}] the two backends tokenized the same rendered prompt differently"
+        );
+    }
+
+    assert_eq!(
+        cu_short.stream(),
+        cu_short_again.stream(),
+        "the armed stack must still be deterministic across two back-to-back greedy requests"
+    );
+    assert!(
+        or_short.content.to_lowercase().contains("paris"),
+        "the wgpu oracle itself did not answer the question, so it cannot judge cuda: {:?}",
+        or_short.content
+    );
+    assert!(
+        cu_short.content.to_lowercase().contains("paris"),
+        "the armed serving stack decoded text that is not the answer the oracle gives: {:?}",
+        cu_short.content
+    );
+    assert_eq!(
+        cu_short.stream(),
+        or_short.stream(),
+        "the eleven-arm serving stack reproduced the wgpu oracle's short greedy answer byte for \
+         byte when this gate was written, and it separated from the oracle LATER on the long \
+         trace than the unarmed trunk does (char 357 vs 218) while reusing more of its content \
+         words (38/49 vs 35/49) -- so the stack is not a coarsening here and a separation on \
+         seven tokens is a numerics change in the armed cuda trunk. It is not by itself a verdict \
+         on the arms: the quantization-class verdict is ppl_qwen35_dense (4.833 against a 4.862 \
+         basis)"
+    );
+    assert_eq!(
+        cu_short.finish_reason, "stop",
+        "the armed turn must end on the checkpoint's stop set, not run out of budget: {:?}",
+        cu_short.content
+    );
+    let mut oracle_content_words: Vec<String> = or_long
+        .stream()
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 7)
+        .map(|w| w.to_string())
+        .collect();
+    oracle_content_words.sort();
+    oracle_content_words.dedup();
+    let cuda_lower = cu_long.stream().to_lowercase();
+    let shared = oracle_content_words
+        .iter()
+        .filter(|w| cuda_lower.contains(w.as_str()))
+        .count();
+    eprintln!(
+        "[ab-armed-long] armed cuda reuses {shared}/{} of the oracle's distinct content words",
+        oracle_content_words.len()
+    );
+    assert!(
+        oracle_content_words.len() >= 20,
+        "the wgpu oracle produced too little long-form text to judge cuda against: {:?}",
+        or_long.stream()
+    );
+    assert!(
+        shared * 2 >= oracle_content_words.len(),
+        "the armed serving stack stops writing about the same subject as the oracle -- it reuses \
+         only {shared} of {} distinct content words. cuda {:?} vs wgpu {:?}",
         oracle_content_words.len(),
         cu_long.stream(),
         or_long.stream()

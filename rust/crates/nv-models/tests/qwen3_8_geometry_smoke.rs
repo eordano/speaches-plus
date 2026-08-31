@@ -370,6 +370,7 @@ mod tiny_host_weights {
                         .into(),
                         q_norm: bf16_bits(q_norm_effective),
                         k_norm: bf16_bits(k_norm_effective),
+                        qkv_bias_bf16: vec![],
                     })),
                 };
                 q3d::HostDenseLayer {

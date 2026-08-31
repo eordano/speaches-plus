@@ -2,4 +2,4 @@
 import type { Hyperparameters } from "./Hyperparameters";
 import type { JsonValue } from "./serde_json/JsonValue";
 
-export type CreateFineTuningJobRequest = { model: string, training_file?: string | null, training_data?: Array<JsonValue> | null, suffix?: string | null, output_dir?: string | null, hyperparameters?: Hyperparameters | null, };
+export type CreateFineTuningJobRequest = { model: string, training_file?: string | null, training_data?: Array<JsonValue> | null, validation_file?: string | null, validation_data?: Array<JsonValue> | null, suffix?: string | null, output_dir?: string | null, hyperparameters?: Hyperparameters | null, };

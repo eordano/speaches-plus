@@ -26,8 +26,12 @@ fn bench_us(stream: &Arc<CudaStream>, iters: usize, mut launch: impl FnMut()) ->
 #[ignore = "measurement ladder, GPU-time only; set NV_KERNELS_BENCH=1 -- sweeps gemv_e4m3_mk m=1..8 on N=17408 K=5120 (the q38 dense mlp gate/up decode shape) and N=6144 K=5120 (o_proj/out_proj) reporting us + GB/s over fp8 weight bytes; the m>=2 xf32-staged-smem arm pays the bf16->f32 x conversion once per element instead of once per output row per chunk"]
 fn gemv_e4m3_mk_m_sweep_gbs_on_q38_decode_shapes() {
     if std::env::var("NV_KERNELS_BENCH").as_deref() != Ok("1") {
-        eprintln!("SKIP: set NV_KERNELS_BENCH=1 to run the m-sweep bench");
-        return;
+        panic!(
+            "NV_KERNELS_BENCH is not 1, so this bench executed nothing. It is already #[ignore]d, \
+             which makes --ignored the opt-in; a second env gate behind that can only make an \
+             --ignored run print `1 passed` for a bench that measured nothing. A suite whose \
+             precondition is absent must fail or be ignored, never return green."
+        );
     }
     let ctx = CudaContext::new(0).expect("cuda device 0");
     let stream = ctx.default_stream();

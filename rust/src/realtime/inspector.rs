@@ -945,7 +945,7 @@ mod tests {
         let ev = InspectorEvent::EouPredictedRollback {
             session_id: "s".into(),
             response_id: "resp_r".into(),
-            reason: "transcript_mismatch",
+            reason: "speech_resumed",
             llm_chars_thrown: 12,
         };
         let w = ev.to_wire();
@@ -953,7 +953,7 @@ mod tests {
         assert_eq!(w.kind, "predicted_rollback");
         assert_eq!(
             w.payload.get("reason"),
-            Some(&serde_json::json!("transcript_mismatch"))
+            Some(&serde_json::json!("speech_resumed"))
         );
         assert_eq!(
             w.payload.get("llm_chars_thrown"),

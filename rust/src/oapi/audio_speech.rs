@@ -60,6 +60,10 @@ pub trait AudioSpeech {
     fn model_id(&self) -> Option<String> {
         None
     }
+
+    fn voices(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,18 +230,11 @@ pub async fn handle(
         _ => return route_to_kokoro(state, req).await,
     };
 
-    let mut entries: Vec<serde_json::Value> = Vec::new();
     if req.input.is_none() {
-        entries.push(missing_field(&["body", "input"]));
-    }
-    if req.voice.is_none() {
-        entries.push(missing_field(&["body", "voice"]));
-    }
-    if !entries.is_empty() {
-        return fastapi_validation_error(entries);
+        return fastapi_validation_error(vec![missing_field(&["body", "input"])]);
     }
     let text = req.input.as_deref().unwrap_or_default();
-    let voice = req.voice.as_deref().unwrap_or("alloy");
+    let voice = req.voice.as_deref().map(str::trim).unwrap_or("");
     let response_format = req
         .response_format
         .clone()

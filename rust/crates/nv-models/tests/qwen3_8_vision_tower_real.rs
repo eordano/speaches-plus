@@ -238,6 +238,7 @@ mod splice {
                         o: bf16_lin(&mut r, hidden, c.num_attention_heads * hd, 0.12).into(),
                         q_norm: norm_vec(&mut r, hd),
                         k_norm: norm_vec(&mut r, hd),
+                        qkv_bias_bf16: vec![],
                     }))
                 }
             };

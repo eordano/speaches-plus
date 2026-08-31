@@ -59,7 +59,7 @@ mod gated {
             .unwrap_or_else(|| panic!("no complete snapshot under {}", root.display()))
     }
 
-    fn assert_checkpoint_declares_vision(dir: &PathBuf) {
+    fn assert_checkpoint_declares_vision(dir: &std::path::Path) {
         let raw = std::fs::read_to_string(dir.join("config.json")).expect("read config.json");
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parse config.json");
         let vision = v

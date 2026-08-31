@@ -2166,14 +2166,6 @@ def test_realtime_eou_wiring_speaches_plus_parity():
     assert rt2.shared is shared and rt2.cap == 42
     ok("PredictedLlmRunnerHandle from_runner/into_runner roundtrip")
 
-    from realtime.eou_predicted import transcripts_materially_differ as _tmd
-    assert not _tmd("hello", "hello", 0.5)
-    assert not _tmd("hi there", "hi there.", 0.5)
-    assert _tmd("cats", "weather", 0.5)
-    assert _tmd("hello", "", 0.5)
-    assert not _tmd("", "", 0.5)
-    ok("transcripts_materially_differ matches Rust decision table")
-
     import asyncio as _asyncio
     from realtime.session import Session, Intent, RealtimeQuery
     from eou.integrated import IntegratedVerdict

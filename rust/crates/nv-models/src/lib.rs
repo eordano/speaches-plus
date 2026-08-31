@@ -11,6 +11,8 @@ pub mod gemma4_e4b;
 #[cfg(feature = "wgpu")]
 pub mod gemma4_e4b_wgpu;
 pub mod gemma4_gguf;
+#[cfg(all(test, feature = "cuda"))]
+mod marlin_zero_drop_lifecycle;
 #[cfg(feature = "cuda")]
 pub mod gemma4_graph;
 pub mod gemma4_mm_splice;
@@ -46,7 +48,14 @@ pub mod laguna_serve;
 pub mod laguna_step_graph;
 #[cfg(feature = "laguna-wip")]
 pub mod laguna_wgpu;
+pub mod laguna_train;
 pub mod hadamard_kv;
+pub mod host_serving_util;
+pub use nv_config::{
+    env_arm_opt_in_eq_some_1_cached_first_read_wins,
+    env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins,
+    env_arm_present_at_all_cached_first_read_wins,
+};
 pub mod paged_fp8;
 pub mod prefix_reuse;
 pub mod qwen3;
@@ -63,9 +72,12 @@ pub mod nvfp4_host;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_ledger;
 #[cfg(feature = "wgpu")]
+pub mod wgpu_lora;
+#[cfg(feature = "wgpu")]
 pub(crate) mod wgpu_state_snapshot;
 
 pub mod dense_train;
+pub mod eagle3_train;
 pub mod train_runner;
 
 pub trait CausalLm {

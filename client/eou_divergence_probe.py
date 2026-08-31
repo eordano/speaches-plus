@@ -1,11 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "numpy>=2.0",
-#   "onnxruntime>=1.20",
-# ]
-# ///
 """eou_divergence_probe -- run smart-turn-v3 directly on captured mic_in.raw
 recordings from inspector dirs, at a sweep of trailing-window positions.
 Used for post-mortem: when EOU verdicts disagree across transports / runs,
@@ -18,7 +11,6 @@ toolchain required.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 

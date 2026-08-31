@@ -115,6 +115,7 @@ pub(crate) async fn run_sampling_laguna(
     if tx.send(ChatEvent::Started { prompt_tokens }).await.is_err() {
         return Ok(());
     }
+    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
     if prompt_ids.is_empty() {
         let _ = tx
             .send(ChatEvent::Done {
@@ -249,6 +250,7 @@ pub(crate) async fn run_sampling_laguna(
         {
             return Ok(());
         }
+        yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
 
         if stop_strings
             .iter()

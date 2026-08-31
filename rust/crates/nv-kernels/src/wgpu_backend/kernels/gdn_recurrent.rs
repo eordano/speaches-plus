@@ -8,6 +8,32 @@ pub const WGSL: &str = include_str!("../../../wgsl/gdn_recurrent.wgsl");
 pub const HEAD_DIM: usize = 128;
 pub const WORKGROUP_SIZE: u32 = 128;
 
+pub const W32_ENTRY: &str = "gdn_recurrent_f32_w32";
+pub const W32_LANES_ONE_WARP_STAGES_KQ_NO_SUBGROUP_OPS_SO_ANY_WIDTH_IS_CORRECT: u32 = 32;
+pub const W32_COL_GROUPS_WG_Z_SPANS_THE_128_COLUMNS: u32 =
+    HEAD_DIM as u32 / W32_LANES_ONE_WARP_STAGES_KQ_NO_SUBGROUP_OPS_SO_ANY_WIDTH_IS_CORRECT;
+pub const SCAN_W32_ENV_OPT_IN_THE_BARRIER_KERNEL_STAYS_THE_DEFAULT: &str = "NV_Q3D_GDN_SCAN_W32";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanArm {
+    Barrier128,
+    Warp32Smem,
+}
+
+pub fn scan_w32_env_opted_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        SCAN_W32_ENV_OPT_IN_THE_BARRIER_KERNEL_STAYS_THE_DEFAULT,
+    )
+}
+
+pub fn scan_arm() -> ScanArm {
+    if scan_w32_env_opted_in() {
+        ScanArm::Warp32Smem
+    } else {
+        ScanArm::Barrier128
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct GdnRecParams {
@@ -58,6 +84,23 @@ pub fn gdn_recurrent_f32(
     h: usize,
     t: usize,
 ) -> Result<()> {
+    gdn_recurrent_f32_with_arm(ctx, q, k, v, g_exp, beta, out, state, b, h, t, scan_arm())
+}
+
+pub fn gdn_recurrent_f32_with_arm(
+    ctx: &WgpuContext,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    g_exp: &[f32],
+    beta: &[f32],
+    out: &mut [f32],
+    state: &mut [f32],
+    b: usize,
+    h: usize,
+    t: usize,
+    arm: ScanArm,
+) -> Result<()> {
     check_shapes(
         q.len(),
         k.len(),
@@ -101,12 +144,24 @@ pub fn gdn_recurrent_f32(
     let sb = dispatch::storage_zeroed(ctx, "gdn-recurrent-state", state_bytes);
     let pb = dispatch::uniform_from(ctx, "gdn-recurrent-params", &params);
 
-    let groups = dispatch::workgroup_count_1d(ctx, pairs as u64, 1);
+    let pair_groups = dispatch::workgroup_count_1d(ctx, pairs as u64, 1);
+    let (label, entry, groups) = match arm {
+        ScanArm::Barrier128 => ("nv_kernels_gdn_recurrent_f32", "gdn_recurrent_f32", pair_groups),
+        ScanArm::Warp32Smem => (
+            "nv_kernels_gdn_recurrent_f32_w32",
+            W32_ENTRY,
+            (
+                pair_groups.0,
+                pair_groups.1,
+                W32_COL_GROUPS_WG_Z_SPANS_THE_128_COLUMNS,
+            ),
+        ),
+    };
     dispatch::run(
         ctx,
-        "nv_kernels_gdn_recurrent_f32",
+        label,
         &compose(WGSL),
-        "gdn_recurrent_f32",
+        entry,
         &[
             (0, &qb),
             (1, &kb),
@@ -143,5 +198,18 @@ mod tests {
         assert!(matches!(e, WgpuError::Shape(_)), "{e}");
         let e = check_shapes(vecs, vecs, vecs, rows, rows, vecs, st - 4, 2, 4, 3).unwrap_err();
         assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+    }
+
+    #[test]
+    fn four_wg32_column_groups_cover_the_head_dim_and_the_entry_uses_no_subgroup_ops() {
+        assert_eq!(
+            W32_COL_GROUPS_WG_Z_SPANS_THE_128_COLUMNS
+                * W32_LANES_ONE_WARP_STAGES_KQ_NO_SUBGROUP_OPS_SO_ANY_WIDTH_IS_CORRECT,
+            HEAD_DIM as u32
+        );
+        assert!(WGSL.contains(W32_ENTRY));
+        assert!(WGSL.contains("@workgroup_size(32)"));
+        assert!(!WGSL.contains("subgroup"));
+        assert!(!WGSL.contains("enable subgroups"));
     }
 }

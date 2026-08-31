@@ -50,7 +50,6 @@ pub mod eou {
     pub const PREDICTED_TOKEN_BUFFER_CAP: u32 = 256;
     pub const EOT_THRESHOLD: f32 = 0.7;
     pub const EAGER_EOT_THRESHOLD: f32 = 0.5;
-    pub const EAGER_TRANSCRIPT_MISMATCH_RATIO: f32 = 0.5;
 
     pub const INPUT_IDS: &str = "input_ids";
     pub const ATTENTION_MASK: &str = "attention_mask";
@@ -268,6 +267,7 @@ pub mod env {
     pub const EOU_EAGER_PERIODIC: &str = "EOU_EAGER_PERIODIC";
     pub const EOU_EAGER_INTERVAL_MS: &str = "EOU_EAGER_INTERVAL_MS";
     pub const EOU_PREDICTED_TOKEN_BUFFER_CAP: &str = "EOU_PREDICTED_TOKEN_BUFFER_CAP";
+    pub const REASONING_EFFORT: &str = "NV_REASONING_EFFORT";
     pub const EOU_EOT_THRESHOLD: &str = "EOU_EOT_THRESHOLD";
     pub const EOU_EAGER_EOT_THRESHOLD: &str = "EOU_EAGER_EOT_THRESHOLD";
     pub const EOU_FUSION_RULE: &str = "EOU_FUSION_RULE";

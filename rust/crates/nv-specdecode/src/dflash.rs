@@ -8,7 +8,7 @@ use nv_weights::WeightLoader;
 use std::path::Path;
 
 use crate::eagle3_loader::{load_d2t, load_t2d, validate_d2t, validate_t2d};
-use crate::util::{load_linear, load_rmsnorm, load_tensor};
+use nv_layers::weight_load::{load_linear, load_rmsnorm, load_tensor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DFlashLayerAttn {
@@ -44,6 +44,77 @@ pub struct DFlashSpeculatorConfig {
     pub sliding_window: usize,
     pub logit_softcap: Option<f64>,
     pub tied_embeddings: bool,
+    pub markov_rank: usize,
+    pub rope_yarn: Option<DFlashRopeYarn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DFlashRopeYarn {
+    pub factor: f64,
+    pub original_max_position_embeddings: usize,
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+}
+
+impl DFlashRopeYarn {
+    fn from_rope_params_json(rp: &serde_json::Value) -> Option<Self> {
+        let kind = rp
+            .get("rope_type")
+            .or_else(|| rp.get("type"))
+            .and_then(|x| x.as_str())?;
+        if kind != "yarn" {
+            return None;
+        }
+        let factor = rp.get("factor").and_then(|x| x.as_f64())?;
+        let original = rp
+            .get("original_max_position_embeddings")
+            .and_then(|x| x.as_u64())? as usize;
+        if !(factor > 1.0) || original == 0 {
+            return None;
+        }
+        Some(Self {
+            factor,
+            original_max_position_embeddings: original,
+            beta_fast: rp.get("beta_fast").and_then(|x| x.as_f64()).unwrap_or(32.0),
+            beta_slow: rp.get("beta_slow").and_then(|x| x.as_f64()).unwrap_or(1.0),
+        })
+    }
+
+    pub fn attention_factor(&self) -> f64 {
+        0.1 * self.factor.ln() + 1.0
+    }
+
+    pub fn inv_freq(&self, head_dim: usize, base: f64) -> Vec<f64> {
+        let half = head_dim / 2;
+        let dim = head_dim as f64;
+        let orig = self.original_max_position_embeddings as f64;
+        let corr = |beta: f64| dim * (orig / (beta * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln());
+        let low = corr(self.beta_fast).floor();
+        let high = corr(self.beta_slow).ceil();
+        let span = if (high - low).abs() < 1e-3 {
+            1e-3
+        } else {
+            high - low
+        };
+        (0..half)
+            .map(|i| {
+                let pos_freq = base.powf((i as f64 * 2.0) / dim);
+                let extrapolation = 1.0 / pos_freq;
+                let interpolation = 1.0 / (self.factor * pos_freq);
+                let ramp = ((i as f64 - low) / span).clamp(0.0, 1.0);
+                let extrapolation_weight = 1.0 - ramp;
+                interpolation * (1.0 - extrapolation_weight) + extrapolation * extrapolation_weight
+            })
+            .collect()
+    }
+}
+
+pub const YARN_MSCALE_IS_FOLDED_INTO_THE_ROPE_TABLES_BECAUSE_SCALING_COS_AND_SIN_SCALES_Q_AND_K_IDENTICALLY: &str = "YaRN multiplies the cos/sin tables by attention_factor = 0.1*ln(factor)+1. Because q_embed = q*cos + rotate_half(q)*sin is linear in the tables, scaling both tables scales q and k by the same constant, so folding the factor into the tables at build time is exact and needs no change to any attention scale, graphed or eager. DFlashRopeYarn::inv_freq plus a pre-scaled table pair reach Rope through from_precomputed_tables_one_row_per_token_so_mrope_rides_the_standard_apply, so the drafter's rope stays one object and every draft path -- eager, masked and cuda-graphed -- picks the scaling up without knowing about it";
+
+pub const HEADLESS_DFLASH_DRAFTER_BORROWS_TARGET_EMBED_AND_LM_HEAD_AND_IS_DETECTED_FROM_THE_FILE_NOT_A_FLAG: &str = "RadixArk/Qwen3.8-27B-DSpark ships 62 tensors and none of them is embed_tokens.weight or lm_head.weight, while its config sets tie_word_embeddings=false. That is not a broken export: dflash.py::spec_generate builds the block's noise embedding from target.model.embed_tokens and reads draft logits through target.lm_head, so a DFlash/DSpark drafter is headless by construction and shares the target's vocabulary heads. Headless mode is therefore entered from the CONTENTS of the safetensors file -- neither head present and no tie flag -- never from an environment variable, so no checkpoint that loaded before can take a different path than it took before: every such checkpoint either ships the two tensors or sets the tie flag, and both of those branches are unchanged. In headless mode the caller MUST supply both the target embedding and the target lm_head; supplying the embedding alone and reusing it as the lm_head is wrong for this family because the target itself is untied (unsloth/Qwen3.8-27B-NVFP4 text_config.tie_word_embeddings=false, lm_head.weight is a separate F8_E4M3 [248320,5120] tensor with its own per-row scale)";
+
+fn dfc_opt_get<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    v.get("dflash_config").and_then(|d| d.get(key))
 }
 
 impl Default for DFlashSpeculatorConfig {
@@ -68,6 +139,8 @@ impl Default for DFlashSpeculatorConfig {
             sliding_window: 0,
             logit_softcap: None,
             tied_embeddings: false,
+            markov_rank: 0,
+            rope_yarn: None,
         }
     }
 }
@@ -172,6 +245,16 @@ impl DFlashSpeculatorConfig {
         {
             cfg.rope_theta = theta as f32;
         }
+        cfg.rope_yarn = v
+            .get("rope_parameters")
+            .or_else(|| v.get("rope_scaling"))
+            .and_then(DFlashRopeYarn::from_rope_params_json);
+        cfg.markov_rank = v
+            .get("markov_rank")
+            .or_else(|| dfc_opt_get(v, "markov_rank"))
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize)
+            .unwrap_or(0);
         if let Some(b) = v.get("block_size").and_then(|x| x.as_u64()) {
             cfg.block_size = b as usize;
         }
@@ -537,6 +620,118 @@ impl DFlashContextKv {
     }
 }
 
+pub const DSPARK_MARKOV_HEAD_MAKES_A_PARALLEL_BLOCK_CONDITION_ON_ITS_OWN_PREVIOUS_ROW_WITHOUT_A_SECOND_BACKBONE_PASS: &str = "VanillaMarkov is nn.Embedding(vocab, rank) followed by nn.Linear(rank, vocab, bias=False), and the reference adds its output to the draft logits keyed on the PREVIOUS token. In a DFlash block every row after the anchor is a MASK, so the previous token of row j is row j-1's own draft. Applying the head therefore walks the block once: the backbone still runs a single parallel pass producing all m hidden rows, and only the vocabulary epilogue is sequential -- one rank-256 lookup and one rank-to-vocab GEMV per row. That is the whole mechanism by which the head raises acceptance: without it every row is drafted independently from a mask and nothing carries the block's own choices forward";
+
+pub const DSPARK_CONFIDENCE_HEAD_SCORES_A_ROW_FROM_HIDDEN_CONCAT_MARKOV_LATENT_WHICH_IS_WHY_ITS_INPUT_IS_5376: &str = "AcceptRatePredictor is a single nn.Linear(input_dim, 1) trained against the empirical draft-vs-target accept rate. With confidence_head_with_markov=true its input_dim is hidden_size + markov_rank, which is exactly the 5376 of confidence_head.proj.weight [1, 5376] against hidden 5120 and rank 256 -- so the feature is the concatenation of the row's backbone hidden state with the rank-256 markov latent of the row's previous token, and the shape of the shipped tensor is what proves the concatenation order is (hidden, latent)";
+
+pub struct DSparkHeads {
+    markov_w1: Tensor,
+    markov_w2: Linear,
+    confidence: Linear,
+    markov_rank: usize,
+}
+
+impl DSparkHeads {
+    pub const MARKOV_W1: &'static str = "markov_head.markov_w1.weight";
+    pub const MARKOV_W2: &'static str = "markov_head.markov_w2.weight";
+    pub const CONFIDENCE_W: &'static str = "confidence_head.proj.weight";
+    pub const CONFIDENCE_B: &'static str = "confidence_head.proj.bias";
+
+    pub fn try_load(
+        weights: &WeightLoader,
+        cfg: &DFlashSpeculatorConfig,
+        dtype: DType,
+    ) -> Result<Option<Self>> {
+        if !weights.has(Self::MARKOV_W1) && !weights.has(Self::CONFIDENCE_W) {
+            return Ok(None);
+        }
+        let rank = cfg.markov_rank;
+        if rank == 0 {
+            bail!(
+                "checkpoint ships {} / {} but config declares markov_rank 0",
+                Self::MARKOV_W1,
+                Self::CONFIDENCE_W
+            );
+        }
+        let v = cfg.target_vocab_size;
+        let markov_w1 = load_tensor(weights, Self::MARKOV_W1, &[v, rank], dtype)?;
+        let markov_w2 = load_linear(weights, Self::MARKOV_W2, v, rank, dtype)?;
+        let confidence = nv_layers::weight_load::load_linear_with_bias_names(
+            weights,
+            Self::CONFIDENCE_W,
+            1,
+            cfg.hidden_size + rank,
+            Some(Self::CONFIDENCE_B),
+            dtype,
+        )?;
+        Ok(Some(Self {
+            markov_w1,
+            markov_w2,
+            confidence,
+            markov_rank: rank,
+        }))
+    }
+
+    pub fn markov_rank(&self) -> usize {
+        self.markov_rank
+    }
+
+    pub fn markov_latent(&self, prev_token: u32) -> Result<Tensor> {
+        let idx = Tensor::from_vec(vec![prev_token], 1, self.markov_w1.device())?;
+        Ok(self.markov_w1.index_select(&idx, 0)?.contiguous()?)
+    }
+
+    pub fn logit_bias(&self, latent: &Tensor) -> Result<Tensor> {
+        self.markov_w2.forward(latent)
+    }
+
+    pub fn accept_prob(&self, hidden_row: &Tensor, latent: &Tensor) -> Result<f32> {
+        let feats = Tensor::cat(
+            &[
+                &hidden_row.reshape((1, hidden_row.elem_count()))?,
+                &latent.reshape((1, latent.elem_count()))?,
+            ],
+            1,
+        )?
+        .contiguous()?;
+        let logit = self
+            .confidence
+            .forward(&feats)?
+            .to_dtype(DType::F32)?
+            .reshape(1)?
+            .to_vec1::<f32>()?[0];
+        Ok(1.0 / (1.0 + (-logit).exp()))
+    }
+}
+
+pub const DSPARK_ADAPTIVE_SUBMIT_IS_ENV_GATED_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_NUMBER_WAS_TAKEN_FIXED_K: &str = "NV_DSPARK_ADAPTIVE=<threshold> turns the confidence head from a reported statistic into a decision: the block is truncated at the last row whose cumulative predicted accept probability is still at or above the threshold, so a step submits between 1 and block rows instead of always block rows. It is unset by default and the drafter behaves exactly as it did before, because the fixed-k block is what every acceptance and every timing on record was measured with, and because a truncation rule changes how many verify rows the target is asked for, which moves the verify block's cost as well as its yield";
+
+pub fn dspark_adaptive_threshold_from_env() -> Option<f32> {
+    std::env::var("NV_DSPARK_ADAPTIVE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|t| *t > 0.0 && *t < 1.0)
+}
+
+pub fn adaptive_submit_len(accept_probs: &[f32], threshold: f32) -> usize {
+    let mut cumulative = 1.0f32;
+    let mut len = 0usize;
+    for &p in accept_probs {
+        cumulative *= p.clamp(0.0, 1.0);
+        if cumulative < threshold {
+            break;
+        }
+        len += 1;
+    }
+    len.max(1)
+}
+
+pub struct DSparkBlockDraft {
+    pub ids: Vec<u32>,
+    pub accept_probs: Vec<f32>,
+    pub submit_len: usize,
+}
+
 pub struct LoadedDFlashDrafter {
     cfg: DFlashSpeculatorConfig,
     device: Device,
@@ -551,6 +746,7 @@ pub struct LoadedDFlashDrafter {
     d2t: Vec<u32>,
     t2d: Vec<bool>,
     d2t_map_dev: std::sync::OnceLock<Tensor>,
+    dspark: Option<DSparkHeads>,
 }
 
 impl LoadedDFlashDrafter {
@@ -587,6 +783,31 @@ impl LoadedDFlashDrafter {
         Self::try_load_with_target_embed(model_dir, device, None)
     }
 
+    pub fn try_load_with_target_heads(
+        model_dir: &Path,
+        device: &Device,
+        target_embed: Option<&Tensor>,
+        target_lm_head: Option<Linear>,
+    ) -> Result<Self> {
+        let cfg_path = model_dir.join("config.json");
+        let cfg = if cfg_path.is_file() {
+            DFlashSpeculatorConfig::from_hf_json_file(&cfg_path)?
+        } else {
+            DFlashSpeculatorConfig::default()
+        };
+        let st_path = model_dir.join("model.safetensors");
+        if !st_path.is_file() {
+            bail!("missing model.safetensors at {}", st_path.display());
+        }
+        Self::load_from_safetensors_with_target_heads(
+            &cfg,
+            &st_path,
+            device,
+            target_embed,
+            target_lm_head,
+        )
+    }
+
     pub fn try_load_with_target_embed(
         model_dir: &Path,
         device: &Device,
@@ -619,6 +840,16 @@ impl LoadedDFlashDrafter {
         device: &Device,
         target_embed: Option<&Tensor>,
     ) -> Result<Self> {
+        Self::load_from_safetensors_with_target_heads(cfg, safetensors_path, device, target_embed, None)
+    }
+
+    pub fn load_from_safetensors_with_target_heads(
+        cfg: &DFlashSpeculatorConfig,
+        safetensors_path: &Path,
+        device: &Device,
+        target_embed: Option<&Tensor>,
+        target_lm_head: Option<Linear>,
+    ) -> Result<Self> {
         let weights = WeightLoader::open_file(safetensors_path, device)
             .with_context(|| format!("open {}", safetensors_path.display()))?;
 
@@ -628,6 +859,17 @@ impl LoadedDFlashDrafter {
             DType::BF16
         };
 
+        let headless = !weights.has("embed_tokens.weight")
+            && !weights.has("lm_head.weight")
+            && !cfg.tied_embeddings;
+        if headless {
+            anyhow::ensure!(
+                target_embed.is_some() && target_lm_head.is_some(),
+                "{}",
+                HEADLESS_DFLASH_DRAFTER_BORROWS_TARGET_EMBED_AND_LM_HEAD_AND_IS_DETECTED_FROM_THE_FILE_NOT_A_FLAG
+            );
+        }
+
         let embed_tokens = if weights.has("embed_tokens.weight") {
             load_tensor(
                 &weights,
@@ -636,7 +878,7 @@ impl LoadedDFlashDrafter {
                 dtype,
             )?
         } else {
-            if !cfg.tied_embeddings {
+            if !cfg.tied_embeddings && !headless {
                 bail!(
                     "checkpoint ships no embed_tokens.weight and config does not set \
                      tie_word_embeddings"
@@ -691,6 +933,8 @@ impl LoadedDFlashDrafter {
                 cfg.hidden_size,
                 dtype,
             )?
+        } else if headless {
+            target_lm_head.expect("headless gate above already required a target lm_head")
         } else {
             if !cfg.tied_embeddings {
                 bail!(
@@ -729,10 +973,12 @@ impl LoadedDFlashDrafter {
         validate_t2d(&t2d, cfg.target_vocab_size)
             .with_context(|| format!("speculator {}", safetensors_path.display()))?;
 
+        let dspark = DSparkHeads::try_load(&weights, cfg, dtype)?;
+
         #[cfg(feature = "cuda")]
         let (layers, lm_head) = maybe_quantize_dflash_nvfp4(layers, lm_head, device, dtype)?;
 
-        Self::from_parts(
+        let mut loaded = Self::from_parts(
             cfg.clone(),
             device.clone(),
             dtype,
@@ -744,7 +990,13 @@ impl LoadedDFlashDrafter {
             lm_head,
             d2t,
             t2d,
-        )
+        )?;
+        loaded.dspark = dspark;
+        Ok(loaded)
+    }
+
+    pub fn dspark_heads(&self) -> Option<&DSparkHeads> {
+        self.dspark.as_ref()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -770,15 +1022,40 @@ impl LoadedDFlashDrafter {
         }
         validate_d2t(&d2t, cfg.draft_vocab_size, cfg.target_vocab_size)?;
         validate_t2d(&t2d, cfg.target_vocab_size)?;
-        let rope = Rope::new(
-            RopeConfig {
-                head_dim: cfg.head_dim,
-                max_seq_len: cfg.max_position_embeddings,
-                base: cfg.rope_theta,
-                kind: RopeKind::Standard,
-            },
-            &device,
-        )?;
+        let rope = match cfg.rope_yarn {
+            None => Rope::new(
+                RopeConfig {
+                    head_dim: cfg.head_dim,
+                    max_seq_len: cfg.max_position_embeddings,
+                    base: cfg.rope_theta,
+                    kind: RopeKind::Standard,
+                },
+                &device,
+            )?,
+            Some(yarn) => {
+                let inv_freq = yarn.inv_freq(cfg.head_dim, cfg.rope_theta as f64);
+                let (mut cos, mut sin) = nv_layers::rope::build_rope_tables_f64(
+                    &inv_freq,
+                    cfg.max_position_embeddings,
+                );
+                let mscale = yarn.attention_factor() as f32;
+                for v in cos.iter_mut().chain(sin.iter_mut()) {
+                    *v *= mscale;
+                }
+                let half = cfg.head_dim / 2;
+                let shape = (cfg.max_position_embeddings, half);
+                Rope::from_precomputed_tables_one_row_per_token_so_mrope_rides_the_standard_apply(
+                    RopeConfig {
+                        head_dim: cfg.head_dim,
+                        max_seq_len: cfg.max_position_embeddings,
+                        base: cfg.rope_theta,
+                        kind: RopeKind::Yarn,
+                    },
+                    Tensor::from_vec(cos, shape, &device)?,
+                    Tensor::from_vec(sin, shape, &device)?,
+                )?
+            }
+        };
         Ok(Self {
             cfg,
             device,
@@ -793,6 +1070,7 @@ impl LoadedDFlashDrafter {
             d2t,
             t2d,
             d2t_map_dev: std::sync::OnceLock::new(),
+            dspark: None,
         })
     }
 
@@ -1183,6 +1461,51 @@ impl LoadedDFlashDrafter {
         Ok((ids, top_prob, margin))
     }
 
+    pub fn draft_block_dspark(
+        &self,
+        ctx: &DFlashContextKv,
+        anchor: u32,
+    ) -> Result<DSparkBlockDraft> {
+        let heads = self.dspark.as_ref().ok_or_else(|| {
+            anyhow!(
+                "draft_block_dspark needs the DSpark heads; this checkpoint ships no {}",
+                DSparkHeads::MARKOV_W1
+            )
+        })?;
+        let m = self.cfg.query_rows();
+        let hidden = self
+            .forward_block_hidden(ctx, anchor)?
+            .reshape((m, self.cfg.hidden_size))?;
+        let base = self
+            .lm_head
+            .forward(&hidden)?
+            .to_dtype(DType::F32)?
+            .reshape((m, self.cfg.draft_vocab_size))?;
+        let mut ids = Vec::with_capacity(m);
+        let mut accept_probs = Vec::with_capacity(m);
+        let mut prev = anchor;
+        for row in 0..m {
+            let latent = heads.markov_latent(prev)?;
+            let biased = base
+                .narrow(0, row, 1)?
+                .broadcast_add(&heads.logit_bias(&latent)?.to_dtype(DType::F32)?)?;
+            let next = biased.argmax(D::Minus1)?.to_vec1::<u32>()?[0];
+            accept_probs.push(heads.accept_prob(&hidden.narrow(0, row, 1)?, &latent)?);
+            let mapped = self.d2t_map(next);
+            ids.push(mapped);
+            prev = mapped;
+        }
+        let submit_len = match dspark_adaptive_threshold_from_env() {
+            Some(t) => adaptive_submit_len(&accept_probs, t),
+            None => m,
+        };
+        Ok(DSparkBlockDraft {
+            ids,
+            accept_probs,
+            submit_len,
+        })
+    }
+
     pub fn draft_block_dev(&self, ctx: &DFlashContextKv, anchor: u32) -> Result<Tensor> {
         let idx = self.draft_indices(ctx, anchor)?;
         Ok(self.d2t_map_dev_tensor()?.index_select(&idx, 0)?)
@@ -1209,9 +1532,9 @@ fn dflash_quant_nvfp4_enabled() -> bool {
 
 #[cfg(feature = "cuda")]
 fn dflash_quant_lmhead_enabled() -> bool {
-    std::env::var("NV_DFLASH_QUANT_LMHEAD")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_DFLASH_QUANT_LMHEAD",
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -2077,7 +2400,7 @@ impl LoadedDFlashDrafter {
                 .wrapping_add(l.vc);
         }
         token = token.rotate_left(11).wrapping_add(m as u64);
-        let dbg = std::env::var_os("NV_DFLASH_GRAPH_DEBUG").is_some();
+        let dbg = nv_config::env_arm_present_at_all_reread_every_call("NV_DFLASH_GRAPH_DEBUG");
         let t_run = std::time::Instant::now();
         g.runner.run(token, body)?;
         let launch_ms = t_run.elapsed().as_secs_f64() * 1000.0;
@@ -2123,6 +2446,8 @@ mod tests {
             sliding_window: 0,
             logit_softcap: None,
             tied_embeddings: false,
+            markov_rank: 0,
+            rope_yarn: None,
         }
     }
 

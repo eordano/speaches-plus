@@ -6,7 +6,7 @@ use common::ctx;
 use nv_kernels::wgpu_backend::device::WgpuContext;
 use nv_kernels::wgpu_backend::kernels::flash_decode as fd;
 use nv_kernels::wgpu_backend::{compose, dispatch};
-use nv_models::gemma4_e4b_wgpu::{flash1_e4b_entry, flash1_e4b_source, flash1_sg_supported};
+use nv_models::gemma4_e4b_wgpu::flash1_sg_supported;
 use std::time::Instant;
 
 const BATCH: usize = 64;
@@ -82,8 +82,8 @@ fn what_the_gqa_fold_is_worth() {
             &s,
             &inp,
             "fb-plain",
-            &format!("{}\n{}", compose(fd::WGSL), flash1_e4b_source(s.hd, sg)),
-            &flash1_e4b_entry(s.hd, sg),
+            &format!("{}\n{}", compose(fd::WGSL), fd::fold_stage1_source(s.hd, sg, 1)),
+            &fd::fold_stage1_entry(s.hd, sg, 1),
             s.n_q,
         );
 

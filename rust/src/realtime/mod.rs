@@ -428,14 +428,12 @@ mod admission_tests {
     }
 }
 
-pub(crate) fn hold_slot<F>(guard: ActiveSessionGuard, fut: F) -> impl std::future::Future<Output = ()>
+pub(crate) async fn hold_slot<F>(guard: ActiveSessionGuard, fut: F)
 where
     F: std::future::Future<Output = ()>,
 {
-    async move {
-        let _hold = guard;
-        fut.await
-    }
+    let _hold = guard;
+    fut.await
 }
 
 pub async fn handle_offer(offer_sdp: &str, query: &RealtimeQuery) -> anyhow::Result<String> {

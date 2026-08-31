@@ -100,6 +100,26 @@ fn gemma4_cuda_decode_ms_per_token_vs_context_depth_eager_path() {
             1000.0 / median,
             step_ms.len()
         );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "cuda",
+                device: ctx_timing_common::cuda_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_cuda_decode_step_chunked_prefill_primed",
+            },
+            &[
+                ("arm", ctx_timing_common::arm_label_from_the_resolved_value_of_every_gate_accessor_because_a_presence_label_lies_after_a_default_flip(
+                    &ctx_timing_common::GEMMA4_DECODE_NUMERICS_GATES_EVERY_ONE_APPEARS_RESOLVED_IN_THE_ARM_LABEL,
+                )),
+                ("prefill_s", format!("{prefill_s:.1}")),
+            ],
+        );
     }
 }
 
@@ -178,6 +198,26 @@ fn gemma4_cuda_decode_ms_per_token_vs_context_depth_synthetic_cache_fill() {
             "CTX-SCALING gemma4-cuda-eager-synthfill depth={depth} median_ms_tok={median:.3} tok_s={:.1} fill_s={fill_s:.1} steps={} warmup_steps={warmup_steps}",
             1000.0 / median,
             step_ms.len()
+        );
+        ctx_timing_common::emit_nv_measure_v1_alongside_the_legacy_line_which_stays_for_one_release(
+            ctx_timing_common::NvMeasureCtxLine {
+                instrument: "ctx-scaling",
+                model_dir: &dir,
+                backend: "cuda",
+                device: ctx_timing_common::cuda_device_name_for_the_nv_measure_device_basis_field(),
+                tokens_primed_kv_depth_of_this_run_never_a_capacity: depth,
+                steps: step_ms.len(),
+                warmup: warmup_steps,
+                value: median,
+                unit: "ms/tok",
+                basis: "eager_cuda_decode_step_synthetic_state_fill",
+            },
+            &[
+                ("arm", ctx_timing_common::arm_label_from_the_resolved_value_of_every_gate_accessor_because_a_presence_label_lies_after_a_default_flip(
+                    &ctx_timing_common::GEMMA4_DECODE_NUMERICS_GATES_EVERY_ONE_APPEARS_RESOLVED_IN_THE_ARM_LABEL,
+                )),
+                ("fill_s", format!("{fill_s:.1}")),
+            ],
         );
     }
 }

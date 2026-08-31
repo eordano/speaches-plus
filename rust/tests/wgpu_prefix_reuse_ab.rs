@@ -22,7 +22,7 @@ mod gated {
     use speaches_plus::oapi::chat::{handle_chat_completions, ChatAppState, ChatEngine};
     use speaches_plus::oapi::chat_engine::ChatRegistry;
     use speaches_plus::oapi::chat_engine_wgpu::persist::KV_CACHE_DIR_ENV;
-    use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, PREFIX_REUSE_ENV};
+    use speaches_plus::oapi::chat_engine_wgpu::{WgpuChatEngine, PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -30,7 +30,7 @@ mod gated {
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            std::env::remove_var(PREFIX_REUSE_ENV);
+            std::env::remove_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM);
             std::env::remove_var(KV_CACHE_DIR_ENV);
         }
     }
@@ -166,7 +166,7 @@ mod gated {
             .with_writer(std::io::stderr)
             .try_init();
 
-        std::env::remove_var(PREFIX_REUSE_ENV);
+        std::env::set_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM, "0");
         let engine = Arc::new(
             WgpuChatEngine::load_with(&dir, MAX_SEQ, None)
                 .unwrap_or_else(|err| panic!("wgpu engine did not load: {err:#}")),
@@ -179,12 +179,12 @@ mod gated {
             .unwrap();
 
         rt.block_on(async {
-            let cold = serve(&app, &model, "cold", &prompt_a()).await;
-            let cold_again = serve(&app, &model, "cold-again", &prompt_a()).await;
+            let cold = serve(&app, model, "cold", &prompt_a()).await;
+            let cold_again = serve(&app, model, "cold-again", &prompt_a()).await;
             assert_eq!(
                 engine.prefix_tokens_reused(),
                 0,
-                "reuse is off by default: {PREFIX_REUSE_ENV} unset must reset every request"
+                "the cold arms pin {PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM}=0 (reuse is the unset default), so every request here must reset"
             );
             assert_eq!(
                 cold.2, None,
@@ -197,12 +197,12 @@ mod gated {
                  about prefix reuse could not mean anything"
             );
 
-            std::env::set_var(PREFIX_REUSE_ENV, "1");
-            serve(&app, &model, "warm-b", &prompt_b()).await;
+            std::env::set_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM, "1");
+            serve(&app, model, "warm-b", &prompt_b()).await;
             let before = engine.prefix_tokens_reused();
-            let reused = serve(&app, &model, "reused", &prompt_a()).await;
+            let reused = serve(&app, model, "reused", &prompt_a()).await;
             let gained = engine.prefix_tokens_reused() - before;
-            std::env::remove_var(PREFIX_REUSE_ENV);
+            std::env::set_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM, "0");
 
             assert!(
                 gained > 0,
@@ -260,7 +260,7 @@ mod gated {
         let _ = std::fs::remove_dir_all(&cache_dir);
         std::fs::create_dir_all(&cache_dir).unwrap();
         std::env::set_var(KV_CACHE_DIR_ENV, &cache_dir);
-        std::env::set_var(PREFIX_REUSE_ENV, "1");
+        std::env::set_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM, "1");
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -347,7 +347,7 @@ mod gated {
         drop(engine);
 
         std::env::remove_var(KV_CACHE_DIR_ENV);
-        std::env::remove_var(PREFIX_REUSE_ENV);
+        std::env::remove_var(PREFIX_REUSE_ENV_DEFAULT_ON_SET_0_FOR_THE_COLD_PREFILL_EVERY_TURN_ARM);
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

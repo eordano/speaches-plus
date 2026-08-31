@@ -1,15 +1,4 @@
 #!/usr/bin/env -S uv run --script
-# /// script
-# requires-python = ">=3.11,<3.13"
-# dependencies = [
-#   "huggingface_hub>=0.27",
-#   "soundfile>=0.13",
-#   "numpy>=2.0",
-#   "onnxruntime>=1.20",
-#   "faster-whisper>=1.1",
-#   "pyarrow>=17",
-# ]
-# ///
 """extract_features -- pull a real-data sample from
 pipecat-ai/smart-turn-data-v3 and produce a JSONL of feature rows for
 client/gated_fusion/train.py to fit a logistic regression on.
@@ -45,7 +34,6 @@ import argparse
 import io
 import json
 import logging
-import os
 import sys
 import time
 from pathlib import Path

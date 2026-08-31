@@ -10,6 +10,7 @@ pub struct WgpuContext {
     pub queue: wgpu::Queue,
     pub info: wgpu::AdapterInfo,
     pub caps: Capabilities,
+    pub ts_inside_passes: bool,
 }
 
 static SG_WIDTH: OnceLock<Option<u32>> = OnceLock::new();
@@ -192,6 +193,9 @@ impl WgpuContext {
         }
         if caps.timestamp_query {
             base |= wgpu::Features::TIMESTAMP_QUERY;
+            if available.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES) {
+                base |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+            }
         }
         if available.contains(wgpu::Features::PASSTHROUGH_SHADERS) {
             base |= wgpu::Features::PASSTHROUGH_SHADERS;
@@ -228,6 +232,9 @@ impl WgpuContext {
         };
 
         caps.timestamp_query = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let ts_inside_passes = device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
         caps.cooperative_matrix = device.features().contains(coop_bit);
         if !caps.cooperative_matrix {
             caps.coop_configs.clear();
@@ -241,6 +248,7 @@ impl WgpuContext {
             queue,
             info,
             caps,
+            ts_inside_passes,
         };
         ctx.caps.subgroup_runtime_width = ctx.subgroup_width();
         Ok(ctx)

@@ -26,56 +26,61 @@
 
   <div class="axis-scroll" id="axisScroll">
   <div class="axis-stage">
-    <div class="pin tier3 pin-vllm" style="left:65.4%">
+    <div class="pin tier3 pin-vllm" style="left:58.18%">
       <div class="pin-label">
         <span class="pin-name ghost-name">VLLM &middot; FP8</span>
-        <span class="pin-val">&asymp;1.18 TB/s</span>
+        <span class="pin-val">&asymp;1.107 TB/s</span>
         <span class="pin-tag pending">decode rows being measured &middot; position from prefill ratio</span>
       </div>
       <div class="pin-line dashed"></div>
     </div>
-    <div class="pin tier2 pin-plain" style="left:67.4%">
+    <div class="pin tier2 pin-plain" style="left:59.89%">
       <div class="pin-label">
         <span class="pin-name ours-name">OURS &middot; PLAIN</span>
-        <span class="pin-val">1.213 TB/s</span>
-        <span class="pin-tag">16.9 ms/tok</span>
+        <span class="pin-val">1.140 TB/s</span>
+        <span class="pin-tag">16.9 ms/tok &middot; 70% of sustained</span>
       </div>
       <div class="pin-line"></div>
     </div>
-    <div class="pin tier1 pin-llama" style="left:69.9%">
+    <div class="pin tier1 pin-llama" style="left:62.17%">
       <div class="pin-label">
         <span class="pin-name ghost-name">LLAMA.CPP &middot; Q4_K_M</span>
-        <span class="pin-val">1.259 TB/s</span>
-        <span class="pin-tag">16.28 ms/tok</span>
+        <span class="pin-val">1.183 TB/s</span>
+        <span class="pin-tag">16.28 ms/tok &middot; 73% of sustained</span>
       </div>
       <div class="pin-line"></div>
     </div>
 
-    <div class="wall" style="left:81.67%">
-      <div class="wall-bar"></div>
-      <div class="wall-label">SPEED OF LIGHT<br><b>1.47 TB/s</b><br>practical D2D</div>
-    </div>
-
-    <div class="pin tier2 pin-mtp" style="left:92.6%">
+    <div class="pin tier2 pin-mtp" style="left:82.29%">
       <div class="pin-label">
         <span class="pin-name ours-name">OURS &middot; MTP</span>
-        <span class="pin-val hot">1.667 TB/s</span>
-        <span class="pin-tag">12.3 ms/tok</span>
+        <span class="pin-val hot">1.566 TB/s<span class="pin-caveat">counterfactual</span></span>
+        <span class="pin-tag">12.3 ms/tok &middot; amortized, not device traffic</span>
       </div>
-      <div class="pin-line hot"></div>
+      <div class="pin-line hot dashed"></div>
+    </div>
+
+    <div class="wall wall-sustained" style="left:85.64%">
+      <div class="wall-bar"></div>
+      <div class="wall-label">SUSTAINED &middot; MEASURED<br><b>1.63 TB/s</b><br>read ceiling on this card</div>
+    </div>
+
+    <div class="wall wall-spec" style="left:94.15%">
+      <div class="wall-bar"></div>
+      <div class="wall-label">SPEC<br><b>1.792 TB/s</b><br>512-bit &times; 28 Gbps GDDR7</div>
     </div>
 
     <div class="axis-bar">
       <div class="axis-fill"></div>
       <div class="axis-ticks" aria-hidden="true">
         <span style="left:0%"><i></i>0</span>
-        <span style="left:13.9%"><i></i>0.25</span>
-        <span style="left:27.8%"><i></i>0.50</span>
-        <span style="left:41.7%"><i></i>0.75</span>
-        <span style="left:55.6%"><i></i>1.00</span>
-        <span style="left:69.4%"><i></i>1.25</span>
-        <span style="left:83.3%"><i></i>1.50</span>
-        <span style="left:97.2%"><i></i>1.75&nbsp;TB/s</span>
+        <span style="left:13.14%"><i></i>0.25</span>
+        <span style="left:26.27%"><i></i>0.50</span>
+        <span style="left:39.41%"><i></i>0.75</span>
+        <span style="left:52.54%"><i></i>1.00</span>
+        <span style="left:65.68%"><i></i>1.25</span>
+        <span style="left:78.81%"><i></i>1.50</span>
+        <span style="left:91.95%"><i></i>1.75&nbsp;TB/s</span>
       </div>
     </div>
   </div>
@@ -84,18 +89,28 @@
   <div class="hero-plaques">
     <div class="plaque">
       <span class="plaque-stamp">BASIS</span>
-      <p>Every pin uses the same numerator: <b>&asymp;20.5&thinsp;GB</b> weights-resident read per token
-      (qwen3.8-27B at 4-bit), divided by that engine's measured decode ms/token at depth 256.
-      Same model, same card, same formula &mdash; apples to apples. vLLM's decode rows are still being
-      measured; its pin is the llama.cpp decode position scaled by the measured prefill ratio
-      (2404&thinsp;/&thinsp;2569) and drawn dashed until real rows land.</p>
+      <p>The ceiling is a <b>pair</b>, not one number. <b>1.63&thinsp;TB/s</b> is what this card
+      sustains on a read stream (BabelStream 5.0 <i>Dot</i> 1630.4&thinsp;/&thinsp;1628.4&thinsp;GB/s;
+      matched-shape CUDA stream-read 1626.7&thinsp;/&thinsp;1626.3 at 16&thinsp;GiB) and
+      <b>1.792&thinsp;TB/s</b> is the datasheet: 512-bit &times; 28&thinsp;Gbps GDDR7. Every pin uses the
+      same numerator &mdash; <b>19.26&thinsp;GB</b> resident-active bytes per token for qwen3.8-27B at
+      4-bit (19.104 weights + 0.151 recurrent state + 0.009 fp8 KV at depth 256) &mdash; divided by that
+      engine's measured decode ms/token at depth 256. Because each engine holds the weights in its own
+      format (ours NVFP4-class, llama.cpp Q4_K_M, vLLM FP8), a shared numerator makes this a
+      <i>decode-time</i> comparison drawn in bandwidth units, not a per-engine utilisation. vLLM's
+      decode rows are still being measured; its pin is the llama.cpp decode position scaled by the
+      measured prefill ratio (2404&thinsp;/&thinsp;2569) and drawn dashed until real rows land.</p>
     </div>
     <div class="plaque callout">
-      <span class="plaque-stamp hot-stamp">PAST THE WALL</span>
-      <p>The bus cannot move more than 1.47&thinsp;TB/s, and no single-token decoder can beat that.
-      MTP speculative decode emits <b>more than one accepted token per weight pass</b>, so the
-      per-token <i>effective</i> read rate lands at 1.67&thinsp;TB/s &mdash; past the physical wall.
-      You don't break physics; you amortize it.</p>
+      <span class="plaque-stamp hot-stamp">NOTHING HERE PASSES THE WALL</span>
+      <p>MTP speculative decode emits <b>more than one accepted token per weight pass</b>, so dividing
+      the whole single-token weight pool by the per-accepted-token time gives 1.566&thinsp;TB/s. That is
+      <b>96% of the sustained ceiling</b>, and at or above 95% this project reads a bandwidth number as
+      an accounting error rather than a result: the device did not move 19.26&thinsp;GB for that token,
+      it moved that much for the <i>round</i>. The MTP pin is therefore drawn dashed as a
+      counterfactual &mdash; the honest claim is 16.9&thinsp;&rarr;&thinsp;12.3&thinsp;ms/token, a
+      <b>1.37&times; speedup</b> bought with redundant compute, not extra bandwidth. You don't break
+      physics; you stop needing as much of it.</p>
     </div>
   </div>
 </section>

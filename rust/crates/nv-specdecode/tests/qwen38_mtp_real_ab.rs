@@ -268,6 +268,7 @@ fn mrow_verify_matches_the_per_row_fused_loop_on_a_synthetic_gdn_layer() {
     let out_b = la
         .forward_verify_mrow_projections_once_because_per_row_fused_steps_reread_every_gdn_weight(
             &x_rows, &st_b, &ckpts_b,
+            None,
         )
         .expect("m-row verify")
         .expect("the m-row primitive refused a geometry it was built for");
@@ -597,11 +598,17 @@ fn qwen38_mtp_warm_ab_v3_graphed_verify_creative_prompts_steady_state_ms_per_tok
             &stop,
             Some(V2_JUNK_DRAFT_TOKEN_ANY_POLICY_MUST_EMIT_THE_SAME_STREAM_IF_ROLLBACK_IS_LOSSLESS),
         );
-        assert_eq!(
-            spec.ids, junk.ids,
-            "draft-policy invariance broken on prompt {pi} through the GRAPHED verify: every \
-             emitted token is the batched verify's own greedy continuation of the committed \
-             prefix; a mismatch is a rollback/reanchor/lin-ckpt/graph-replay bug, not numerics"
+        common::assert_draft_policy_invariance_exact_when_fixed_k_or_tie_class_when_the_p_min_cut_varies_the_verify_shape(
+            &mut engine,
+            &mtp,
+            k,
+            &prompt,
+            max_new,
+            &stop,
+            &tok,
+            &spec,
+            &junk,
+            &format!("v3 prompt {pi}"),
         );
         let ref_agreement_prefix = leading_agreement_prefix_len(&spec.ids, &ref_ids);
         let content = spec.ids.iter().filter(|t| !stop.contains(t)).count();
@@ -648,6 +655,242 @@ fn qwen38_mtp_warm_ab_v3_graphed_verify_creative_prompts_steady_state_ms_per_tok
             stats.verify_ms,
             stats.commit_ms,
             ref_s / spec_s.max(1e-9),
+        );
+    }
+}
+
+const IDENTITY_TILE: &str = "The lighthouse keeper rose before dawn and climbed the spiral \
+     stair, counting each cold iron step out of habit rather than need. Below, the sea worked \
+     at the rocks with a patience older than the tower, and the lamp room smelled of brass \
+     polish and paraffin. ";
+
+const IDENTITY_DEPTHS_SHALLOW_MID_DEEP: [usize; 3] = [256, 2048, 8192];
+
+const IDENTITY_MAX_NEW_96_LONG_ENOUGH_TO_CROSS_MANY_ROUNDS: usize = 96;
+
+fn tiled_identity_prompt_ids(tok: &Tokenizer, depth: usize) -> Vec<u32> {
+    let tile: Vec<u32> = tok
+        .encode(IDENTITY_TILE, false)
+        .expect("encode identity tile")
+        .get_ids()
+        .to_vec();
+    let mut ids: Vec<u32> = Vec::with_capacity(depth);
+    while ids.len() < depth {
+        ids.extend_from_slice(&tile);
+    }
+    ids.truncate(depth);
+    ids
+}
+
+fn shadow_prefill_top2_of_next_token(
+    base: &Qwen3Moe,
+    prefix: &[u32],
+) -> (u32, f32) {
+    use candle_core::Tensor;
+    let device = base.device().clone();
+    let mut cache = base
+        .new_kv_cache(prefix.len() + 1)
+        .expect("shadow prefill cache");
+    let chunk = 2048usize;
+    let mut fed = 0usize;
+    let mut last: Option<Tensor> = None;
+    while fed < prefix.len() {
+        let n = chunk.min(prefix.len() - fed);
+        let toks = Tensor::from_vec(prefix[fed..fed + n].to_vec(), (1usize, n), &device)
+            .expect("shadow tokens");
+        let pos = Tensor::from_vec(
+            (fed as i32..(fed + n) as i32).collect::<Vec<i32>>(),
+            n,
+            &device,
+        )
+        .expect("shadow positions");
+        let (logits, _hidden) = base
+            .forward_with_cache_dispatched_hidden_rows(&toks, &pos, &mut cache, None, Some(1))
+            .expect("shadow prefill forward");
+        last = Some(logits);
+        fed += n;
+    }
+    let logits = last.expect("non-empty shadow prefix");
+    let seq = logits.dim(1).expect("dims");
+    let row: Vec<f32> = logits
+        .narrow(1, seq - 1, 1)
+        .expect("last row")
+        .to_dtype(candle_core::DType::F32)
+        .expect("f32")
+        .flatten_all()
+        .expect("flatten")
+        .to_vec1()
+        .expect("host");
+    let (mut t1, mut v1, mut v2) = (0u32, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (i, &v) in row.iter().enumerate() {
+        if v > v1 {
+            v2 = v1;
+            v1 = v;
+            t1 = i as u32;
+        } else if v > v2 {
+            v2 = v;
+        }
+    }
+    (t1, v1 - v2)
+}
+
+fn generate_eager_greedy_rounds(
+    base: &Qwen3Moe,
+    mtp: &Qwen38DenseMtpHead,
+    k: usize,
+    prompt: &[u32],
+    max_new: usize,
+    max_seq: usize,
+    stop: &[u32],
+) -> Vec<u32> {
+    let mut session =
+        nv_specdecode::qwen38_mtp::Qwen38MtpDecodeSession::start(base, mtp, k, prompt, max_seq)
+            .expect("eager identity session start");
+    let anchor = session.anchor();
+    let mut ids: Vec<u32> = vec![anchor];
+    if stop.contains(&anchor) {
+        return ids;
+    }
+    'rounds: while ids.len() < max_new && session.round_fits() {
+        let emitted = session.round().expect("eager identity round");
+        for &t in emitted.iter() {
+            ids.push(t);
+            if stop.contains(&t) {
+                break 'rounds;
+            }
+            if ids.len() >= max_new {
+                break 'rounds;
+            }
+        }
+    }
+    ids
+}
+
+#[test]
+#[ignore = "loads the ~54 GB Qwen3.8-27B NVFP4 checkpoint; set NV_Q38_MTP=1 -- the serving \
+            adoption identity gate: at 256/2048/8192-token tiled prompts the eager \
+            Qwen38MtpDecodeSession and the graphed Qwen38MtpGraphedDecodeSession (the two \
+            bodies NV_Q38_SERVE_GRAPHED switches between in gserve) generate the same greedy \
+            stream or an inc2-class divergence: the arms share the m=k+1 verify chain and \
+            accept contract but run different kernel plans (fused-lin graphed cache + mk \
+            captured verify vs the eager cache and eager verify), whose ULP drift compounds \
+            through the recurrent lin state and flips argmax at near-ties -- the v2/v3 \
+            precedent in this file; a divergence site is triaged against an independent eager \
+            prefill recompute of the agreed prefix: the graphed arm passes when the recompute \
+            sides with it, or when either the graphed margin or the recompute margin sits \
+            inside the 1.0-bf16 tie band -- a CONFIDENT graphed deviation from a confident \
+            recompute fails; the graphed stream must also reproduce itself exactly on a rerun \
+            (nondeterminism is graph-replay/state corruption, not a tie)"]
+fn qwen38_mtp_greedy_stream_identity_eager_vs_graphed_sessions_across_depths() {
+    if std::env::var("NV_Q38_MTP").as_deref() != Ok("1") {
+        panic!("set NV_Q38_MTP=1 to run (it must never silently skip)");
+    }
+    let dir = hub_dirs::snapshot(
+        NVFP4_REPO,
+        &["config.json", "tokenizer.json", MTP_WEIGHTS_FILE_NAME],
+    )
+    .expect("Qwen3.8-27B-NVFP4 snapshot with the MTP shard not found in the hub cache");
+    let tok = Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer.json");
+    let stop: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
+        .iter()
+        .filter_map(|s| tok.token_to_id(s))
+        .collect();
+    assert!(!stop.is_empty(), "tokenizer lost the im_end/endoftext stop tokens");
+
+    let device = Device::new_cuda_with_stream(0).expect("cuda");
+    let raw = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+    let cfg = Qwen3_5DenseConfig::from_hf_json_str(&raw).expect("dense config");
+    let qcfg = QuantizationConfig::from_hf_json_str(&raw).expect("quant config");
+    let weights = WeightLoader::open_dir(&dir, &device).expect("weights");
+    let base = Qwen3Moe::from_loader_dense_quantized(cfg, &weights, &qcfg, &device)
+        .expect("track-2 dense NVFP4 loader must load Qwen3.8-27B before this gate can run");
+    drop(weights);
+
+    let k = mtp_chain_depth_from_env();
+    let max_new = IDENTITY_MAX_NEW_96_LONG_ENOUGH_TO_CROSS_MANY_ROUNDS;
+    let deepest = *IDENTITY_DEPTHS_SHALLOW_MID_DEEP.iter().max().unwrap();
+    let engine_max_seq = deepest + max_new + k + 64;
+    let mut engine =
+        nv_models::graph_engine::GraphedQwen3Moe::new(base, &device, engine_max_seq)
+            .expect("graphed engine over the dense arm");
+    let mtp = Qwen38DenseMtpHead::from_checkpoint(
+        mtp_draft_dir_override_from_env().as_deref(),
+        &dir,
+        engine.underlying(),
+        &device,
+    )
+    .expect("MTP head loads from the shipped model_mtp.safetensors");
+
+    for &depth in &IDENTITY_DEPTHS_SHALLOW_MID_DEEP {
+        let prompt = tiled_identity_prompt_ids(&tok, depth);
+        let eager_max_seq = depth + max_new + k + 8;
+        let eager_ids = generate_eager_greedy_rounds(
+            engine.underlying(),
+            &mtp,
+            k,
+            &prompt,
+            max_new,
+            eager_max_seq,
+            &stop,
+        );
+        let graphed = generate_graphed(&mut engine, &mtp, k, &prompt, max_new, &stop, None);
+        if eager_ids == graphed.ids {
+            eprintln!(
+                "[q38-identity] depth={depth} k={k} new_toks={} verdict=IDENTICAL",
+                eager_ids.len()
+            );
+            continue;
+        }
+        let i = eager_ids
+            .iter()
+            .zip(graphed.ids.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| eager_ids.len().min(graphed.ids.len()));
+        assert!(
+            i >= 1,
+            "depth={depth}: the arms disagree on the prefill anchor itself; both prefills are \
+             chunked eager forwards of the same ids, so this is state corruption, not a tie"
+        );
+        let graphed_margin = graphed.emitted_argmax_margins_after_anchor[i - 1];
+        let mut agreed_prefix: Vec<u32> = prompt.clone();
+        agreed_prefix.extend_from_slice(&eager_ids[..i]);
+        let (shadow_tok, shadow_margin) =
+            shadow_prefill_top2_of_next_token(engine.underlying(), &agreed_prefix);
+        eprintln!(
+            "[q38-identity] depth={depth} k={k} verdict=DIVERGED idx={i} eager_tok={} \
+             graphed_tok={} graphed_margin={graphed_margin:.4} shadow_tok={shadow_tok} \
+             shadow_margin={shadow_margin:.4} shadow_sides_with={} eager_text={:?} \
+             graphed_text={:?}",
+            eager_ids[i],
+            graphed.ids[i],
+            if shadow_tok == graphed.ids[i] {
+                "graphed"
+            } else if shadow_tok == eager_ids[i] {
+                "eager"
+            } else {
+                "neither"
+            },
+            tok.decode(&eager_ids, true).unwrap_or_default(),
+            tok.decode(&graphed.ids, true).unwrap_or_default()
+        );
+        assert!(
+            shadow_tok == graphed.ids[i]
+                || shadow_margin
+                    <= common::ADAPTIVE_TIE_MARGIN_MAX_1_BF16_LOGIT_UNIT_SHALLOW_FLIPS_MEASURE_0_0_TO_0_9_AND_DEEP_DRIFT_KEEPS_ONE_SIDE_UNDER_0_4
+                || graphed_margin
+                    <= common::ADAPTIVE_TIE_MARGIN_MAX_1_BF16_LOGIT_UNIT_SHALLOW_FLIPS_MEASURE_0_0_TO_0_9_AND_DEEP_DRIFT_KEEPS_ONE_SIDE_UNDER_0_4,
+            "depth={depth} idx={i}: the graphed arm confidently (margin {graphed_margin}) \
+             emitted {} while an independent eager prefill recompute of the same committed \
+             prefix confidently (margin {shadow_margin}) prefers {shadow_tok}; a confident \
+             graphed deviation from the recompute reference is the \
+             rollback/reanchor/lin-ckpt/graph-replay bug class, not fp-tie noise",
+            graphed.ids[i]
+        );
+        let graphed_again = generate_graphed(&mut engine, &mtp, k, &prompt, max_new, &stop, None);
+        assert_eq!(
+            graphed.ids, graphed_again.ids,
+            "depth={depth}: the graphed stream must reproduce itself across identical sessions; \
+             nondeterminism here is graph-replay/state corruption, not a tie"
         );
     }
 }

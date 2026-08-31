@@ -4,6 +4,7 @@ use super::config::{window_start, GateKind, LagunaShapes, LayerShape, MAX_HEAD_D
 use super::gpu::{
     alloc_lin_scratch, push_lin_gemv, upload_lin, Builder, Sources, StepBuffers, W8Scope,
 };
+use super::lora::LoraSiteCtx;
 use super::weights::{bf16_val, pack_pairs, HostAttention};
 use super::{rbf, ref_gemv_lin, softplus, RefState};
 
@@ -82,6 +83,7 @@ pub fn build_attn_layer(
     out_packed: &wgpu::Buffer,
     step: &StepBuffers,
     rope: &RopeTablesGpu,
+    lora: Option<&LoraSiteCtx>,
 ) -> Result<()> {
     let li = layer.idx;
     let hidden = shapes.hidden_size;
@@ -194,6 +196,11 @@ pub fn build_attn_layer(
         x_normed_packed,
         &v_buf,
     )?;
+    if let Some(lc) = lora {
+        if let Some(site) = &lc.layer.qkv {
+            lc.push_site(b, site, x_normed_packed, &[&q_buf, &k_buf, &v_buf]);
+        }
+    }
 
     let gate = match (&w.g, shapes.gate_kind) {
         (Some(g), GateKind::PerHead) | (Some(g), GateKind::PerElement) => {
@@ -209,6 +216,11 @@ pub fn build_attn_layer(
                 x_normed_packed,
                 &g_buf,
             )?;
+            if let Some(lc) = lora {
+                if let Some(site) = &lc.layer.g {
+                    lc.push_site(b, site, x_normed_packed, &[&g_buf]);
+                }
+            }
             Some(g_buf)
         }
         _ => None,
@@ -341,7 +353,13 @@ pub fn build_attn_layer(
         &os,
         &mixed,
         out_packed,
-    )
+    )?;
+    if let Some(lc) = lora {
+        if let Some(site) = &lc.layer.o {
+            lc.push_site(b, site, &mixed, &[out_packed]);
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

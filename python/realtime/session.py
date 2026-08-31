@@ -5,17 +5,14 @@ import enum
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from . import (
     AUDIO_FORMAT_DEFAULT,
     TURN_DETECTION_NONE,
     TURN_DETECTION_SERVER_VAD,
-    audio_defaults,
     buffer_defaults,
-    eou_defaults,
-    response_defaults,
     session_defaults,
     turn_detection,
     wire_defaults,
@@ -29,32 +26,25 @@ from .errors import code as errcode
 from .events import (
     item_to_json,
     make_error_event,
-    make_response_done,
     parse_client_event,
 )
 from .state import (
     ConversationItem,
     InvariantViolation,
-    ItemContent,
     ItemRole,
     ItemStatus,
     PendingBargein,
-    PredictedRunner,
-    PredictedSharedState,
-    RespPhase,
-    SealedBuffer,
     SessionPhase,
     SessionState,
     TerminationReason,
     Topic,
-    VadPhase,
     _AtomicU64,
     apply_truncate_to_conversation,
     check_state,
 )
 from .observer import NullObserver, SessionObserver
 from .transport import EventSink, OutboundAudioSpec
-from .wire import OutboundEvent, ResponsePayload, ResponseStatus, ResponseStatusReason
+from .wire import OutboundEvent, ResponseStatusReason
 
 log = logging.getLogger("realtime.session")
 

@@ -65,16 +65,7 @@ pub struct Kv4Params {
 }
 
 pub fn kv4_div_rn(a: f32, b: f32) -> f32 {
-    const KV4_DIV_BIG: f32 = 1.0e37;
-    const KV4_DIV_DOWN: f32 = 0.00390625;
-    let (bb, post) = if b.abs() > KV4_DIV_BIG {
-        (b * KV4_DIV_DOWN, KV4_DIV_DOWN)
-    } else {
-        (b, 1.0)
-    };
-    let r = 1.0f32 / bb;
-    let q = a * r;
-    (-q).mul_add(bb, a).mul_add(r, q) * post
+    a / b
 }
 
 pub fn nibble_word_index(elem: usize) -> (usize, u32) {
@@ -376,10 +367,20 @@ mod tests {
                     let v = f32::from_bits((cache[e] as u32) << 16);
                     let q = cpu_dequantize_kv_nvfp4_v(&out, &scales, slot, n_kv, kvh, hd, d);
                     let sc = scales[slot * n_kv + kvh];
+                    let t = (v / sc).abs();
+                    let half_gap = if t <= 2.0 {
+                        0.25
+                    } else if t <= 4.0 {
+                        0.5
+                    } else {
+                        1.0
+                    };
                     assert!(
-                        (q - v).abs() <= 0.5 * sc + 1e-6,
-                        "slot {slot} kvh {kvh} d {d}: {q} vs {v} (scale {sc}); e2m1 spacing \
-                         never exceeds one scale step below E2M1_MAX"
+                        (q - v).abs() <= half_gap * sc + 1e-6,
+                        "slot {slot} kvh {kvh} d {d}: {q} vs {v} (scale {sc}, t {t}); nearest \
+                         e2m1 errs at most half the local code gap, and the gaps are 0.5 through \
+                         2.0, then 1.0 through 4.0, then 2.0 through E2M1_MAX -- the top gap is \
+                         two scale steps, not one"
                     );
                 }
             }

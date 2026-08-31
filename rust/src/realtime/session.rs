@@ -78,8 +78,10 @@ pub struct Session {
     pub input_audio_format: std::sync::Mutex<String>,
     pub output_audio_format: std::sync::Mutex<String>,
     pub voice: std::sync::Mutex<Option<String>>,
+    pub tts_speed_bits: AtomicU32,
     pub model: std::sync::Mutex<String>,
     pub transcription_model: std::sync::Mutex<Option<String>>,
+    pub stt_language: std::sync::Mutex<Option<String>>,
 
     pub eou_runtime: std::sync::Mutex<EouRuntime>,
     pub relay: Arc<InspectorRelay>,
@@ -447,8 +449,10 @@ impl Session {
             input_audio_format: std::sync::Mutex::new(defaults::audio_format::DEFAULT.to_string()),
             output_audio_format: std::sync::Mutex::new(defaults::audio_format::DEFAULT.to_string()),
             voice: std::sync::Mutex::new(voice_label),
+            tts_speed_bits: AtomicU32::new(1.0f32.to_bits()),
             model: std::sync::Mutex::new(model_label),
             transcription_model: std::sync::Mutex::new(transcription_model_label),
+            stt_language: std::sync::Mutex::new(None),
             eou_runtime: std::sync::Mutex::new(eou_runtime_init),
             relay,
             audio_store,
@@ -821,6 +825,33 @@ impl Session {
             }
         };
 
+        if let Some(iat) = &staged.input_audio_transcription {
+            if let Some(requested) = iat.model.as_deref() {
+                let loaded = self.models.whisper().ok();
+                let matches = loaded
+                    .as_ref()
+                    .is_some_and(|w| w.matches_requested_model(requested));
+                if !matches {
+                    let loaded_id = loaded
+                        .map(|w| w.model_id().to_string())
+                        .unwrap_or_else(|| "<no STT model loaded>".to_string());
+                    super::events::emit_error(
+                        self,
+                        errcode::SESSION_UPDATE_INVALID,
+                        &format!(
+                            "input_audio_transcription.model {requested:?} does not match the \
+                             loaded speech-to-text model {loaded_id:?}; the update was rejected \
+                             rather than transcribed by whichever model happened to be loaded"
+                        ),
+                        event_id,
+                        Some("session.input_audio_transcription.model"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
         if let Some(instr) = staged.instructions {
             let mut state = self.state.lock().await;
             match instr {
@@ -848,6 +879,18 @@ impl Session {
         }
         if let Some(v) = staged.voice {
             *self.voice.lock().expect("voice poisoned") = v;
+        }
+        if let Some(f) = staged.speed {
+            self.tts_speed_bits.store(f.to_bits(), Ordering::Relaxed);
+        }
+        if let Some(iat) = staged.input_audio_transcription {
+            if let Some(m) = iat.model {
+                *self
+                    .transcription_model
+                    .lock()
+                    .expect("transcription_model poisoned") = Some(m);
+            }
+            *self.stt_language.lock().expect("stt_language poisoned") = iat.language;
         }
         if let Some(n) = staged.min_speech_ms {
             self.min_speech_ms.store(n, Ordering::Relaxed);
@@ -894,6 +937,17 @@ impl Session {
         }))
         .await;
         info!("session.update applied");
+    }
+
+    pub fn tts_speed(&self) -> f32 {
+        f32::from_bits(self.tts_speed_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn stt_language(&self) -> Option<String> {
+        self.stt_language
+            .lock()
+            .expect("stt_language poisoned")
+            .clone()
     }
 
     pub fn noise_gate_thresholds(&self) -> crate::stt::noise_gate::GateThresholds {
@@ -949,13 +1003,22 @@ impl Session {
             "min_speech_ms": self.min_speech_ms.load(Ordering::Relaxed),
             "min_speech_for_response_ms": self.min_speech_for_response_ms.load(Ordering::Relaxed),
             "sealed_buffer_retention_count": self.sealed_buffer_retention_count.load(Ordering::Relaxed),
+            "speed": self.tts_speed(),
         });
         if let Some(obj) = sess.as_object_mut() {
             if let Some(v) = voice {
                 obj.insert("voice".into(), serde_json::Value::String(v));
             }
-            if let Some(m) = transcription_model {
-                obj.insert("input_audio_transcription".into(), json!({ "model": m }));
+            let stt_language = self.stt_language();
+            if transcription_model.is_some() || stt_language.is_some() {
+                let mut iat = serde_json::Map::new();
+                if let Some(m) = transcription_model {
+                    iat.insert("model".into(), serde_json::Value::String(m));
+                }
+                if let Some(l) = stt_language {
+                    iat.insert("language".into(), serde_json::Value::String(l));
+                }
+                obj.insert("input_audio_transcription".into(), serde_json::Value::Object(iat));
             }
         }
 
@@ -2346,8 +2409,13 @@ async fn run_partial_transcription(
         tracing::error!("partial transcription requested but speech-to-text is unavailable");
         return;
     };
-    let transcript =
-        match super::pipeline::run_stt(whisper, crate::types::MonoF32At16k::new(audio)).await {
+    let transcript = match super::pipeline::run_stt(
+        whisper,
+        crate::types::MonoF32At16k::new(audio),
+        session.stt_language(),
+    )
+    .await
+    {
             Ok(t) => t,
             Err(err) => {
                 debug!(error = %err, "partial STT failed; dropping");

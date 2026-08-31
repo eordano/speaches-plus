@@ -405,6 +405,115 @@ fn synthetic_w4_sg16_routing_stays_close_to_v4() {
 }
 
 #[test]
+fn synthetic_w4_kpre_and_rowsplit_arms_are_bit_identical_to_sg16_and_must_engage() {
+    let Some(ctx) = ctx_or_skip() else {
+        return;
+    };
+    let width = ctx.subgroup_width();
+    if !nv_kernels::wgpu_backend::kernels::gemv_w4a16::sg_pk_supported(width) {
+        eprintln!("skipping: sg16 pk unsupported on subgroup width {width:?}");
+        return;
+    }
+    let config = Gemma4Config::from_hf_json_str(TINY_E4B_CONFIG).unwrap();
+    let mut weights = tiny_e4b_host_weights(&config, 0x5eed);
+    for l in weights.layers.iter_mut() {
+        l.qkv = quantize_w4(&l.qkv, 64);
+        l.o = quantize_w4(&l.o, 32);
+        l.gate_up = quantize_w4(&l.gate_up, 64);
+        l.down = quantize_w4(&l.down, 32);
+        l.per_layer_input_gate = quantize_w4(&l.per_layer_input_gate, 32);
+    }
+    let steps: Vec<u32> = vec![7, 300, 42, 511, 0, 13, 99, 250];
+
+    let run = |label: &str, envs: &[(&str, &str)]| -> (Vec<(u32, Vec<f32>)>, Vec<String>) {
+        let guard = env_guard();
+        for (k, v) in envs {
+            std::env::set_var(k, v);
+        }
+        let mut m = Gemma4E4bWgpu::new(
+            Gemma4Config::from_hf_json_str(TINY_E4B_CONFIG).unwrap(),
+            &weights,
+            64,
+        )
+        .unwrap();
+        for (k, _) in envs {
+            std::env::remove_var(k);
+        }
+        drop(guard);
+        let labels: Vec<String> = (0..m.pass_count())
+            .map(|i| m.pass_label(i).to_string())
+            .collect();
+        eprintln!("[{label}] passes per decode step: {}", m.pass_count());
+        (
+            steps
+                .iter()
+                .map(|t| m.decode_step_logits(*t).unwrap())
+                .collect(),
+            labels,
+        )
+    };
+
+    let (base, base_labels) = run("sg16-base", &[]);
+    assert_eq!(
+        base_labels.iter().filter(|l| l.contains("kpre")).count()
+            + base_labels.iter().filter(|l| l.contains("rowsplit")).count(),
+        0,
+        "arm entries routed without their env"
+    );
+    let bitwise = |name: &str, arm: &[(u32, Vec<f32>)]| {
+        let mut diff_words = 0usize;
+        for ((ta, la), (tb, lb)) in base.iter().zip(arm.iter()) {
+            assert_eq!(ta, tb, "argmax token diverged between sg16 and {name}");
+            for (x, y) in la.iter().zip(lb.iter()) {
+                if x.to_bits() != y.to_bits() {
+                    diff_words += 1;
+                }
+            }
+        }
+        assert_eq!(diff_words, 0, "{name} must be bit-identical to the sg16 path");
+    };
+
+    let (kpre, kpre_labels) = run("w4-kpre", &[("NV_E4B_WGPU_W4_KPRE", "1")]);
+    let kpre_n = kpre_labels.iter().filter(|l| l.contains("kpre")).count();
+    assert!(
+        kpre_n >= config.num_hidden_layers,
+        "NV_E4B_WGPU_W4_KPRE=1 must route at least the {} per-layer down gemvs (k=512 \
+         clears the min-k fence) through kpre entries, saw {kpre_n}",
+        config.num_hidden_layers
+    );
+    bitwise("kpre", &kpre);
+
+    let (rs, rs_labels) = run("w4-rowsplit", &[("NV_E4B_WGPU_SG_ROWSPLIT", "4")]);
+    let rs_n = rs_labels.iter().filter(|l| l.contains("rowsplit")).count();
+    assert!(
+        rs_n > 2 * config.num_hidden_layers,
+        "NV_E4B_WGPU_SG_ROWSPLIT=4 must route every sg16 decode gemv through the \
+         rowsplit entries, saw {rs_n}"
+    );
+    bitwise("rowsplit", &rs);
+
+    let (stack, stack_labels) = run(
+        "w4-kpre-rowsplit-stack",
+        &[
+            ("NV_E4B_WGPU_W4_KPRE", "1"),
+            ("NV_E4B_WGPU_SG_ROWSPLIT", "4"),
+        ],
+    );
+    assert!(
+        stack_labels.iter().any(|l| l.contains("kpre"))
+            && stack_labels.iter().any(|l| l.contains("rowsplit")),
+        "the stacked arms must each keep their routed sites"
+    );
+    bitwise("kpre+rowsplit", &stack);
+    eprintln!(
+        "w4 kpre/rowsplit arms: {} logits x {} steps bit-identical (kpre sites {kpre_n}, \
+         rowsplit sites {rs_n})",
+        config.vocab_size,
+        steps.len()
+    );
+}
+
+#[test]
 fn synthetic_int8_lmhead_matches_bf16_head_on_exactly_representable_rows() {
     if ctx_or_skip().is_none() {
         return;
@@ -527,6 +636,7 @@ fn synthetic_sg_lmhead_is_bit_identical_to_tree_lmhead() {
 }
 
 type AttnRun = (
+    usize,
     Vec<(u32, Vec<f32>)>,
     Vec<Option<nv_models::gemma4_e4b_wgpu::KvCacheSnapshot>>,
 );
@@ -560,12 +670,12 @@ fn synthetic_fused_attn_matches_unfused_bitwise_including_kv_cache() {
         let kvs: Vec<Option<nv_models::gemma4_e4b_wgpu::KvCacheSnapshot>> = (0..n_layers)
             .map(|li| m.kv_cache_snapshot(li).unwrap())
             .collect();
-        (outs, kvs)
+        (m.pass_count(), outs, kvs)
     };
 
-    let (unfused, kv_unfused) = run("attn-unfused", "0");
-    let (fused, kv_fused) = run("attn-fused", "1");
-    let (default_env, kv_default) = {
+    let (pc_unfused, unfused, kv_unfused) = run("attn-unfused", "0");
+    let (pc_fused, fused, kv_fused) = run("attn-fused", "1");
+    let (pc_default, default_env, kv_default) = {
         let guard = env_guard();
         std::env::remove_var("NV_E4B_WGPU_FUSE_ATTN");
         let mut m = Gemma4E4bWgpu::new(
@@ -582,15 +692,24 @@ fn synthetic_fused_attn_matches_unfused_bitwise_including_kv_cache() {
         let kvs: Vec<Option<nv_models::gemma4_e4b_wgpu::KvCacheSnapshot>> = (0..n_layers)
             .map(|li| m.kv_cache_snapshot(li).unwrap())
             .collect();
-        (outs, kvs)
+        (m.pass_count(), outs, kvs)
     };
+    assert_eq!(
+        pc_default, pc_fused,
+        "the unset default must record the fused attention passes (per-step passes: unfused \
+         {pc_unfused}, fused {pc_fused}, default {pc_default}): NV_E4B_WGPU_FUSE_ATTN is \
+         opt-out default-ON in gemma4_e4b_wgpu.rs and =0 restores the unfused arm; a default \
+         that silently fell back to unfused would make the bitwise gate below compare an arm \
+         to itself"
+    );
     for (i, ((ta, la), (tb, lb))) in unfused.iter().zip(default_env.iter()).enumerate() {
         assert_eq!(ta, tb, "step {i}: default env must equal fusion-off");
         assert!(
             la.iter()
                 .zip(lb.iter())
                 .all(|(x, y)| x.to_bits() == y.to_bits()),
-            "step {i}: default env logits must be bitwise equal to fusion-off (attn fusion must default OFF)"
+            "step {i}: the unset default (fused) must stay bitwise equal to the fusion-off arm; \
+             that bit identity is what made the default flip legal"
         );
     }
     assert_eq!(
@@ -1153,7 +1272,7 @@ fn synthetic_from_loader_matches_host_build() {
     }
     let dir = std::path::PathBuf::from(
         std::env::var("NV_E4B_WGPU_TMP")
-            .unwrap_or_else(|_| format!("{}/.cache/nvk-tmp", std::env::var("HOME").unwrap())),
+            .unwrap_or_else(|_| format!("{}/.cache/claude-tmp", std::env::var("HOME").unwrap())),
     )
     .join(format!("e4bwgpu-stream-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1195,14 +1314,6 @@ mod cuda_compare {
     use super::*;
     use candle_core::{DType, Device, Tensor};
 
-    fn softcap(v: f32, cap: f32) -> f32 {
-        if cap > 0.0 && cap.is_finite() {
-            cap * (v / cap).tanh()
-        } else {
-            v
-        }
-    }
-
     fn compare_against_cuda(label: &str, weights: E4bHostWeights, rel_bound: f32) {
         if ctx_or_skip().is_none() {
             return;
@@ -1221,7 +1332,7 @@ mod cuda_compare {
 
         let dir =
             std::path::PathBuf::from(std::env::var("NV_E4B_WGPU_TMP").unwrap_or_else(|_| {
-                format!("{}/.cache/nvk-tmp", std::env::var("HOME").unwrap())
+                format!("{}/.cache/claude-tmp", std::env::var("HOME").unwrap())
             }))
             .join(format!("e4bwgpu-cmp-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1244,7 +1355,10 @@ mod cuda_compare {
         .unwrap();
         eprintln!("wgpu passes per decode step: {}", wg.pass_count());
 
-        let cap = config.final_logit_softcapping;
+        assert!(
+            !nv_models::gemma4_e4b::step_logits_uncapped_env_opted_in(),
+            "this parity gate compares the capped serving default on both backends"
+        );
         let mut cache: Vec<Option<(Tensor, Tensor)>> = vec![None; config.num_hidden_layers];
         let steps: Vec<u32> = vec![7, 300, 42, 511, 0, 13, 99, 250, 8, 9, 10, 11];
         let mut worst_abs = 0f32;
@@ -1260,10 +1374,7 @@ mod cuda_compare {
                 .to_dtype(DType::F32)
                 .unwrap()
                 .to_vec1::<f32>()
-                .unwrap()
-                .into_iter()
-                .map(|v| softcap(v, cap))
-                .collect();
+                .unwrap();
             let (wg_tok, wg_logits) = wg.decode_step_logits(*tok).unwrap();
 
             let cuda_argmax = cuda_logits

@@ -14,6 +14,7 @@ struct GpnParams {
 @group(0) @binding(5) var<storage, read> pn_w2: array<u32>;
 @group(0) @binding(6) var<storage, read> pn_h1: array<u32>;
 @group(0) @binding(7) var<storage, read_write> pn_y2: array<u32>;
+@group(0) @binding(8) var<storage, read> pn_w3: array<u32>;
 
 const PN_FUSED_MAX_WORDS: u32 = 2048u;
 
@@ -199,5 +200,56 @@ fn g4m_norm_add_norm_resout(@builtin(local_invocation_id) lid3: vec3<u32>) {
             (bf16_lo(comb) + bf16_lo(rw)) * pn_p.scale,
             (bf16_hi(comb) + bf16_hi(rw)) * pn_p.scale
         );
+    }
+}
+
+@compute @workgroup_size(256)
+fn g4m_norm_add_norm_resout_normnext(@builtin(local_invocation_id) lid3: vec3<u32>) {
+    let lid = lid3.x;
+    var local = 0.0;
+    for (var w = lid; w < pn_p.words; w = w + 256u) {
+        let xw = pn_x[w];
+        let x0 = bf16_lo(xw);
+        let x1 = bf16_hi(xw);
+        local = local + x0 * x0 + x1 * x1;
+    }
+    let s1 = pn_reduce(lid, local);
+    var local2 = 0.0;
+    for (var w = lid; w < pn_p.words; w = w + 256u) {
+        let xw = pn_x[w];
+        let ww = pn_w[w];
+        let h2 = bf16_pack(bf16_lo(xw) * s1 * bf16_lo(ww), bf16_hi(xw) * s1 * bf16_hi(ww));
+        let h1w = pn_h1[w];
+        let sum = bf16_pack(
+            (bf16_lo(h1w) + bf16_lo(h2)) * 1.0,
+            (bf16_hi(h1w) + bf16_hi(h2)) * 1.0
+        );
+        pn_buf[w] = sum;
+        let r0 = bf16_lo(sum);
+        let r1 = bf16_hi(sum);
+        local2 = local2 + r0 * r0 + r1 * r1;
+    }
+    let s2 = pn_reduce(lid, local2);
+    var local3 = 0.0;
+    for (var w = lid; w < pn_p.words; w = w + 256u) {
+        let sum = pn_buf[w];
+        let w3 = pn_w2[w];
+        let comb = bf16_pack(bf16_lo(sum) * s2 * bf16_lo(w3), bf16_hi(sum) * s2 * bf16_hi(w3));
+        let rw = pn_res[w];
+        let outw = bf16_pack(
+            (bf16_lo(comb) + bf16_lo(rw)) * pn_p.scale,
+            (bf16_hi(comb) + bf16_hi(rw)) * pn_p.scale
+        );
+        pn_y[w] = outw;
+        pn_buf[w] = outw;
+        let o0 = bf16_lo(outw);
+        let o1 = bf16_hi(outw);
+        local3 = local3 + o0 * o0 + o1 * o1;
+    }
+    let s3 = pn_reduce(lid, local3);
+    for (var w = lid; w < pn_p.words; w = w + 256u) {
+        let outw = pn_buf[w];
+        let wn = pn_w3[w];
+        pn_y2[w] = bf16_pack(bf16_lo(outw) * s3 * bf16_lo(wn), bf16_hi(outw) * s3 * bf16_hi(wn));
     }
 }

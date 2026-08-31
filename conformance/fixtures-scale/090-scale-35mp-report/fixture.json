@@ -1,0 +1,170 @@
+{
+  "name": "090-scale-35mp-report",
+  "family": "090-scale",
+  "description": "35MP A4-at-600dpi report: fine (50px) and micro (33px) tiers sit at 0.57x single-pass downscale; the micro notes section is two-column.",
+  "input": "input.png",
+  "expected_text": "GEOTHERMAL TEST WELL KV-9\nQuarterly Integrity Report, Q3 2026\n1. Summary of Operations\nThe wellhead held a stable 41.3 bar across the quarter. Flow\ntesting on 12 August reached 96 kg/s at 243 degrees Celsius,\nmatching the drawdown model within 2.1 percent.\n2. Casing Inspection\nUltrasonic logs show wall thickness above 11.2 mm everywhere\nexcept joint 41, where pitting reduced it to 9.7 mm. The joint\nremains inside the 8.5 mm retirement threshold.\n3. Instrumentation\nDownhole gauge DG-118 drifted 0.4 bar and was recalibrated.\nFibre line FL-2 returned clean DTS traces after splice repair.\nAppendix A: Sample Assays\nSample KV9-S31: silica 612 mg/kg, chloride 88 mg/kg, pH 7.9\nSample KV9-S32: silica 598 mg/kg, chloride 91 mg/kg, pH 8.0\nSample KV9-S33: silica 640 mg/kg, chloride 84 mg/kg, pH 7.8\nNote 1: Assay uncertainty is 3 percent\nrelative, one sigma, per lab method\nLM-410 revision D.\nNote 2: Chloride trend remains below\nthe scaling advisory limit defined in\noperations memo OM-2214.\n4. Reinjection Performance\nInjection well KV-9R accepted the full 71 kg/s return stream at\n18.9 bar wellhead pressure. Tracer test T-14 shows 4.1 percent\nbreakthrough after 62 days, unchanged from the spring campaign.\n5. Planned Work\nA caliper rerun of joints 38 through 44 is scheduled for early\nNovember, together with replacement of the annulus bleed valve\nand a full recalibration of the fiscal metering skid.\nAppendix B: Vibration Survey\nPump P-201: 2.1 mm/s RMS at bearing housing, within ISO zone B\nPump P-202: 4.8 mm/s RMS, rising trend, realignment scheduled\nSeparator feed line: no cavitation signature above 2 kilohertz\n6. Environmental Compliance\nHydrogen sulphide at the site boundary averaged 3.1 micrograms\nper cubic metre, well under the 15 microgram consent ceiling.\nBrine pond levels stayed within the freeboard requirement and\nno discharge events were recorded during the quarter.\nReport KV9-Q3-2026-INT, revision 2. Approved by R. Steinsdottir, 30 September 2026.",
+  "render": {
+    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "page_px": [
+      4956,
+      7016
+    ],
+    "megapixels": 34.77,
+    "single_pass_downscale_at_default_cap": 0.57
+  },
+  "regions": [
+    {
+      "bbox": [
+        220,
+        288,
+        2720,
+        407
+      ],
+      "tier": "heading",
+      "text": "GEOTHERMAL TEST WELL KV-9"
+    },
+    {
+      "bbox": [
+        220,
+        575,
+        1717,
+        665
+      ],
+      "tier": "heading",
+      "text": "Quarterly Integrity Report, Q3 2026"
+    },
+    {
+      "bbox": [
+        220,
+        898,
+        2517,
+        1304
+      ],
+      "tier": "body",
+      "text": "1. Summary of Operations\nThe wellhead held a stable 41.3 bar across the quarter. Flow\ntesting on 12 August reached 96 kg/s at 243 degrees Celsius,\nmatching the drawdown model within 2.1 percent."
+    },
+    {
+      "bbox": [
+        220,
+        1554,
+        2598,
+        1943
+      ],
+      "tier": "body",
+      "text": "2. Casing Inspection\nUltrasonic logs show wall thickness above 11.2 mm everywhere\nexcept joint 41, where pitting reduced it to 9.7 mm. The joint\nremains inside the 8.5 mm retirement threshold."
+    },
+    {
+      "bbox": [
+        220,
+        2211,
+        2538,
+        2506
+      ],
+      "tier": "body",
+      "text": "3. Instrumentation\nDownhole gauge DG-118 drifted 0.4 bar and was recalibrated.\nFibre line FL-2 returned clean DTS traces after splice repair."
+    },
+    {
+      "bbox": [
+        220,
+        2798,
+        1515,
+        2888
+      ],
+      "tier": "heading",
+      "text": "Appendix A: Sample Assays"
+    },
+    {
+      "bbox": [
+        220,
+        3013,
+        1990,
+        3186
+      ],
+      "tier": "fine",
+      "text": "Sample KV9-S31: silica 612 mg/kg, chloride 88 mg/kg, pH 7.9\nSample KV9-S32: silica 598 mg/kg, chloride 91 mg/kg, pH 8.0\nSample KV9-S33: silica 640 mg/kg, chloride 84 mg/kg, pH 7.8"
+    },
+    {
+      "bbox": [
+        220,
+        3406,
+        772,
+        3514
+      ],
+      "tier": "micro",
+      "text": "Note 1: Assay uncertainty is 3 percent\nrelative, one sigma, per lab method\nLM-410 revision D."
+    },
+    {
+      "bbox": [
+        2700,
+        3406,
+        3237,
+        3521
+      ],
+      "tier": "micro",
+      "text": "Note 2: Chloride trend remains below\nthe scaling advisory limit defined in\noperations memo OM-2214."
+    },
+    {
+      "bbox": [
+        220,
+        3742,
+        2686,
+        4148
+      ],
+      "tier": "body",
+      "text": "4. Reinjection Performance\nInjection well KV-9R accepted the full 71 kg/s return stream at\n18.9 bar wellhead pressure. Tracer test T-14 shows 4.1 percent\nbreakthrough after 62 days, unchanged from the spring campaign."
+    },
+    {
+      "bbox": [
+        219,
+        4399,
+        2626,
+        4804
+      ],
+      "tier": "body",
+      "text": "5. Planned Work\nA caliper rerun of joints 38 through 44 is scheduled for early\nNovember, together with replacement of the annulus bleed valve\nand a full recalibration of the fiscal metering skid."
+    },
+    {
+      "bbox": [
+        220,
+        5095,
+        1576,
+        5185
+      ],
+      "tier": "heading",
+      "text": "Appendix B: Vibration Survey"
+    },
+    {
+      "bbox": [
+        220,
+        5310,
+        2080,
+        5483
+      ],
+      "tier": "fine",
+      "text": "Pump P-201: 2.1 mm/s RMS at bearing housing, within ISO zone B\nPump P-202: 4.8 mm/s RMS, rising trend, realignment scheduled\nSeparator feed line: no cavitation signature above 2 kilohertz"
+    },
+    {
+      "bbox": [
+        220,
+        5713,
+        2664,
+        6228
+      ],
+      "tier": "body",
+      "text": "6. Environmental Compliance\nHydrogen sulphide at the site boundary averaged 3.1 micrograms\nper cubic metre, well under the 15 microgram consent ceiling.\nBrine pond levels stayed within the freeboard requirement and\nno discharge events were recorded during the quarter."
+    },
+    {
+      "bbox": [
+        220,
+        6431,
+        2156,
+        6478
+      ],
+      "tier": "fine",
+      "text": "Report KV9-Q3-2026-INT, revision 2. Approved by R. Steinsdottir, 30 September 2026."
+    }
+  ],
+  "comparison_strategy": "cer",
+  "skip_when_no_model": true
+}

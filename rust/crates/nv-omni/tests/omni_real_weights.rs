@@ -13,9 +13,9 @@ use nv_omni::{
 
 const PREP: &str = "\
 NV_OMNI_MODEL_DIR is missing/invalid. Procure the checkpoint:\n\
-  cd <repo root>\n\
+  cd /persist/colmena/projects/speaches-plus\n\
   unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE; export HF_HUB_DISABLE_XET=1\n\
-  df -h .      # require >= 300GB free before starting\n\
+  zpool list   # require >= 300GB free before starting\n\
   hf download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir <dst>\n\
   # verify each model-000NN-of-00015.safetensors real byte size (sum 70,523,299,202);\n\
   # any 135-byte shard is an LFS pointer stub = BLOCKER.\n\

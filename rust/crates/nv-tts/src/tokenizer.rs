@@ -133,7 +133,7 @@ impl Qwen3TtsTokenizer {
                 })
                 .collect();
 
-            let _added_count = tk.add_special_tokens(&added);
+            let _added_count = tk.add_special_tokens(added);
             for (id, e) in entries {
                 let actual = tk.token_to_id(&e.content);
                 match actual {
@@ -163,7 +163,7 @@ impl Qwen3TtsTokenizer {
                 .iter()
                 .map(|(s, _)| AddedToken::from(s.to_string(), true))
                 .collect();
-            let _ = tk.add_special_tokens(&added);
+            let _ = tk.add_special_tokens(added);
             for (s, id) in builtin {
                 let actual = tk.token_to_id(s).unwrap_or(id);
                 special_token_ids.insert(s.to_string(), actual);

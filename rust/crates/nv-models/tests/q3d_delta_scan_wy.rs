@@ -4,7 +4,12 @@ use nv_kernels::wgpu_backend::{dispatch, WgpuContext};
 
 const SEQ_ENTRY: &str = "q3w_delta_scan";
 const WY_ENTRY: &str = "q3w_delta_scan_wy";
+const WY16_ENTRY: &str = "q3w_delta_scan_wy16";
 const WY_VSPLIT_4_WORKGROUPS_PER_HEAD_EACH_OWNS_32_V_COLUMNS: u32 = 4;
+
+const WY16_SCAN_WORKGROUP_BYTES_TWO_8K_VEC4_TILES_TWO_1K_TRIANGLES_ONE_2K_SCALAR_U_TWO_64B_LANES:
+    u32 = 2 * 512 * 16 + 2 * 256 * 4 + 512 * 4 + 2 * 16 * 4;
+const METAL_WORKGROUP_STORAGE_LIMIT_THE_WY16_GEOMETRY_EXISTS_TO_FIT: u32 = 32768;
 
 const WY_CPU_F64_AGREEMENT_TOL_REL: f64 = 1e-10;
 
@@ -283,7 +288,7 @@ fn ctx() -> &'static WgpuContext {
 
 fn prefill_source() -> String {
     let src = nv_models::qwen3_5_dense_wgpu::shipped_prefill_source();
-    for entry in [SEQ_ENTRY, WY_ENTRY] {
+    for entry in [SEQ_ENTRY, WY_ENTRY, WY16_ENTRY] {
         assert!(
             src.contains(&format!("fn {entry}(")),
             "the shipped prefill source no longer declares {entry}; the entry moved and this \
@@ -322,10 +327,10 @@ fn run_scan(c: &Case, entry: &str, src: &str) -> (Vec<f32>, Vec<f32>) {
             pad1: 0,
         },
     );
-    let grid_y = if entry == WY_ENTRY {
-        WY_VSPLIT_4_WORKGROUPS_PER_HEAD_EACH_OWNS_32_V_COLUMNS
-    } else {
+    let grid_y = if entry == SEQ_ENTRY {
         1
+    } else {
+        WY_VSPLIT_4_WORKGROUPS_PER_HEAD_EACH_OWNS_32_V_COLUMNS
     };
     dispatch::run(
         ctx,
@@ -359,6 +364,19 @@ fn to_f64(v: &[f32]) -> Vec<f64> {
 
 #[test]
 fn q3w_delta_scan_wy_matches_the_f64_reference_and_the_sequential_kernel_at_real_dims() {
+    let ctx = WgpuContext::shared().expect("wgpu adapter");
+    if !ctx.caps.workgroup_storage_fits(
+        nv_models::qwen3_5_dense_wgpu::WY_SCAN_WORKGROUP_BYTES_TWO_16K_VEC4_TILES_TWO_4K_ROWS_TWO_128B_LANES,
+    ) {
+        eprintln!(
+            "SKIP: adapter workgroup storage {} < the {} B the wy tiles need; the serving route \
+             refuses this kernel here (pf_scan_wy_route), so a red on it would test an \
+             unreachable configuration",
+            ctx.caps.max_compute_workgroup_storage_size,
+            nv_models::qwen3_5_dense_wgpu::WY_SCAN_WORKGROUP_BYTES_TWO_16K_VEC4_TILES_TWO_4K_ROWS_TWO_128B_LANES
+        );
+        return;
+    }
     let src = prefill_source();
     let tol = WY_GPU_TOL_REL_1E4_BOTH_KERNELS_SUM_F32_OVER_DK128_AND_THE_WY_FORM_REGROUPS_A_32_TOKEN_CHUNK;
     let mut worst = 0f64;
@@ -405,4 +423,61 @@ fn q3w_delta_scan_wy_matches_the_f64_reference_and_the_sequential_kernel_at_real
          both, the chunk-seam arithmetic is untested"
     );
     eprintln!("[q3d-scan-wy] worst gpu rel: {worst:.3e}");
+}
+
+#[test]
+fn q3w_delta_scan_wy16_matches_the_f64_reference_within_the_32k_metal_workgroup_limit() {
+    assert!(
+        WY16_SCAN_WORKGROUP_BYTES_TWO_8K_VEC4_TILES_TWO_1K_TRIANGLES_ONE_2K_SCALAR_U_TWO_64B_LANES
+            <= METAL_WORKGROUP_STORAGE_LIMIT_THE_WY16_GEOMETRY_EXISTS_TO_FIT,
+        "the wy16 tiles ({} B) outgrew the 32768 B Metal workgroup limit this geometry exists \
+         to fit; Metal EXECUTES over-limit pipelines with aliased tiles instead of failing, so \
+         shipping this is silent corruption, not a launch error",
+        WY16_SCAN_WORKGROUP_BYTES_TWO_8K_VEC4_TILES_TWO_1K_TRIANGLES_ONE_2K_SCALAR_U_TWO_64B_LANES
+    );
+    let ctx = WgpuContext::shared().expect("wgpu adapter");
+    if !ctx.caps.workgroup_storage_fits(
+        WY16_SCAN_WORKGROUP_BYTES_TWO_8K_VEC4_TILES_TWO_1K_TRIANGLES_ONE_2K_SCALAR_U_TWO_64B_LANES,
+    ) {
+        eprintln!(
+            "SKIP: adapter workgroup storage {} < the {} B the wy16 tiles need; even the C=16 \
+             geometry does not fit here, so a red on it would test an unreachable configuration",
+            ctx.caps.max_compute_workgroup_storage_size,
+            WY16_SCAN_WORKGROUP_BYTES_TWO_8K_VEC4_TILES_TWO_1K_TRIANGLES_ONE_2K_SCALAR_U_TWO_64B_LANES
+        );
+        return;
+    }
+    let src = prefill_source();
+    let tol = WY_GPU_TOL_REL_1E4_BOTH_KERNELS_SUM_F32_OVER_DK128_AND_THE_WY_FORM_REGROUPS_A_32_TOKEN_CHUNK;
+    let mut worst = 0f64;
+    let mut saw_partial_tail_chunk = false;
+    let mut saw_full_chunks = false;
+    for m in [1usize, 6, 16, 33, 67, 256] {
+        saw_partial_tail_chunk |= m % 16 != 0;
+        saw_full_chunks |= m >= 32;
+        let c = case(32, 128, 128, m, 0x16_77e5 ^ m as u64);
+        let (want_out, want_state) = seq_reference(&c);
+        let (wy_out, wy_state) = run_scan(&c, WY16_ENTRY, &src);
+        let ro = rel_err(&to_f64(&wy_out), &want_out, "output", &c.label);
+        let rs = rel_err(&to_f64(&wy_state), &want_state, "state", &c.label);
+        assert!(
+            ro < tol && rs < tol,
+            "{}: {WY16_ENTRY} diverged from the f64 sequential reference (out rel {ro:e}, state \
+             rel {rs:e} vs tol {tol:e}, error normalized by the reference max). C=16 regroups \
+             half the tokens the wy32 form does, so the wy32 budget is an upper bound here and \
+             exceeding it is a kernel defect, not accumulated reassociation",
+            c.label
+        );
+        eprintln!(
+            "[q3d-scan-wy16] {}: wy16-vs-f64 out {ro:.3e} state {rs:.3e}",
+            c.label
+        );
+        worst = worst.max(ro).max(rs);
+    }
+    assert!(
+        saw_partial_tail_chunk && saw_full_chunks,
+        "the corpus must exercise both full 16-token chunks and a partial tail chunk; without \
+         both, the chunk-seam arithmetic is untested"
+    );
+    eprintln!("[q3d-scan-wy16] worst gpu rel: {worst:.3e}");
 }

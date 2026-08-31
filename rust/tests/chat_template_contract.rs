@@ -41,7 +41,7 @@ fn snapshot_dir(repo: &str, snap: &str) -> Option<PathBuf> {
 fn scratch(tag: &str) -> PathBuf {
     let mut p = std::env::var("TMPDIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| hub_root().parent().unwrap().join("nvk-tmp"));
+        .unwrap_or_else(|_| hub_root().parent().unwrap().join("claude-tmp"));
     p.push(format!("tmplcontract-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();

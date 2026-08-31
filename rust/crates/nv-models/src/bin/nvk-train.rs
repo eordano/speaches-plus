@@ -48,6 +48,7 @@ fn main() -> Result<()> {
     let args = TrainArgs {
         base: cli.base,
         data: cli.data,
+        eval_data: None,
         out: cli.out.clone(),
         rank: cli.rank,
         alpha: cli.alpha.unwrap_or(cli.rank as f64),
@@ -60,6 +61,7 @@ fn main() -> Result<()> {
     let s = run(&args)?;
 
     println!("BASE_DTYPE {}", s.base_dtype);
+    println!("RESIDENT_BASE {}", if s.resident_base { 1 } else { 0 });
     println!("NVFP4_BASE {}", if s.nvfp4_base { 1 } else { 0 });
     println!("DENSE_BASE {}", if s.dense_base { 1 } else { 0 });
     println!("DEVICE {}", s.device);

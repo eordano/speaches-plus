@@ -441,6 +441,768 @@ mod wgpu_runtime {
     }
 }
 
+pub struct ServingDeltaSlice {
+    pub offset: usize,
+    pub width: usize,
+    pub scaling: f64,
+    pub a_t: Tensor,
+    pub b_t: Tensor,
+}
+
+impl ServingDeltaSlice {
+    pub fn from_peft_pair(
+        module: &str,
+        offset: usize,
+        width: usize,
+        in_features: usize,
+        a: &Tensor,
+        b: &Tensor,
+        scaling: f64,
+    ) -> Result<Self> {
+        let (a_rank, a_in) = a.dims2()?;
+        if a_in != in_features {
+            bail!(
+                "{module}: lora_A in dim {a_in} != linear in_features {in_features}; this \
+                 adapter was trained against a different base"
+            );
+        }
+        let (b_out, b_rank) = b.dims2()?;
+        if b_out != width {
+            bail!(
+                "{module}: lora_B out dim {b_out} != projection slice width {width}; this \
+                 adapter was trained against a different base"
+            );
+        }
+        if a_rank != b_rank || a_rank == 0 {
+            bail!("{module}: lora_A rank {a_rank} and lora_B rank {b_rank} must match and be non-zero");
+        }
+        Ok(Self {
+            offset,
+            width,
+            scaling,
+            a_t: a
+                .t()?
+                .contiguous()?
+                .to_dtype(candle_core::DType::F32)?,
+            b_t: b
+                .t()?
+                .contiguous()?
+                .to_dtype(candle_core::DType::F32)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServingHookEngagement {
+    pub m1_kernel_applies: u64,
+    pub m1_applies_inside_an_open_capture: u64,
+    pub fallback_candle_applies: u64,
+}
+
+static SERVING_M1_KERNEL_APPLIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SERVING_M1_APPLIES_INSIDE_AN_OPEN_CAPTURE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SERVING_FALLBACK_CANDLE_APPLIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn serving_hook_engagement_counted_host_side_so_replays_of_a_captured_graph_leave_it_flat(
+) -> ServingHookEngagement {
+    use std::sync::atomic::Ordering::Relaxed;
+    ServingHookEngagement {
+        m1_kernel_applies: SERVING_M1_KERNEL_APPLIES.load(Relaxed),
+        m1_applies_inside_an_open_capture: SERVING_M1_APPLIES_INSIDE_AN_OPEN_CAPTURE.load(Relaxed),
+        fallback_candle_applies: SERVING_FALLBACK_CANDLE_APPLIES.load(Relaxed),
+    }
+}
+
+pub struct ServingLoraHook {
+    slices: Vec<ServingDeltaSlice>,
+    in_features: usize,
+    out_features: usize,
+    #[cfg(feature = "cuda")]
+    cuda_m1_kernel_delta_that_survives_the_forked_stream_decode_capture:
+        Option<Arc<CudaM1TwoPhaseDelta>>,
+}
+
+#[cfg(feature = "cuda")]
+struct CudaM1TwoPhaseDelta {
+    device: candle_core::CudaDevice,
+    _a_tensors: Vec<Tensor>,
+    _b_tensors: Vec<Tensor>,
+    _a_ptrs_d: cudarc::driver::CudaSlice<u64>,
+    _b_ptrs_d: cudarc::driver::CudaSlice<u64>,
+    _slice_n_d: cudarc::driver::CudaSlice<i32>,
+    _slice_start_d: cudarc::driver::CudaSlice<i32>,
+    _partials: cudarc::driver::CudaSlice<f32>,
+    a_ptrs_ptr: u64,
+    b_ptrs_ptr: u64,
+    slice_n_ptr: u64,
+    slice_start_ptr: u64,
+    partials_ptr: u64,
+    rank: usize,
+    in_features: usize,
+    n_slices: usize,
+    n_tiles: usize,
+    k_tile: usize,
+    max_n: usize,
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_bf16_ptr(t: &Tensor, stream: &Arc<cudarc::driver::CudaStream>) -> Result<u64> {
+    use cudarc::driver::DevicePtr as _;
+    let (storage, layout) = t.storage_and_layout();
+    let s = match &*storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => bail!("expected cuda storage"),
+    };
+    let sl = s.as_cuda_slice::<half::bf16>()?;
+    let view = sl.slice(layout.start_offset()..);
+    let (p, g) = view.device_ptr(stream);
+    drop(g);
+    Ok(p as u64)
+}
+
+#[cfg(feature = "cuda")]
+impl CudaM1TwoPhaseDelta {
+    fn launch(&self, x2: &Tensor, y2: &Tensor, win_off: usize, win_len: usize) -> Result<()> {
+        use std::ffi::c_void;
+        anyhow::ensure!(
+            x2.dtype() == candle_core::DType::BF16 && x2.is_contiguous(),
+            "CudaM1TwoPhaseDelta::launch requires a bf16 contiguous input: a candle dtype or \
+             layout conversion here would launch on the legacy stream inside the open decode \
+             capture, the exact failure this kernel path exists to avoid (got {:?}, \
+             contiguous={})",
+            x2.dtype(),
+            x2.is_contiguous()
+        );
+        let stream = nv_layers::cuda_stream::current_stream(&self.device);
+        let x_ptr = cuda_bf16_ptr(x2, &stream)?;
+        let y_ptr = cuda_bf16_ptr(y2, &stream)?;
+        let rc = unsafe {
+            nv_kernels::lora::lora_m1_shrink_tiles(
+                stream.cu_stream() as *mut c_void,
+                x_ptr as *const u16,
+                self.a_ptrs_ptr as *const u64,
+                self.partials_ptr as *mut f32,
+                self.n_slices as i32,
+                self.rank as i32,
+                self.in_features as i32,
+                self.k_tile as i32,
+                self.n_tiles as i32,
+            )
+        };
+        if rc != 0 {
+            bail!("lora_m1_shrink_tiles rc={rc}");
+        }
+        let rc = unsafe {
+            nv_kernels::lora::lora_m1_expand_tiles(
+                stream.cu_stream() as *mut c_void,
+                self.partials_ptr as *const f32,
+                self.b_ptrs_ptr as *const u64,
+                y_ptr as *mut u16,
+                self.slice_n_ptr as *const i32,
+                self.slice_start_ptr as *const i32,
+                self.n_slices as i32,
+                self.rank as i32,
+                self.n_tiles as i32,
+                self.max_n as i32,
+                win_off as i32,
+                win_len as i32,
+            )
+        };
+        if rc != 0 {
+            bail!("lora_m1_expand_tiles rc={rc}");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn build_cuda_m1_kernel_delta(
+    in_features: usize,
+    out_features: usize,
+    slices: &[ServingDeltaSlice],
+) -> Result<Option<Arc<CudaM1TwoPhaseDelta>>> {
+    use candle_core::{DType, Device};
+    use cudarc::driver::{DevicePtr as _, DevicePtrMut as _};
+    let device = slices[0].a_t.device().clone();
+    let Device::Cuda(dev) = device else {
+        return Ok(None);
+    };
+    let mut sorted: Vec<&ServingDeltaSlice> = slices.iter().collect();
+    sorted.sort_by_key(|s| s.offset);
+    for w in sorted.windows(2) {
+        if w[0].offset + w[0].width > w[1].offset {
+            bail!(
+                "ServingLoraHook: slices {}..{} and {}..{} overlap; the m=1 kernel slice \
+                 table needs disjoint column ranges",
+                w[0].offset,
+                w[0].offset + w[0].width,
+                w[1].offset,
+                w[1].offset + w[1].width
+            );
+        }
+    }
+    let mut max_rank = 0usize;
+    for s in &sorted {
+        max_rank = max_rank.max(s.a_t.dims2()?.1);
+    }
+    if max_rank > nv_kernels::lora::M1_MAX_RANK {
+        bail!(
+            "ServingLoraHook: adapter rank {max_rank} exceeds the m=1 kernel limit {}; the \
+             captured gemma4 decode runs on a forked stream where candle matmuls launch \
+             uncaptured on the legacy stream and bake freed addresses, so serving on cuda \
+             REQUIRES the nv-kernels m=1 path and an adapter it cannot express must refuse \
+             to install",
+            nv_kernels::lora::M1_MAX_RANK
+        );
+    }
+    let cuda_dev = dev.clone();
+    let stream = nv_layers::cuda_stream::current_stream(&cuda_dev);
+    let mut a_tensors: Vec<Tensor> = Vec::with_capacity(sorted.len());
+    let mut b_tensors: Vec<Tensor> = Vec::with_capacity(sorted.len());
+    let mut a_addrs: Vec<u64> = Vec::with_capacity(sorted.len());
+    let mut b_addrs: Vec<u64> = Vec::with_capacity(sorted.len());
+    let mut slice_n: Vec<i32> = Vec::with_capacity(sorted.len());
+    let mut slice_start: Vec<i32> = Vec::with_capacity(sorted.len());
+    let mut max_n = 0usize;
+    let cdev = candle_core::Device::Cuda(dev.clone());
+    for s in sorted {
+        let rank = s.a_t.dims2()?.1;
+        let mut a = s.a_t.t()?.contiguous()?.to_dtype(DType::BF16)?;
+        if rank < max_rank {
+            let z = Tensor::zeros((max_rank - rank, in_features), DType::BF16, &cdev)?;
+            a = Tensor::cat(&[a, z], 0)?.contiguous()?;
+        }
+        let b_t = if s.scaling != 1.0 {
+            s.b_t.affine(s.scaling, 0.0)?
+        } else {
+            s.b_t.clone()
+        };
+        let mut b = b_t.t()?.contiguous()?.to_dtype(DType::BF16)?;
+        if rank < max_rank {
+            let z = Tensor::zeros((s.width, max_rank - rank), DType::BF16, &cdev)?;
+            b = Tensor::cat(&[b, z], 1)?.contiguous()?;
+        }
+        a_addrs.push(cuda_bf16_ptr(&a, &stream)?);
+        b_addrs.push(cuda_bf16_ptr(&b, &stream)?);
+        a_tensors.push(a);
+        b_tensors.push(b);
+        slice_n.push(s.width as i32);
+        slice_start.push(s.offset as i32);
+        max_n = max_n.max(s.width);
+    }
+    let n_slices = a_tensors.len();
+    let (n_tiles, k_tile) = nv_kernels::lora::m1_shrink_tiling(in_features);
+    #[allow(deprecated)]
+    let a_ptrs_d = stream.clone_htod(&a_addrs).map_err(|e| anyhow::anyhow!(e))?;
+    #[allow(deprecated)]
+    let b_ptrs_d = stream.clone_htod(&b_addrs).map_err(|e| anyhow::anyhow!(e))?;
+    #[allow(deprecated)]
+    let slice_n_d = stream.clone_htod(&slice_n).map_err(|e| anyhow::anyhow!(e))?;
+    #[allow(deprecated)]
+    let slice_start_d = stream.clone_htod(&slice_start).map_err(|e| anyhow::anyhow!(e))?;
+    let mut partials = stream
+        .alloc_zeros::<f32>(n_slices * n_tiles * max_rank)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let ro = |s: &cudarc::driver::CudaSlice<u64>| -> u64 {
+        let (p, g) = s.device_ptr(&stream);
+        drop(g);
+        p as u64
+    };
+    let roi = |s: &cudarc::driver::CudaSlice<i32>| -> u64 {
+        let (p, g) = s.device_ptr(&stream);
+        drop(g);
+        p as u64
+    };
+    let a_ptrs_ptr = ro(&a_ptrs_d);
+    let b_ptrs_ptr = ro(&b_ptrs_d);
+    let slice_n_ptr = roi(&slice_n_d);
+    let slice_start_ptr = roi(&slice_start_d);
+    let partials_ptr = {
+        let (p, g) = partials.device_ptr_mut(&stream);
+        drop(g);
+        p as u64
+    };
+    let _ = out_features;
+    Ok(Some(Arc::new(CudaM1TwoPhaseDelta {
+        device: cuda_dev,
+        _a_tensors: a_tensors,
+        _b_tensors: b_tensors,
+        _a_ptrs_d: a_ptrs_d,
+        _b_ptrs_d: b_ptrs_d,
+        _slice_n_d: slice_n_d,
+        _slice_start_d: slice_start_d,
+        _partials: partials,
+        a_ptrs_ptr,
+        b_ptrs_ptr,
+        slice_n_ptr,
+        slice_start_ptr,
+        partials_ptr,
+        rank: max_rank,
+        in_features,
+        n_slices,
+        n_tiles,
+        k_tile,
+        max_n,
+    })))
+}
+
+#[cfg(feature = "cuda")]
+fn a_capture_is_open_so_candle_matmuls_would_launch_uncaptured_on_the_legacy_stream(
+    x2: &Tensor,
+) -> bool {
+    use cudarc::driver::sys as drv;
+    let candle_core::Device::Cuda(d) = x2.device() else {
+        return false;
+    };
+    let stream = nv_layers::cuda_stream::current_stream(d);
+    let mut st = drv::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    let rc = unsafe { drv::cuStreamIsCapturing(stream.cu_stream(), &mut st) };
+    rc == drv::CUresult::CUDA_SUCCESS
+        && st != drv::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+}
+
+impl ServingLoraHook {
+    pub fn new(
+        in_features: usize,
+        out_features: usize,
+        slices: Vec<ServingDeltaSlice>,
+    ) -> Result<Arc<Self>> {
+        if slices.is_empty() {
+            bail!(
+                "ServingLoraHook with zero slices would be an always-on no-op that still \
+                 disables every has_lora fast path; skip attaching instead"
+            );
+        }
+        for s in &slices {
+            if s.offset + s.width > out_features {
+                bail!(
+                    "ServingLoraHook slice {}+{} exceeds out_features {out_features}",
+                    s.offset,
+                    s.width
+                );
+            }
+        }
+        #[cfg(feature = "cuda")]
+        let cuda_m1 = build_cuda_m1_kernel_delta(in_features, out_features, &slices)?;
+        Ok(Arc::new(Self {
+            slices,
+            in_features,
+            out_features,
+            #[cfg(feature = "cuda")]
+            cuda_m1_kernel_delta_that_survives_the_forked_stream_decode_capture: cuda_m1,
+        }))
+    }
+}
+
+impl nv_layers::linear::LoraDeltaHook for ServingLoraHook {
+    fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    fn apply(
+        &self,
+        x2: &Tensor,
+        y2: &Tensor,
+        win: Option<(usize, usize)>,
+    ) -> Result<Option<Tensor>> {
+        let (m, k) = x2.dims2()?;
+        if k != self.in_features {
+            bail!(
+                "ServingLoraHook.apply: x cols {k} != in_features {}",
+                self.in_features
+            );
+        }
+        let (win_off, win_len) = win.unwrap_or((0, self.out_features));
+        if win_off + win_len > self.out_features {
+            bail!(
+                "ServingLoraHook.apply: window {win_off}+{win_len} exceeds out_features {}",
+                self.out_features
+            );
+        }
+        let (ym, yn) = y2.dims2()?;
+        if ym != m || yn != win_len {
+            bail!("ServingLoraHook.apply: y dims [{ym},{yn}] != [{m},{win_len}]");
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(hook) = &self.cuda_m1_kernel_delta_that_survives_the_forked_stream_decode_capture
+            {
+                if m == 1
+                    && matches!(x2.device(), candle_core::Device::Cuda(_))
+                    && y2.dtype() == candle_core::DType::BF16
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    SERVING_M1_KERNEL_APPLIES.fetch_add(1, Relaxed);
+                    if a_capture_is_open_so_candle_matmuls_would_launch_uncaptured_on_the_legacy_stream(x2) {
+                        SERVING_M1_APPLIES_INSIDE_AN_OPEN_CAPTURE.fetch_add(1, Relaxed);
+                    }
+                    hook.launch(x2, y2, win_off, win_len)?;
+                    return Ok(None);
+                }
+            }
+            if matches!(x2.device(), candle_core::Device::Cuda(_))
+                && a_capture_is_open_so_candle_matmuls_would_launch_uncaptured_on_the_legacy_stream(
+                    x2,
+                )
+            {
+                bail!(
+                    "ServingLoraHook.apply: the current stream is capturing and this call \
+                     (m={m}, y dtype {:?}) cannot take the nv-kernels m=1 path; refusing the \
+                     candle fallback because its cublas launches go to the legacy stream, \
+                     execute outside the capture, and bake freed buffer addresses into the \
+                     replayed graph",
+                    y2.dtype()
+                );
+            }
+        }
+        SERVING_FALLBACK_CANDLE_APPLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let x_f32 = if x2.dtype() == candle_core::DType::F32 {
+            x2.clone()
+        } else {
+            x2.to_dtype(candle_core::DType::F32)?
+        };
+        let mut out = y2.clone();
+        let mut changed = false;
+        for s in &self.slices {
+            let lo = s.offset.max(win_off);
+            let hi = (s.offset + s.width).min(win_off + win_len);
+            if lo >= hi {
+                continue;
+            }
+            let h = x_f32.matmul(&s.a_t)?;
+            let b_t = s.b_t.narrow(1, lo - s.offset, hi - lo)?.contiguous()?;
+            let mut d = h.matmul(&b_t)?;
+            if s.scaling != 1.0 {
+                d = d.affine(s.scaling, 0.0)?;
+            }
+            let d = d.to_dtype(out.dtype())?;
+            let c0 = lo - win_off;
+            let len = hi - lo;
+            let seg = out.narrow(1, c0, len)?.add(&d)?;
+            let mut parts: Vec<Tensor> = Vec::with_capacity(3);
+            if c0 > 0 {
+                parts.push(out.narrow(1, 0, c0)?);
+            }
+            parts.push(seg);
+            if c0 + len < yn {
+                parts.push(out.narrow(1, c0 + len, yn - c0 - len)?);
+            }
+            out = Tensor::cat(&parts, 1)?;
+            changed = true;
+        }
+        if changed {
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+pub const GEMMA4_SERVING_LORA_PREFIX: &str = "model.language_model";
+
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub struct ServingInstall {
+    pub matched_modules: usize,
+    pub hooked_linears: usize,
+    pub skipped: Vec<String>,
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+fn plan_serving_hook<'m>(
+    linear: &'m nv_layers::linear::Linear,
+    slices: &[(String, usize, usize)],
+    adapter: &nv_weights::lora_adapter::LoraAdapter,
+    planned: &mut Vec<(&'m nv_layers::linear::Linear, Arc<ServingLoraHook>)>,
+    matched: &mut usize,
+) -> Result<()> {
+    let mut hook_slices = Vec::new();
+    for (module, offset, width) in slices {
+        let Some(w) = adapter.loras.get(module) else {
+            continue;
+        };
+        if w.is_embedding {
+            bail!("{module}: embedding LoRA tensors have no linear projection to hook");
+        }
+        hook_slices.push(ServingDeltaSlice::from_peft_pair(
+            module,
+            *offset,
+            *width,
+            linear.in_features(),
+            &w.lora_a,
+            &w.lora_b,
+            w.scaling,
+        )?);
+        *matched += 1;
+    }
+    if hook_slices.is_empty() {
+        return Ok(());
+    }
+    let hook = ServingLoraHook::new(linear.in_features(), linear.out_features(), hook_slices)?;
+    planned.push((linear, hook));
+    Ok(())
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub fn detach_gemma4_serving_adapter(model: &Gemma4) {
+    for layer in model.layers() {
+        layer.self_attn.qkv_proj.detach_lora();
+        layer.self_attn.o_proj.detach_lora();
+        layer.mlp.gate_up_proj.detach_lora();
+        layer.mlp.down_proj.detach_lora();
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub fn install_gemma4_serving_adapter(
+    model: &Gemma4,
+    adapter: &nv_weights::lora_adapter::LoraAdapter,
+) -> Result<ServingInstall> {
+    let mut planned: Vec<(&nv_layers::linear::Linear, Arc<ServingLoraHook>)> = Vec::new();
+    let mut matched = 0usize;
+    let mut skipped: Vec<String> = Vec::new();
+    for (li, layer) in model.layers().iter().enumerate() {
+        let p = format!("{GEMMA4_SERVING_LORA_PREFIX}.layers.{li}");
+        let attn = &layer.self_attn;
+        let mut qkv_slices: Vec<(String, usize, usize)> = vec![
+            (format!("{p}.self_attn.q_proj"), 0, attn.q_dim),
+            (format!("{p}.self_attn.k_proj"), attn.q_dim, attn.kv_dim),
+        ];
+        let v_name = format!("{p}.self_attn.v_proj");
+        if attn.has_v {
+            qkv_slices.push((v_name, attn.q_dim + attn.kv_dim, attn.kv_dim));
+        } else if adapter.loras.contains_key(&v_name) {
+            skipped.push(format!(
+                "{v_name}: this layer computes v as k (attention_k_eq_v), so the fused qkv \
+                 projection has no v slice for the adapter to land on"
+            ));
+        }
+        plan_serving_hook(&attn.qkv_proj, &qkv_slices, adapter, &mut planned, &mut matched)?;
+        plan_serving_hook(
+            &attn.o_proj,
+            &[(format!("{p}.self_attn.o_proj"), 0, attn.o_proj.out_features())],
+            adapter,
+            &mut planned,
+            &mut matched,
+        )?;
+        let inter = layer.mlp.gate_up_proj.out_features() / 2;
+        plan_serving_hook(
+            &layer.mlp.gate_up_proj,
+            &[
+                (format!("{p}.mlp.gate_proj"), 0, inter),
+                (format!("{p}.mlp.up_proj"), inter, inter),
+            ],
+            adapter,
+            &mut planned,
+            &mut matched,
+        )?;
+        plan_serving_hook(
+            &layer.mlp.down_proj,
+            &[(
+                format!("{p}.mlp.down_proj"),
+                0,
+                layer.mlp.down_proj.out_features(),
+            )],
+            adapter,
+            &mut planned,
+            &mut matched,
+        )?;
+    }
+    if matched == 0 {
+        bail!(
+            "lora adapter matched no gemma4 projection; it carries {} modules, the first of \
+             which is {:?}. Expected names like {GEMMA4_SERVING_LORA_PREFIX}.layers.0.self_attn.q_proj",
+            adapter.loras.len(),
+            adapter.loras.keys().next()
+        );
+    }
+    let mut attached: Vec<&nv_layers::linear::Linear> = Vec::new();
+    for (linear, hook) in planned {
+        if let Err(err) = linear.attach_lora(hook) {
+            for l in attached {
+                l.detach_lora();
+            }
+            return Err(err.context(
+                "attach_lora failed after dim validation; every already-attached hook was \
+                 detached so a refused adapter leaves no partial application",
+            ));
+        }
+        attached.push(linear);
+    }
+    Ok(ServingInstall {
+        matched_modules: matched,
+        hooked_linears: attached.len(),
+        skipped,
+    })
+}
+
+pub const LAGUNA_SERVING_LORA_PREFIX_IS_THE_GEMMA4_NAMESPACE_BECAUSE_NV_WEIGHTS_NORMALIZE_MODULE_NAME_REWRITES_MODEL_LAYERS:
+    &str = GEMMA4_SERVING_LORA_PREFIX;
+
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub fn detach_laguna_serving_adapter(model: &nv_models::laguna::Laguna) {
+    for layer in model.layers() {
+        let attn = &layer.self_attn;
+        attn.q_proj.detach_lora();
+        attn.k_proj.detach_lora();
+        attn.v_proj.detach_lora();
+        attn.o_proj.detach_lora();
+        if let Some(g) = &attn.g_proj {
+            g.detach_lora();
+        }
+        if let nv_models::laguna::LagunaFfn::Dense(mlp) = &layer.ffn {
+            mlp.gate_proj().detach_lora();
+            mlp.up_proj().detach_lora();
+            mlp.down_proj().detach_lora();
+        }
+    }
+    model.set_attn_w8(true);
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub fn install_laguna_serving_adapter(
+    model: &nv_models::laguna::Laguna,
+    adapter: &nv_weights::lora_adapter::LoraAdapter,
+) -> Result<ServingInstall> {
+    use nv_models::laguna::LagunaFfn;
+    let prefix =
+        LAGUNA_SERVING_LORA_PREFIX_IS_THE_GEMMA4_NAMESPACE_BECAUSE_NV_WEIGHTS_NORMALIZE_MODULE_NAME_REWRITES_MODEL_LAYERS;
+    let mut planned: Vec<(&nv_layers::linear::Linear, Arc<ServingLoraHook>)> = Vec::new();
+    let mut matched = 0usize;
+    let mut matched_names: Vec<String> = Vec::new();
+    let mut w8_bypassed_attention_matched = false;
+    for (li, layer) in model.layers().iter().enumerate() {
+        let p = format!("{prefix}.layers.{li}");
+        let attn = &layer.self_attn;
+        let mut targets: Vec<(&nv_layers::linear::Linear, String, bool)> = vec![
+            (&attn.q_proj, format!("{p}.self_attn.q_proj"), true),
+            (&attn.k_proj, format!("{p}.self_attn.k_proj"), true),
+            (&attn.v_proj, format!("{p}.self_attn.v_proj"), true),
+            (&attn.o_proj, format!("{p}.self_attn.o_proj"), true),
+        ];
+        let g_name = format!("{p}.self_attn.g_proj");
+        match &attn.g_proj {
+            Some(g) => targets.push((g, g_name, false)),
+            None => {
+                if adapter.loras.contains_key(&g_name) {
+                    bail!(
+                        "{g_name}: this laguna config declares gating=none, so there is no \
+                         g_proj linear for the adapter to land on"
+                    );
+                }
+            }
+        }
+        match &layer.ffn {
+            LagunaFfn::Dense(mlp) => {
+                targets.push((mlp.gate_proj(), format!("{p}.mlp.gate_proj"), false));
+                targets.push((mlp.up_proj(), format!("{p}.mlp.up_proj"), false));
+                targets.push((mlp.down_proj(), format!("{p}.mlp.down_proj"), false));
+            }
+            LagunaFfn::Moe(_) => {
+                let moe_ns = format!("{p}.mlp.");
+                if let Some(name) = adapter.loras.keys().find(|k| k.starts_with(&moe_ns)) {
+                    bail!(
+                        "{name}: layer {li} is MoE, and laguna MoE ffn runs grouped expert \
+                         kernels (with captured per-layer MoE graphs at m=1) that never route \
+                         nv-layers Linear::forward, so a hook there would be silently ignored; \
+                         refusing the whole adapter rather than serving a module subset"
+                    );
+                }
+            }
+        }
+        for (linear, name, is_a_w8_bypassable_qkvo_site) in targets {
+            if adapter.loras.contains_key(&name) {
+                matched_names.push(name.clone());
+                w8_bypassed_attention_matched |= is_a_w8_bypassable_qkvo_site;
+            }
+            plan_serving_hook(
+                linear,
+                &[(name, 0, linear.out_features())],
+                adapter,
+                &mut planned,
+                &mut matched,
+            )?;
+        }
+    }
+    if matched == 0 {
+        bail!(
+            "lora adapter matched no laguna projection; it carries {} modules, the first of \
+             which is {:?}. Laguna peft targets (model.layers.N.self_attn.q_proj, ...) arrive \
+             here rewritten by nv_weights::lora_adapter::normalize_module_name to names like \
+             {prefix}.layers.0.self_attn.q_proj",
+            adapter.loras.len(),
+            adapter.loras.keys().next()
+        );
+    }
+    for key in adapter.loras.keys() {
+        if !matched_names.iter().any(|m| m == key) {
+            bail!(
+                "{key}: matched no laguna projection while {matched} other modules did; \
+                 serving a module subset would silently change the adapter's trained \
+                 function. Hookable laguna targets are self_attn.{{q,k,v,o,g}}_proj and \
+                 dense-layer mlp.{{gate,up,down}}_proj"
+            );
+        }
+    }
+    if w8_bypassed_attention_matched
+        && model.attn_w8_active()
+        && model.attn_w8_shape_policy()
+    {
+        bail!(
+            "this laguna engine booted with the attn-w8 'shape' policy \
+             (NV_LAGUNA_ATTN_W8/NV_LAGUNA_ATTN_FP8 contains 'shape'): apply_attn_w8_for \
+             re-arms the quantized q/k/v/o gemv before every m=1 forward, and that gemv \
+             bypasses the nv-layers Linear hook this adapter needs, so disabling it at \
+             install cannot stick; boot the adapter engine without the shape policy"
+        );
+    }
+    let mut attached: Vec<&nv_layers::linear::Linear> = Vec::new();
+    for (linear, hook) in planned {
+        if let Err(err) = linear.attach_lora(hook) {
+            for l in attached {
+                l.detach_lora();
+            }
+            return Err(err.context(
+                "attach_lora failed after dim validation; every already-attached hook was \
+                 detached so a refused adapter leaves no partial application",
+            ));
+        }
+        attached.push(linear);
+    }
+    let mut skipped: Vec<String> = Vec::new();
+    if w8_bypassed_attention_matched && model.attn_w8_active() {
+        model.set_attn_w8(false);
+        let scope = model.attn_w8_scope();
+        if scope != 0 {
+            for l in attached {
+                l.detach_lora();
+            }
+            model.set_attn_w8(true);
+            bail!(
+                "set_attn_w8(false) left w8 scope {scope}; the quantized q/k/v/o gemv would \
+                 bypass the attached attention hooks, so every hook was detached and the \
+                 adapter refused"
+            );
+        }
+        skipped.push(
+            "attn w8/fp8 m=1 projections disabled on this adapter engine: the quantized gemv \
+             bypasses nv-layers Linear hooks, so hooked q/k/v/o must take Linear::forward"
+                .into(),
+        );
+    }
+    Ok(ServingInstall {
+        matched_modules: matched,
+        hooked_linears: attached.len(),
+        skipped,
+    })
+}
+
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub fn synth_qkv_adapter(
     model: &Gemma4,

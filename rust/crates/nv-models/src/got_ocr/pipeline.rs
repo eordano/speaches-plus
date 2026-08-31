@@ -11,6 +11,29 @@ use crate::deepseek_ocr::preprocess::{resize_rgb, RgbImage};
 use crate::dots_ocr::decoder::{
     argmax_banned, DotsDecoder, DotsDecoderConfig, DotsKvCache, GenerateOptions, GenerateOutcome,
 };
+use crate::dots_ocr::DotsPrecision;
+
+pub const GOT_PRECISION_ENV: &str = "NV_GOT_DEC_PRECISION";
+
+pub fn got_precision(raw: Option<&str>, default: DotsPrecision) -> Result<DotsPrecision> {
+    DotsPrecision::parse(raw, default)
+        .map_err(|e| anyhow!("{GOT_PRECISION_ENV}: {e:#}"))
+}
+
+pub fn got_default_precision(device: &Device) -> DotsPrecision {
+    if device.is_cuda() {
+        DotsPrecision::Nvfp4
+    } else {
+        DotsPrecision::Bf16
+    }
+}
+
+pub fn got_precision_from_env(device: &Device) -> Result<DotsPrecision> {
+    got_precision(
+        std::env::var(GOT_PRECISION_ENV).ok().as_deref(),
+        got_default_precision(device),
+    )
+}
 
 pub const GOT_IMAGE_TOKENS: usize = 256;
 pub const GOT_SYSTEM: &str =
@@ -49,6 +72,7 @@ pub struct GotOcrPipeline {
     eos_ids: Vec<u32>,
     device: Device,
     dtype: DType,
+    precision: DotsPrecision,
 }
 
 fn rope_span_from_env() -> usize {
@@ -59,7 +83,7 @@ fn rope_span_from_env() -> usize {
 }
 
 fn fast_kv_grow_by_concat_matches_accurate_numerics_at_1_33x() -> bool {
-    std::env::var("NV_GOT_FAST_KV").as_deref() == Ok("1")
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_GOT_FAST_KV")
 }
 
 fn text_config_json(raw: &str) -> Result<String> {
@@ -77,6 +101,21 @@ fn text_config_json(raw: &str) -> Result<String> {
 
 impl GotOcrPipeline {
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
+        Self::load_with_precision(dir, device, got_precision_from_env(device)?)
+    }
+
+    pub fn load_with_precision(
+        dir: &Path,
+        device: &Device,
+        precision: DotsPrecision,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "cuda"))]
+        if precision == DotsPrecision::Nvfp4 {
+            anyhow::bail!(
+                "got-ocr2: DotsPrecision::Nvfp4 requires the cuda feature; \
+                 rebuild with --features cuda or set {GOT_PRECISION_ENV}=bf16"
+            );
+        }
         let raw = std::fs::read_to_string(dir.join("config.json"))
             .with_context(|| format!("read {}/config.json", dir.display()))?;
         let cfg = nv_ocr::ModelOcrConfig::from_json_str(&raw).map_err(|e| anyhow!("{e}"))?;
@@ -122,14 +161,48 @@ impl GotOcrPipeline {
             text_cfg.tie_word_embeddings,
             "GOT ties word embeddings; a checkpoint with a separate lm_head breaks the 471-tensor gate"
         );
-        let decoder = DotsDecoder::from_loader(
-            text_cfg,
-            &GotLmNames(&weights),
-            device,
-            dtype,
-            rope_span_from_env(),
-        )
-        .context("load GOT Qwen2 decoder")?;
+        let decoder = match precision {
+            DotsPrecision::Bf16 => DotsDecoder::from_loader(
+                text_cfg,
+                &GotLmNames(&weights),
+                device,
+                dtype,
+                rope_span_from_env(),
+            )
+            .context("load GOT Qwen2 decoder bf16")?,
+            DotsPrecision::Nvfp4 => {
+                #[cfg(feature = "cuda")]
+                {
+                    DotsDecoder::from_loader_nvfp4(
+                        text_cfg,
+                        &GotLmNames(&weights),
+                        device,
+                        rope_span_from_env(),
+                    )
+                    .context("load GOT Qwen2 decoder nvfp4")?
+                }
+                #[cfg(not(feature = "cuda"))]
+                unreachable!("Nvfp4 rejected above on non-cuda builds")
+            }
+            DotsPrecision::W4 => DotsDecoder::from_loader_ggml(
+                text_cfg,
+                &GotLmNames(&weights),
+                device,
+                dtype,
+                candle_core::quantized::GgmlDType::Q4K,
+                rope_span_from_env(),
+            )
+            .context("load GOT Qwen2 decoder w4 (ggml Q4K)")?,
+            DotsPrecision::W8 => DotsDecoder::from_loader_ggml(
+                text_cfg,
+                &GotLmNames(&weights),
+                device,
+                dtype,
+                candle_core::quantized::GgmlDType::Q8_0,
+                rope_span_from_env(),
+            )
+            .context("load GOT Qwen2 decoder w8 (ggml Q8_0)")?,
+        };
 
         let tokenizer = nv_tokenizer::load_tokenizer(&dir.join("tokenizer.json"))
             .context("load GOT tokenizer.json")?;
@@ -165,7 +238,12 @@ impl GotOcrPipeline {
             eos_ids,
             device: device.clone(),
             dtype,
+            precision,
         })
+    }
+
+    pub fn precision(&self) -> DotsPrecision {
+        self.precision
     }
 
     fn preprocess(&self, img: &RgbImage) -> Vec<f32> {
@@ -335,5 +413,42 @@ impl GotOcrPipeline {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precision_parse_accepts_bf16_nvfp4_and_rejects_the_rest() {
+        assert_eq!(
+            got_precision(None, DotsPrecision::Nvfp4).unwrap(),
+            DotsPrecision::Nvfp4
+        );
+        assert_eq!(
+            got_precision(Some(""), DotsPrecision::Bf16).unwrap(),
+            DotsPrecision::Bf16
+        );
+        assert_eq!(
+            got_precision(Some("bf16"), DotsPrecision::Nvfp4).unwrap(),
+            DotsPrecision::Bf16
+        );
+        assert_eq!(
+            got_precision(Some("nvfp4"), DotsPrecision::Bf16).unwrap(),
+            DotsPrecision::Nvfp4
+        );
+        let err = got_precision(Some("int4"), DotsPrecision::Bf16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(GOT_PRECISION_ENV), "error names the env var: {err}");
+    }
+
+    #[test]
+    fn cpu_default_precision_is_bf16_nvfp4_kernels_are_cuda_only() {
+        assert_eq!(
+            got_default_precision(&Device::Cpu),
+            DotsPrecision::Bf16
+        );
     }
 }

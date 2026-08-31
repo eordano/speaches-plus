@@ -194,6 +194,144 @@ extern "C" int nv_kernels_gdn_recurrent_stateful_gqa_bf16out(
     return (int)cudaGetLastError();
 }
 
+template <int K_DIM, int V_DIM, int COLS, int SUBS>
+__global__ void gdn_recurrent_stateful_gqa_shfl_kernel(
+    const float* __restrict__ qn,
+    const float* __restrict__ kn,
+    const __nv_bfloat16* __restrict__ mixed,
+    const float* __restrict__ g_exp,
+    const float* __restrict__ beta,
+    float* __restrict__ state_inout,
+    __nv_bfloat16* __restrict__ out,
+    int B, int T, int H, int HK,
+    int conv_dim, int v_channel_offset
+) {
+    const int VSPLIT = V_DIM / COLS;
+    const int KPS = K_DIM / SUBS;
+    int vblock = blockIdx.x % VSPLIT;
+    int bh = blockIdx.x / VSPLIT;
+    int h = bh % H;
+    int b = bh / H;
+    if (b >= B) return;
+    int kh = h / (H / HK);
+
+    int tid = threadIdx.x;
+    int col = tid / SUBS;
+    int sub = tid % SUBS;
+    int v_glob = vblock * COLS + col;
+
+    float st[KPS];
+    float* g_state = state_inout + (size_t)bh * K_DIM * V_DIM;
+#pragma unroll
+    for (int j = 0; j < KPS; ++j) {
+        st[j] = g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob];
+    }
+
+    size_t qk_base0 = (((size_t)b * T) * HK + kh) * K_DIM;
+    float4 k_next = *(const float4*)(kn + qk_base0 + tid * 4);
+    float4 q_next = *(const float4*)(qn + qk_base0 + tid * 4);
+    float ge_next = g_exp[(size_t)b * T * H + h];
+    float bt_next = beta[(size_t)b * T * H + h];
+    float v_next = __bfloat162float(
+        mixed[(size_t)b * T * conv_dim + v_channel_offset + (size_t)h * V_DIM + v_glob]);
+
+    int lane0 = sub * (KPS / 4);
+    for (int t = 0; t < T; ++t) {
+        size_t bt_idx = (size_t)b * T + t;
+        float ge = ge_next;
+        float bt_c = bt_next;
+        float v_t = v_next;
+        float4 kc = k_next;
+        float4 qc = q_next;
+        if (t + 1 < T) {
+            size_t nb = bt_idx + 1;
+            size_t qk_base = (nb * HK + kh) * K_DIM;
+            k_next = *(const float4*)(kn + qk_base + tid * 4);
+            q_next = *(const float4*)(qn + qk_base + tid * 4);
+            ge_next = g_exp[nb * H + h];
+            bt_next = beta[nb * H + h];
+            v_next = __bfloat162float(
+                mixed[nb * conv_dim + v_channel_offset + (size_t)h * V_DIM + v_glob]);
+        }
+
+        float karr[KPS];
+        float qarr[KPS];
+#pragma unroll
+        for (int j = 0; j < KPS; ++j) {
+            int src = lane0 + (j >> 2);
+            float kcomp = (j & 3) == 0 ? kc.x : (j & 3) == 1 ? kc.y : (j & 3) == 2 ? kc.z : kc.w;
+            float qcomp = (j & 3) == 0 ? qc.x : (j & 3) == 1 ? qc.y : (j & 3) == 2 ? qc.z : qc.w;
+            karr[j] = __shfl_sync(0xffffffffu, kcomp, src);
+            qarr[j] = __shfl_sync(0xffffffffu, qcomp, src);
+        }
+
+        float kv = 0.f;
+#pragma unroll
+        for (int j = 0; j < KPS; ++j) {
+            float s = st[j] * ge;
+            st[j] = s;
+            kv += s * karr[j];
+        }
+#pragma unroll
+        for (int off = SUBS / 2; off > 0; off >>= 1) {
+            kv += __shfl_xor_sync(0xffffffffu, kv, off);
+        }
+        float delta = (v_t - kv) * bt_c;
+        float ov = 0.f;
+#pragma unroll
+        for (int j = 0; j < KPS; ++j) {
+            float s = st[j] + karr[j] * delta;
+            st[j] = s;
+            ov += s * qarr[j];
+        }
+#pragma unroll
+        for (int off = SUBS / 2; off > 0; off >>= 1) {
+            ov += __shfl_xor_sync(0xffffffffu, ov, off);
+        }
+        if (sub == 0) {
+            out[(bt_idx * H + h) * V_DIM + v_glob] = __float2bfloat16(ov);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < KPS; ++j) {
+        g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob] = st[j];
+    }
+}
+
+extern "C" int nv_kernels_gdn_recurrent_stateful_gqa_bf16out_shfl(
+    void* stream,
+    const float* qn,
+    const float* kn,
+    const uint16_t* mixed,
+    const float* g_exp,
+    const float* beta,
+    float* state_inout,
+    uint16_t* out,
+    int B,
+    int T,
+    int H,
+    int HK,
+    int K,
+    int V,
+    int conv_dim,
+    int v_channel_offset
+) {
+    cudaStream_t s = (cudaStream_t)stream;
+    if (B * T * H == 0) return 0;
+    if (K != 128 || V != 128) return -2;
+    if (HK <= 0 || H % HK != 0) return -3;
+    const int COLS = 4;
+    const int SUBS = 8;
+    const int VSPLIT = 128 / COLS;
+    int blocks = B * H * VSPLIT;
+    gdn_recurrent_stateful_gqa_shfl_kernel<128, 128, COLS, SUBS>
+        <<<blocks, COLS * SUBS, 0, s>>>(
+            qn, kn, (const __nv_bfloat16*)mixed, g_exp, beta, state_inout,
+            (__nv_bfloat16*)out, B, T, H, HK, conv_dim, v_channel_offset);
+    return (int)cudaGetLastError();
+}
+
 __global__ void gdn_prefill_rmsnorm_gate_kernel(
     const __nv_bfloat16* __restrict__ core,
     const __nv_bfloat16* __restrict__ z,

@@ -126,7 +126,7 @@ pub struct Gemma4AssistantWgpu {
     unpack_decode: Option<Recorded>,
     unpack_verify: Option<Recorded>,
     unpack_p: Option<GpuUniform<UpkParams>>,
-    _keep: Vec<Box<dyn std::any::Any>>,
+    _keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 #[repr(C)]
@@ -234,7 +234,7 @@ impl Gemma4AssistantWgpu {
         check("centroids", &weights.centroids, spec.n_centroids * h)?;
 
         let src = compose(ad::WGSL);
-        let mut keep: Vec<Box<dyn std::any::Any>> = Vec::new();
+        let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
         let up16 = |ctx: &'static WgpuContext, label: &str, bits: &[u16]| -> GpuTensor<u32> {
             GpuTensor::upload(ctx, label, &pack_pairs(bits))
         };
@@ -413,7 +413,7 @@ impl Gemma4AssistantWgpu {
             (h as u32, 1, 1),
         )?;
 
-        let mut layer_keep: Vec<Box<dyn std::any::Any>> = Vec::new();
+        let mut layer_keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
         for (li, lw) in weights.layers.iter().enumerate() {
             let sliding = spec.layers_sliding[li];
             let hd = if sliding {

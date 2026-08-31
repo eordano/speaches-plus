@@ -11,7 +11,7 @@ Usage:
     SPEACHES_URL=http://host:18080 python3 scripts/bench.py
 """
 
-import argparse, json, os, statistics, sys, time
+import argparse, json, os, statistics, time
 import requests
 
 BASE = os.environ.get("SPEACHES_URL", "http://127.0.0.1:8000")

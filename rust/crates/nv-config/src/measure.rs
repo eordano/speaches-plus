@@ -32,6 +32,32 @@ pub struct Measurement {
     pub extras: Vec<(String, String)>,
 }
 
+pub fn model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(
+    dir: &std::path::Path,
+) -> String {
+    let snap = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let repo = dir.ancestors().find_map(|a| {
+        let name = a.file_name()?.to_string_lossy().to_string();
+        name.strip_prefix("models--")
+            .map(|r| r.replacen("--", "/", 1))
+    });
+    match repo {
+        Some(r) => {
+            let rev = if snap.is_empty() {
+                "unpinned".to_string()
+            } else {
+                snap[..snap.len().min(7)].to_string()
+            };
+            format!("{r}@{rev}")
+        }
+        None if snap.is_empty() => "local/unknown@unpinned".to_string(),
+        None => format!("local/{snap}@unpinned"),
+    }
+}
+
 fn quote_if_needed(v: &str) -> String {
     if !v.is_empty() && !v.contains([' ', '"', '\\', '\n']) {
         return v.to_string();
@@ -223,7 +249,7 @@ mod tests {
             instrument: "ctx-scaling".into(),
             model_at_rev: "unsloth/Qwen3.8-27B-NVFP4@e850c69".into(),
             backend: "wgpu".into(),
-            device: "Example GPU (Vulkan)".into(),
+            device: "NVIDIA GeForce RTX 5090 (Vulkan)".into(),
             batch: 1,
             tokens: 8192,
             steps: 64,
@@ -241,7 +267,7 @@ mod tests {
         assert_eq!(
             sample().line(),
             "NV-MEASURE v1 instrument=ctx-scaling model=unsloth/Qwen3.8-27B-NVFP4@e850c69 \
-             backend=wgpu device=\"Example GPU (Vulkan)\" batch=1 tokens=8192 \
+             backend=wgpu device=\"NVIDIA GeForce RTX 5090 (Vulkan)\" batch=1 tokens=8192 \
              steps=64 warmup=200 value=21.7 unit=ms/tok \
              basis=eager_dense_wgpu_decode_step_synthetic_state_fill fill_s=3.1"
         );
@@ -294,5 +320,25 @@ mod tests {
     #[should_panic(expected = "shadows a required basis field")]
     fn extras_cannot_shadow_basis_fields() {
         let _ = sample().extra("tokens", "999");
+    }
+
+    #[test]
+    fn model_at_rev_derives_owner_slash_repo_at_short_rev_from_a_hub_snapshot_dir() {
+        let dir = std::path::Path::new(
+            "/home/x/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/e850c696e6d75f965367e816c16bc7dacd955ffa",
+        );
+        assert_eq!(
+            model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(dir),
+            "unsloth/Qwen3.8-27B-NVFP4@e850c69"
+        );
+    }
+
+    #[test]
+    fn model_at_rev_labels_a_loose_override_dir_as_local_and_unpinned_instead_of_inventing_a_rev() {
+        let dir = std::path::Path::new("/data/checkpoints/my-export");
+        assert_eq!(
+            model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(dir),
+            "local/my-export@unpinned"
+        );
     }
 }

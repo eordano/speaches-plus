@@ -27,7 +27,7 @@ enum CodecForm {
     DecodeBranchlessBitcast,
 }
 
-const CUDA_UE4M3_CODEC_CENSUS: [(&str, &str, CodecForm); 11] = [
+const CUDA_UE4M3_CODEC_CENSUS: [(&str, &str, CodecForm); 14] = [
     (
         "gemm_nvfp4_w4a16_mk_mma.cu",
         "decode_ue4m3_scale",
@@ -54,6 +54,21 @@ const CUDA_UE4M3_CODEC_CENSUS: [(&str, &str, CodecForm); 11] = [
         "moe_grouped_fp4_gemv.cu",
         "decode_ue4m3_dev",
         CodecForm::Decode,
+    ),
+    (
+        "moe_grouped_fp4_gemv.cu",
+        "gvq_encode_ue4m3",
+        CodecForm::Encode,
+    ),
+    (
+        "moe_route.cu",
+        "rgq_decode_ue4m3",
+        CodecForm::Decode,
+    ),
+    (
+        "moe_route.cu",
+        "rgq_encode_ue4m3",
+        CodecForm::Encode,
     ),
     (
         "quantize_nvfp4_bf16.cu",
@@ -564,13 +579,20 @@ fn every_cuda_ue4m3_codec_in_the_tree_is_the_same_pinned_function() {
             .map(|(_, n)| *n)
             .unwrap_or(0)
     };
-    assert_eq!(counted(CodecForm::Encode), 3, "three ue4m3 encoders were pinned");
+    assert_eq!(
+        counted(CodecForm::Encode),
+        5,
+        "five ue4m3 encoders were pinned: encode_ue4m3_dev in gemv_nvfp4 and quantize_nvfp4_bf16, \
+         moe_route's rgq_encode_ue4m3, rmsnorm_quantize_nvfp4_bf16's rq_encode_ue4m3, and \
+         moe_grouped_fp4_gemv's gvq_encode_ue4m3 -- the last was line-identical to the canonical \
+         encoder but unregistered, so nothing was checking it for drift"
+    );
     assert_eq!(
         counted(CodecForm::Decode),
-        7,
-        "seven #define-step ue4m3 decoders were pinned: four decode_ue4m3 and the three \
-         decode_ue4m3_scale copies unified onto the same body -- a drifting copy hides from \
-         cross-backend parity"
+        8,
+        "eight #define-step ue4m3 decoders were pinned: four decode_ue4m3, the three \
+         decode_ue4m3_scale copies unified onto the same body, and moe_route's \
+         rgq_decode_ue4m3 -- a drifting copy hides from cross-backend parity"
     );
     assert_eq!(
         counted(CodecForm::DecodeBranchlessBitcast),

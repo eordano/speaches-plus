@@ -208,7 +208,7 @@ mod tests {
              into the capture and then record an error on teardown. Constructing a CaptureStream \
              is therefore not free -- it disables tracking for the whole CONTEXT -- so an engine \
              whose eager candle path is still live must not build one in its constructor: {}",
-            crate::graph_engine::THE_EAGER_ALL_NAN_IS_INSTALL_GROUPED_MOE_NOT_THIS_DISABLE_AND_NEEDS_A_HOST_STALL
+            crate::graph_engine::THE_EAGER_ALL_NAN_WAS_THE_GROUPED_MULTI_TOKEN_DEFECT_NOW_FIXED_NOT_THIS_DISABLE
         );
         assert!(
             std::ptr::eq(

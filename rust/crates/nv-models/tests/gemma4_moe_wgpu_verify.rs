@@ -19,6 +19,14 @@ use common::norm_tensor;
 use common::rand_tensor_f32_shape as rand_tensor;
 use common::tensors_for_cfg;
 
+fn pin_flash_decode_and_attn_i8_off_process_wide_because_the_verify_surface_asserts_bf16_value_identity() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("NV_G4MOE_FLASH_DECODE", "0");
+        std::env::set_var("NV_G4MOE_ATTN_I8", "0");
+    });
+}
+
 fn temp_dir(tag: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("g4m_vf_{}_{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -28,6 +36,7 @@ fn temp_dir(tag: &str) -> TempDir {
 const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
 fn tiny_model(tag: &str, max_seq: usize) -> (Gemma4MoeWgpu, HashMap<String, Tensor>, TempDir) {
+    pin_flash_decode_and_attn_i8_off_process_wide_because_the_verify_surface_asserts_bf16_value_identity();
     let cfg = Gemma4MoeConfig::from_hf_json_str(&tiny_config_json()).unwrap();
     let dir = temp_dir(tag);
     let st = dir.0.join("model.safetensors");
@@ -288,6 +297,7 @@ fn splicing_the_models_own_embedding_rows_is_bit_identical_to_plain_prefill() {
 #[test]
 #[ignore = "loads the real gemma-4-26B-A4B checkpoint; set NV_GEMMA4_MOE_VERIFY_TEST=1"]
 fn real_gemma4_moe_verify_chain_matches_stepped_decode() {
+    pin_flash_decode_and_attn_i8_off_process_wide_because_the_verify_surface_asserts_bf16_value_identity();
     if std::env::var("NV_GEMMA4_MOE_VERIFY_TEST").as_deref() != Ok("1") {
         panic!("set NV_GEMMA4_MOE_VERIFY_TEST=1 to run this GPU test (it must never silently skip)");
     }

@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
-from . import task
 from .models import ListModelsResponse, Model
 
 def hf_owner(model_id: str) -> str:

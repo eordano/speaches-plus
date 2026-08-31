@@ -14,19 +14,88 @@ struct Kv4Params {
 const KV4_WG: u32 = 256u;
 const KV4_K_BLOCK_TOKENS: u32 = 32u;
 const KV4_MAX_HEAD_DIM: u32 = 512u;
-const KV4_DIV_BIG: f32 = 1.0e37;
-const KV4_DIV_DOWN: f32 = 0.00390625;
-
 fn kv4_div_rn(a: f32, b: f32) -> f32 {
-    var bb = b;
-    var post = 1.0;
-    if (abs(b) > KV4_DIV_BIG) {
-        bb = b * KV4_DIV_DOWN;
-        post = KV4_DIV_DOWN;
+    let ua = bitcast<u32>(a);
+    let ub = bitcast<u32>(b);
+    let sign = (ua ^ ub) & 0x80000000u;
+    let amag = ua & 0x7fffffffu;
+    let bmag = ub & 0x7fffffffu;
+    if (amag > 0x7f800000u || bmag > 0x7f800000u
+        || (amag == 0u && bmag == 0u)
+        || (amag == 0x7f800000u && bmag == 0x7f800000u)) {
+        return bitcast<f32>(0x7fc00000u);
     }
-    let r = 1.0 / bb;
-    let q = a * r;
-    return fma(fma(-q, bb, a), r, q) * post;
+    if (amag == 0u || bmag == 0x7f800000u) {
+        return bitcast<f32>(sign);
+    }
+    if (amag == 0x7f800000u || bmag == 0u) {
+        return bitcast<f32>(sign | 0x7f800000u);
+    }
+    var ea = i32(amag >> 23u);
+    var ma = amag & 0x7fffffu;
+    if (ea == 0) {
+        let sh = countLeadingZeros(ma) - 8u;
+        ma = ma << sh;
+        ea = 1 - i32(sh);
+    } else {
+        ma = ma | 0x800000u;
+    }
+    var eb = i32(bmag >> 23u);
+    var mb = bmag & 0x7fffffu;
+    if (eb == 0) {
+        let sh = countLeadingZeros(mb) - 8u;
+        mb = mb << sh;
+        eb = 1 - i32(sh);
+    } else {
+        mb = mb | 0x800000u;
+    }
+    var q = 0u;
+    var rem = ma;
+    for (var i = 0u; i < 26u; i = i + 1u) {
+        q = q << 1u;
+        if (rem >= mb) {
+            rem = rem - mb;
+            q = q | 1u;
+        }
+        rem = rem << 1u;
+    }
+    var mant: u32;
+    var round: u32;
+    var sticky = u32(rem != 0u);
+    var be: i32;
+    if (q >= 0x2000000u) {
+        mant = q >> 2u;
+        round = (q >> 1u) & 1u;
+        sticky = sticky | (q & 1u);
+        be = ea - eb + 127;
+    } else {
+        mant = q >> 1u;
+        round = q & 1u;
+        be = ea - eb + 126;
+    }
+    if (be >= 255) {
+        return bitcast<f32>(sign | 0x7f800000u);
+    }
+    if (be <= 0) {
+        let s = u32(1 - be);
+        if (s > 24u) {
+            return bitcast<f32>(sign);
+        }
+        sticky = sticky | round | u32((mant & ((1u << (s - 1u)) - 1u)) != 0u);
+        round = (mant >> (s - 1u)) & 1u;
+        mant = mant >> s;
+        be = 0;
+    }
+    if (round == 1u && (sticky != 0u || (mant & 1u) == 1u)) {
+        mant = mant + 1u;
+    }
+    var bits: u32;
+    if (be == 0) {
+        bits = sign | mant;
+    } else {
+        bits = sign | ((u32(be) << 23u) + (mant - 0x800000u));
+    }
+    return bitcast<f32>(bits);
 }
 
 fn kv4_bf16_cache_at(idx: u32) -> f32 {

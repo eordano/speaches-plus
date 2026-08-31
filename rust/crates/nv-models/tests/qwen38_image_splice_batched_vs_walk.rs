@@ -77,14 +77,28 @@ fn normalized_pixel_tensor(img: &image::RgbImage, device: &Device) -> Tensor {
 }
 
 fn real_image_rows_bf16_from_the_cuda_tower(dir: &PathBuf) -> Vec<u16> {
+    let t_boot = Instant::now();
     let device = Device::new_cuda_with_stream(0).expect("cuda device for the vision tower");
     let weights = WeightLoader::open_dir(dir, &device).expect("open snapshot");
     let vis_cfg = Qwen3VisionConfig::from_hf_config_json(dir.join("config.json"))
         .expect("vision_config parses");
     let mut tower = Qwen3VisionTower::new_empty(vis_cfg, &device).expect("tower");
     tower.load_weights(&weights).expect("visual.* bf16 tensors load");
+    let boot_s = t_boot.elapsed().as_secs_f64();
     let pixels = normalized_pixel_tensor(&test_png_rgb(), &device);
-    let rows = tower.forward(&pixels).expect("tower forward");
+    let t_fwd = Instant::now();
+    let cold_rows = tower.forward(&pixels).expect("tower forward");
+    device.synchronize().expect("sync after cold forward");
+    drop(cold_rows);
+    let cold_fwd_s = t_fwd.elapsed().as_secs_f64();
+    let t_warm = Instant::now();
+    let rows = tower.forward(&pixels).expect("tower forward warm");
+    device.synchronize().expect("sync after warm forward");
+    let warm_fwd_s = t_warm.elapsed().as_secs_f64();
+    eprintln!(
+        "[q38-img-tower] boot_s={boot_s:.2} cold_forward_s={cold_fwd_s:.2} \
+         warm_forward_s={warm_fwd_s:.2}"
+    );
     let (n_rows, width) = rows.dims2().expect("2d embedding");
     assert_eq!((n_rows, width), (196, 5120), "448x448 merges to 196 trunk rows");
     let flat: Vec<f32> = rows

@@ -250,7 +250,7 @@ async fn tool_definitions_render_and_calls_parse() {
         .unwrap();
     assert_eq!(block["name"], "get_weather");
     assert_eq!(block["input"], json!({"city": "Paris"}));
-    assert!(block["id"].as_str().unwrap().len() > 0);
+    assert!(!block["id"].as_str().unwrap().is_empty());
 }
 
 struct ThinkEchoEngine {
@@ -333,7 +333,7 @@ async fn streaming_tool_use_emits_the_tool_block_lifecycle() {
         .expect("tool_use content_block_start");
     assert_eq!(tool_start["content_block"]["name"], "get_weather");
     assert_eq!(tool_start["content_block"]["input"], json!({}));
-    assert!(tool_start["content_block"]["id"].as_str().unwrap().len() > 0);
+    assert!(!tool_start["content_block"]["id"].as_str().unwrap().is_empty());
     let tool_index = tool_start["index"].clone();
 
     let (_, jd) = events
@@ -1065,6 +1065,27 @@ async fn sampling_fields_and_the_max_tokens_ceiling_reach_the_engine() {
     assert_eq!(
         s.max_new_tokens, MAX_MAX_TOKENS,
         "max_tokens above the surface ceiling is clamped, not refused"
+    );
+
+    std::env::set_var("NV_MAX_MAX_TOKENS", "65536");
+    let (port2, seen2) = boot_spy(REPLY, false).await;
+    let (status2, v2, _) = post_json(
+        port2,
+        "/v1/messages",
+        json!({
+            "model": MODEL,
+            "max_tokens": 32768,
+            "messages": [{"role": "user", "content": "hi"}],
+        }),
+    )
+    .await;
+    std::env::remove_var("NV_MAX_MAX_TOKENS");
+    assert_eq!(status2, reqwest::StatusCode::OK, "body: {v2}");
+    assert_eq!(
+        seen_of(&seen2).max_new_tokens,
+        32768,
+        "NV_MAX_MAX_TOKENS=65536 must lift the 8192 ceiling so a 32768-token ask reaches the \
+         engine unclamped (limits census ARB-1)"
     );
     assert_eq!(s.temperature, Some(0.25));
     assert_eq!(s.top_p, Some(0.8));

@@ -15,6 +15,21 @@ use nv_quant::mxfp4::Mxfp4Tensor;
 
 const MAX_SEQ: usize = 64;
 
+fn pin_the_decode_arms_off_process_wide_because_the_verify_surface_refuses_the_arm_stack_default() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for env in [
+            gow::FLASH_DECODE_ENV,
+            gow::FLASH_SLIDING_ENV,
+            gow::FUSED_STEP_ENV,
+            gow::GEMV_SG_ENV,
+            gow::MX_SG_GATE_ENV,
+        ] {
+            std::env::set_var(env, "0");
+        }
+    });
+}
+
 const CHAIN_WIDTHS_COVER_ONE_ROW_A_SHORT_CHAIN_AND_THE_FULL_VERIFY_WIDTH: [usize; 3] = [1, 3, 6];
 
 fn norm_vec(r: &mut Lcg, n: usize) -> Vec<u16> {
@@ -24,6 +39,7 @@ fn norm_vec(r: &mut Lcg, n: usize) -> Vec<u16> {
 }
 
 fn tiny_weights(cfg: &GptOssConfig, seed: u64) -> gow::HostWeights {
+    pin_the_decode_arms_off_process_wide_because_the_verify_surface_refuses_the_arm_stack_default();
     let mut r = Lcg::new(seed);
     let h = cfg.hidden_size;
     let hd = cfg.head_dim;
@@ -436,6 +452,7 @@ fn gptoss_snapshot() -> Option<std::path::PathBuf> {
 #[test]
 #[ignore = "loads ~13 GB of MXFP4 weights; set NV_GPTOSS_WGPU_TEST=1"]
 fn gptoss_real_weights_verify_chain_matches_per_token_decode() {
+    pin_the_decode_arms_off_process_wide_because_the_verify_surface_refuses_the_arm_stack_default();
     if std::env::var("NV_GPTOSS_WGPU_TEST").is_err() {
         eprintln!("[skip] NV_GPTOSS_WGPU_TEST not set");
         return;

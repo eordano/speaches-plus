@@ -1,0 +1,170 @@
+{
+  "name": "090-scale-15mp-catalog",
+  "family": "090-scale",
+  "description": "15MP 300dpi-class catalog page: the tier-policy boundary fixture; single-pass downscale 0.87x keeps every glyph tier legible.",
+  "input": "input.png",
+  "expected_text": "HARBORLIGHT INSTRUMENTS\nPrecision Components Catalog, Edition 14\nSection 3: Optical Assemblies\nAll housings are machined from 6061-T6 aluminium and anodized in matte black. Threads follow the RMS standard unless\nnoted otherwise in the item description. Every assembly ships with a test card recording the measured transmitted\nwavefront and the coating run code.\nOA-2210 Collimator, 25 mm aperture, serial range LN-4821 to LN-5140\nOA-2214 Beam expander 3x, fused silica, coated 400-700 nm, code BX-31\nOA-2290 Kinematic mount, 80 TPI adjusters, lockable, code KM-80\nOrdering and Lead Times\nOrders received before 14:00 UTC ship the same business day from the Kiel works. Custom coatings add nine working days\nto any line item. Quote code QX-77 applies to universities and public research laboratories only and cannot combine with\ndistributor pricing.\nBatch acceptance: MIL-PRF-13830B, scratch-dig 40-20 on all catalogue optics.\nInterferometric flatness lambda/10 at 632.8 nm available on request per lot.\nHarborlight Instruments GmbH, Werftstrasse 21, 24103 Kiel. Registered HRB 8821 KI.\nVAT DE 318 442 901. Catalog data sheet HL-CAT-14-3EN. Errata via the service desk.\nSection 4: Mounting Hardware\nMH-410 Post holder, 40 mm bore, side-locking thumbscrew, black anodize\nMH-415 Damped post, filled core, first resonance above 900 Hz measured\nMH-460 Rail carrier, dovetail profile, 25 mm of travel per adjuster turn\nWarranty and Returns\nAll items carry a three year warranty against defects in materials and workmanship. Return authorisations issue from\nservice desk RMA-9 within one business day of request, and advance replacements are available for any item stocked in\nthe Kiel or Portsmouth warehouses.\nPrices exclude carriage and import duty. INCOTERMS 2020 EXW Kiel applies throughout.\nThis edition supersedes HL-CAT-13 in whole. The errata list is available on request.\nSection 5: Cleaning and Handling\nHandle coated optics by their edges with powder-free gloves and blow loose dust away with dry nitrogen before any\ncontact method. Use spectroscopic grade acetone on lint-free wipes, one pass per wipe surface, and never rewet a used\nwipe. Store optics in their shipped membrane boxes below 60 percent relative humidity.\nTechnical Support\nApplication engineers answer at support@harborlight.example between 07:00 and 18:00 CET on working days. Include the\nserial number and the coating run code from the edge engraving with any query. Calibration certificates reissue free\nwithin three years of shipment, and out-of-warranty repairs are quoted within five working days.",
+  "render": {
+    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "page_px": [
+      3248,
+      4592
+    ],
+    "megapixels": 14.91,
+    "single_pass_downscale_at_default_cap": 0.87
+  },
+  "regions": [
+    {
+      "bbox": [
+        140,
+        197,
+        1569,
+        268
+      ],
+      "tier": "heading",
+      "text": "HARBORLIGHT INSTRUMENTS"
+    },
+    {
+      "bbox": [
+        140,
+        375,
+        1350,
+        436
+      ],
+      "tier": "heading",
+      "text": "Precision Components Catalog, Edition 14"
+    },
+    {
+      "bbox": [
+        139,
+        586,
+        2399,
+        786
+      ],
+      "tier": "body",
+      "text": "Section 3: Optical Assemblies\nAll housings are machined from 6061-T6 aluminium and anodized in matte black. Threads follow the RMS standard unless\nnoted otherwise in the item description. Every assembly ships with a test card recording the measured transmitted\nwavefront and the coating run code."
+    },
+    {
+      "bbox": [
+        140,
+        912,
+        1524,
+        1058
+      ],
+      "tier": "body",
+      "text": "OA-2210 Collimator, 25 mm aperture, serial range LN-4821 to LN-5140\nOA-2214 Beam expander 3x, fused silica, coated 400-700 nm, code BX-31\nOA-2290 Kinematic mount, 80 TPI adjusters, lockable, code KM-80"
+    },
+    {
+      "bbox": [
+        140,
+        1216,
+        915,
+        1277
+      ],
+      "tier": "heading",
+      "text": "Ordering and Lead Times"
+    },
+    {
+      "bbox": [
+        140,
+        1357,
+        2437,
+        1503
+      ],
+      "tier": "body",
+      "text": "Orders received before 14:00 UTC ship the same business day from the Kiel works. Custom coatings add nine working days\nto any line item. Quote code QX-77 applies to universities and public research laboratories only and cannot combine with\ndistributor pricing."
+    },
+    {
+      "bbox": [
+        140,
+        1655,
+        1034,
+        1712
+      ],
+      "tier": "fine",
+      "text": "Batch acceptance: MIL-PRF-13830B, scratch-dig 40-20 on all catalogue optics.\nInterferometric flatness lambda/10 at 632.8 nm available on request per lot."
+    },
+    {
+      "bbox": [
+        140,
+        1811,
+        1127,
+        1868
+      ],
+      "tier": "fine",
+      "text": "Harborlight Instruments GmbH, Werftstrasse 21, 24103 Kiel. Registered HRB 8821 KI.\nVAT DE 318 442 901. Catalog data sheet HL-CAT-14-3EN. Errata via the service desk."
+    },
+    {
+      "bbox": [
+        140,
+        2043,
+        1063,
+        2104
+      ],
+      "tier": "heading",
+      "text": "Section 4: Mounting Hardware"
+    },
+    {
+      "bbox": [
+        140,
+        2184,
+        1516,
+        2330
+      ],
+      "tier": "body",
+      "text": "MH-410 Post holder, 40 mm bore, side-locking thumbscrew, black anodize\nMH-415 Damped post, filled core, first resonance above 900 Hz measured\nMH-460 Rail carrier, dovetail profile, 25 mm of travel per adjuster turn"
+    },
+    {
+      "bbox": [
+        140,
+        2489,
+        810,
+        2549
+      ],
+      "tier": "heading",
+      "text": "Warranty and Returns"
+    },
+    {
+      "bbox": [
+        139,
+        2629,
+        2368,
+        2767
+      ],
+      "tier": "body",
+      "text": "All items carry a three year warranty against defects in materials and workmanship. Return authorisations issue from\nservice desk RMA-9 within one business day of request, and advance replacements are available for any item stocked in\nthe Kiel or Portsmouth warehouses."
+    },
+    {
+      "bbox": [
+        140,
+        2927,
+        1162,
+        2984
+      ],
+      "tier": "fine",
+      "text": "Prices exclude carriage and import duty. INCOTERMS 2020 EXW Kiel applies throughout.\nThis edition supersedes HL-CAT-13 in whole. The errata list is available on request."
+    },
+    {
+      "bbox": [
+        140,
+        3157,
+        2367,
+        3357
+      ],
+      "tier": "body",
+      "text": "Section 5: Cleaning and Handling\nHandle coated optics by their edges with powder-free gloves and blow loose dust away with dry nitrogen before any\ncontact method. Use spectroscopic grade acetone on lint-free wipes, one pass per wipe surface, and never rewet a used\nwipe. Store optics in their shipped membrane boxes below 60 percent relative humidity."
+    },
+    {
+      "bbox": [
+        139,
+        3513,
+        2408,
+        3713
+      ],
+      "tier": "body",
+      "text": "Technical Support\nApplication engineers answer at support@harborlight.example between 07:00 and 18:00 CET on working days. Include the\nserial number and the coating run code from the edge engraving with any query. Calibration certificates reissue free\nwithin three years of shipment, and out-of-warranty repairs are quoted within five working days."
+    }
+  ],
+  "comparison_strategy": "cer",
+  "skip_when_no_model": true
+}

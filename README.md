@@ -19,7 +19,7 @@ Canonical references, in order of authority:
 
 - [`docs/book/05.7-apple-silicon-inference-architecture.md`](docs/book/05.7-apple-silicon-inference-architecture.md)
   -- **read this first before measuring, quantizing, or optimizing anything
-  on Apple silicon.** How to run LLMs well on Ultra-class Apple silicon: the crossover
+  on Apple silicon.** How to run LLMs well on the M2 Ultra: the crossover
   rule that decides whether fewer bits is actually faster (here it usually
   is not -- int8 beats every 4-bit kernel in the survey, and the 31B got
   1.96x faster by reading 43.5% *more* bytes), why our own per-dispatch
@@ -82,7 +82,7 @@ Apple-silicon measured matrix.
   speculative decoding all live there. The wgpu path is real and serves
   chat with coherent output on five checkpoints across four model graphs
   (Gemma4-E4B bf16 and qat-w4a16-ct, Gemma4-31B-NVFP4, Qwen3.6-35B-A3B-NVFP4,
-  Laguna-XS-2.1-NVFP4 -- all re-verified over HTTP on Apple silicon,
+  Laguna-XS-2.1-NVFP4 -- all re-verified over HTTP on M2 Ultra,
   [`docs/book/05.6-macos-port-status.md`](docs/book/05.6-macos-port-status.md)), but it is
   newer and less proven ([`docs/book/05.1-wgpu-status.md`](docs/book/05.1-wgpu-status.md)).
   Backend selection is `NV_SERVE_BACKEND=cuda|wgpu|auto`; `auto` is

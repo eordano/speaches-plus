@@ -174,10 +174,11 @@ fn gdn_chunk_scan_tracks_the_candle_scan_on_a_synthetic_512_token_layer() {
             .expect("host")
     };
     let run_arm = |on: bool| -> (Vec<f32>, Vec<f32>) {
+        std::env::set_var("NV_Q38_GDN_CHUNK_GEMM", "0");
         if on {
             std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "1");
         } else {
-            std::env::remove_var("NV_Q38_GDN_CHUNK_PREFILL");
+            std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "0");
         }
         let mut state: Option<LinAttnState> = None;
         let out = la
@@ -189,6 +190,7 @@ fn gdn_chunk_scan_tracks_the_candle_scan_on_a_synthetic_512_token_layer() {
     };
     let (out_eager, st_eager) = run_arm(false);
     let (out_chunk, st_chunk) = run_arm(true);
+    std::env::remove_var("NV_Q38_GDN_CHUNK_GEMM");
     std::env::remove_var("NV_Q38_GDN_CHUNK_PREFILL");
 
     let max_abs = |a: &[f32], b: &[f32]| -> f32 {
@@ -220,6 +222,56 @@ fn gdn_chunk_scan_tracks_the_candle_scan_on_a_synthetic_512_token_layer() {
         d_out / m_out,
         d_st / m_st
     );
+}
+
+fn teacher_forced_avg_nll(logits: &[f32], ids: &[u32], chunk: usize, vocab: usize) -> f64 {
+    let mut acc = 0f64;
+    for row in 0..chunk - 1 {
+        let r = &logits[row * vocab..(row + 1) * vocab];
+        let m = r.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+        let lse = m + r.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln();
+        acc += lse - r[ids[row + 1] as usize] as f64;
+    }
+    acc / (chunk - 1) as f64
+}
+
+fn top1_flip_compare(a: &[f32], b: &[f32], chunk: usize, vocab: usize) -> (f32, Vec<(usize, f32)>) {
+    let mut max_abs = 0f32;
+    let mut flips: Vec<(usize, f32)> = Vec::new();
+    for row in 0..chunk {
+        let ra = &a[row * vocab..(row + 1) * vocab];
+        let rb = &b[row * vocab..(row + 1) * vocab];
+        let mut a_top = 0usize;
+        let mut b_top = 0usize;
+        let mut a_best = f32::NEG_INFINITY;
+        let mut a_second = f32::NEG_INFINITY;
+        let mut b_best = f32::NEG_INFINITY;
+        for i in 0..vocab {
+            assert!(
+                ra[i].is_finite() && rb[i].is_finite(),
+                "non-finite logit at row {row} col {i}"
+            );
+            let d = (ra[i] - rb[i]).abs();
+            if d > max_abs {
+                max_abs = d;
+            }
+            if ra[i] > a_best {
+                a_second = a_best;
+                a_best = ra[i];
+                a_top = i;
+            } else if ra[i] > a_second {
+                a_second = ra[i];
+            }
+            if rb[i] > b_best {
+                b_best = rb[i];
+                b_top = i;
+            }
+        }
+        if a_top != b_top {
+            flips.push((row, a_best - a_second));
+        }
+    }
+    (max_abs, flips)
 }
 
 fn natural_text_512_ids_because_random_ids_make_every_next_token_a_near_tie(
@@ -271,7 +323,7 @@ fn qwen38_cuda_gdn_chunk_prefill_parity_teacher_forced_512_rows_vs_eager_scan() 
         if chunked_env_on {
             std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "1");
         } else {
-            std::env::remove_var("NV_Q38_GDN_CHUNK_PREFILL");
+            std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "0");
         }
         let mut cache = model.new_kv_cache(chunk).expect("kv cache");
         let tokens = Tensor::from_vec(ids.clone(), (1usize, chunk), &device).expect("tokens");
@@ -292,7 +344,7 @@ fn qwen38_cuda_gdn_chunk_prefill_parity_teacher_forced_512_rows_vs_eager_scan() 
     };
 
     let run_split_control = || -> Vec<f32> {
-        std::env::remove_var("NV_Q38_GDN_CHUNK_PREFILL");
+        std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "0");
         let mut cache = model.new_kv_cache(chunk).expect("kv cache");
         let mut all: Vec<f32> = Vec::new();
         let half = chunk / 2;
@@ -331,60 +383,11 @@ fn qwen38_cuda_gdn_chunk_prefill_parity_teacher_forced_512_rows_vs_eager_scan() 
     assert_eq!(eager.len(), split_control.len(), "split control logit count mismatch");
     let vocab = eager.len() / chunk;
 
-    let avg_nll = |logits: &[f32]| -> f64 {
-        let mut acc = 0f64;
-        for row in 0..chunk - 1 {
-            let r = &logits[row * vocab..(row + 1) * vocab];
-            let m = r.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
-            let lse = m + r.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln();
-            acc += lse - r[ids[row + 1] as usize] as f64;
-        }
-        acc / (chunk - 1) as f64
-    };
-    let compare = |a: &[f32], b: &[f32]| -> (f32, Vec<(usize, f32)>) {
-        let mut max_abs = 0f32;
-        let mut flips: Vec<(usize, f32)> = Vec::new();
-        for row in 0..chunk {
-            let ra = &a[row * vocab..(row + 1) * vocab];
-            let rb = &b[row * vocab..(row + 1) * vocab];
-            let mut a_top = 0usize;
-            let mut b_top = 0usize;
-            let mut a_best = f32::NEG_INFINITY;
-            let mut a_second = f32::NEG_INFINITY;
-            let mut b_best = f32::NEG_INFINITY;
-            for i in 0..vocab {
-                assert!(
-                    ra[i].is_finite() && rb[i].is_finite(),
-                    "non-finite logit at row {row} col {i}"
-                );
-                let d = (ra[i] - rb[i]).abs();
-                if d > max_abs {
-                    max_abs = d;
-                }
-                if ra[i] > a_best {
-                    a_second = a_best;
-                    a_best = ra[i];
-                    a_top = i;
-                } else if ra[i] > a_second {
-                    a_second = ra[i];
-                }
-                if rb[i] > b_best {
-                    b_best = rb[i];
-                    b_top = i;
-                }
-            }
-            if a_top != b_top {
-                flips.push((row, a_best - a_second));
-            }
-        }
-        (max_abs, flips)
-    };
-
-    let nll_eager = avg_nll(&eager);
-    let nll_chunked = avg_nll(&chunked);
-    let nll_split = avg_nll(&split_control);
-    let (max_abs_chunk, flips_chunk) = compare(&eager, &chunked);
-    let (max_abs_split, flips_split) = compare(&eager, &split_control);
+    let nll_eager = teacher_forced_avg_nll(&eager, &ids, chunk, vocab);
+    let nll_chunked = teacher_forced_avg_nll(&chunked, &ids, chunk, vocab);
+    let nll_split = teacher_forced_avg_nll(&split_control, &ids, chunk, vocab);
+    let (max_abs_chunk, flips_chunk) = top1_flip_compare(&eager, &chunked, chunk, vocab);
+    let (max_abs_split, flips_split) = top1_flip_compare(&eager, &split_control, chunk, vocab);
     let nll_delta_chunk = (nll_eager - nll_chunked).abs();
     let nll_delta_split = (nll_eager - nll_split).abs();
     eprintln!(
@@ -410,6 +413,216 @@ fn qwen38_cuda_gdn_chunk_prefill_parity_teacher_forced_512_rows_vs_eager_scan() 
         "top-1 flipped on {} of {chunk} rows vs eager, above the bar {flip_bar} (3x the \
          same-code rechunking control at {}, floored at 8); rows {flips_chunk:?}",
         flips_chunk.len(),
+        flips_split.len()
+    );
+}
+
+#[test]
+fn gdn_chunk_gemm_scan_tracks_the_chunk_scan_on_a_synthetic_512_token_layer() {
+    use nv_layers::linear::Linear;
+    use nv_layers::linear_attn::{LinAttnState, LinearAttention, LinearAttentionConfig};
+
+    let Ok(device) = Device::new_cuda_with_stream(0) else {
+        eprintln!("[skip] no cuda device; the chunk-gemm scan parity needs the card");
+        return;
+    };
+    let cfg = LinearAttentionConfig {
+        hidden_size: 256,
+        linear_num_key_heads: 16,
+        linear_num_value_heads: 48,
+        linear_key_head_dim: 128,
+        linear_value_head_dim: 128,
+        linear_conv_kernel_dim: 4,
+        mamba_ssm_dtype: DType::F32,
+        rms_eps: 1e-6,
+    };
+    let hidden = cfg.hidden_size;
+    let conv_dim = cfg.conv_dim();
+    let value_dim = cfg.value_dim();
+    let n_v = cfg.linear_num_value_heads;
+    let bf = |t: Tensor| t.to_dtype(DType::BF16).expect("bf16 cast");
+    let rnd = |shape: &[usize]| bf(Tensor::randn(0f32, 0.25f32, shape, &device).expect("randn"));
+    let la = LinearAttention::new(
+        cfg,
+        Linear::new(rnd(&[conv_dim, hidden]), None).expect("qkv"),
+        Linear::new(rnd(&[value_dim, hidden]), None).expect("z"),
+        Linear::new(rnd(&[n_v, hidden]), None).expect("a"),
+        Linear::new(rnd(&[n_v, hidden]), None).expect("b"),
+        rnd(&[conv_dim, 1, cfg.linear_conv_kernel_dim]),
+        rnd(&[n_v]),
+        rnd(&[n_v]),
+        rnd(&[cfg.linear_value_head_dim]),
+        Linear::new(rnd(&[hidden, value_dim]), None).expect("out"),
+    )
+    .expect("synthetic GDN layer with the q38 head count and head dims");
+
+    let t = SCAN_PARITY_T_512_MATCHES_THE_PP512_CHUNK;
+    let x = bf(Tensor::randn(0f32, 1.0f32, &[1usize, t, hidden][..], &device).expect("randn x"));
+    let host = |t: &Tensor| -> Vec<f32> {
+        t.to_dtype(DType::F32)
+            .expect("f32")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("host")
+    };
+    let run_arm = |gemm_on: bool| -> (Vec<f32>, Vec<f32>) {
+        std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "1");
+        std::env::set_var("NV_Q38_GDN_CHUNK_GEMM_V3", "0");
+        std::env::set_var("NV_Q38_GDN_CHUNK_GEMM", if gemm_on { "1" } else { "0" });
+        let mut state: Option<LinAttnState> = None;
+        let out = la
+            .forward_with_state(&x, &mut state)
+            .expect("stateful forward");
+        device.synchronize().expect("sync");
+        let st = state.expect("scan must leave a state");
+        (host(&out), host(st.recurrent_state()))
+    };
+    let (out_seq, st_seq) = run_arm(false);
+    let (out_gemm, st_gemm) = run_arm(true);
+    std::env::remove_var("NV_Q38_GDN_CHUNK_GEMM");
+    std::env::remove_var("NV_Q38_GDN_CHUNK_GEMM_V3");
+    std::env::remove_var("NV_Q38_GDN_CHUNK_PREFILL");
+
+    let max_abs = |a: &[f32], b: &[f32]| -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+    let max_mag = |a: &[f32]| a.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let d_out = max_abs(&out_seq, &out_gemm);
+    let d_st = max_abs(&st_seq, &st_gemm);
+    let m_out = max_mag(&out_seq).max(1e-6);
+    let m_st = max_mag(&st_seq).max(1e-6);
+    eprintln!(
+        "PP qwen38 gdn-chunk-gemm synthetic parity basis=(q38 head geometry, t={t}, fresh state, \
+         arm A=token-sequential scan kernel, arm B=WY/UT batched-GEMM scan, both inside the \
+         fused conv+qknorm+gate CUDA path): out max_abs={d_out:.6} max_mag={m_out:.4} \
+         rel={:.6}; final_state max_abs={d_st:.6} max_mag={m_st:.4} rel={:.6}",
+        d_out / m_out,
+        d_st / m_st
+    );
+    let tol =
+        SCAN_PARITY_REL_TOL_5E3_BOUNDS_FMA_VS_SPLIT_MUL_ADD_DRIFT_THROUGH_THE_512_STEP_RECURRENCE;
+    assert!(
+        d_out / m_out <= tol && d_st / m_st <= tol,
+        "chunk-gemm scan diverged from the sequential scan kernel beyond fp-reorder drift: out \
+         rel {} state rel {} tol {tol}",
+        d_out / m_out,
+        d_st / m_st
+    );
+}
+
+#[test]
+#[ignore = "loads the ~54 GB Qwen3.8-27B NVFP4 dense arm; set NV_QWEN38_SERVING_TEST=1 -- the WY/UT batched-GEMM GDN scan parity gate: teacher-forced 512 natural-text rows through forward_with_cache with lm_head over all positions, three arms: the shipped chunk scan (reference), NV_Q38_GDN_CHUNK_GEMM=1 (treatment, different associativity so NOT bitwise), and the same chunk-scan code re-chunked 2x256 (control measuring the accepted fp-reorder noise floor through 64 bf16 residual layers); the treatment must stay within 3x the control on teacher-forced avg NLL delta and top-1 flip count (floored at 0.01 nats / 8 rows), because a real defect -- wrong subchunk seam, dropped decay ratio, stale state -- moves NLL by whole nats"]
+fn qwen38_cuda_gdn_chunk_gemm_prefill_parity_teacher_forced_512_rows_vs_chunk_scan() {
+    if !gate_env_or_allow_skip() {
+        return;
+    }
+    let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
+    let device = Device::new_cuda_with_stream(0).expect("cuda");
+    let dir = qwen38_snapshot_dir_env_override_then_home_hub();
+    let model = load_dense_arm(&device);
+
+    let chunk = PP_CHUNK_512_MATCHES_LLAMA_BENCH_PP512_AND_THE_PROVEN_PREFILL_BLOCK;
+    let ids = natural_text_512_ids_because_random_ids_make_every_next_token_a_near_tie(&dir, chunk);
+    let positions_v: Vec<i32> = (0..chunk as i32).collect();
+
+    let run_arm = |label: &str, gemm_on: bool| -> Vec<f32> {
+        std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "1");
+        std::env::set_var("NV_Q38_GDN_CHUNK_GEMM", if gemm_on { "1" } else { "0" });
+        let mut cache = model.new_kv_cache(chunk).expect("kv cache");
+        let tokens = Tensor::from_vec(ids.clone(), (1usize, chunk), &device).expect("tokens");
+        let positions =
+            Tensor::from_vec(positions_v.clone(), chunk, &device).expect("positions");
+        let logits = model
+            .forward_with_cache(&tokens, &positions, &mut cache)
+            .unwrap_or_else(|e| panic!("parity arm {label}: {e:#}"));
+        device.synchronize().expect("sync after parity arm");
+        assert_eq!(cache.current_len(), chunk, "arm {label} must commit all {chunk} tokens");
+        logits
+            .to_dtype(DType::F32)
+            .expect("f32")
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1()
+            .expect("to host")
+    };
+
+    let run_split_control = || -> Vec<f32> {
+        std::env::set_var("NV_Q38_GDN_CHUNK_PREFILL", "1");
+        std::env::set_var("NV_Q38_GDN_CHUNK_GEMM", "0");
+        let mut cache = model.new_kv_cache(chunk).expect("kv cache");
+        let mut all: Vec<f32> = Vec::new();
+        let half = chunk / 2;
+        for start in [0usize, half] {
+            let tokens =
+                Tensor::from_vec(ids[start..start + half].to_vec(), (1usize, half), &device)
+                    .expect("tokens");
+            let positions = Tensor::from_vec(
+                (start as i32..(start + half) as i32).collect::<Vec<i32>>(),
+                half,
+                &device,
+            )
+            .expect("positions");
+            let logits = model
+                .forward_with_cache(&tokens, &positions, &mut cache)
+                .unwrap_or_else(|e| panic!("split control arm: {e:#}"));
+            device.synchronize().expect("sync split arm");
+            all.extend(
+                logits
+                    .to_dtype(DType::F32)
+                    .expect("f32")
+                    .flatten_all()
+                    .expect("flatten")
+                    .to_vec1::<f32>()
+                    .expect("to host"),
+            );
+        }
+        all
+    };
+
+    let scan = run_arm("cuda_chunk_scan", false);
+    let gemm = run_arm("cuda_chunk_gemm", true);
+    let split_control = run_split_control();
+    std::env::remove_var("NV_Q38_GDN_CHUNK_GEMM");
+    std::env::remove_var("NV_Q38_GDN_CHUNK_PREFILL");
+    assert_eq!(scan.len(), gemm.len(), "arms returned different logit counts");
+    assert_eq!(scan.len(), split_control.len(), "split control logit count mismatch");
+    let vocab = scan.len() / chunk;
+
+    let nll_scan = teacher_forced_avg_nll(&scan, &ids, chunk, vocab);
+    let nll_gemm = teacher_forced_avg_nll(&gemm, &ids, chunk, vocab);
+    let nll_split = teacher_forced_avg_nll(&split_control, &ids, chunk, vocab);
+    let (max_abs_gemm, flips_gemm) = top1_flip_compare(&scan, &gemm, chunk, vocab);
+    let (max_abs_split, flips_split) = top1_flip_compare(&scan, &split_control, chunk, vocab);
+    let nll_delta_gemm = (nll_scan - nll_gemm).abs();
+    let nll_delta_split = (nll_scan - nll_split).abs();
+    eprintln!(
+        "PP qwen38-cuda gdn-chunk-gemm parity basis=teacher_forced_512_rows_natural_text_forward_with_cache_all_positions_fresh_cache rows={chunk} vocab={vocab} avg_nll: chunk_scan={nll_scan:.5} chunk_gemm={nll_gemm:.5} split_control={nll_split:.5} | gemm_vs_scan: nll_delta={nll_delta_gemm:.5} top1_flips={} max_abs={max_abs_gemm:.4} | split_control_vs_scan (same scan code, 2x256 chunking): nll_delta={nll_delta_split:.5} top1_flips={} max_abs={max_abs_split:.4} | gemm_flip_rows={flips_gemm:?} split_flip_rows={flips_split:?}",
+        flips_gemm.len(),
+        flips_split.len()
+    );
+    let nll_bar = (CHUNK_PARITY_CONTROL_MARGIN_3X_OVER_THE_SAME_CODE_RECHUNKING_NOISE_FLOOR
+        * nll_delta_split)
+        .max(CHUNK_PARITY_AVG_NLL_DELTA_FLOOR_0_01_NATS_A_STRIDE_DEFECT_MOVES_WHOLE_NATS);
+    assert!(
+        nll_delta_gemm <= nll_bar,
+        "teacher-forced avg NLL moved {nll_delta_gemm:.5} nats vs the chunk scan, above the bar \
+         {nll_bar:.5} (3x the same-code 2x256 rechunking control at {nll_delta_split:.5}, floored \
+         at 0.01); a wrong-seam/dropped-decay/stale-state defect moves whole nats"
+    );
+    let flip_bar = (CHUNK_PARITY_CONTROL_MARGIN_3X_OVER_THE_SAME_CODE_RECHUNKING_NOISE_FLOOR
+        as usize
+        * flips_split.len())
+        .max(CHUNK_PARITY_TOP1_FLIP_FLOOR_8_OF_512_THE_BF16_RESIDUAL_CASCADE_BAND);
+    assert!(
+        flips_gemm.len() <= flip_bar,
+        "top-1 flipped on {} of {chunk} rows vs the chunk scan, above the bar {flip_bar} (3x the \
+         same-code rechunking control at {}, floored at 8); rows {flips_gemm:?}",
+        flips_gemm.len(),
         flips_split.len()
     );
 }

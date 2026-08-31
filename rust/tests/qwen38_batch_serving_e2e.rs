@@ -27,6 +27,9 @@ const FOUR_PROMPTS_LONG_GENERATIONS_SO_DECODE_RATE_DOMINATES_PREFILL: [&str; 4] 
 
 const MAX_TOKENS_160_SO_EVERY_LANE_DECODES_LONG_ENOUGH_TO_MEASURE: u32 = 160;
 
+const SOLO_REFERENCES_PIN_THE_EAGER_SESSION_BECAUSE_BATCH_CANNOT_GRAPH_AND_THE_BYTE_ASSERT_NEEDS_THE_SAME_CODE_BOTH_SIDES:
+    &str = "0";
+
 const MTP_VERIFY_ROWS_ARE_A_DIFFERENT_NUMERIC_CLASS_THAN_M1_STEPPING: &str =
     "the MTP verify pass scores k+1 rows per round, which is not the m=1 row-twin route, so \
      MTP-greedy may flip a knife-edge token vs eager stepping; the batch lanes are proven \
@@ -228,6 +231,10 @@ fn four_concurrent_requests_batch_decode_together_and_match_the_solo_reference()
     std::env::set_var("NV_QWEN35_DENSE_CUDA_SERVE", "1");
     std::env::set_var("NV_GDN_FUSED_DECODE", "1");
     std::env::remove_var("NV_Q38_BATCH");
+    std::env::set_var(
+        "NV_Q38_SERVE_GRAPHED",
+        SOLO_REFERENCES_PIN_THE_EAGER_SESSION_BECAUSE_BATCH_CANNOT_GRAPH_AND_THE_BYTE_ASSERT_NEEDS_THE_SAME_CODE_BOTH_SIDES,
+    );
 
     std::env::set_var("NV_DRAFTER", "mtp");
     let mtp_engine = load_engine(&dir, "mtp-solo");

@@ -61,6 +61,16 @@ impl OfficialTemplate {
     }
 
     fn build(path: PathBuf, source: String, cfg: &Value) -> Result<Self, String> {
+        const HF_GENERATION_MASK_TAGS_ONLY_MARK_ASSISTANT_SPANS_FOR_TRAINING_SO_STRIPPING_THEM_RENDERS_IDENTICALLY:
+            [&str; 4] = [
+            "{%- generation -%}",
+            "{%- endgeneration -%}",
+            "{% generation %}",
+            "{% endgeneration %}",
+        ];
+        let source = HF_GENERATION_MASK_TAGS_ONLY_MARK_ASSISTANT_SPANS_FOR_TRAINING_SO_STRIPPING_THEM_RENDERS_IDENTICALLY
+            .iter()
+            .fold(source, |s, tag| s.replace(tag, ""));
         let bos = cfg.get("bos_token").and_then(token_str).unwrap_or_default();
         let eos = cfg.get("eos_token").and_then(token_str).unwrap_or_default();
         let mut env = Environment::new();

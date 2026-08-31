@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Self-Improving Serving Harness — speaches-plus continual-LoRA</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page:           #f9f9f7;
+    --surface-1:      #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --muted:          #898781;
+    --grid:           #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1:       #2a78d6;  /* blue */
+    --series-2:       #eb6834;  /* orange */
+    --series-3:       #1baf7a;  /* aqua */
+    --good:           #0ca30c;
+    --serious:        #ec835a;
+    --critical:       #d03b3b;
+    --delta-good:     #006300;
+    --neutral-mid:    #f0efec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:           #0d0d0d;
+      --surface-1:      #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted:          #898781;
+      --grid:           #2c2c2a;
+      --baseline:       #383835;
+      --border:         rgba(255,255,255,0.10);
+      --series-1:       #3987e5;
+      --series-2:       #d95926;
+      --series-3:       #199e70;
+      --delta-good:     #0ca30c;
+      --neutral-mid:    #383835;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:           #0d0d0d;
+    --surface-1:      #1a1a19;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --muted:          #898781;
+    --grid:           #2c2c2a;
+    --baseline:       #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --series-3:       #199e70;
+    --delta-good:     #0ca30c;
+    --neutral-mid:    #383835;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  main { max-width: 1060px; margin: 0 auto; padding: 40px 28px 80px; }
+
+  header.hero { margin-bottom: 8px; }
+  .kicker {
+    font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 10px;
+  }
+  h1 { font-size: 34px; line-height: 1.15; margin: 0 0 10px; font-weight: 700; }
+  .subtitle { font-size: 17px; color: var(--text-secondary); max-width: 780px; margin: 0 0 18px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+  .badge {
+    font-size: 12px; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-secondary); display: inline-flex; align-items: center; gap: 6px;
+  }
+  .badge .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+
+  h2 {
+    font-size: 21px; margin: 52px 0 6px; font-weight: 700;
+    display: flex; align-items: baseline; gap: 10px;
+  }
+  h2 .n { color: var(--muted); font-size: 14px; font-weight: 600; }
+  .lede { color: var(--text-secondary); margin: 0 0 18px; max-width: 820px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin: 22px 0; }
+  .tile {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px 18px 14px;
+  }
+  .tile .value { font-size: 30px; font-weight: 700; line-height: 1.1; }
+  .tile .value small { font-size: 16px; font-weight: 600; color: var(--text-secondary); }
+  .tile .label { font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+  .tile .delta { font-size: 13px; font-weight: 600; margin-top: 6px; }
+  .delta.good { color: var(--delta-good); }
+  .delta.neutral { color: var(--muted); }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px 24px; margin: 18px 0;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 16px; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th {
+    text-align: left; font-weight: 600; color: var(--text-secondary);
+    border-bottom: 1px solid var(--baseline); padding: 8px 12px 8px 0;
+    font-size: 13px;
+  }
+  td { padding: 9px 12px 9px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.num { font-variant-numeric: tabular-nums; }
+  code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em; background: var(--neutral-mid);
+    padding: 1px 5px; border-radius: 4px;
+  }
+  .card code, .tile code { background: var(--page); }
+
+  /* loop diagram */
+  .loop-wrap { overflow-x: auto; }
+  svg.loop { display: block; width: 100%; height: auto; min-width: 900px; }
+  svg.loop .box { fill: var(--surface-1); stroke: var(--border); rx: 10px; }
+  svg.loop .box-title { font-size: 13.5px; font-weight: 700; fill: var(--text-primary); }
+  svg.loop .box-sub   { font-size: 11px; fill: var(--text-secondary); }
+  svg.loop .box-code  { font-size: 10.5px; fill: var(--muted); font-family: ui-monospace, Menlo, monospace; }
+  svg.loop .arrow { stroke: var(--baseline); stroke-width: 2; fill: none; }
+  svg.loop .arrowhead { fill: var(--baseline); }
+  svg.loop .accent { stroke: var(--series-1); }
+  svg.loop .accenthead { fill: var(--series-1); }
+  svg.loop .stage-tag { font-size: 10px; fill: var(--muted); letter-spacing: 0.1em; }
+
+  /* bar chart */
+  .chart { margin-top: 10px; }
+  .chart .row { display: grid; grid-template-columns: 210px 1fr; align-items: center; gap: 12px; margin: 10px 0; }
+  .chart .name { font-size: 13.5px; color: var(--text-secondary); text-align: right; }
+  .chart .track { position: relative; height: 26px; }
+  .chart .bar {
+    position: absolute; left: 0; top: 4px; height: 18px;
+    border-radius: 0 4px 4px 0; min-width: 3px;
+  }
+  .chart .bar:hover { filter: brightness(1.12); }
+  .chart .val {
+    position: absolute; top: 3px; font-size: 13px; font-weight: 600;
+    font-variant-numeric: tabular-nums; color: var(--text-primary); white-space: nowrap;
+  }
+  .chart .axisline { border-top: 1px solid var(--baseline); margin-left: 222px; }
+  .chart .axlabels { display: grid; grid-template-columns: 210px 1fr; gap: 12px; }
+  .chart .axlabels .ticks { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 3px; }
+  .chart-note { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 10;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 12px; font-size: 12.5px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18); display: none; max-width: 300px;
+  }
+  .tooltip b { display: block; margin-bottom: 2px; }
+
+  details { margin-top: 10px; }
+  summary { cursor: pointer; font-size: 13px; color: var(--text-secondary); }
+
+  .finding { border-left: 3px solid var(--critical); padding: 2px 0 2px 16px; margin: 16px 0; }
+  .finding.minor { border-left-color: var(--serious); }
+  .finding.info  { border-left-color: var(--baseline); }
+  .finding .sev { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+  .finding .sev.crit  { color: var(--critical); }
+  .finding .sev.ser   { color: var(--serious); }
+  .finding .sev.note  { color: var(--muted); }
+  .finding h4 { margin: 2px 0 4px; font-size: 15px; }
+  .finding p { margin: 4px 0; font-size: 14px; color: var(--text-secondary); }
+
+  ol.queue { padding-left: 20px; margin: 10px 0; }
+  ol.queue li { margin: 9px 0; color: var(--text-secondary); }
+  ol.queue li b { color: var(--text-primary); }
+
+  .caveats li { margin: 8px 0; color: var(--text-secondary); }
+  .caveats li b { color: var(--text-primary); }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .two-col { grid-template-columns: 1fr; } .chart .row { grid-template-columns: 130px 1fr; } .chart .name { font-size: 12px; } .chart .axisline { margin-left: 142px; } .chart .axlabels { grid-template-columns: 130px 1fr; } }
+
+  .theme-toggle {
+    position: fixed; top: 14px; right: 16px;
+    border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+    border-radius: 999px; padding: 5px 13px; font-size: 12px; cursor: pointer;
+  }
+  footer { margin-top: 60px; font-size: 12.5px; color: var(--muted); border-top: 1px solid var(--grid); padding-top: 16px; }
+</style>
+</head>
+<body>
+<button class="theme-toggle" onclick="toggleTheme()">◐ theme</button>
+<div class="tooltip" id="tt"></div>
+<main>
+
+<header class="hero">
+  <div class="kicker">speaches-plus · continual-LoRA · 2026-08-26</div>
+  <h1>A Self-Improving Serving Harness</h1>
+  <p class="subtitle">
+    The Prime Agent recipe — capture trajectories in production, judge them, train a LoRA,
+    hot-load it back into the live server — instrumented end-to-end on our own Rust inference
+    stack, trained directly against the quantized NVFP4 base, and formally audited with
+    machine-checked Rocq proofs that found real bugs.
+  </p>
+  <div class="badges">
+    <span class="badge"><span class="dot" style="background:var(--good)"></span>loop proven live end-to-end</span>
+    <span class="badge"><span class="dot" style="background:var(--good)"></span>1,436 tests, 0 failures</span>
+    <span class="badge"><span class="dot" style="background:var(--good)"></span>27B trains on its serving NVFP4 weights</span>
+    <span class="badge"><span class="dot" style="background:var(--series-2)"></span>Rocq audit in flight — 2 real bugs already found</span>
+    <span class="badge"><span class="dot" style="background:var(--baseline)"></span>fleet deploy pending (user-gated)</span>
+  </div>
+</header>
+
+<h2><span class="n">01</span>The loop</h2>
+<p class="lede">
+  Every stage is a real, shipped component with its own endpoint or artifact — not a script
+  taped to the side. The server improves itself while serving; a human steers with a thumb.
+</p>
+
+<div class="card loop-wrap">
+<svg class="loop" viewBox="0 0 980 330" role="img" aria-label="Continual-LoRA loop: serve, capture, label, consolidate, train, gate, hot-load, back to serve">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>
+    <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="accenthead"/></marker>
+  </defs>
+
+  <g>
+    <rect class="box" x="10" y="30" width="220" height="92" rx="10"/>
+    <text class="stage-tag" x="24" y="50">SERVE</text>
+    <text class="box-title" x="24" y="68">speaches-plus</text>
+    <text class="box-sub" x="24" y="86">Qwen3.8 + Gemma E4B, NVFP4/FP8</text>
+    <text class="box-code" x="24" y="103">/v1/{chat,messages,responses}</text>
+  </g>
+  <path class="arrow" d="M230,76 L270,76" marker-end="url(#ah)"/>
+  <g>
+    <rect class="box" x="272" y="30" width="210" height="92" rx="10"/>
+    <text class="stage-tag" x="286" y="50">CAPTURE</text>
+    <text class="box-title" x="286" y="68">Trajectory log</text>
+    <text class="box-sub" x="286" y="86">every completion → daily JSONL, 7d</text>
+    <text class="box-code" x="286" y="103">NV_TRAJECTORY_DIR</text>
+  </g>
+  <path class="arrow" d="M482,76 L522,76" marker-end="url(#ah)"/>
+  <g>
+    <rect class="box" x="524" y="30" width="210" height="92" rx="10"/>
+    <text class="stage-tag" x="538" y="50">LABEL</text>
+    <text class="box-title" x="538" y="68">Human + machine signal</text>
+    <text class="box-sub" x="538" y="86">portal 👍/👎 · Rock app · client tags</text>
+    <text class="box-code" x="538" y="103">/v1/trajectory/label</text>
+  </g>
+  <path class="arrow" d="M734,76 L774,76" marker-end="url(#ah)"/>
+  <g>
+    <rect class="box" x="776" y="30" width="194" height="92" rx="10"/>
+    <text class="stage-tag" x="790" y="50">CONSOLIDATE</text>
+    <text class="box-title" x="790" y="68">Curate the round</text>
+    <text class="box-sub" x="790" y="86">teacher pin · LLM judge · dedupe</text>
+    <text class="box-code" x="790" y="103">consolidate_trajectories.py</text>
+  </g>
+
+  <path class="arrow" d="M873,122 L873,180" marker-end="url(#ah)"/>
+
+  <g>
+    <rect class="box" x="776" y="182" width="194" height="92" rx="10"/>
+    <text class="stage-tag" x="790" y="202">TRAIN</text>
+    <text class="box-title" x="790" y="220">QLoRA on the live base</text>
+    <text class="box-sub" x="790" y="238">quantized-resident, masked CE</text>
+    <text class="box-code" x="790" y="255">/v1/fine_tuning/jobs</text>
+  </g>
+  <path class="arrow" d="M776,228 L736,228" marker-end="url(#ah)"/>
+  <g>
+    <rect class="box" x="524" y="182" width="210" height="92" rx="10"/>
+    <text class="stage-tag" x="538" y="202">GATE</text>
+    <text class="box-title" x="538" y="220">Held-out ppl gate</text>
+    <text class="box-sub" x="538" y="238">adapter must beat base or refuse</text>
+    <text class="box-code" x="538" y="255">adapter &lt; base ppl · exit 2</text>
+  </g>
+  <path class="arrow" d="M524,228 L484,228" marker-end="url(#ah)"/>
+  <g>
+    <rect class="box" x="272" y="182" width="210" height="92" rx="10"/>
+    <text class="stage-tag" x="286" y="202">HOT-LOAD</text>
+    <text class="box-title" x="286" y="220">Rolling adapter, no restart</text>
+    <text class="box-sub" x="286" y="238">versioned ft: ids · vLLM contract</text>
+    <text class="box-code" x="286" y="255">/v1/load_lora_adapter</text>
+  </g>
+
+  <path class="accent arrow" d="M272,228 L120,228 L120,124" marker-end="url(#ahb)"/>
+  <text class="box-sub" x="132" y="248" fill="var(--series-1)">served on the next request</text>
+</svg>
+</div>
+
+<h2><span class="n">02</span>Paper → instrumentation</h2>
+<p class="lede">
+  Prime Agent (arXiv 2608.23552) describes the recipe abstractly; the ART/Unsloth/vLLM stack is
+  its common practical form. This is what each idea became in our stack — with the places we
+  deliberately hardened beyond the paper.
+</p>
+
+<div class="card">
+<table>
+  <tr><th style="width:34%">Prime Agent / ecosystem idea</th><th>Our instrumentation</th></tr>
+  <tr>
+    <td>Trajectories collected during normal operation</td>
+    <td>Capture module inside the server on every completion (<code>oapi/trajectory.rs</code>): prompt, completion, reasoning, finish reason, model — daily JSONL, tmpfiles-pruned at 7 days, on every fleet host.</td>
+  </tr>
+  <tr>
+    <td>RULER-style LLM-judge rewards, no labeled data</td>
+    <td>Judge filter in consolidation (Qwen judges E4B) — <b>plus</b> the labels the paper doesn't have: portal and Rock-app thumbs and client <code>x-trajectory-tag</code> retro-labels, joined by id or tag with an honesty <code>matched</code> field.</td>
+  </tr>
+  <tr>
+    <td>GRPO RL step per round</td>
+    <td>Deliberately simplified to SFT distillation on accepted trajectories with a pinned teacher (Qwen teaches E4B; <code>ft:*</code> teachers refused, so the loop can't distill from itself).</td>
+  </tr>
+  <tr>
+    <td>Hot-load each LoRA checkpoint into the inference server</td>
+    <td><code>/v1/load_lora_adapter</code> / <code>unload</code> implementing the vLLM contract; engine-per-adapter registry; KV-persist tagged with a weights fingerprint so stale caches can't serve.</td>
+  </tr>
+  <tr>
+    <td>Concurrent multi-LoRA continual training stack</td>
+    <td>One rolling adapter with versioned <code>ft:</code> ids and same-suffix unload — the operator's choice: simpler lifecycle over adapter zoo.</td>
+  </tr>
+  <tr>
+    <td><i>(no equivalent in the paper)</i></td>
+    <td>Safety rails the paper skips: held-out perplexity gate that <b>refuses to ship</b> a losing adapter (exit 2), non-finite-gradient abort in both trainer arms, and a machine-checked Rocq audit of the training math itself (§ 06).</td>
+  </tr>
+</table>
+</div>
+
+<h2><span class="n">03</span>Proven live, end to end</h2>
+<p class="lede">
+  One full revolution of the loop on a running server — no mocks, the same binary that serves
+  production traffic.
+</p>
+
+<div class="tiles">
+  <div class="tile">
+    <div class="value">7 <small>rows</small></div>
+    <div class="label">captured from live traffic; the thumbs-down row was excluded by its label</div>
+  </div>
+  <div class="tile">
+    <div class="value">165 → 24.5</div>
+    <div class="label">train loss over the fine-tuning job</div>
+    <div class="delta good">▼ converged</div>
+  </div>
+  <div class="tile">
+    <div class="value">hot_loaded: true</div>
+    <div class="label">adapter live without a restart, then served by its <code>ft:</code> id, then unloaded</div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>The gate: held-out eval loss, adapter vs base</h3>
+  <div class="chart" id="gatechart">
+    <div class="row">
+      <div class="name">base model (E4B)</div>
+      <div class="track"><div class="bar" data-tt="<b>Base model</b>held-out eval loss 33.2 — the bar the adapter must beat" style="background:var(--series-1); width:100%"></div><div class="val" style="right:6px; color:#fff">33.2</div></div>
+    </div>
+    <div class="row">
+      <div class="name">trained adapter</div>
+      <div class="track"><div class="bar" data-tt="<b>Trained adapter</b>held-out eval loss 4.72 — gate passed, adapter shipped" style="background:var(--series-2); width:14.2%"></div><div class="val" style="left:calc(14.2% + 8px)">4.72</div></div>
+    </div>
+    <div class="axisline"></div>
+    <div class="axlabels"><div></div><div class="ticks"><span>0</span><span>held-out eval loss</span><span>33.2</span></div></div>
+  </div>
+  <p class="chart-note">
+    Honesty note: 6 training rows overfit by design — this demonstrates the <b>mechanism</b>
+    (capture → exclusion → gate → hot-load), not adapter quality. The first real judged round
+    runs on live traffic after deploy.
+  </p>
+  <details><summary>data table</summary>
+    <table><tr><th>arm</th><th>held-out eval loss</th><th>gate verdict</th></tr>
+    <tr><td>base (E4B)</td><td class="num">33.2</td><td>—</td></tr>
+    <tr><td>adapter</td><td class="num">4.72</td><td>pass → hot-load</td></tr></table>
+  </details>
+</div>
+
+<h2><span class="n">04</span>QLoRA on the serving weights</h2>
+<p class="lede">
+  The step nobody upstream ships: training directly against the <b>same NVFP4-packed weights the
+  server runs on</b> — no second bf16 copy of the model, no export/import round-trip. The
+  forward is the storage-native quantized GEMM; only the backward transiently dequantizes.
+</p>
+
+<div class="tiles">
+  <div class="tile">
+    <div class="value">27B <small>NVFP4</small></div>
+    <div class="label">real Gemma weights, trained in place</div>
+    <div class="delta good">loss 2.24 → 2.04 nats</div>
+  </div>
+  <div class="tile">
+    <div class="value">625.9 <small>tok/s</small></div>
+    <div class="label">windowed training throughput, release build, gate run</div>
+  </div>
+  <div class="tile">
+    <div class="value">24.4 <small>GiB peak</small></div>
+    <div class="label">full T=512 run at 565 tok/s — full-depth headroom on one card</div>
+  </div>
+  <div class="tile">
+    <div class="value">1,436</div>
+    <div class="label">tests green across 53 suites after the merge</div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>The 84-GiB-free OOM, killed at the root</h3>
+  <p style="color:var(--text-secondary); margin:6px 0">
+    Training initially OOM'd with 84 GiB free. Root cause: candle's generic matmul retained
+    fp32 transposed weight copies (~16.8 GiB per allocator bucket) <i>plus</i> phantom
+    <code>rhs_grad</code> GEMMs for frozen weights — full gradients computed and discarded.
+    The fix is <code>Bf16LinearOp</code>, a custom autograd op whose backward is exactly
+    <code>dx&nbsp;=&nbsp;dy·W</code> with the weight held inside the op: candle never sees it as a graph
+    argument, so there is nothing to build a phantom gradient for and nothing to transpose.
+    The previously-OOMing shape now trains non-checkpointed. This matches — and beats — the
+    bitsandbytes/torchao shape (they dequantize twice per module per step; we dequantize once,
+    backward only, since our forward is quantized-native).
+  </p>
+</div>
+
+<div class="two-col">
+  <div class="card">
+    <h3>Training data path is real</h3>
+    <p style="color:var(--text-secondary); margin:6px 0">
+      The fine-tuning endpoint tokenizes through the base model's actual tokenizer (byte
+      fallback survives only for tokenizer-less test fixtures and refuses real bases), masks
+      prompt tokens out of the loss, caps sequences at 512, drops degenerate rows, and
+      hard-errors on out-of-vocab ids. <code>grad_layers</code> and LoRA+
+      <code>b_lr_ratio</code> are request hyperparameters with family-aware validation.
+    </p>
+  </div>
+  <div class="card">
+    <h3>One wire vocabulary, four languages</h3>
+    <p style="color:var(--text-secondary); margin:6px 0">
+      The feedback/trajectory types are defined once in Rust and generated via typeshare into
+      TypeScript (garden), Kotlin (Rock app), and Go, with drift gates in CI — a thumbs-down
+      tapped on a phone and a label posted by a script land as the same record.
+    </p>
+  </div>
+</div>
+
+<h2><span class="n">05</span>The human in the loop</h2>
+<p class="lede">The operator workflow is three gestures, not a pipeline to babysit.</p>
+<div class="card">
+<table>
+  <tr><th style="width:22%">Gesture</th><th>What happens</th></tr>
+  <tr>
+    <td><b>Thumb a response</b></td>
+    <td>👍/👎 pills on every portal.decent.* attempt and every Rock (android) message. The tap posts to <code>/v1/trajectory/label</code>, joining by the <code>x-trajectory-tag</code> the client stamped at request time — labels survive LiteLLM rewriting response ids.</td>
+  </tr>
+  <tr>
+    <td><b>Run a round</b></td>
+    <td><code>consolidate_trajectories.py --model &lt;teacher&gt;</code> over the week's logs: applies labels, judge-filters, distills, submits the fine-tune, and only ships if the held-out gate passes. A losing adapter is a refusal (exit 2), not a deploy.</td>
+  </tr>
+  <tr>
+    <td><b>Forget a round</b></td>
+    <td><code>/v1/unload_lora_adapter</code> — the base is untouched underneath; the rolling adapter is the only mutable state, and it is versioned.</td>
+  </tr>
+</table>
+</div>
+
+<h2><span class="n">06</span>Formally audited — and it found bugs</h2>
+<p class="lede">
+  The ask: prove the quantized training path equivalent to serving, <i>with the goal of
+  detecting bugs</i>. Rocq 9.1 proof development, zero admits, independent kernel re-check
+  (<code>rocqchk</code>), assumption audits, and planted-defect falsification (mutations to the
+  transcribed code must break the build — 8/8 did). Three of six proof agents complete;
+  adversarial verification in flight; merge pending.
+</p>
+
+<div class="tiles">
+  <div class="tile">
+    <div class="value">4 <small>new modules</small></div>
+    <div class="label"><code>TrainBackward.v</code> · <code>LoraSlices.v</code> · <code>Nvfp4Semantics.v</code> · <code>TrainStepSpec.v</code></div>
+  </div>
+  <div class="tile">
+    <div class="value">35+ <small>theorems</small></div>
+    <div class="label">zero axioms on the key results — closed under the global context</div>
+  </div>
+  <div class="tile">
+    <div class="value">8/8</div>
+    <div class="label">planted defects each fail compilation — the proofs are falsifiable, not vacuous</div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>What is now theorem, not belief</h3>
+  <p style="color:var(--text-secondary); margin:6px 0 10px">
+    The serving GEMM configs (<code>bf16_matmul_row_major_bt_offs</code> and the plain variant)
+    provably realize <code>y = x·Wᵀ</code> under column-major cuBLASLt semantics, transcribed
+    field-for-field from the <code>MatmulConfig</code> literals. The <code>Bf16LinearOp</code>
+    backward <code>dx = dy·W</code> is proved to be the adjoint of that forward, the true
+    derivative of any loss through it, and <b>unique</b> — the transposed-copy orientation is
+    refuted on a concrete instance. NVFP4 nibble packing, the CUTLASS scale swizzle (including
+    tail tiles), and per-block scale indexing round-trip and are injective; the training-side
+    host dequant (<code>HostDequantWeights</code>) equals the serving reference dequant on
+    every index. LoRA slice/cumsum machinery, the gated-q value/gate lane split, and the
+    scaling-fold are proved against the shipped WGSL and Rust. Floating-point rounding is an
+    explicit non-claim (exact ℝ/ℚ model); every exclusion is recorded in
+    <code>08.3-rocq-proof-notes.md</code>.
+  </p>
+
+  <div class="finding">
+    <div class="sev crit">Confirmed bug · train/serve divergence</div>
+    <h4><code>Nvfp4DequantSource::get</code> uses <code>weight_scale_2</code> raw</h4>
+    <p>
+      Every serving consumer guards this scalar (<code>safe_recip</code> / finiteness checks);
+      the training-side reader in <code>train_runner.rs</code> does not. Machine-checked
+      divergence witness (by <code>vm_compute</code>): at <code>weight_scale_2 = 0</code>,
+      training dequantizes the <b>entire base weight matrix to zeros</b> while the CUDA serving
+      path for the same checkpoint falls back to scale 1.0 — train and serve compute different
+      functions. NaN/inf is the same class. The one-line guard is specified and its corrected
+      form is <b>proved index-identical to serving everywhere</b>
+      (<code>train_runner_guarded_agrees_serve</code>). Fix queued for the merge.
+    </p>
+  </div>
+  <div class="finding minor">
+    <div class="sev ser">Minor · same guard class</div>
+    <h4><code>dequantize_nvfp4_to_bf16</code> missing finiteness check</h4>
+    <p>
+      The small-matrix serving fallback guards the global scale against 0.0 but not
+      NaN/inf, unlike its sibling <code>safe_recip</code> paths — a non-finite global scale
+      silently diverges small matrices from large ones on the same checkpoint.
+    </p>
+  </div>
+  <div class="finding info">
+    <div class="sev note">Downgraded by adversarial verify · defense-in-depth</div>
+    <h4>Under-width LoRA B on a gated projection scatters onto gate lanes</h4>
+    <p>
+      Proved (zero-axiom): <code>LoraSlotStack::set_lora</code>'s corner-padding would silently
+      modulate the sigmoid gates of low heads and skip high heads entirely for an adapter sized
+      for the un-gated layout. The verify pass then showed the shipped wgpu loader already
+      rejects this exact shape (<code>…MUST_COVER_VALUE_AND_GATE_LANES</code> guard) — so this
+      is a proved hazard behind one guard at one loader, not a live corruption. Residual action:
+      push the reject down into <code>set_lora</code> itself.
+    </p>
+  </div>
+</div>
+
+<h2><span class="n">07</span>What's next, in order</h2>
+<div class="two-col">
+  <div class="card">
+    <h3>Queued (evidence-ranked)</h3>
+    <ol class="queue">
+      <li><b>Merge the Rocq workflow</b> + land the <code>weight_scale_2</code> guard its proof already validated.</li>
+      <li><b>Chunked-CE port to the Qwen arm</b> — CE peak ~9–10 GB → &lt;1 GB at T=512; kills a phantom 1.3-TFLOP GEMM per example. Prerequisite for full-depth.</li>
+      <li><b>Example batching B≥8</b> — the big full-depth throughput lever (~85 → ~600 tok/s class); fits because the quantized-resident base frees ~40 GB.</li>
+      <li><b>W4A4 numerics A/B</b> — our NVFP4 training forward quantizes activations; <i>no upstream precedent</i>. Mandatory before the loop consumes adapters trained through it.</li>
+      <li><b>Device NVFP4 dequant kernel</b> — unblocks <code>QuantLinearOp</code> (single-dequant backward fully on-device).</li>
+      <li><b>Deploy</b> (user-gated): internal compute hosts, Rock APK — then the first real judged consolidation round on live traffic.</li>
+    </ol>
+  </div>
+  <div class="card">
+    <h3>Honest caveats</h3>
+    <ul class="caveats">
+      <li><b>The demo adapter is degenerate</b> — six rows overfit, as expected. It proves plumbing, not quality.</li>
+      <li><b>W4A4 training forward is unprecedented</b> — every upstream QLoRA keeps activations ≥16-bit. The A/B gate stands between it and the loop.</li>
+      <li><b>Rocq scope is exact arithmetic</b> — bf16/f32 rounding and split-K reduction order are declared non-claims, not proven.</li>
+      <li><b>Nothing is deployed yet</b> — every number here is from the benchmark host; the fleet rollout is a separate, user-gated step.</li>
+      <li><b>Adapter-shipping policy</b>: flips require landed perplexity rows — an adapter with no eval row does not ship.</li>
+    </ul>
+  </div>
+</div>
+
+<footer>
+  speaches-plus continual-LoRA program · loop, QLoRA trainer, portal/Rock feedback, typeshare wire
+  types, and Rocq audit all on <code>main</code> (origin @ 4701af08c) · design record and upstream
+  benchmark in the session scratchpad · Prime Agent: arXiv 2608.23552.
+</footer>
+</main>
+
+<script>
+  function toggleTheme() {
+    const r = document.documentElement;
+    const cur = r.getAttribute('data-theme');
+    const osDark = matchMedia('(prefers-color-scheme: dark)').matches;
+    const now = cur ? (cur === 'dark' ? 'light' : 'dark') : (osDark ? 'light' : 'dark');
+    r.setAttribute('data-theme', now);
+  }
+  const tt = document.getElementById('tt');
+  document.querySelectorAll('.bar[data-tt]').forEach(el => {
+    el.addEventListener('mousemove', e => {
+      tt.innerHTML = el.dataset.tt.replace('</b>', '</b> ');
+      tt.style.display = 'block';
+      const x = Math.min(e.clientX + 14, innerWidth - tt.offsetWidth - 10);
+      tt.style.left = x + 'px';
+      tt.style.top = (e.clientY + 14) + 'px';
+    });
+    el.addEventListener('mouseleave', () => { tt.style.display = 'none'; });
+  });
+</script>
+</body>
+</html>

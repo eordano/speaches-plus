@@ -104,6 +104,7 @@ fn dense_tiny_weights(cfg: &Qwen3_5DenseConfig, seed: u64) -> q3d::HostDenseWeig
                     o: bf16_lin(&mut r, hidden, cfg.num_attention_heads * hd, 0.12).into(),
                     q_norm: norm_vec(&mut r, hd),
                     k_norm: norm_vec(&mut r, hd),
+                    qkv_bias_bf16: vec![],
                 }))
             }
         };
@@ -376,6 +377,106 @@ fn dense_full_and_partial_accepts_leave_a_stream_bit_identical_to_pure_m1_steppi
 }
 
 #[test]
+fn dense_scan_replay_commit_is_bit_identical_to_the_commit_only_reforward_it_replaces() {
+    let _env = env_lock();
+    require_gpu();
+    std::env::set_var(
+        DENSE_M_ENV,
+        VERIFY_ROWS_8_KEEPS_THE_TINY_MAX_SEQ_64_ABLE_TO_HOLD_A_PROMPT_PLUS_TWO_ROUNDS.to_string(),
+    );
+    std::env::set_var(
+        q3d::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM,
+        "6",
+    );
+    let cfg = dense_tiny_config();
+    let hw = dense_tiny_weights(&cfg, 0x5ca9_4e91_a7f3);
+    let prompt = ids_from(cfg.vocab_size, 9, 7);
+    let chain = ids_from(cfg.vocab_size, 6, 23);
+    let tail = ids_from(cfg.vocab_size, 4, 41);
+    let mut first_tail_row_per_accept: Vec<Vec<f32>> = Vec::new();
+
+    for accepted in [1usize, 3, 5] {
+        std::env::set_var(
+            q3d::MTP_COMMIT_SCAN_REPLAY_ENV_DEFAULT_ON_SET_0_FOR_THE_COMMIT_ONLY_REFORWARD_ARM,
+            "0",
+        );
+        let rf = Qwen3_5DenseWgpu::new(cfg.clone(), &hw, TINY_MAX_SEQ);
+        std::env::remove_var(
+            q3d::MTP_COMMIT_SCAN_REPLAY_ENV_DEFAULT_ON_SET_0_FOR_THE_COMMIT_ONLY_REFORWARD_ARM,
+        );
+        let mut rf = rf.expect("build reforward");
+        assert!(
+            !rf.mtp_commit_scan_replay_active(),
+            "the reference arm must ride the commit-only reforward, not scan-replay"
+        );
+        assert!(
+            rf.verify_chain_rides_dedicated_graph(),
+            "no dedicated verify graph: both arms would ride the padded prefill graph and the \
+             scan-replay commit under test would never build"
+        );
+        for &t in &prompt {
+            rf.prefill_step(t).expect("reforward prefill step");
+        }
+        rf.verify_chain(&chain).expect("reforward verify_chain");
+        rf.advance(0).expect("reforward rollback");
+        rf.verify_chain_commit_only(&chain[..accepted])
+            .expect("commit-only prefix reforward");
+        rf.advance(accepted).expect("reforward commit");
+        let want: Vec<(u32, Vec<f32>)> = tail
+            .iter()
+            .map(|&t| rf.decode_step_logits(t).expect("reforward tail step"))
+            .collect();
+
+        std::env::set_var(
+            q3d::MTP_COMMIT_SCAN_REPLAY_ENV_DEFAULT_ON_SET_0_FOR_THE_COMMIT_ONLY_REFORWARD_ARM,
+            "1",
+        );
+        let sr = Qwen3_5DenseWgpu::new(cfg.clone(), &hw, TINY_MAX_SEQ);
+        std::env::remove_var(
+            q3d::MTP_COMMIT_SCAN_REPLAY_ENV_DEFAULT_ON_SET_0_FOR_THE_COMMIT_ONLY_REFORWARD_ARM,
+        );
+        let mut sr = sr.expect("build scan-replay");
+        assert!(
+            sr.mtp_commit_scan_replay_active(),
+            "NV_Q3D_MTP_COMMIT_SCAN_REPLAY=1 at build did not record the per-layer commit \
+             passes, so this test would compare the reforward against itself"
+        );
+        for &t in &prompt {
+            sr.prefill_step(t).expect("scan-replay prefill step");
+        }
+        sr.verify_chain(&chain).expect("scan-replay verify_chain");
+        sr.advance(accepted).expect("scan-replay commit");
+        assert_eq!(
+            sr.current_pos(),
+            rf.current_pos() - tail.len(),
+            "accepted={accepted}: scan-replay commit must land pos where the reforward commit \
+             landed it"
+        );
+        for (i, (want_tok, want_row)) in want.iter().enumerate() {
+            let (got_tok, got_row) = sr.decode_step_logits(tail[i]).expect("scan-replay tail");
+            assert_eq!(
+                bit_diff(want_row, &got_row),
+                0,
+                "accepted={accepted} tail step {i}: the scan-replay commit drifted from the \
+                 commit-only reforward it replaces, so the redispatched conv_shift/scan did not \
+                 reproduce the reforward's DeltaNet state"
+            );
+            assert_eq!(got_tok, *want_tok, "accepted={accepted} tail step {i} argmax");
+        }
+        first_tail_row_per_accept.push(want[0].1.clone());
+    }
+    assert!(
+        first_tail_row_per_accept
+            .windows(2)
+            .any(|w| bit_diff(&w[0], &w[1]) > 0),
+        "every accept length produced the same first tail logits, so this suite would pass \
+         with a commit that ignores n entirely"
+    );
+    std::env::remove_var(q3d::VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM);
+    std::env::remove_var(DENSE_M_ENV);
+}
+
+#[test]
 fn dense_verify_chain_refuses_a_second_round_before_advance_commits_or_rolls_back() {
     let _env = env_lock();
     require_gpu();
@@ -412,6 +513,75 @@ fn dense_verify_chain_refuses_a_second_round_before_advance_commits_or_rolls_bac
     assert!(
         format!("{err}").contains("without a pending"),
         "got: {err}"
+    );
+    std::env::remove_var(DENSE_M_ENV);
+}
+
+const VFL_ENV: &str =
+    q3d::VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM;
+
+#[test]
+fn dense_vflash_depth_gate_is_bitwise_the_slab_arm_below_the_knee_and_the_loop_arm_at_or_above() {
+    let _env = env_lock();
+    require_gpu();
+    std::env::set_var(
+        DENSE_M_ENV,
+        VERIFY_ROWS_8_KEEPS_THE_TINY_MAX_SEQ_64_ABLE_TO_HOLD_A_PROMPT_PLUS_TWO_ROUNDS.to_string(),
+    );
+    let cfg = dense_tiny_config();
+    let hw = dense_tiny_weights(&cfg, 0xfa5f_1a5b_0001);
+    let prompt = ids_from(cfg.vocab_size, 9, 3);
+    let chain = ids_from(cfg.vocab_size, 4, 17);
+
+    let run = |env_val: Option<&str>| -> (Vec<f32>, Vec<f32>) {
+        match env_val {
+            Some(v) => std::env::set_var(VFL_ENV, v),
+            None => std::env::remove_var(VFL_ENV),
+        }
+        let mut m = Qwen3_5DenseWgpu::new(cfg.clone(), &hw, TINY_MAX_SEQ).expect("build");
+        std::env::remove_var(VFL_ENV);
+        for &t in &prompt {
+            m.prefill_step(t).expect("prefill step");
+        }
+        let (_, logits) = m.verify_chain_logits(&chain).expect("verify_chain");
+        let attn = m
+            .debug_verify_attn_out_rows_for_test()
+            .expect("attn out probe");
+        (attn, logits)
+    };
+
+    let (slab, slab_logits) = run(Some("0"));
+    let (loop_pure, _) = run(Some("loop"));
+    assert!(
+        bit_diff(&slab, &loop_pure) > 0,
+        "the pure slab and pure loop arms wrote bit-identical a_attn rows on tiny random \
+         weights; both gate comparisons below would then pass with the depth gate stuck on \
+         either arm, so this contract certifies nothing. \
+         {}",
+        Qwen3_5DenseWgpu::ATTN_OUT_IS_THE_ARM_PROBE_BECAUSE_THE_GATED_RESIDUAL_ROUNDS_ARM_DRIFT_OUT_OF_TINY_LOGITS
+    );
+    let (gated_below, below_logits) = run(Some("60"));
+    assert_eq!(
+        bit_diff(&slab, &gated_below),
+        0,
+        "gate=60 with total {} rows must dispatch exactly the slab arm and match the slab-only \
+         build's a_attn bit for bit; a diff means the encode filter let a loop pass through \
+         below the knee",
+        prompt.len() + chain.len()
+    );
+    assert_eq!(
+        bit_diff(&slab_logits, &below_logits),
+        0,
+        "below-the-knee gated logits must match the slab-only build bit for bit"
+    );
+    let (gated_above, _) = run(Some("2"));
+    assert_eq!(
+        bit_diff(&loop_pure, &gated_above),
+        0,
+        "gate=2 with total {} rows must dispatch exactly the loop arm and match the loop-only \
+         build's a_attn bit for bit; a diff means the slab arm still ran or the loop arm was \
+         skipped",
+        prompt.len() + chain.len()
     );
     std::env::remove_var(DENSE_M_ENV);
 }

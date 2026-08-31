@@ -1,5 +1,6 @@
 pub mod gguf;
 pub mod lora_adapter;
+pub mod lora_merge;
 
 #[macro_export]
 macro_rules! hf_json_from_file {
@@ -314,6 +315,7 @@ pub enum QuantScheme {
     None,
     Fp8E4m3,
     Nvfp4,
+    MlxAffineW4,
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +333,7 @@ impl QuantizationConfig {
             QuantScheme::None => None,
             QuantScheme::Nvfp4 => Some(NVFP4_GROUP_SIZE),
             QuantScheme::Fp8E4m3 => None,
+            QuantScheme::MlxAffineW4 => Some(64),
         }
     }
 
@@ -346,6 +349,7 @@ impl QuantizationConfig {
         };
         match self.scheme {
             QuantScheme::None => Ok(()),
+            QuantScheme::MlxAffineW4 => Ok(()),
             QuantScheme::Nvfp4 => {
                 if declared == NVFP4_GROUP_SIZE {
                     Ok(())
@@ -398,6 +402,17 @@ impl QuantizationConfig {
                     .collect(),
                 _ => Vec::new(),
             };
+
+        if obj.get("mode").and_then(|x| x.as_str()) == Some("affine")
+            && obj.get("bits").and_then(|x| x.as_u64()) == Some(4)
+        {
+            let group_size = obj.get("group_size").and_then(|x| x.as_u64()).map(|g| g as usize);
+            return Ok(Self {
+                scheme: QuantScheme::MlxAffineW4,
+                ignored_modules,
+                group_size,
+            });
+        }
 
         if let Some(method) = obj.get("quant_method").and_then(|x| x.as_str()) {
             if method == "modelopt" {
@@ -481,6 +496,7 @@ impl QuantizationConfig {
         let v: serde_json::Value = serde_json::from_str(s).context("parse config.json")?;
         let q = v
             .get("quantization_config")
+            .or_else(|| v.get("quantization"))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         Self::from_hf_value(&q)
@@ -527,6 +543,7 @@ pub struct QuantizedWeight {
     pub packed_dtype: StDtype,
     pub weight_scale: Option<Tensor>,
     pub weight_scale_bytes: Option<Vec<u8>>,
+    pub weight_bias_bytes: Option<Vec<u8>>,
     pub input_scale: Option<f32>,
 }
 
@@ -604,6 +621,28 @@ impl WeightLoader {
     ) -> Result<QuantizedWeight> {
         match scheme {
             QuantScheme::None => bail!("load_quantized_weight called with scheme None"),
+            QuantScheme::MlxAffineW4 => {
+                let packed_bytes = self.raw_bytes(base_name)?.to_vec();
+                let shape = self
+                    .shape_of(base_name)
+                    .ok_or_else(|| anyhow!("missing shape for {base_name}"))?;
+                let module = strip_weight_suffix(base_name);
+                let weight_scale_bytes = Some(self.raw_bytes(&format!("{module}.scales"))?.to_vec());
+                let weight_bias_bytes = Some(self.raw_bytes(&format!("{module}.biases"))?.to_vec());
+                let packed_dtype = self
+                    .st_dtype_of(base_name)
+                    .ok_or_else(|| anyhow!("missing dtype for {base_name}"))?;
+                Ok(QuantizedWeight {
+                    scheme,
+                    shape,
+                    packed_bytes,
+                    packed_dtype,
+                    weight_scale: None,
+                    weight_scale_bytes,
+                    weight_bias_bytes,
+                    input_scale: None,
+                })
+            }
             QuantScheme::Fp8E4m3 => {
                 let weight_bytes = self.raw_bytes(base_name)?.to_vec();
                 let shape = self
@@ -647,6 +686,7 @@ impl WeightLoader {
                     packed_dtype,
                     weight_scale,
                     weight_scale_bytes: None,
+                    weight_bias_bytes: None,
                     input_scale,
                 };
 
@@ -680,6 +720,7 @@ impl WeightLoader {
                     packed_dtype,
                     weight_scale: None,
                     weight_scale_bytes,
+                    weight_bias_bytes: None,
                     input_scale: None,
                 })
             }

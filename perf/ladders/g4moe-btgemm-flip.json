@@ -1,0 +1,41 @@
+{
+  "ladder": "g4moe-btgemm-flip",
+  "mode": "ours",
+  "base_args": {
+    "build-name": "g4moe btgemm-flip",
+    "model": "gemma4-26b-a4b",
+    "backend": "wgpu-vulkan",
+    "pkg": "nv-models",
+    "features": "cuda,wgpu",
+    "suite": "wgpu_ctx_scaling",
+    "exact": "g4moe_wgpu_decode_ms_per_token_vs_context_depth_chunked_prefill_primed",
+    "parse": "ctx-scaling",
+    "timeout": "2400"
+  },
+  "base_env": {
+    "NV_G4MOE_CTX_CHUNKED_TEST": "1",
+    "NV_G4MOE_KV_RING": "1"
+  },
+  "depth_env": "NV_CTX_TOKENS",
+  "depths": [
+    256,
+    8192,
+    120000
+  ],
+  "depths_per_run": false,
+  "notes": "ADJUDICATED 2026-08-28: btgemm is NEUTRAL-TO-NEGATIVE on current HEAD (-4.9% at 256, +0.2% at 8192, default 87.7/81.6) -- the 08-20 destall-era evidence is stale, the default path improved past the arm; the flip came OFF the queue; the earlier +94% spot-check was a profiled-vs-unprofiled comparison error, retracted; llamacpp-vulkan refs 236.5/218.5 (gap 2.7x confirmed)",
+  "baseline_arm": "default",
+  "arms": [
+    {
+      "name": "default",
+      "env": {}
+    },
+    {
+      "name": "btgemm",
+      "env": {
+        "NV_G4MOE_EXPERT_BT_GEMM": "1"
+      }
+    }
+  ],
+  "null_pair_waived_because": "predates the null-pair rule; this spec's arm deltas were read against no measured floor, so treat any margin under ~5.5% as unresolved until a null pair is added and re-run"
+}

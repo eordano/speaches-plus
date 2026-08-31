@@ -5,7 +5,10 @@ use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
+use nv_layers::weight_load::{load_linear_with_bias_names, load_rmsnorm};
 use serde::Deserialize;
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex};
 
 use crate::deepseek_ocr::decoder::{banned_tokens_windowed_ngram, detect_loop, LoopDetection};
 
@@ -69,6 +72,7 @@ pub struct DotsKvCache {
     n_kv_heads: usize,
     head_dim: usize,
     grow_by_concat_avoids_full_buffer_slice_assign: bool,
+    bhsd: bool,
 }
 
 impl DotsKvCache {
@@ -89,8 +93,13 @@ impl DotsKvCache {
         grow_by_concat: bool,
     ) -> Result<Self> {
         let head_dim = cfg.head_dim();
+        let bhsd = !matches!(device, Device::Cuda(_));
         let alloc_len = if grow_by_concat { 0 } else { max_seq_len };
-        let shape = (1usize, alloc_len, cfg.num_key_value_heads, head_dim);
+        let shape = if bhsd {
+            (1usize, cfg.num_key_value_heads, alloc_len, head_dim)
+        } else {
+            (1usize, alloc_len, cfg.num_key_value_heads, head_dim)
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for _ in 0..cfg.num_hidden_layers {
             layers.push((
@@ -105,7 +114,12 @@ impl DotsKvCache {
             n_kv_heads: cfg.num_key_value_heads,
             head_dim,
             grow_by_concat_avoids_full_buffer_slice_assign: grow_by_concat,
+            bhsd,
         })
+    }
+
+    pub fn bhsd(&self) -> bool {
+        self.bhsd
     }
 
     pub fn current_len(&self) -> usize {
@@ -128,27 +142,44 @@ impl DotsKvCache {
             "kv cache overflow: {end} > {}",
             self.max_seq_len
         );
+        let seq_dim = if self.bhsd { 2 } else { 1 };
+        let (k, v) = if self.bhsd {
+            if t == 1 {
+                let shape = (1, self.n_kv_heads, 1, self.head_dim);
+                (k.reshape(shape)?, v.reshape(shape)?)
+            } else {
+                (
+                    k.permute((0, 2, 1, 3))?.contiguous()?,
+                    v.permute((0, 2, 1, 3))?.contiguous()?,
+                )
+            }
+        } else {
+            (k.clone(), v.clone())
+        };
         if self.grow_by_concat_avoids_full_buffer_slice_assign {
             let (kb, vb) = &self.layers[layer];
-            let (ku, vu) = if kb.dim(1)? == 0 {
-                (k.clone(), v.clone())
+            let (ku, vu) = if kb.dim(seq_dim)? == 0 {
+                (k, v)
             } else {
-                (Tensor::cat(&[kb, k], 1)?, Tensor::cat(&[vb, v], 1)?)
+                (
+                    Tensor::cat(&[kb, &k], seq_dim)?,
+                    Tensor::cat(&[vb, &v], seq_dim)?,
+                )
             };
             self.layers[layer] = (ku, vu);
             return Ok(());
         }
         let (kb, vb) = &self.layers[layer];
-        let range = [0..1, start..end, 0..self.n_kv_heads, 0..self.head_dim];
-        let ku = kb.slice_assign(&range, k)?;
-        let vu = vb.slice_assign(&range, v)?;
-        self.layers[layer] = (ku, vu);
+        kb.slice_set(&k.contiguous()?, seq_dim, start)?;
+        vb.slice_set(&v.contiguous()?, seq_dim, start)?;
         Ok(())
     }
 
+    /// (1, len, h_kv, d) on CUDA; (1, h_kv, len, d) when `bhsd()`.
     pub fn view(&self, layer: usize, len: usize) -> Result<(Tensor, Tensor)> {
         let (k, v) = &self.layers[layer];
-        Ok((k.narrow(1, 0, len)?, v.narrow(1, 0, len)?))
+        let seq_dim = if self.bhsd { 2 } else { 1 };
+        Ok((k.narrow(seq_dim, 0, len)?, v.narrow(seq_dim, 0, len)?))
     }
 
     pub fn advance(&mut self, n: usize) {
@@ -178,44 +209,112 @@ pub struct DotsDecoder {
     dtype: DType,
 }
 
-fn load_linear(
-    weights: &dyn nv_weights::TensorSource,
-    name: &str,
-    out_dim: usize,
-    in_dim: usize,
-    bias: Option<&str>,
-    dtype: DType,
-) -> Result<Linear> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    anyhow::ensure!(
-        w.dims2()? == (out_dim, in_dim),
-        "{name}: expected [{out_dim}, {in_dim}], got {:?}",
-        w.dims()
-    );
-    let b = match bias {
-        Some(bn) => Some(
-            weights
-                .get(bn, dtype)
-                .with_context(|| format!("load {bn}"))?,
-        ),
-        None => None,
-    };
-    Linear::new(w.contiguous()?, b)
+trait LinearFactory {
+    fn load(
+        &self,
+        weights: &dyn nv_weights::TensorSource,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        bias: Option<&str>,
+    ) -> Result<Linear>;
 }
 
-fn load_rmsnorm(
-    weights: &dyn nv_weights::TensorSource,
-    name: &str,
-    dim: usize,
-    eps: f64,
-) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, DType::F32)
-        .with_context(|| format!("load {name}"))?;
-    anyhow::ensure!(w.dims() == [dim], "{name}: got {:?}", w.dims());
-    Ok(RmsNorm::new(w, eps))
+struct Bf16Factory {
+    dtype: DType,
+}
+
+impl LinearFactory for Bf16Factory {
+    fn load(
+        &self,
+        weights: &dyn nv_weights::TensorSource,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        bias: Option<&str>,
+    ) -> Result<Linear> {
+        load_linear_with_bias_names(weights, name, out_dim, in_dim, bias, self.dtype)
+    }
+}
+
+struct GgmlFactory {
+    dtype: DType,
+    gdt: candle_core::quantized::GgmlDType,
+}
+
+impl LinearFactory for GgmlFactory {
+    fn load(
+        &self,
+        weights: &dyn nv_weights::TensorSource,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        bias: Option<&str>,
+    ) -> Result<Linear> {
+        if !in_dim.is_multiple_of(self.gdt.block_size()) {
+            return load_linear_with_bias_names(weights, name, out_dim, in_dim, bias, self.dtype);
+        }
+        let w = weights
+            .get(name, DType::BF16)
+            .with_context(|| format!("load {name}"))?;
+        anyhow::ensure!(
+            w.dims2()? == (out_dim, in_dim),
+            "{name}: expected [{out_dim}, {in_dim}], got {:?}",
+            w.dims()
+        );
+        let b = match bias {
+            Some(bn) => Some(
+                weights
+                    .get(bn, self.dtype)
+                    .with_context(|| format!("load {bn}"))?,
+            ),
+            None => None,
+        };
+        Linear::from_bf16_quantized_ggml(&w.contiguous()?, b, self.gdt)
+            .with_context(|| format!("quantize {name} to {:?}", self.gdt))
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct Nvfp4Factory {
+    dtype: DType,
+    runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+    device: Device,
+}
+
+#[cfg(feature = "cuda")]
+impl LinearFactory for Nvfp4Factory {
+    fn load(
+        &self,
+        weights: &dyn nv_weights::TensorSource,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        bias: Option<&str>,
+    ) -> Result<Linear> {
+        use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
+        if out_dim < MIN_TILE || in_dim < MIN_TILE || !in_dim.is_multiple_of(BLOCK_SIZE) {
+            return load_linear_with_bias_names(weights, name, out_dim, in_dim, bias, self.dtype);
+        }
+        let w = weights
+            .get(name, DType::BF16)
+            .with_context(|| format!("load {name}"))?;
+        anyhow::ensure!(
+            w.dims2()? == (out_dim, in_dim),
+            "{name}: expected [{out_dim}, {in_dim}], got {:?}",
+            w.dims()
+        );
+        let b = match bias {
+            Some(bn) => Some(
+                weights
+                    .get(bn, DType::BF16)
+                    .with_context(|| format!("load {bn}"))?,
+            ),
+            None => None,
+        };
+        Linear::from_bf16_quantized_nvfp4(&w.contiguous()?, b, &self.device, self.runner.clone())
+            .with_context(|| format!("quantize {name} to nvfp4"))
+    }
 }
 
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
@@ -231,6 +330,27 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Ten
     sdpa(q, k, v, cfg)
 }
 
+fn decode_attention_grouped(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
+    let (_b, _one, h, d) = q.dims4()?;
+    let (_bk, h_kv, s_k, dk) = k.dims4()?;
+    anyhow::ensure!(
+        h == cfg.num_heads && h_kv == cfg.num_kv_heads && d == dk && h % h_kv == 0,
+        "decode_attention_grouped: bad shapes q={:?} k={:?}",
+        q.dims(),
+        k.dims()
+    );
+    let groups = h / h_kv;
+    let qg = q
+        .reshape((h_kv, groups, d))?
+        .affine(cfg.softmax_scale as f64, 0.0)?;
+    let kg = k.reshape((h_kv, s_k, d))?;
+    let vg = v.reshape((h_kv, s_k, d))?;
+    let scores = qg.matmul(&kg.transpose(1, 2)?)?.to_dtype(DType::F32)?;
+    let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(q.dtype())?;
+    let out = probs.matmul(&vg)?;
+    out.reshape((1, 1, h, d)).map_err(|e| anyhow::anyhow!(e))
+}
+
 impl DotsDecoder {
     pub fn from_loader(
         cfg: DotsDecoderConfig,
@@ -238,6 +358,59 @@ impl DotsDecoder {
         device: &Device,
         dtype: DType,
         rope_max_seq_len: usize,
+    ) -> Result<Self> {
+        let factory = Bf16Factory { dtype };
+        Self::build(cfg, weights, device, dtype, rope_max_seq_len, &factory)
+    }
+
+    pub fn from_loader_ggml(
+        cfg: DotsDecoderConfig,
+        weights: &dyn nv_weights::TensorSource,
+        device: &Device,
+        dtype: DType,
+        gdt: candle_core::quantized::GgmlDType,
+        rope_max_seq_len: usize,
+    ) -> Result<Self> {
+        let factory = GgmlFactory { dtype, gdt };
+        Self::build(cfg, weights, device, dtype, rope_max_seq_len, &factory)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn from_loader_nvfp4(
+        cfg: DotsDecoderConfig,
+        weights: &dyn nv_weights::TensorSource,
+        device: &Device,
+        rope_max_seq_len: usize,
+    ) -> Result<Self> {
+        let dev = match device {
+            Device::Cuda(d) => d.clone(),
+            _ => anyhow::bail!("from_loader_nvfp4 requires a CUDA device"),
+        };
+        let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
+            dev.cuda_stream(),
+        )?));
+        let factory = Nvfp4Factory {
+            dtype: DType::BF16,
+            runner,
+            device: device.clone(),
+        };
+        Self::build(
+            cfg,
+            weights,
+            device,
+            DType::BF16,
+            rope_max_seq_len,
+            &factory,
+        )
+    }
+
+    fn build(
+        cfg: DotsDecoderConfig,
+        weights: &dyn nv_weights::TensorSource,
+        device: &Device,
+        dtype: DType,
+        rope_max_seq_len: usize,
+        factory: &dyn LinearFactory,
     ) -> Result<Self> {
         let hidden = cfg.hidden_size;
         let head_dim = cfg.head_dim();
@@ -273,79 +446,74 @@ impl DotsDecoder {
                     &format!("{p}.input_layernorm.weight"),
                     hidden,
                     eps,
+                    DType::F32,
                 )?,
-                q_proj: load_linear(
+                q_proj: factory.load(
                     weights,
                     &format!("{p}.self_attn.q_proj.weight"),
                     qd,
                     hidden,
                     qb.as_deref(),
-                    dtype,
                 )?,
-                k_proj: load_linear(
+                k_proj: factory.load(
                     weights,
                     &format!("{p}.self_attn.k_proj.weight"),
                     kvd,
                     hidden,
                     kb.as_deref(),
-                    dtype,
                 )?,
-                v_proj: load_linear(
+                v_proj: factory.load(
                     weights,
                     &format!("{p}.self_attn.v_proj.weight"),
                     kvd,
                     hidden,
                     vb.as_deref(),
-                    dtype,
                 )?,
-                o_proj: load_linear(
+                o_proj: factory.load(
                     weights,
                     &format!("{p}.self_attn.o_proj.weight"),
                     hidden,
                     qd,
                     None,
-                    dtype,
                 )?,
                 pre_mlp_norm: load_rmsnorm(
                     weights,
                     &format!("{p}.post_attention_layernorm.weight"),
                     hidden,
                     eps,
+                    DType::F32,
                 )?,
                 mlp: Mlp::new(
-                    load_linear(
+                    factory.load(
                         weights,
                         &format!("{p}.mlp.gate_proj.weight"),
                         inter,
                         hidden,
                         None,
-                        dtype,
                     )?,
-                    load_linear(
+                    factory.load(
                         weights,
                         &format!("{p}.mlp.up_proj.weight"),
                         inter,
                         hidden,
                         None,
-                        dtype,
                     )?,
-                    load_linear(
+                    factory.load(
                         weights,
                         &format!("{p}.mlp.down_proj.weight"),
                         hidden,
                         inter,
                         None,
-                        dtype,
                     )?,
                 )?,
             });
         }
 
-        let final_norm = load_rmsnorm(weights, "model.norm.weight", hidden, eps)?;
+        let final_norm = load_rmsnorm(weights, "model.norm.weight", hidden, eps, DType::F32)?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::new(embed.contiguous()?, None)?
         } else {
-            load_linear(
+            load_linear_with_bias_names(
                 weights,
                 "lm_head.weight",
                 cfg.vocab_size,
@@ -452,7 +620,38 @@ impl DotsDecoder {
             let k = k_rot.to_dtype(self.dtype)?;
             cache.write_at(i, start_pos, &k.contiguous()?, &v.contiguous()?)?;
             let (k_full, v_full) = cache.view(i, new_total)?;
-            let attn = attention(&q, &k_full, &v_full, &attn_cfg)?;
+            let attn = if cache.bhsd() {
+                if matches!(self.device, Device::Metal(_)) {
+                    let q4 = if seq == 1 {
+                        q.reshape((1, n_heads, 1, head_dim))?
+                    } else {
+                        q.permute((0, 2, 1, 3))?.contiguous()?
+                    };
+                    let (kc, vc) = (k_full.contiguous()?, v_full.contiguous()?);
+                    let out = candle_nn::ops::sdpa(
+                        &q4,
+                        &kc,
+                        &vc,
+                        None,
+                        seq > 1,
+                        attn_cfg.softmax_scale,
+                        1.0,
+                    )?;
+                    if seq == 1 {
+                        out.reshape((1, 1, n_heads, head_dim))?
+                    } else {
+                        out.permute((0, 2, 1, 3))?.contiguous()?
+                    }
+                } else if seq == 1 {
+                    decode_attention_grouped(&q, &k_full, &v_full, &attn_cfg)?
+                } else {
+                    let k_sdpa = k_full.permute((0, 2, 1, 3))?.contiguous()?;
+                    let v_sdpa = v_full.permute((0, 2, 1, 3))?.contiguous()?;
+                    attention(&q, &k_sdpa, &v_sdpa, &attn_cfg)?
+                }
+            } else {
+                attention(&q, &k_full, &v_full, &attn_cfg)?
+            };
             let attn = attn.reshape((1, seq, n_heads * head_dim))?;
             let attn = layer.o_proj.forward(&attn)?;
             x = x.add(&attn)?;
@@ -579,7 +778,7 @@ impl DotsDecoder {
             "prompt of {prompt_len} tokens exceeds the rope span {} (raise NV_DOTS_MAX_SEQ or lower NV_DOTS_MAX_PIXELS)",
             self.rope_span
         );
-        let grow_kv = std::env::var("NV_DOTS_FAST_KV").as_deref() == Ok("1");
+        let grow_kv = nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_DOTS_FAST_KV");
         let mut cache = DotsKvCache::new_with_mode(
             &self.cfg,
             budget.min(self.rope_span),

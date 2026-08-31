@@ -37,9 +37,12 @@ pub const SPEC_KINDS_DEFAULT_IS_GEMMA4_E4B_ALONE_BECAUSE_A_VERIFY_FORWARD_IS_NOT
      AssistantGate.";
 
 pub const SPEC_KINDS_ABSENT_FROM_THE_SLUG_TABLE_HAVE_NO_CHAIN_TARGET_ARM_ON_THIS_SEAM: &str =
-    "gemma4-dense, gemma4-moe, qwen3.5-moe and laguna carry decoder-level verify_chain entries but \
-     no ChainVerifyTarget arm in chat_engine_wgpu; giving them a slug would admit a route that \
-     bails at the first multi-row round instead of refusing at admission.";
+    "gemma4-dense, qwen3.5-moe and laguna carry decoder-level verify_chain entries but no \
+     ChainVerifyTarget arm in chat_engine_wgpu; giving them a slug would admit a route that \
+     bails at the first multi-row round instead of refusing at admission. gemma4-moe has an arm \
+     but no slug: NV_WGPU_SPEC_G4MOE_ASSISTANT=1 is its only admission, because its verify_chain \
+     refuses the flash decode default and a slug would flip a serving default onto an unmeasured \
+     path.";
 
 pub const SPEC_CHAIN_ROUTE_SLUGS: [&[&str]; 3] = [
     &["gemma4-e4b"],

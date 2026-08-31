@@ -54,6 +54,43 @@ pub(crate) async fn push_event_async(
 }
 
 #[allow(dead_code)]
+pub(crate) fn sse_timeout_opt_from_ms_zero_keeps_the_old_infinite_wait(
+    ms: u64,
+) -> Option<std::time::Duration> {
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+#[allow(dead_code)]
+pub(crate) fn sse_send_timeout_opt_for_the_batch_sched_zero_disables_unlike_the_solo_paths_1ms_clamp(
+) -> Option<std::time::Duration> {
+    let ms = std::env::var("NV_SSE_SEND_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10_000);
+    sse_timeout_opt_from_ms_zero_keeps_the_old_infinite_wait(ms)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn push_event_async_opt(
+    tx: &mpsc::Sender<ChatEvent>,
+    ev: ChatEvent,
+    timeout: Option<std::time::Duration>,
+) -> SsePush {
+    match timeout {
+        Some(t) => push_event_async(tx, ev, t).await,
+        None => match tx.send(ev).await {
+            Ok(()) => SsePush::Sent,
+            Err(_) => SsePush::Closed,
+        },
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot() {
+    tokio::task::yield_now().await;
+}
+
+#[allow(dead_code)]
 pub(crate) fn log_sse_abort(outcome: SsePush, path: &str) {
     match outcome {
         SsePush::TimedOut => tracing::warn!(

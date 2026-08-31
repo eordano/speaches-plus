@@ -86,7 +86,8 @@ fn assert_text_path_is_vision_free(loader: &WeightLoader) {
          Qwen3.8-27B checkpoint whose text-only decode path we are proving self-sufficient"
     );
     assert!(
-        loader.has("model.language_model.embed_tokens.weight"),
+        loader.has("model.language_model.embed_tokens.weight")
+            || loader.has("language_model.model.embed_tokens.weight"),
         "text embed under model.language_model.* is absent; the wgpu decoder resolves \
          model.language_model.*/model.layers.*/lm_head.weight/model.norm.weight candidates only, \
          never model.visual.* -- a successful boot below therefore requests zero vision tensors"
@@ -430,6 +431,7 @@ mod pf_coop_tiny {
                         o: fp8_dense(&mut r, hidden, cfg.num_attention_heads * hd, 0.12),
                         q_norm: norm_vec(&mut r, hd),
                         k_norm: norm_vec(&mut r, hd),
+                        qkv_bias_bf16: vec![],
                     }))
                 }
             };
@@ -966,6 +968,8 @@ fn fused_decode_envs_are_bit_identical_on_the_real_checkpoint() {
     let max_seq = prompt.len() + steps + 16;
 
     let mut run = |fuse1: bool, fuse2: bool| -> (usize, Vec<(u32, Vec<u32>)>) {
+        std::env::set_var("NV_Q3D_MLP_W4A8", "0");
+        std::env::set_var("NV_Q3D_REQUANT_FP8_TO_NVFP4", "0");
         for k in FUSED_DECODE_ENVS {
             std::env::set_var(k, if fuse1 { "1" } else { "0" });
         }

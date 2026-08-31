@@ -1,0 +1,68 @@
+{
+ "ladder": "q38-mtp-chain-sweep",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "q38 mtp chain sweep",
+  "model": "qwen3.8-27b-nvfp4",
+  "backend": "cuda",
+  "pkg": "nv-specdecode",
+  "features": "cuda",
+  "suite": "qwen38_mtp_ctx_depth",
+  "exact": "qwen38_cuda_mtp_graphed_effective_decode_tok_s_vs_context_depth_real_chunked_prefill_per_depth_engine_rebuild",
+  "parse": "ctx-scaling",
+  "timeout": "2400"
+ },
+ "base_env": {
+  "NV_DRAFTER": "mtp",
+  "NV_QWEN38_SERVING_TEST": "1",
+  "NV_TIMED_EMITTED_TOKENS": "512",
+  "NV_Q38_DRAFTER_ATTN_SPLITK": "1",
+  "NV_Q38_DRAFT_FAST": "1",
+  "NV_Q38_DRAFT_FP8": "1",
+  "NV_Q38_DRAFT_LMHEAD_NVFP4": "1",
+  "NV_Q38_MK_VERIFY_KVSHARE": "gate",
+  "NV_Q38_MK_VERIFY_TCTILE": "1",
+  "NV_Q38_VERIFY_TC": "1"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  256,
+  8192,
+  172032
+ ],
+ "depths_per_run": false,
+ "notes": "r2 of the chain sweep: r1 (rows 2026-08-29 ~11:0x) omitted NV_Q38_VERIFY_TC so its absolutes sit ~40% under champion and overstate deep-k penalties; r1's acceptance curve stands (k3 0.51-0.69 -> k7 0.24-0.40 overall, marginal positions ~0.2) and killed the depth hypothesis; these arms test whether the champion's QUANTIZED drafter (fp8 + nvfp4 lmhead) is what buys speed and burns acceptance",
+ "rationale": "The engine-best table (rows 2026-08-29: llamacpp draft-mtp 147.7/146.8/104.7 vs ours-served 123.8/123.0/84.9) is carried by their DRAFT DEPTH, not their engine: their server logs show 92-96% draft acceptance with n_max tuned upward (sweep files wf/q38/records/mtpsweep/bench-n{3,5,8,12,16}.json), while our champion runs NV_MTP_K unset = MTP_CHAIN_DEPTH_DEFAULT 3 at a recorded 0.720 acceptance. Two hypotheses this ladder separates: (a) our accept rate is corpus-comparable to theirs and k=3 is simply leaving tokens on the table -- then k5/k7 close much of the 1.2x; (b) our acceptance genuinely decays fast with position -- then deeper k buys little and the lever is drafter QUALITY (acceptance criterion, drafter dtype, #242's tap), not depth. k7 is the ceiling arm because MTP_CHAIN_DEPTH_MAX_SO_VERIFY_ROWS_STAY_UNDER_THE_F32_FAST_PATH_HARD_CAP clamps higher values silently; matching their n=16 would need the tctile verify route to lift that cap -- a code task this ladder's result either justifies or kills. k3-explicit vs zero-k is the null pair (mtp_chain_depth parses explicit 3 to the same value as unset). Cooldown-gate the run; 250W cells per #278; the instrument emits accept stats in its CTX-SCALING lines, so read accepted-tokens-per-round per arm alongside tok/s. R1 VERDICT APPENDED: deeper k LOSES outright on this instrument (k5 -18/-29%, k7 -34/-41%) and the emitted accept stats show the collapse is per-position acceptance, not verify cost alone. R2 therefore swaps k7 for bf16-drafter arms: if dropping NV_Q38_DRAFT_FP8/NV_Q38_DRAFT_LMHEAD_NVFP4 lifts acceptance materially, the drafter quantization is the wrong trade at depth and the acceptance gap to llamacpp's 0.92-0.96 has a mechanical cause; if acceptance stays ~0.65, the gap is the drafter architecture itself and #242's tap becomes the lever.",
+ "baseline_arm": "k3-default",
+ "null_pair": [
+  "k3-default",
+  "k3-explicit"
+ ],
+ "arms": [
+  {
+   "name": "k3-default",
+   "env": {}
+  },
+  {
+   "name": "k3-explicit",
+   "env": {
+    "NV_MTP_K": "3"
+   }
+  },
+  {
+   "name": "k3-draft-bf16",
+   "env": {
+    "NV_Q38_DRAFT_FP8": "0",
+    "NV_Q38_DRAFT_LMHEAD_NVFP4": "0"
+   }
+  },
+  {
+   "name": "k5-draft-bf16",
+   "env": {
+    "NV_MTP_K": "5",
+    "NV_Q38_DRAFT_FP8": "0",
+    "NV_Q38_DRAFT_LMHEAD_NVFP4": "0"
+   }
+  }
+ ]
+}

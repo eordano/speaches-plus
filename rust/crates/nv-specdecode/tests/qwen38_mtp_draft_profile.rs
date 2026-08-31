@@ -106,16 +106,38 @@ fn qwen38_mtp_draft_step_segment_attribution_on_the_graphed_session() {
         }
         let rounds = session.stats.rounds;
         assert!(rounds > 0, "no timed rounds ran; the profile measured nothing");
+        session
+            .trunk_for_shadow_probes()
+            .dump_trunk_phase_ladder_after_replay_when_nv_q36_trunk_events_1();
         let draft_ms_per_round = session.stats.draft_ms / rounds as f64;
         eprintln!(
             "[q38-mtp-draftprof] arm={arm} k={k} prompt_toks={} rounds={rounds} \
              draft_ms_per_round={draft_ms_per_round:.3} draft_ms_per_step={:.3} \
+             verify_ms_per_round={:.3} commit_ms_per_round={:.3} \
              tokens_per_round={:.2} accept={:.3} \
              basis=(model=unsloth/Qwen3.8-27B-NVFP4 graphed-session doc-changelog-prompt)",
             prompt.len(),
             draft_ms_per_round / k as f64,
+            session.stats.verify_ms / rounds as f64,
+            session.stats.commit_ms / rounds as f64,
             session.stats.tokens_per_round(),
             session.stats.accept_rate(),
+        );
+        let series: Vec<String> = session
+            .stats
+            .verify_ms_rounds
+            .iter()
+            .map(|v| format!("{v:.2}"))
+            .collect();
+        eprintln!(
+            "[q38-mtp-draftprof] arm={arm} verify_ms_by_round=[{}] steady_median_ms={:.3}",
+            series.join(","),
+            {
+                let mut tail: Vec<f64> = session.stats.verify_ms_rounds[1.min(rounds - 1)..]
+                    .to_vec();
+                tail.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                tail[tail.len() / 2]
+            }
         );
         if armed_chains > 0 {
             unsafe {
@@ -134,12 +156,60 @@ fn qwen38_mtp_draft_step_segment_attribution_on_the_graphed_session() {
     };
 
     let (baseline_ids, baseline_ms) = run_arm(&mut engine, "baseline", PROFILE_ARMED_CHAINS);
+    eprintln!(
+        "[q38-mtp-draftprof] arm=baseline captured_graph_nodes_after_arm={}",
+        engine.captured_graph_node_count()
+    );
+    eprintln!(
+        "[q38-mtp-draftprof] node_type_census_cugraphnodetype={:?}",
+        engine.captured_graph_node_type_census_type_ids_are_cugraphnodetype()
+    );
+    for (tok, census) in engine.captured_graph_node_type_census_per_shape_token() {
+        eprintln!("[q38-mtp-draftprof] census shape_token={tok} {census:?}");
+    }
+    eprintln!(
+        "[q38-mtp-draftprof] memset_census_elemsize_bytes_count={:?}",
+        engine.captured_graph_memset_census_key_is_element_size_and_bytes()
+    );
+    for ((bytes, kname), count) in
+        engine.captured_graph_memset_consumer_census_key_is_bytes_and_kernel_name()
+    {
+        eprintln!("[q38-mtp-draftprof] memset_consumer bytes={bytes} count={count} kernel={kname}");
+    }
+    for ((bytes, kname), count) in
+        engine.captured_graph_memcpy_consumer_census_key_is_bytes_and_kernel_name()
+    {
+        eprintln!("[q38-mtp-draftprof] memcpy_consumer bytes={bytes} count={count} kernel={kname}");
+    }
+    let mut by_count: Vec<(usize, String)> = engine
+        .captured_graph_kernel_name_census()
+        .into_iter()
+        .map(|(k, v)| (v, k))
+        .collect();
+    by_count.sort_unstable_by(|a, b| b.cmp(a));
+    for ((pred, succ), count) in
+        engine.captured_graph_kernel_context_census_for_name_substring("wmma")
+    {
+        eprintln!("[q38-mtp-draftprof] wmma_context count={count} pred={pred} succ={succ}");
+    }
+    for (count, kname) in by_count.iter().take(24) {
+        eprintln!("[q38-mtp-draftprof] kernel_census count={count} kernel={kname}");
+    }
 
     unsafe {
         std::env::set_var(nv_specdecode::qwen38_mtp::NV_Q38_DRAFT_FAST_ENV, "1");
     }
     let (fast_ids, fast_ms) = run_arm(&mut engine, "draft_fast", 0);
+
     unsafe {
+        std::env::set_var(
+            nv_specdecode::qwen38_mtp::NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE_ENV,
+            "1",
+        );
+    }
+    let (lmfuse_ids, lmfuse_ms) = run_arm(&mut engine, "draft_fast_lmfuse", PROFILE_ARMED_CHAINS);
+    unsafe {
+        std::env::remove_var(nv_specdecode::qwen38_mtp::NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE_ENV);
         std::env::remove_var(nv_specdecode::qwen38_mtp::NV_Q38_DRAFT_FAST_ENV);
     }
 
@@ -148,10 +218,18 @@ fn qwen38_mtp_draft_step_segment_attribution_on_the_graphed_session() {
         "NV_Q38_DRAFT_FAST=1 must be bit-exact: the device-chained tokens are the same argmax \
          of the same logits, so any stream difference is a chaining bug"
     );
+    assert_eq!(
+        fast_ids, lmfuse_ids,
+        "NV_Q38_DRAFT_LMHEAD_ARGMAX_FUSE=1 must be bit-exact: the fused kernel argmaxes the \
+         same bf16-rounded logits with the same lowest-index tie break, so any stream \
+         difference is a fused-kernel defect"
+    );
     eprintln!(
         "[q38-mtp-draftprof] arm=DELTA k={k} baseline_draft_ms_per_round={baseline_ms:.3} \
-         fast_draft_ms_per_round={fast_ms:.3} speedup={:.3}x off_pct={:.1}",
+         fast_draft_ms_per_round={fast_ms:.3} lmfuse_draft_ms_per_round={lmfuse_ms:.3} \
+         fast_speedup={:.3}x lmfuse_over_fast_speedup={:.3}x lmfuse_off_pct_vs_fast={:.1}",
         baseline_ms / fast_ms.max(1e-9),
-        100.0 * (baseline_ms - fast_ms) / baseline_ms.max(1e-9),
+        fast_ms / lmfuse_ms.max(1e-9),
+        100.0 * (fast_ms - lmfuse_ms) / fast_ms.max(1e-9),
     );
 }

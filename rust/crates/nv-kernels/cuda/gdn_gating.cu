@@ -2,6 +2,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 #include "nv_kernels.h"
+#include "nvk_pdl.cuh"
 
 __device__ inline float softplus_safe(float x) {
     if (x > 20.0f) return x;
@@ -21,6 +22,7 @@ __global__ void gdn_gating_kernel_bf16(const __nv_bfloat16* __restrict__ a,
                                        __nv_bfloat16* __restrict__ beta_out,
                                        size_t tokens,
                                        size_t num_heads) {
+    NVK_PDL_PROLOG();
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = tokens * num_heads;
     if (idx >= total) return;
@@ -37,6 +39,7 @@ __global__ void gdn_gating_kernel_bf16(const __nv_bfloat16* __restrict__ a,
 
     g_out[idx]    = g;
     beta_out[idx] = __float2bfloat16(beta);
+    NVK_PDL_EPILOG();
 }
 
 __global__ void gdn_gating_kernel_f32(const float* __restrict__ a,
@@ -47,6 +50,7 @@ __global__ void gdn_gating_kernel_f32(const float* __restrict__ a,
                                       float* __restrict__ beta_out,
                                       size_t tokens,
                                       size_t num_heads) {
+    NVK_PDL_PROLOG();
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = tokens * num_heads;
     if (idx >= total) return;
@@ -75,6 +79,18 @@ extern "C" int nv_kernels_gdn_gating_bf16(
     if (total == 0) return 0;
     constexpr int BLOCK = 256;
     int grid = (int)((total + BLOCK - 1) / BLOCK);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, dim3((unsigned)grid), dim3(BLOCK), 0, s);
+        cudaLaunchKernelEx(&cfg, gdn_gating_kernel_bf16,
+            reinterpret_cast<const __nv_bfloat16*>(a),
+            reinterpret_cast<const __nv_bfloat16*>(b),
+            reinterpret_cast<const __nv_bfloat16*>(A_log),
+            reinterpret_cast<const __nv_bfloat16*>(dt_bias),
+            g_out,
+            reinterpret_cast<__nv_bfloat16*>(beta_out),
+            tokens, num_heads);
+        return (int)cudaGetLastError();
+    }
     gdn_gating_kernel_bf16<<<grid, BLOCK, 0, s>>>(
         reinterpret_cast<const __nv_bfloat16*>(a),
         reinterpret_cast<const __nv_bfloat16*>(b),
@@ -102,6 +118,12 @@ extern "C" int nv_kernels_gdn_gating_f32(
     if (total == 0) return 0;
     constexpr int BLOCK = 256;
     int grid = (int)((total + BLOCK - 1) / BLOCK);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, dim3((unsigned)grid), dim3(BLOCK), 0, s);
+        cudaLaunchKernelEx(&cfg, gdn_gating_kernel_f32,
+            a, b, A_log, dt_bias, g_out, beta_out, tokens, num_heads);
+        return (int)cudaGetLastError();
+    }
     gdn_gating_kernel_f32<<<grid, BLOCK, 0, s>>>(
         a, b, A_log, dt_bias, g_out, beta_out, tokens, num_heads);
     return (int)cudaGetLastError();

@@ -97,7 +97,7 @@ fn tiny_model_arms(ring_on: bool, kv_fp8_on: bool, seed: u64) -> Gemma4MoeWgpu {
     let pins = EnvPins::pin(&[
         ("NV_G4MOE_KV_RING", Some(if ring_on { "1" } else { "0" })),
         ("NV_G4MOE_KV_FP8", Some(if kv_fp8_on { "1" } else { "0" })),
-        ("NV_G4MOE_FLASH_DECODE", None),
+        ("NV_G4MOE_FLASH_DECODE", Some("0")),
         ("NV_G4MOE_WGPU_PREFILL_M", Some(m_s.as_str())),
         ("NV_WGPU_PREFILL_M", None),
         ("NV_G4MOE_GEMV_WIDE", None),
@@ -120,11 +120,12 @@ fn tiny_ring_rows() -> usize {
 }
 
 #[test]
-fn ring_gate_defaults_off_and_shrinks_only_the_sliding_layers_when_on() {
+fn ring_gate_defaults_on_and_shrinks_only_the_sliding_layers_when_on() {
     let _g = env_lock();
     assert!(
-        !G4MOE_SLIDING_KV_RING_DEFAULT_ON,
-        "the sliding kv ring must stay opt-in: g4moe-wgpu numbers on record were measured on full-depth caches"
+        G4MOE_SLIDING_KV_RING_DEFAULT_ON,
+        "the sliding kv ring ships on: full-depth caches OOM the deep ladder, both arms are on \
+         the runs.jsonl record, and NV_G4MOE_KV_RING=0 restores the flat caches"
     );
     if ctx_or_skip().is_none() {
         return;

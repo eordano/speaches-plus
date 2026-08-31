@@ -126,7 +126,7 @@ pub fn scratch_dir() -> PathBuf {
     if let Ok(v) = std::env::var("NV_CHAT_EVAL_OUT") {
         return PathBuf::from(v);
     }
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/nvk-tmp/chat-eval")
+    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/claude-tmp/chat-eval")
 }
 
 pub struct LagunaPromptSource {

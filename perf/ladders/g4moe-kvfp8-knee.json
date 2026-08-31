@@ -1,0 +1,53 @@
+{
+ "ladder": "g4moe-kvfp8-knee",
+ "mode": "ours",
+ "base_args": {
+  "build-name": "g4moe kvfp8 knee",
+  "model": "gemma4-26b-a4b",
+  "backend": "wgpu-vulkan",
+  "pkg": "nv-models",
+  "features": "cuda,wgpu",
+  "suite": "wgpu_ctx_scaling",
+  "exact": "g4moe_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_the_only_depth_state",
+  "parse": "ctx-scaling",
+  "timeout": "3600"
+ },
+ "base_env": {
+  "NV_G4MOE_CTX_TEST": "1",
+  "NV_G4MOE_KV_RING": "1"
+ },
+ "depth_env": "NV_CTX_TOKENS",
+ "depths": [
+  16384,
+  32768,
+  65536,
+  131072,
+  196608
+ ],
+ "depths_per_run": false,
+ "notes": "#231's knee: KV fp8 read ~-4% at 16k and ~+2.7% at 196k with nothing between; this ladder bisects the crossover so any future depth gate has a measured knee instead of a guess",
+ "rationale": "kv_fp8_enabled(): unset = G4MOE_KV_FP8_DEFAULT_ON = false, and explicit '0' parses to the same false — so bf16-default {} and bf16-null {NV_G4MOE_KV_FP8:'0'} are a genuine null pair. The fp8 arm quantizes KV values, which is NOT reassociation-class: the speed knee measured here does NOT discharge the quality half of #231 — per 08.2 section 3 a value-quantization arm owes windowed dppl/dacc at an engaged depth against the family's measured null (0.232 spread) before any gate ships, and that read is deliberately not in this spec (multi-hour wgpu prefill economics, the g4qual snapshot design is the template when sanctioned). Depths bracket the sign change; the foldgate rows say the fold arms dominate deep, so this runs on the same base_env as the foldgate ladder (KV_RING on, foldgate unset = off) to keep the comparison to the prior +-cells clean. compare --a/--b with the crossover printout is the read per 08.4. 250W cells per #278.",
+ "baseline_arm": "bf16-default",
+ "null_pair": [
+  "bf16-default",
+  "bf16-null"
+ ],
+ "arms": [
+  {
+   "name": "bf16-default",
+   "env": {}
+  },
+  {
+   "name": "bf16-null",
+   "env": {
+    "NV_G4MOE_KV_FP8": "0"
+   }
+  },
+  {
+   "name": "kvfp8",
+   "env": {
+    "NV_G4MOE_KV_FP8": "1"
+   }
+  }
+ ]
+}

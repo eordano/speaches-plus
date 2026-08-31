@@ -196,17 +196,183 @@ pub fn small_m_det_from(raw: Option<&str>) -> bool {
 }
 
 #[cfg(feature = "cuda")]
-pub const NVFP4_M1_GEMV_STAYS_OPT_IN_UNTIL_A_SERVING_AB_LANDS: &str =
-    "NV_NVFP4_M1_GEMV=1 routes m=1 NVFP4 linears through nvfp4_gemv_bf16act (bf16 activations, \
-     no activation quantize, no m=16 padding) -- it outruns the padded-16 LT route at 31B \
-     decode shapes (current numbers: perf/runs.jsonl) and is numerically TIGHTER than the \
-     default (it skips the fp4 activation round-trip), but any argmax it flips vs the shipping \
-     route is unmeasured, so the LT route stays the default until a serving A/B lands";
+pub const NVFP4_M1_GEMV_IS_A_SERVING_DEFAULT_WHERE_A_SERVING_AB_LANDED_AND_OPT_IN_EVERYWHERE_ELSE: &str =
+    "NV_NVFP4_M1_GEMV=1 routes short-row NVFP4 linears through nvfp4_gemv_bf16act (bf16 \
+     activations, no activation quantize, no m=16 padding) -- it outruns the padded-16 LT route \
+     at 31B decode shapes and is numerically TIGHTER than the default because it skips the fp4 \
+     activation round-trip. The serving A/B this key once waited on has landed, and the argmax \
+     question it named is answered rather than deferred: on Gemma-4-31B-IT-NVFP4 the key alone \
+     scores 16.308 -> 15.566 ppl with the shuffled control intact, the three-key record it \
+     belongs to scores 16.344 on the graphed serving shape against a 16.276 basis, and the \
+     128-step real-chat-template greedy chains fork where the zero-env eager and zero-env \
+     graphed chains already fork; on ig1/Qwen3.5-9B-NVFP4 it scores 4.862 -> 4.773 alone and \
+     rides an 11-arm record at 4.833, whose eager and graphed chains are token-identical 128/128. \
+     Verify blocks take this same kernel row by row up to \
+     NVFP4_VERIFY_BLOCK_ROWS_LOOPED_THROUGH_THE_M1_GEMV_SO_A_DRAFT_BLOCK_REPRODUCES_DECODE, so a \
+     draft block reproduces decode bit-for-bit instead of disagreeing with it. This crate cannot \
+     see a model family, so the key stays default-off HERE and is turned on per family by the \
+     serving engine: oapi::chat_engine::build names which checkpoints arm it and which env \
+     restores the LT route -- today gemma4 NVFP4 dense and the qwen3.5-9B dense cuda opt-in. \
+     Every other caller still opts in explicitly.";
+
+#[cfg(feature = "cuda")]
+pub const A_VERIFY_BLOCK_MUST_TAKE_THE_SAME_KERNEL_DECODE_TAKES_OR_IT_CANNOT_REPRODUCE_DECODES_ROWS: &str =
+    "speculative verify exists to recompute, in one m-row block, exactly what m=1 decode would \
+     have produced row by row. Routing m=1 to nvfp4_gemv_bf16act while routing the m-row block to \
+     the padded cutlass block-scaled tile makes the two arithmetically different, and \
+     gemma4_verify_forward::gemma4_verify_batch_vs_sequential reads that difference as a \
+     row-argmax mismatch. Looping the m=1 gemv once per row keeps every verify row \
+     bit-identical to the decode row it stands in for: same kernel, same n, same k, same alpha, \
+     same input bytes";
+
+#[cfg(feature = "cuda")]
+pub const LOOPING_THE_M1_GEMV_COSTS_ONE_FULL_WEIGHT_READ_PER_ROW_SO_IT_ONLY_OUTRUNS_THE_PADDED_CUTLASS_TILE_AT_ONE_ROW: &str =
+    "measured on the gemma4-31B NVFP4 projection shapes (qkv 20736x5376, o 5376x8192 and \
+     5376x16384, gate_up 43008x5376, down 5376x21504), release, quiet card, 200 iterations, \
+     4-way weight rotation: summed over one sliding layer the padded cutlass block-scaled tile \
+     is flat at 256-286 us across m=1..16, while the looped gemv runs 223 us at m=1, 378 at \
+     m=2 and 2974 at m=16. So rows above one buy verify/decode row agreement with bandwidth, \
+     not with speed. The route that would buy the same agreement without paying it is \
+     gemm_nvfp4_w4a16_mk_dual (kMMax=16, bf16 activations, one weight read for all rows), which \
+     no serving path wires today";
+
+#[cfg(feature = "cuda")]
+pub const NVFP4_VERIFY_BLOCK_ROWS_LOOPED_THROUGH_THE_M1_GEMV_SO_A_DRAFT_BLOCK_REPRODUCES_DECODE: usize = 8;
+
+#[cfg(feature = "cuda")]
+pub const THE_STAGED_FP8_GEMV_KEEPS_BF16_ACTIVATIONS_AND_PAYS_M_SCALAR_MACS_PER_WEIGHT_BYTE_WHILE_THE_CUBLASLT_E4M3_TILE_QUANTISES_THE_ACTIVATIONS_AND_PAYS_NONE: &str =
+    "measured on the qwen3.8-27B fp8 projection shapes, release, quiet card, 200 iterations over \
+     a 768 MB rotating weight set so nothing is served from L2. The cublasLt e4m3 tile route \
+     (rowquant_e4m3 + cublasLtMatmul + scale_rowcol_bf16) is FLAT in m: gdn.in_proj_qkv \
+     10240x5120 reads 1104 GB/s at m=1 and 1095 at m=16, gdn.out_proj 5120x6144 reads 855 and \
+     851, attn.o_proj 855 and 852 -- the x1.03 round 23's kernel census measured on vLLM's own \
+     SM120 FP8 pingpong tile. The staged gemv is NOT flat: the same shape reads 1421 GB/s at \
+     m=1, 942 at m=4, 416 at m=8 and REFUSES from m=9 because staging the whole x row for m \
+     rows needs m*(K/16)*9*4 bytes against a 101376-byte dynamic-shared opt-in cap. A scalar \
+     FFMA route owes m multiply-adds per weight byte and a tile owes none, so the two routes \
+     cross and the crossing is the whole of the m-row fp8 residual";
+
+#[cfg(feature = "cuda")]
+pub const E4M3_STAGED_GEMV_OUTRUNS_THE_TILE_TO_THIS_MANY_ROWS_AND_LOSES_WIDER_SO_THE_TILE_MINIMUM_IS_A_CROSSOVER_NOT_A_CAP: usize = 3;
+
+#[cfg(feature = "cuda")]
+pub const VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC: usize = 8;
+
+#[cfg(feature = "cuda")]
+pub const VERIFY_INTERIOR_REACHES_3_TO_7_ARE_THE_SHAPES_WHOSE_TILE_FALLBACK_SPLIT_THE_VERIFY_RANGE:
+    std::ops::RangeInclusive<usize> = 3..=7;
+
+#[cfg(feature = "cuda")]
+pub const LT_TILE_ROWS_PER_CHUNK_6_THE_WIDEST_ROW_COUNT_WHOSE_HEURISTIC_PLAN_FAMILY_COVERS_EVERY_SHIPPED_VERIFY_CELL: usize =
+    6;
+
+#[cfg(feature = "cuda")]
+pub const LT_TILE_SPAN_4_THE_PRODUCTION_MTP_VERIFY_LAUNCH_WHOSE_PLAN_FAMILY_ALSO_COVERS_M5_AND_M6_AT_THE_CHEAPEST_ROW_COUNT: usize =
+    4;
+
+#[cfg(feature = "cuda")]
+pub const A_ROW_CHUNKED_LT_TILE_RIDES_THE_M6_PLAN_BECAUSE_THE_HEURISTIC_MOVES_PLANS_BETWEEN_M6_AND_M7: &str =
+    "cublasLtMatmulAlgoGetHeuristic is re-queried per call with the true m in the activation \
+     layout, and at the fp8-resident down_proj shape (n=5120, k=17408: layers 56..=63 of the \
+     Qwen3.8 checkpoint keep their MLPs e4m3, and that shape's staged-gemv reach is 2, so every \
+     verify-sized call lands on this tile) the chosen plan's shared-row outputs form bitwise \
+     families {m2,m3} {m4,m5,m6} {m7,m8} -- the suite covering this is \
+     nv-quant/tests/fp8_lt_row0_m_invariance (down_proj family map, and under NV_Q38_VERIFY_TC=1 \
+     the same tile serves every e4m3 projection, where (10240,5120) moves plans at m=7 and \
+     (12288,5120) at m=8: the all-shapes span gate). A 7- or 8-row verify therefore computed a \
+     different row 0 than the 4..6-row verifies for the same anchor and kv: the one-time 6->7 \
+     trunk transition that capped suffix drafts at 5. A 7- or 8-row verify runs as ONE m-row \
+     launch riding the algo the heuristic returns for the 4-row layout -- the production mtp \
+     verify plan, whose family also covers m5 and m6 -- so every row, deep rows included, \
+     rides the {m4,m5,m6} plan family every emission-bearing mtp and suffix verify row rides \
+     instead of an m=7/m=8 plan (the row-0 flip) or an m=1/m=2 tail plan (the deep-row \
+     near-tie flip), at single-launch weight-read cost; the launch is bitwise the \
+     (0,4)+(m-4,4) span composition, which stays as the fallback should the m4 algo ever \
+     refuse the wider problem (the planned-vs-composition and position-invariance gates in \
+     the same suite), so row 0 of every verify in 2..=8 is the m<=6 arithmetic and every \
+     shipped cell (m<=6 single launch) is an untouched call";
+
+#[cfg(feature = "cuda")]
+pub const A_ROW_CHUNKED_GEMV_IS_BITWISE_THE_SINGLE_LAUNCH_BECAUSE_EVERY_ROW_ACCUMULATES_ALONE_IN_ONE_K_ORDER: &str =
+    "each gemv_e4m3_mk template accumulates output row j over the identical lane-strided K walk \
+     with acc[j] private to the row, so launching rows [s, s+c) with offset activation and \
+     output pointers reproduces those rows of one wide launch bit for bit; the suite covering \
+     this is nv-kernels/tests/gemv_e4m3_mk_row0_m_invariance. The k=6144 o_proj and gdn \
+     out_proj fit the staging smem for seven rows and not eight, so before the chunk arm an \
+     eight-row verify silently fell to the activation-quantizing cublasLt tile in 64 layers and \
+     returned a different row 0 for the same anchor and kv than the four-row verify -- a chain \
+     length must never change what an earlier row computes. Rows past \
+     VERIFY_ROWS_TEMPLATE_CAP_8 (the m=16 drafter fc) and shapes whose reach is outside 3..=7 \
+     (k=17408 reaches 2: the production m=4 verify already serves it from the tile) keep their \
+     routes, so the shipped m<=7 cells and the m=16 drafter cell are untouched launches";
+
+#[cfg(feature = "cuda")]
+pub const E4M3_GROUP_LEAVES_THE_M1_ROUTE_ALONE_BECAUSE_ITS_TWO_ROWS_PER_WARP_KERNEL_IS_ALREADY_THE_TUNED_ONE_ROW_SHAPE: usize = 2;
+
+#[cfg(feature = "cuda")]
+pub const THE_GROUP_GEMV_NEEDS_THIS_MANY_OUTPUT_ROWS_BEFORE_ITS_K_TILE_PAYS_FOR_ITS_EXTRA_SYNCS_BECAUSE_A_NARROW_N_GIVES_EACH_BLOCK_TOO_FEW_WEIGHT_BYTES_PER_STAGED_TILE: usize =
+    2048;
+
+#[cfg(feature = "cuda")]
+pub const THE_TILE_NEEDS_THIS_MANY_OUTPUT_ROWS_BEFORE_IT_BEATS_THE_STAGED_GEMV_BECAUSE_A_NARROW_N_STARVES_ITS_CTAS: usize =
+    2048;
+
+#[cfg(feature = "cuda")]
+fn e4m3_route_line_once_per_slot_and_row_count_because_a_single_once_only_ever_reports_whichever_shape_warmed_first(
+    slot: usize,
+    branch: &'static str,
+    leading: usize,
+    n: usize,
+    k: usize,
+    extra: &str,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+    let bit = 1u32 << (leading.min(31) as u32);
+    if SEEN[slot].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        eprintln!("[linear] {branch} m={leading} n={n} k={k} {extra}");
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn e4m3_group_rows_per_warp() -> Option<i32> {
+    static R: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| match std::env::var("NV_Q38_E4M3_GROUP").ok().as_deref() {
+        None | Some("0") | Some("") => None,
+        Some("1") => Some(2),
+        Some(v) => v.parse::<i32>().ok().filter(|r| [1, 2, 4].contains(r)),
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn e4m3_tile_min_m() -> Option<usize> {
+    static M: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("NV_Q38_E4M3_TILE_MIN_M").ok().as_deref() {
+        None | Some("") => None,
+        Some("1") => Some(
+            E4M3_STAGED_GEMV_OUTRUNS_THE_TILE_TO_THIS_MANY_ROWS_AND_LOSES_WIDER_SO_THE_TILE_MINIMUM_IS_A_CROSSOVER_NOT_A_CAP
+                + 1,
+        ),
+        Some(v) => v.parse::<usize>().ok().filter(|m| *m >= 2),
+    })
+}
 
 #[cfg(feature = "cuda")]
 fn nvfp4_m1_gemv_opted_in() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NV_NVFP4_M1_GEMV").ok().as_deref() == Some("1"))
+}
+
+#[cfg(feature = "cuda")]
+fn nvfp4_gemv_row_block_ceiling() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("NV_NVFP4_GEMV_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(NVFP4_VERIFY_BLOCK_ROWS_LOOPED_THROUGH_THE_M1_GEMV_SO_A_DRAFT_BLOCK_REPRODUCES_DECODE)
+            .max(1)
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -282,10 +448,15 @@ enum LinearStorage {
 
         weight_t: Option<Tensor>,
     },
+    GgmlQuant(Arc<GgmlQuantStorage>),
     #[cfg(feature = "cuda")]
-    Fp8E4m3(Fp8Storage),
+    Fp8E4m3(Arc<Fp8Storage>),
     #[cfg(feature = "cuda")]
-    Nvfp4(Nvfp4Storage),
+    Nvfp4(Arc<Nvfp4Storage>),
+}
+
+struct GgmlQuantStorage {
+    qm: candle_core::quantized::QMatMul,
 }
 
 #[cfg(feature = "cuda")]
@@ -348,6 +519,456 @@ fn a_quantized_fast_path_cannot_be_differentiated(path: &str, x: &Tensor) -> Res
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) struct Bf16LinearOp {
+    frozen_weight_kept_inside_the_op_so_candle_sees_one_input_and_never_builds_a_weight_side_graph:
+        Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl Bf16LinearOp {
+    pub(crate) fn holding_the_frozen_weight(weight: &Tensor) -> Result<Self> {
+        anyhow::ensure!(
+            weight.dims().len() == 2
+                && weight.dtype() == DType::BF16
+                && matches!(weight.device(), Device::Cuda(_)),
+            "Bf16LinearOp needs a 2-D bf16 CUDA weight, got {:?} {:?}",
+            weight.dims(),
+            weight.dtype()
+        );
+        anyhow::ensure!(
+            !this_call_is_building_an_autograd_graph(weight),
+            "Bf16LinearOp detaches its weight, so a Var-backed or graph-carrying weight \
+             would receive zero gradient silently while dx and the loss keep moving -- the \
+             weight would train as a no-op. Use matmul_fallback for a trainable weight, or \
+             set NV_ALLOW_LEAF_GRADIENT_LOSS=1 to accept the loss."
+        );
+        Ok(Self {
+            frozen_weight_kept_inside_the_op_so_candle_sees_one_input_and_never_builds_a_weight_side_graph:
+                weight.contiguous()?,
+        })
+    }
+
+    fn weight(&self) -> &Tensor {
+        &self.frozen_weight_kept_inside_the_op_so_candle_sees_one_input_and_never_builds_a_weight_side_graph
+    }
+
+    fn out_features(&self) -> usize {
+        self.weight().dims()[0]
+    }
+
+    fn in_features(&self) -> usize {
+        self.weight().dims()[1]
+    }
+
+    fn weight_cuda_view(
+        &self,
+    ) -> candle_core::Result<(
+        std::sync::RwLockReadGuard<'_, candle_core::Storage>,
+        usize,
+    )> {
+        let (w_storage, wl) = self.weight().storage_and_layout();
+        Ok((w_storage, wl.start_offset()))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for Bf16LinearOp {
+    fn name(&self) -> &'static str {
+        "nv-bf16-linear-forward-with-dx-only-backward"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        Err(candle_core::Error::Msg(
+            "Bf16LinearOp is CUDA-only; the CPU training path stays on matmul_fallback".into(),
+        ))
+    }
+
+    fn cuda_fwd(
+        &self,
+        storage: &candle_core::CudaStorage,
+        layout: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use half::bf16;
+        use nv_quant::matmul::TensorCoreGemm;
+
+        let (m, k) = match layout.shape().dims() {
+            [m, k] => (*m, *k),
+            d => {
+                return Err(candle_core::Error::Msg(format!(
+                    "Bf16LinearOp forward needs a rank-2 input, got {d:?}"
+                )))
+            }
+        };
+        if k != self.in_features() {
+            return Err(candle_core::Error::Msg(format!(
+                "Bf16LinearOp forward: input last dim {k} != in_features {}",
+                self.in_features()
+            )));
+        }
+        let Some((x_start, _x_end)) = layout.contiguous_offsets() else {
+            return Err(candle_core::Error::Msg(
+                "Bf16LinearOp forward needs a contiguous input".into(),
+            ));
+        };
+        let dev = storage.device.clone();
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let n = self.out_features();
+        let mut y_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * n)
+                .map_err(|e| candle_core::Error::Msg(format!("Bf16LinearOp alloc y: {e}")))?
+        };
+        let gemm = TensorCoreGemm::new(stream.clone())
+            .map_err(|e| candle_core::Error::Msg(format!("Bf16LinearOp gemm handle: {e:#}")))?;
+        {
+            let x_slice = storage.as_cuda_slice::<bf16>()?;
+            let (w_storage, w_off) = self.weight_cuda_view()?;
+            let w_cuda = match &*w_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "Bf16LinearOp weight must be CUDA-resident".into(),
+                    ))
+                }
+            };
+            let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
+            gemm.bf16_matmul_row_major_bt_offs(
+                &stream, x_slice, x_start, w_slice, w_off, &mut y_dev, m as u64, n as u64,
+                k as u64, 1.0, 0.0,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("Bf16LinearOp forward gemm: {e:#}")))?;
+        }
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev),
+            (m, n).into(),
+        ))
+    }
+
+    fn bwd(
+        &self,
+        arg: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use half::bf16;
+        use nv_quant::matmul::TensorCoreGemm;
+
+        let dy = grad_res.to_dtype(DType::BF16)?.contiguous()?;
+        let (m, n) = dy.dims2()?;
+        if n != self.out_features() {
+            return Err(candle_core::Error::Msg(format!(
+                "Bf16LinearOp backward: dy last dim {n} != out_features {}",
+                self.out_features()
+            )));
+        }
+        let dev = match dy.device() {
+            Device::Cuda(d) => d.clone(),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "Bf16LinearOp backward needs a CUDA gradient".into(),
+                ))
+            }
+        };
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let k = self.in_features();
+        let mut dx_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * k)
+                .map_err(|e| candle_core::Error::Msg(format!("Bf16LinearOp alloc dx: {e}")))?
+        };
+        let gemm = TensorCoreGemm::new(stream.clone())
+            .map_err(|e| candle_core::Error::Msg(format!("Bf16LinearOp gemm handle: {e:#}")))?;
+        {
+            let (dy_storage, dyl) = dy.storage_and_layout();
+            let dy_cuda = match &*dy_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "Bf16LinearOp backward: expected cuda storage for dy".into(),
+                    ))
+                }
+            };
+            let dy_slice = dy_cuda.as_cuda_slice::<bf16>()?;
+            let (w_storage, w_off) = self.weight_cuda_view()?;
+            let w_cuda = match &*w_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "Bf16LinearOp weight must be CUDA-resident".into(),
+                    ))
+                }
+            };
+            let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
+            let dx_cols = k as u64;
+            let contraction_over_out_features = n as u64;
+            gemm.bf16_matmul_row_major_offs(
+                &stream,
+                dy_slice,
+                dyl.start_offset(),
+                w_slice,
+                w_off,
+                &mut dx_dev,
+                m as u64,
+                dx_cols,
+                contraction_over_out_features,
+                1.0,
+                0.0,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("Bf16LinearOp backward gemm: {e:#}")))?;
+        }
+        let dx = candle_core::Tensor::from_storage(
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(dx_dev, dev)),
+            (m, k),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        Ok(Some(dx.to_dtype(arg.dtype())?))
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct QuantLinearOp {
+    serving_twin_sharing_the_resident_storage_arc_so_a_recompute_reruns_the_quantized_serving_gemm:
+        Linear,
+}
+
+#[cfg(feature = "cuda")]
+impl QuantLinearOp {
+    pub(crate) fn sharing_the_resident_quantized_storage(lin: &Linear) -> Result<Self> {
+        let storage = match &lin.storage {
+            LinearStorage::Fp8E4m3(s) => LinearStorage::Fp8E4m3(Arc::clone(s)),
+            LinearStorage::Nvfp4(s) => LinearStorage::Nvfp4(Arc::clone(s)),
+            LinearStorage::GgmlQuant(_) => anyhow::bail!(
+                "QuantLinearOp has no ggml-quant sibling: ggml storage serves the ocr \
+                 decode path and carries no trainable identity"
+            ),
+            LinearStorage::Bf16 { .. } => anyhow::bail!(
+                "QuantLinearOp is the quantized-storage sibling of Bf16LinearOp and its \
+                 weights are frozen raw device bytes with no autograd identity to detach; \
+                 bf16 storage trains through Bf16LinearOp, which is where a trainable \
+                 weight is refused"
+            ),
+        };
+        Ok(Self {
+            serving_twin_sharing_the_resident_storage_arc_so_a_recompute_reruns_the_quantized_serving_gemm:
+                Linear {
+                    kind: lin.kind,
+                    storage,
+                    bias: None,
+                    in_features: lin.in_features,
+                    out_features: lin.out_features,
+                    lora: std::sync::RwLock::new(None),
+                },
+        })
+    }
+
+    fn twin(&self) -> &Linear {
+        &self.serving_twin_sharing_the_resident_storage_arc_so_a_recompute_reruns_the_quantized_serving_gemm
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for QuantLinearOp {
+    fn name(&self) -> &'static str {
+        "nv-quant-resident-linear-forward-with-straight-through-dx-only-backward"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _storage: &candle_core::CpuStorage,
+        _layout: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        Err(candle_core::Error::Msg(
+            "QuantLinearOp is CUDA-only; quantized-resident storages do not exist on CPU".into(),
+        ))
+    }
+
+    fn cuda_fwd(
+        &self,
+        storage: &candle_core::CudaStorage,
+        layout: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use half::bf16;
+
+        let twin = self.twin();
+        let (m, k) = match layout.shape().dims() {
+            [m, k] => (*m, *k),
+            d => {
+                return Err(candle_core::Error::Msg(format!(
+                    "QuantLinearOp forward needs a rank-2 input, got {d:?}"
+                )))
+            }
+        };
+        if k != twin.in_features {
+            return Err(candle_core::Error::Msg(format!(
+                "QuantLinearOp forward: input last dim {k} != in_features {}",
+                twin.in_features
+            )));
+        }
+        let Some((x_start, x_end)) = layout.contiguous_offsets() else {
+            return Err(candle_core::Error::Msg(
+                "QuantLinearOp forward needs a contiguous input".into(),
+            ));
+        };
+        let dev = storage.device.clone();
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let mut x_owned: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * k)
+                .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp alloc x: {e}")))?
+        };
+        {
+            let x_slice = storage.as_cuda_slice::<bf16>()?;
+            let x_view = x_slice.slice(x_start..x_end);
+            stream
+                .memcpy_dtod(&x_view, &mut x_owned)
+                .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp dtod x: {e}")))?;
+        }
+        let x_t = Tensor::from_storage(
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                x_owned,
+                dev.clone(),
+            )),
+            (m, k),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        let y_t = twin.matmul_impl(&x_t, m, false).map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "QuantLinearOp forward via the serving quantized gemm: {e:#}"
+            ))
+        })?;
+        if y_t.dims() != [m, twin.out_features] || y_t.dtype() != DType::BF16 {
+            return Err(candle_core::Error::Msg(format!(
+                "QuantLinearOp forward: the serving gemm returned {:?} {:?}, expected \
+                 [{m}, {}] BF16",
+                y_t.dims(),
+                y_t.dtype(),
+                twin.out_features
+            )));
+        }
+        let y_c = y_t.contiguous()?;
+        let mut y_owned: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * twin.out_features)
+                .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp alloc y: {e}")))?
+        };
+        {
+            let (y_storage, yl) = y_c.storage_and_layout();
+            let y_cuda = match &*y_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "QuantLinearOp forward: expected cuda storage for the gemm output"
+                            .into(),
+                    ))
+                }
+            };
+            let y_slice = y_cuda.as_cuda_slice::<bf16>()?;
+            let (y_start, y_end) = yl.contiguous_offsets().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "QuantLinearOp forward: non-contiguous gemm output".into(),
+                )
+            })?;
+            let y_view = y_slice.slice(y_start..y_end);
+            stream
+                .memcpy_dtod(&y_view, &mut y_owned)
+                .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp dtod y: {e}")))?;
+        }
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(y_owned, dev),
+            (m, twin.out_features).into(),
+        ))
+    }
+
+    fn bwd(
+        &self,
+        arg: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> candle_core::Result<Option<Tensor>> {
+        use half::bf16;
+        use nv_quant::matmul::TensorCoreGemm;
+
+        let twin = self.twin();
+        let dy = grad_res.to_dtype(DType::BF16)?.contiguous()?;
+        let (m, n) = dy.dims2()?;
+        if n != twin.out_features {
+            return Err(candle_core::Error::Msg(format!(
+                "QuantLinearOp backward: dy last dim {n} != out_features {}",
+                twin.out_features
+            )));
+        }
+        let dev = match dy.device() {
+            Device::Cuda(d) => d.clone(),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "QuantLinearOp backward needs a CUDA gradient".into(),
+                ))
+            }
+        };
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let w_dequant = twin
+            .device_dequant_transient_so_the_dx_gemm_reads_bf16_without_a_host_round_trip(
+                &stream,
+            )
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("QuantLinearOp backward dequant: {e:#}"))
+            })?;
+        let k = twin.in_features;
+        let mut dx_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * k)
+                .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp alloc dx: {e}")))?
+        };
+        let gemm = TensorCoreGemm::new(stream.clone())
+            .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp gemm handle: {e:#}")))?;
+        {
+            let (dy_storage, dyl) = dy.storage_and_layout();
+            let dy_cuda = match &*dy_storage {
+                candle_core::Storage::Cuda(s) => s,
+                _ => {
+                    return Err(candle_core::Error::Msg(
+                        "QuantLinearOp backward: expected cuda storage for dy".into(),
+                    ))
+                }
+            };
+            let dy_slice = dy_cuda.as_cuda_slice::<bf16>()?;
+            let dx_cols = k as u64;
+            let contraction_over_out_features = n as u64;
+            gemm.bf16_matmul_row_major_offs(
+                &stream,
+                dy_slice,
+                dyl.start_offset(),
+                &w_dequant,
+                0,
+                &mut dx_dev,
+                m as u64,
+                dx_cols,
+                contraction_over_out_features,
+                1.0,
+                0.0,
+            )
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("QuantLinearOp backward gemm: {e:#}"))
+            })?;
+        }
+        drop(w_dequant);
+        let dx = candle_core::Tensor::from_storage(
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(dx_dev, dev)),
+            (m, k),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        Ok(Some(dx.to_dtype(arg.dtype())?))
+    }
+}
+
 impl Linear {
     pub fn new(weight: Tensor, bias: Option<Tensor>) -> Result<Self> {
         let dims = weight.dims();
@@ -401,6 +1022,36 @@ impl Linear {
             None
         };
         Self::new(weight, bias)
+    }
+
+    pub fn from_bf16_quantized_ggml(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        gdt: candle_core::quantized::GgmlDType,
+    ) -> Result<Self> {
+        let (out_features, in_features) = weight.dims2()?;
+        anyhow::ensure!(
+            in_features.is_multiple_of(gdt.block_size()),
+            "ggml quant {gdt:?}: in_features {in_features} must be a multiple of the {} block",
+            gdt.block_size()
+        );
+        let kind = match gdt {
+            candle_core::quantized::GgmlDType::Q4K => LinearKind::GgmlQ4k,
+            candle_core::quantized::GgmlDType::Q8_0 => LinearKind::GgmlQ8_0,
+            other => anyhow::bail!(
+                "from_bf16_quantized_ggml carries the two OCR serving grades only (Q4K, Q8_0);                  got {other:?}"
+            ),
+        };
+        let qt = candle_core::quantized::QTensor::quantize(weight, gdt)?;
+        let qm = candle_core::quantized::QMatMul::from_qtensor(qt)?;
+        Ok(Self {
+            kind,
+            storage: LinearStorage::GgmlQuant(Arc::new(GgmlQuantStorage { qm })),
+            bias,
+            in_features,
+            out_features,
+            lora: std::sync::RwLock::new(None),
+        })
     }
 
     pub fn kind(&self) -> &LinearKind {
@@ -494,12 +1145,14 @@ impl Linear {
                 LinearStorage::Bf16 { weight, .. } => Some(weight),
                 LinearStorage::Fp8E4m3(_) => None,
                 LinearStorage::Nvfp4(_) => None,
+                LinearStorage::GgmlQuant(_) => None,
             }
         }
         #[cfg(not(feature = "cuda"))]
         {
             match &self.storage {
                 LinearStorage::Bf16 { weight, .. } => Some(weight),
+                LinearStorage::GgmlQuant(_) => None,
             }
         }
     }
@@ -510,6 +1163,7 @@ impl Linear {
         match &self.storage {
             LinearStorage::Bf16 { weight, .. } => Ok(Some(weight.clone())),
             LinearStorage::Fp8E4m3(_) => Ok(None),
+            LinearStorage::GgmlQuant(_) => Ok(None),
             LinearStorage::Nvfp4(s) => {
                 let stream = crate::cuda_stream::current_stream(&s.cuda_device);
                 #[allow(deprecated)]
@@ -541,6 +1195,74 @@ impl Linear {
     #[cfg(not(feature = "cuda"))]
     pub fn dequant_weight(&self) -> Result<Option<Tensor>> {
         Ok(self.weight().cloned())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn device_dequant_transient_so_the_dx_gemm_reads_bf16_without_a_host_round_trip(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<cudarc::driver::CudaSlice<half::bf16>> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use half::bf16;
+        let mut out: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(self.out_features * self.in_features)
+                .map_err(|e| anyhow::anyhow!("alloc transient dequant weight: {e}"))?
+        };
+        let rc = match &self.storage {
+            LinearStorage::Bf16 { .. } => anyhow::bail!(
+                "bf16 storage never reaches the straight-through backward: Bf16LinearOp \
+                 holds its weight directly"
+            ),
+            LinearStorage::GgmlQuant(_) => anyhow::bail!(
+                "ggml-quant storage has no straight-through backward: the ocr decode \
+                 path never trains"
+            ),
+            LinearStorage::Fp8E4m3(s) => {
+                let (wp, _) = s.weight_u8.device_ptr(stream);
+                let (sp, _) = s.b_scale_rows_dev.device_ptr(stream);
+                let (op, _) = out.device_ptr_mut(stream);
+                unsafe {
+                    nv_kernels::cuda::dequant_weight_e4m3_rowscale_to_bf16_rowmajor(
+                        stream.cu_stream() as *mut _,
+                        wp as *const u8,
+                        sp as *const f32,
+                        op as *mut u16,
+                        self.out_features as i32,
+                        self.in_features as i32,
+                    )
+                }
+            }
+            LinearStorage::Nvfp4(s) => {
+                let (wp, _) = s.weight_u8.device_ptr(stream);
+                let (sp, _) = s.weight_scales_cm.device_ptr(stream);
+                let (op, _) = out.device_ptr_mut(stream);
+                unsafe {
+                    nv_kernels::cuda::dequant_weight_nvfp4_swizzled_to_bf16_rowmajor(
+                        stream.cu_stream() as *mut _,
+                        wp as *const u8,
+                        sp as *const u8,
+                        op as *mut u16,
+                        s.weight_alpha,
+                        self.out_features as i32,
+                        self.in_features as i32,
+                    )
+                }
+            }
+        };
+        anyhow::ensure!(
+            rc == 0,
+            "device weight dequant kernel returned {rc} for [{}x{}] {} storage",
+            self.out_features,
+            self.in_features,
+            match &self.storage {
+                LinearStorage::Fp8E4m3(_) => "fp8-rowscale",
+                LinearStorage::Nvfp4(_) => "nvfp4-swizzled",
+                LinearStorage::Bf16 { .. } => "bf16",
+                LinearStorage::GgmlQuant(_) => "ggml-quant",
+            }
+        );
+        Ok(out)
     }
 
     pub fn bias(&self) -> Option<&Tensor> {
@@ -693,6 +1415,20 @@ impl Linear {
             LinearStorage::Bf16 { weight, weight_t } => {
                 self.matmul_bf16(weight, weight_t.as_ref(), x2, leading, force_dense)
             }
+            LinearStorage::GgmlQuant(s) => {
+                let xdt = x2.dtype();
+                let xq = if xdt == candle_core::DType::F32 {
+                    x2.clone()
+                } else {
+                    x2.to_dtype(candle_core::DType::F32)?
+                };
+                let y = candle_core::Module::forward(&s.qm, &xq)?;
+                Ok(if y.dtype() == xdt {
+                    y
+                } else {
+                    y.to_dtype(xdt)?
+                })
+            }
             #[cfg(feature = "cuda")]
             LinearStorage::Fp8E4m3(s) => self.matmul_fp8(s, x2, leading),
             #[cfg(feature = "cuda")]
@@ -725,6 +1461,9 @@ impl Linear {
         use half::bf16;
         use nv_quant::matmul::TensorCoreGemm;
 
+        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+            return self.matmul_bf16_dx_only(weight, x2);
+        }
         if !matches!(x2.device(), Device::Cuda(_)) || x2.dtype() != DType::BF16 {
             return self.matmul_fallback(weight, x2);
         }
@@ -791,9 +1530,6 @@ impl Linear {
 
         let out_storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev);
         let storage = candle_core::Storage::Cuda(out_storage);
-        if this_call_is_building_an_autograd_graph(x2) {
-            return self.matmul_fallback(weight, x2);
-        }
         let out = candle_core::Tensor::from_storage(
             storage,
             (leading, self.out_features),
@@ -814,6 +1550,9 @@ impl Linear {
         use half::bf16;
         use nv_kernels::cuda as nvk;
 
+        if this_call_is_building_an_autograd_graph(x_bf) {
+            return self.matmul_bf16_dx_only(weight, x_bf);
+        }
         let w_bf = weight.contiguous()?;
         let stream = crate::cuda_stream::current_stream(&dev);
         let n = self.out_features;
@@ -857,9 +1596,6 @@ impl Linear {
 
         let storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev.clone());
         let storage = candle_core::Storage::Cuda(storage);
-        if this_call_is_building_an_autograd_graph(x_bf) {
-            return self.matmul_fallback(weight, x_bf);
-        }
         Ok(candle_core::Tensor::from_storage(
             storage,
             (1usize, self.out_features),
@@ -883,7 +1619,6 @@ impl Linear {
     pub fn forward_rows(&self, x: &Tensor, row_off: usize, rows: usize) -> Result<Tensor> {
         let weight = match &self.storage {
             LinearStorage::Bf16 { weight, .. } => weight,
-            #[cfg(feature = "cuda")]
             _ => anyhow::bail!("forward_rows requires bf16 storage"),
         };
         if self.bias.is_some() {
@@ -927,6 +1662,9 @@ impl Linear {
         use nv_kernels::cuda as nvk;
         use nv_quant::matmul::TensorCoreGemm;
 
+        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+            return self.matmul_bf16_dx_only(&weight.narrow(0, row_off, rows)?, x2);
+        }
         if !matches!(x2.device(), Device::Cuda(_)) || x2.dtype() != DType::BF16 {
             return self.matmul_fallback(&weight.narrow(0, row_off, rows)?, x2);
         }
@@ -979,9 +1717,6 @@ impl Linear {
                 anyhow::bail!("gemv_bf16 kernel returned {rc}");
             }
             let storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev);
-            if this_call_is_building_an_autograd_graph(x2) {
-                return self.matmul_fallback(&weight.narrow(0, row_off, rows)?, x2);
-            }
             return Ok(candle_core::Tensor::from_storage(
                 candle_core::Storage::Cuda(storage),
                 (1usize, rows),
@@ -1027,9 +1762,6 @@ impl Linear {
             )?;
         }
         let out_storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev);
-        if this_call_is_building_an_autograd_graph(x2) {
-            return self.matmul_fallback(&weight.narrow(0, row_off, rows)?, x2);
-        }
         Ok(candle_core::Tensor::from_storage(
             candle_core::Storage::Cuda(out_storage),
             (leading, rows),
@@ -1053,7 +1785,6 @@ impl Linear {
     pub fn forward_dense_det(&self, x: &Tensor) -> Result<Tensor> {
         let weight = match &self.storage {
             LinearStorage::Bf16 { weight, .. } => weight,
-            #[cfg(feature = "cuda")]
             _ => anyhow::bail!("forward_dense_det requires bf16 storage"),
         };
         if self.bias.is_some() {
@@ -1081,6 +1812,9 @@ impl Linear {
         use half::bf16;
         use nv_quant::matmul::TensorCoreGemm;
 
+        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+            return self.matmul_bf16_dx_only(weight, x2);
+        }
         if !matches!(x2.device(), Device::Cuda(_)) || x2.dtype() != DType::BF16 {
             return self.matmul_fallback(weight, x2);
         }
@@ -1129,9 +1863,6 @@ impl Linear {
             )?;
         }
         let out_storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev);
-        if this_call_is_building_an_autograd_graph(x2) {
-            return self.matmul_fallback(weight, x2);
-        }
         Ok(candle_core::Tensor::from_storage(
             candle_core::Storage::Cuda(out_storage),
             (leading, self.out_features),
@@ -1161,13 +1892,45 @@ impl Linear {
     }
 
     #[cfg(feature = "cuda")]
+    fn matmul_bf16_dx_only(&self, weight: &Tensor, x2: &Tensor) -> Result<Tensor> {
+        if !matches!(x2.device(), Device::Cuda(_))
+            || !matches!(weight.device(), Device::Cuda(_))
+            || weight.dtype() != DType::BF16
+        {
+            return self.matmul_fallback(weight, x2);
+        }
+        let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
+        let y_bf = x_bf.apply_op1(Bf16LinearOp::holding_the_frozen_weight(weight)?)?;
+        Ok(y_bf.to_dtype(x2.dtype())?)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn matmul_quant_dx_only(&self, x2: &Tensor) -> Result<Tensor> {
+        let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
+        let y_bf =
+            x_bf.apply_op1(QuantLinearOp::sharing_the_resident_quantized_storage(self)?)?;
+        Ok(y_bf.to_dtype(x2.dtype())?)
+    }
+
+    #[cfg(feature = "cuda")]
     fn matmul_fp8(&self, s: &Fp8Storage, x2: &Tensor, leading: usize) -> Result<Tensor> {
         use half::bf16;
 
+        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+            return self.matmul_quant_dx_only(x2);
+        }
         let dev = match x2.device() {
             Device::Cuda(d) => d.clone(),
             _ => anyhow::bail!("Fp8 Linear requires CUDA input"),
         };
+        e4m3_route_line_once_per_slot_and_row_count_because_a_single_once_only_ever_reports_whichever_shape_warmed_first(
+            0,
+            "fp8 e4m3 linear reached at this row count",
+            leading,
+            self.out_features,
+            self.in_features,
+            &format!("scale_mode={:?} xdtype={:?}", s.scale_mode, x2.dtype()),
+        );
         if let Some(out) = self.matmul_fp8_small_m_gemv(s, x2, leading, &dev)? {
             return Ok(out);
         }
@@ -1225,7 +1988,6 @@ impl Linear {
 
         let out_storage = candle_core::CudaStorage::wrap_cuda_slice(d_dev, dev);
         let storage = candle_core::Storage::Cuda(out_storage);
-        a_quantized_fast_path_cannot_be_differentiated("matmul_fp8", x2)?;
         let out = candle_core::Tensor::from_storage(
             storage,
             (leading, self.out_features),
@@ -1257,7 +2019,23 @@ impl Linear {
         if leading >= 2 && verify_tc_fp8_lt_gemm_scope_active() {
             return Ok(None);
         }
-        a_quantized_fast_path_cannot_be_differentiated("matmul_fp8_small_m_gemv", x2)?;
+        if let Some(min_m) = e4m3_tile_min_m() {
+            if leading >= min_m
+                && self.out_features
+                    >= THE_TILE_NEEDS_THIS_MANY_OUTPUT_ROWS_BEFORE_IT_BEATS_THE_STAGED_GEMV_BECAUSE_A_NARROW_N_STARVES_ITS_CTAS
+            {
+                e4m3_route_line_once_per_slot_and_row_count_because_a_single_once_only_ever_reports_whichever_shape_warmed_first(
+                    1,
+                    "NV_Q38_E4M3_TILE_MIN_M active: the staged bf16-activation gemv yields to the \
+                     cublasLt e4m3 tile, which quantises the activations to e4m3 per row",
+                    leading,
+                    self.out_features,
+                    self.in_features,
+                    &format!("tile_min_m={min_m}"),
+                );
+                return Ok(None);
+            }
+        }
         let x_bf = x2.contiguous()?;
         let stream = crate::cuda_stream::current_stream(dev);
         let n = self.out_features;
@@ -1279,17 +2057,84 @@ impl Linear {
             let (wp, _gw) = s.weight_u8.device_ptr(&stream);
             let (sp, _gs) = s.b_scale_rows_dev.device_ptr(&stream);
             let (yp, _gy) = c_dev.device_ptr_mut(&stream);
+            let group = e4m3_group_rows_per_warp().filter(|_| {
+                leading >= E4M3_GROUP_LEAVES_THE_M1_ROUTE_ALONE_BECAUSE_ITS_TWO_ROWS_PER_WARP_KERNEL_IS_ALREADY_THE_TUNED_ONE_ROW_SHAPE
+                    && n >= THE_GROUP_GEMV_NEEDS_THIS_MANY_OUTPUT_ROWS_BEFORE_ITS_K_TILE_PAYS_FOR_ITS_EXTRA_SYNCS_BECAUSE_A_NARROW_N_GIVES_EACH_BLOCK_TOO_FEW_WEIGHT_BYTES_PER_STAGED_TILE
+                    && leading as i32
+                        <= unsafe { nvk::gemv_e4m3_untiled_staging_reaches_this_m(k as i32) }
+            });
+            e4m3_route_line_once_per_slot_and_row_count_because_a_single_once_only_ever_reports_whichever_shape_warmed_first(
+                2,
+                match group {
+                    Some(_) => "NV_Q38_E4M3_GROUP active: the k-tiled group gemv replaces the \
+                                whole-row-staged gemv_e4m3_mk row for row",
+                    None => "staged gemv route: whole-row-staged gemv_e4m3_mk (group arm not \
+                             engaged at this row count)",
+                },
+                leading,
+                n,
+                k,
+                &format!(
+                    "rows_per_warp={} tile_v={} untiled_reaches_m={}",
+                    group.unwrap_or(0),
+                    unsafe { nvk::gemv_e4m3_group_tile_v(leading as i32, k as i32) },
+                    unsafe { nvk::gemv_e4m3_untiled_staging_reaches_this_m(k as i32) }
+                ),
+            );
             unsafe {
-                nvk::gemv_e4m3_mk(
-                    stream.cu_stream() as *mut _,
-                    wp as *const u8,
-                    sp as *const f32,
-                    xp as *const u16,
-                    yp as *mut u16,
-                    n as i32,
-                    k as i32,
-                    leading as i32,
-                )
+                match group {
+                    Some(rows_per_warp) => nvk::gemv_e4m3_group(
+                        stream.cu_stream() as *mut _,
+                        wp as *const u8,
+                        sp as *const f32,
+                        xp as *const u16,
+                        yp as *mut u16,
+                        n as i32,
+                        k as i32,
+                        leading as i32,
+                        rows_per_warp,
+                    ),
+                    None => {
+                        let reach =
+                            nvk::gemv_e4m3_untiled_staging_reaches_this_m(k as i32) as usize;
+                        let chunk_rows_past_the_staging_cap = leading > reach
+                            && leading
+                                <= VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC
+                            && VERIFY_INTERIOR_REACHES_3_TO_7_ARE_THE_SHAPES_WHOSE_TILE_FALLBACK_SPLIT_THE_VERIFY_RANGE
+                                .contains(&reach);
+                        if chunk_rows_past_the_staging_cap {
+                            let _ = A_ROW_CHUNKED_GEMV_IS_BITWISE_THE_SINGLE_LAUNCH_BECAUSE_EVERY_ROW_ACCUMULATES_ALONE_IN_ONE_K_ORDER;
+                            let mut rc = 0i32;
+                            let mut start = 0usize;
+                            while start < leading && rc == 0 {
+                                let rows = reach.min(leading - start);
+                                rc = nvk::gemv_e4m3_mk(
+                                    stream.cu_stream() as *mut _,
+                                    wp as *const u8,
+                                    sp as *const f32,
+                                    (xp + (start * k * 2) as u64) as *const u16,
+                                    (yp + (start * n * 2) as u64) as *mut u16,
+                                    n as i32,
+                                    k as i32,
+                                    rows as i32,
+                                );
+                                start += rows;
+                            }
+                            rc
+                        } else {
+                            nvk::gemv_e4m3_mk(
+                                stream.cu_stream() as *mut _,
+                                wp as *const u8,
+                                sp as *const f32,
+                                xp as *const u16,
+                                yp as *mut u16,
+                                n as i32,
+                                k as i32,
+                                leading as i32,
+                            )
+                        }
+                    }
+                }
             }
         };
         if rc == -1 {
@@ -1328,10 +2173,6 @@ impl Linear {
             "fp8 row-scaled linear: in_features {k} % 16 != 0; cuBLASLt e4m3 needs 16-element \
              aligned K and every q38 fp8 module satisfies it, so a trip here is a new module"
         );
-        a_quantized_fast_path_cannot_be_differentiated(
-            "matmul_fp8_device_rowquant_pertensor_raw_gemm_rowcol_epilogue",
-            x2,
-        )?;
         let stream = crate::cuda_stream::current_stream(dev);
         let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
 
@@ -1375,16 +2216,60 @@ impl Linear {
                 .runner
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Fp8 runner mutex poisoned: {e}"))?;
-            runner.matmul_e4m3_weight_row(
-                &x_q,
-                &s.weight_u8,
-                &mut d_dev,
-                m as u64,
-                n as u64,
-                k as u64,
-                &s.a_scale_dev,
-                &s.a_scale_dev,
-            )?
+            let chunk_rows_past_the_m6_plan = m
+                > LT_TILE_ROWS_PER_CHUNK_6_THE_WIDEST_ROW_COUNT_WHOSE_HEURISTIC_PLAN_FAMILY_COVERS_EVERY_SHIPPED_VERIFY_CELL
+                && m <= VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC;
+            if chunk_rows_past_the_m6_plan {
+                let _ = A_ROW_CHUNKED_LT_TILE_RIDES_THE_M6_PLAN_BECAUSE_THE_HEURISTIC_MOVES_PLANS_BETWEEN_M6_AND_M7;
+                let span = LT_TILE_SPAN_4_THE_PRODUCTION_MTP_VERIFY_LAUNCH_WHOSE_PLAN_FAMILY_ALSO_COVERS_M5_AND_M6_AT_THE_CHEAPEST_ROW_COUNT;
+                let planned = runner.matmul_e4m3_weight_row_span_with_plan_rows(
+                    &x_q,
+                    &s.weight_u8,
+                    &mut d_dev,
+                    0,
+                    m as u64,
+                    span as u64,
+                    n as u64,
+                    k as u64,
+                    &s.a_scale_dev,
+                    &s.a_scale_dev,
+                );
+                if let Err(e) = planned {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        eprintln!(
+                            "[linear] m4-plan single launch refused at m={m} n={n} k={k} \
+                             ({e:#}); riding the bitwise-equal (0,{span})+({},{span}) span \
+                             composition at its second full weight read",
+                            m - span
+                        );
+                    });
+                    for start in [0usize, m - span] {
+                        runner.matmul_e4m3_weight_row_span(
+                            &x_q,
+                            &s.weight_u8,
+                            &mut d_dev,
+                            start as u64,
+                            span as u64,
+                            n as u64,
+                            k as u64,
+                            &s.a_scale_dev,
+                            &s.a_scale_dev,
+                        )?;
+                    }
+                }
+            } else {
+                runner.matmul_e4m3_weight_row(
+                    &x_q,
+                    &s.weight_u8,
+                    &mut d_dev,
+                    m as u64,
+                    n as u64,
+                    k as u64,
+                    &s.a_scale_dev,
+                    &s.a_scale_dev,
+                )?
+            }
         }
         {
             let (dp, _gd) = d_dev.device_ptr_mut(&stream);
@@ -1413,6 +2298,9 @@ impl Linear {
 
     #[cfg(feature = "cuda")]
     fn matmul_nvfp4(&self, s: &Nvfp4Storage, x2: &Tensor, leading: usize) -> Result<Tensor> {
+        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+            return self.matmul_quant_dx_only(x2);
+        }
         self.matmul_nvfp4_impl(s, x2, leading, None)
     }
 
@@ -1435,7 +2323,7 @@ impl Linear {
         );
         let x2 = x.reshape((1usize, self.in_features))?;
         match &self.storage {
-            LinearStorage::Nvfp4(s) => self.matmul_nvfp4_m1_gemv(s, &x2, None),
+            LinearStorage::Nvfp4(s) => self.matmul_nvfp4_m1_gemv(s, &x2, 1, None),
             _ => anyhow::bail!("forward_nvfp4_gemv_m1: linear is not NVFP4-resident"),
         }
     }
@@ -1445,24 +2333,33 @@ impl Linear {
         &self,
         s: &Nvfp4Storage,
         x2: &Tensor,
+        rows_each_launched_exactly_as_decode_launches_its_one_row: usize,
         prenorm: Option<&FusedPreNorm<'_>>,
     ) -> Result<Tensor> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use half::bf16;
         use std::ffi::c_void;
 
+        let rows = rows_each_launched_exactly_as_decode_launches_its_one_row;
+        anyhow::ensure!(
+            rows >= 1,
+            "matmul_nvfp4_m1_gemv: empty row block ({})",
+            A_VERIFY_BLOCK_MUST_TAKE_THE_SAME_KERNEL_DECODE_TAKES_OR_IT_CANNOT_REPRODUCE_DECODES_ROWS
+        );
         let dev = match x2.device() {
             Device::Cuda(d) => d.clone(),
             _ => anyhow::bail!("NVFP4 Linear requires CUDA input"),
         };
+        a_quantized_fast_path_cannot_be_differentiated("matmul_nvfp4_m1_gemv", x2)?;
         let stream = crate::cuda_stream::current_stream(&dev);
         let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
         let mut d: cudarc::driver::CudaSlice<bf16> = unsafe {
             stream
-                .alloc::<bf16>(self.out_features)
+                .alloc::<bf16>(rows * self.out_features)
                 .map_err(|e| anyhow::anyhow!(e))?
         };
         let mut xn: Option<cudarc::driver::CudaSlice<bf16>> = None;
+        let norm_w_kept_alive_past_the_pointer_guard = prenorm.map(|pn| pn.weight_bf16.clone());
         let rc = {
             let (x_storage, xl) = x_bf.storage_and_layout();
             let x_cuda = match &*x_storage {
@@ -1472,58 +2369,79 @@ impl Linear {
             let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
             let x_view = x_slice.slice(xl.start_offset()..);
             let (x_ptr, _gx) = x_view.device_ptr(&stream);
-            let gemv_x_ptr = if let Some(pn) = prenorm {
-                let mut buf: cudarc::driver::CudaSlice<bf16> = unsafe {
-                    stream
-                        .alloc::<bf16>(self.in_features)
-                        .map_err(|e| anyhow::anyhow!(e))?
-                };
-                let w_c = pn.weight_bf16.clone();
-                let (w_storage, wl) = w_c.storage_and_layout();
-                let w_cuda = match &*w_storage {
-                    candle_core::Storage::Cuda(cs) => cs,
-                    _ => anyhow::bail!("expected cuda storage for norm weight"),
-                };
-                let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
-                let w_view = w_slice.slice(wl.start_offset()..);
-                let (nw_ptr, _gn) = w_view.device_ptr(&stream);
-                let p = {
-                    let (xn_ptr, _gxn) = buf.device_ptr_mut(&stream);
-                    let rc_norm = unsafe {
-                        nv_kernels::cuda::rmsnorm_bf16(
-                            stream.cu_stream() as *mut c_void,
-                            x_ptr as *const u16,
-                            nw_ptr as *const u16,
-                            xn_ptr as *mut u16,
-                            1,
-                            self.in_features,
-                            pn.eps,
-                        )
-                    };
-                    if rc_norm != 0 {
-                        anyhow::bail!("rmsnorm_bf16 rc={rc_norm}");
-                    }
-                    xn_ptr
-                };
-                xn = Some(buf);
-                p
-            } else {
-                x_ptr
-            };
             let (w_ptr, _gw) = s.weight_u8.device_ptr(&stream);
             let (s_ptr, _gs) = s.weight_scales_cm.device_ptr(&stream);
             let (d_ptr, _gd) = d.device_ptr_mut(&stream);
-            unsafe {
-                nv_kernels::cuda::nvfp4_gemv_bf16act(
-                    stream.cu_stream() as *mut c_void,
-                    w_ptr as *const u8,
-                    s_ptr as *const u8,
-                    gemv_x_ptr as *const u16,
-                    d_ptr as *mut u16,
-                    s.weight_alpha,
-                    self.out_features as i32,
-                    self.in_features as i32,
-                )
+            let bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x =
+                s.weight_alpha * s.input_stored_global;
+            let x_row_bytes = self.in_features * std::mem::size_of::<bf16>();
+            let d_row_bytes = self.out_features * std::mem::size_of::<bf16>();
+            let x_base = x_ptr as usize;
+            let d_base = d_ptr as usize;
+            match (prenorm, norm_w_kept_alive_past_the_pointer_guard.as_ref()) {
+                (Some(pn), Some(nw)) => {
+                    let (w_storage, wl) = nw.storage_and_layout();
+                    let w_cuda = match &*w_storage {
+                        candle_core::Storage::Cuda(cs) => cs,
+                        _ => anyhow::bail!("expected cuda storage for norm weight"),
+                    };
+                    let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
+                    let w_view = w_slice.slice(wl.start_offset()..);
+                    let (nw_ptr, _gn) = w_view.device_ptr(&stream);
+                    let mut buf: cudarc::driver::CudaSlice<bf16> = unsafe {
+                        stream
+                            .alloc::<bf16>(self.in_features)
+                            .map_err(|e| anyhow::anyhow!(e))?
+                    };
+                    let rc_fused = {
+                        let (xn_ptr, _gxn) = buf.device_ptr_mut(&stream);
+                        let mut rc_rows = 0i32;
+                        for row in 0..rows {
+                            rc_rows = unsafe {
+                                nv_kernels::cuda::nvfp4_gemv_bf16act_prenorm(
+                                    stream.cu_stream() as *mut c_void,
+                                    w_ptr as *const u8,
+                                    s_ptr as *const u8,
+                                    (x_base + row * x_row_bytes) as *const u16,
+                                    nw_ptr as *const u16,
+                                    xn_ptr as *mut u16,
+                                    (d_base + row * d_row_bytes) as *mut u16,
+                                    bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                                    self.out_features as i32,
+                                    self.in_features as i32,
+                                    pn.eps,
+                                )
+                            };
+                            if rc_rows != 0 {
+                                break;
+                            }
+                        }
+                        rc_rows
+                    };
+                    xn = Some(buf);
+                    rc_fused
+                }
+                _ => {
+                    let mut rc_rows = 0i32;
+                    for row in 0..rows {
+                        rc_rows = unsafe {
+                            nv_kernels::cuda::nvfp4_gemv_bf16act(
+                                stream.cu_stream() as *mut c_void,
+                                w_ptr as *const u8,
+                                s_ptr as *const u8,
+                                (x_base + row * x_row_bytes) as *const u16,
+                                (d_base + row * d_row_bytes) as *mut u16,
+                                bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                                self.out_features as i32,
+                                self.in_features as i32,
+                            )
+                        };
+                        if rc_rows != 0 {
+                            break;
+                        }
+                    }
+                    rc_rows
+                }
             }
         };
         drop(xn);
@@ -1532,10 +2450,9 @@ impl Linear {
         }
         let d_storage = candle_core::CudaStorage::wrap_cuda_slice(d, dev);
         let storage = candle_core::Storage::Cuda(d_storage);
-        a_quantized_fast_path_cannot_be_differentiated("matmul_nvfp4_m1_gemv", x2)?;
         Ok(candle_core::Tensor::from_storage(
             storage,
-            (1, self.out_features),
+            (rows, self.out_features),
             candle_core::op::BackpropOp::none(),
             false,
         ))
@@ -1558,6 +2475,7 @@ impl Linear {
             Device::Cuda(d) => d.clone(),
             _ => anyhow::bail!("NVFP4 Linear requires CUDA input"),
         };
+        a_quantized_fast_path_cannot_be_differentiated("matmul_nvfp4_impl", x2)?;
         let _ = &s.cuda_device;
         let stream = crate::cuda_stream::current_stream(&dev);
         let n = self.out_features as u64;
@@ -1583,8 +2501,8 @@ impl Linear {
             anyhow::bail!("NVFP4 Linear: empty input batch");
         }
 
-        if m_logical == 1 && nvfp4_m1_gemv_opted_in() {
-            return self.matmul_nvfp4_m1_gemv(s, x2, prenorm.as_ref());
+        if nvfp4_m1_gemv_opted_in() && m_logical <= nvfp4_gemv_row_block_ceiling() {
+            return self.matmul_nvfp4_m1_gemv(s, x2, m_logical, prenorm.as_ref());
         }
 
         let true_m = nvfp4_true_m_enabled() && {
@@ -1780,7 +2698,6 @@ impl Linear {
 
         let d_storage = candle_core::CudaStorage::wrap_cuda_slice(d_padded, dev);
         let storage = candle_core::Storage::Cuda(d_storage);
-        a_quantized_fast_path_cannot_be_differentiated("matmul_nvfp4_impl", x2)?;
         let full = candle_core::Tensor::from_storage(
             storage,
             (m_padded, self.out_features),
@@ -1931,7 +2848,7 @@ impl Linear {
         let b_scale_rows_dev = stream
             .clone_htod(&weight_scale_rows)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let storage = LinearStorage::Fp8E4m3(Fp8Storage {
+        let storage = LinearStorage::Fp8E4m3(Arc::new(Fp8Storage {
             weight_u8,
             a_scale_dev,
             b_scale_dev,
@@ -1940,7 +2857,7 @@ impl Linear {
             scale_mode,
             cuda_device: dev,
             runner,
-        });
+        }));
         Ok(Self {
             kind: LinearKind::Fp8E4m3 {
                 a_scale: 1.0,
@@ -2101,7 +3018,7 @@ impl Linear {
         stream
             .memcpy_htod(&[weight_alpha], &mut weight_alpha_dev)
             .map_err(|e| anyhow::anyhow!("htod weight_alpha_dev: {e:?}"))?;
-        let storage = LinearStorage::Nvfp4(Nvfp4Storage {
+        let storage = LinearStorage::Nvfp4(Arc::new(Nvfp4Storage {
             weight_u8,
             weight_scales_cm,
             cuda_device: dev,
@@ -2110,7 +3027,7 @@ impl Linear {
             weight_alpha_dev,
             input_stored_global,
             a_staging: Mutex::new(std::collections::HashMap::new()),
-        });
+        }));
         Ok(Self {
             kind: LinearKind::Nvfp4,
             storage,
@@ -2318,6 +3235,10 @@ impl Linear {
             LinearStorage::Nvfp4(_) => anyhow::bail!(
                 "nvfp4 draft twin: source linear is already NVFP4-resident; use it directly"
             ),
+            LinearStorage::GgmlQuant(_) => anyhow::bail!(
+                "nvfp4 draft twin: ggml-quant storage carries no bf16/fp8 source rows to \
+                 requantize"
+            ),
         }
     }
 }
@@ -2419,6 +3340,7 @@ pub fn fp8_e4m3_rowscale_checkpoint_dequant_linear(
 pub const FP8_RESIDENT_WEIGHT_BYTES_PER_PARAM_REPLACING_4_FROM_BF16_DEQUANT_PLUS_PRETRANSPOSE:
     usize = 1;
 
+#[cfg(feature = "cuda")]
 #[cfg(feature = "cuda")]
 pub fn fp8_e4m3_rowscale_checkpoint_resident_linear(
     weights: &nv_weights::WeightLoader,

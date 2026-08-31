@@ -29,14 +29,11 @@ import launch_geometry as LG  # noqa: E402
 TAG = "selftest"
 CU = "rust/crates/nv-kernels/cuda/"
 
-
 class Wrote(Exception):
     pass
 
-
 def _no_write(path, text):
     raise Wrote("extractor wrote %s during a refusal case" % path)
-
 
 def run_case(name, expect_kind, patch):
     """patch() installs the defect and returns a list of undo callables."""
@@ -64,7 +61,6 @@ def run_case(name, expect_kind, patch):
             print("[%s]   stderr: %s" % (TAG, line))
     return ok
 
-
 def patch_symbols(mutate):
     def go():
         base = LG.load_symbols()
@@ -75,7 +71,6 @@ def patch_symbols(mutate):
         return [lambda: setattr(LG, "load_symbols", _orig_load_symbols)]
 
     return go
-
 
 def patch_sources(mutate):
     def go():
@@ -89,15 +84,11 @@ def patch_sources(mutate):
 
     return go
 
-
 _orig_load_symbols = LG.load_symbols
 _orig_load_sources = cudatu.load_sources
 _orig_sites = cudatext.launch_sites
 _orig_members = cudatext.grid_member_assignments
 
-# extract/guard_fixture.cu, one host function per shape.  None means "must NOT
-# be recognised": for enforcement, a miss is a carried hazard and a false hit is
-# a retired one, so the second half of this table is the half that matters.
 GUARD_EXPECT = {
     "case_early_return_gt": 65535,
     "case_early_return_ge": 65535,
@@ -118,15 +109,12 @@ GUARD_EXPECT = {
     "case_guarded_then_reassigned": None,
     "case_address_of_the_guarded_value": None,
     "case_guard_inside_a_conditional_block": None,
-    # A guard before a switch dominates the launch after it; a guard inside one
-    # case does not dominate a launch in another.
     "case_guard_before_a_switch": 65535,
     "case_guard_inside_a_switch_case": None,
     "case_function_contains_a_label": None,
     "case_guard_is_not_a_constant": None,
     "case_lower_bound_only": None,
 }
-
 
 def guard_fixture():
     """Read every guard shape out of extract/guard_fixture.cu and check it.
@@ -178,7 +166,6 @@ def guard_fixture():
     print("[%s] %-26s %s" % (TAG, "guard shapes", "PASS" if ok else "FAIL"))
     return ok
 
-
 def main():
     results = [guard_fixture()]
 
@@ -194,10 +181,6 @@ def main():
     )
 
     def widen_bound(d):
-        # n_kv is what kv_fp8_paged.cu puts on gridDim.y today.  This case used
-        # to widen n_tokens, and went red when n_tokens moved to gridDim.x --
-        # where 262144 is a legal extent, so no refusal was owed. The case was
-        # right to fail; it is repointed here at the axis that is still limited.
         d["symbols"][CU + "kv_fp8_paged.cu:n_kv"]["hi"] = 262144
 
     results.append(
@@ -312,7 +295,6 @@ def main():
     npass = sum(1 for r in results if r)
     print("[%s] %d/%d refusal paths fire" % (TAG, npass, len(results)))
     return 0 if npass == len(results) else 1
-
 
 if __name__ == "__main__":
     sys.exit(main())

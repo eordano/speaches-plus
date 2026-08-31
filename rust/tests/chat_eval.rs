@@ -903,7 +903,7 @@ pub fn scratch_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".cache/nvk-tmp/chat-eval")
+                .join(".cache/claude-tmp/chat-eval")
         });
     std::fs::create_dir_all(&d).ok();
     d

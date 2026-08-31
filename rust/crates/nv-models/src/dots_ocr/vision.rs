@@ -4,6 +4,7 @@ use nv_layers::attn::AttnConfig;
 use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
 use nv_layers::norm::RmsNorm;
+use nv_layers::weight_load::load_rmsnorm;
 use nv_weights::WeightLoader;
 
 use super::preprocess::{position_ids, PreparedImage, MERGE_SIZE, PATCH_DIM};
@@ -107,18 +108,6 @@ fn load_linear(
         None => None,
     };
     Linear::new(w.contiguous()?, b)
-}
-
-fn load_rmsnorm(weights: &WeightLoader, name: &str, dim: usize, eps: f64) -> Result<RmsNorm> {
-    let w = weights
-        .get(name, DType::F32)
-        .with_context(|| format!("load {name}"))?;
-    anyhow::ensure!(
-        w.dims() == [dim],
-        "{name}: expected [{dim}], got {:?}",
-        w.dims()
-    );
-    Ok(RmsNorm::new(w, eps))
 }
 
 fn rotate_half(x: &Tensor) -> Result<Tensor> {
@@ -259,12 +248,25 @@ impl DotsVisionTower {
             &format!("{prefix}patch_embed.patchifier.norm.weight"),
             dim,
             cfg.rms_norm_eps,
+            DType::F32,
         )?;
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let bp = format!("{prefix}blocks.{i}.");
-            let norm1 = load_rmsnorm(weights, &format!("{bp}norm1.weight"), dim, cfg.rms_norm_eps)?;
-            let norm2 = load_rmsnorm(weights, &format!("{bp}norm2.weight"), dim, cfg.rms_norm_eps)?;
+            let norm1 = load_rmsnorm(
+                weights,
+                &format!("{bp}norm1.weight"),
+                dim,
+                cfg.rms_norm_eps,
+                DType::F32,
+            )?;
+            let norm2 = load_rmsnorm(
+                weights,
+                &format!("{bp}norm2.weight"),
+                dim,
+                cfg.rms_norm_eps,
+                DType::F32,
+            )?;
             let qkv = load_linear(
                 weights,
                 &format!("{bp}attn.qkv.weight"),
@@ -320,6 +322,7 @@ impl DotsVisionTower {
                 &format!("{prefix}post_trunk_norm.weight"),
                 dim,
                 cfg.rms_norm_eps,
+                DType::F32,
             )?)
         } else {
             None

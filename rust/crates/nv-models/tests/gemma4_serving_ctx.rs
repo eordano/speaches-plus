@@ -21,6 +21,14 @@ const KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS: usize = 16;
 const GRAPHED_ARM_NON_POOL_VRAM_HEADROOM_6GIB_FOR_ACTIVATIONS_LOGITS_AND_GRAPH_MEMPOOL: usize =
     6 << 30;
 const SINGLE_SEQUENCE_BUCKET_BECAUSE_THIS_GATE_TIMES_BS1_SERVING_DECODE: usize = 1;
+const NV_G4_SERVING_DEVICE_ARGMAX_ENV: &str = "NV_G4_SERVING_DEVICE_ARGMAX";
+const G4_STREAM_IDENTITY_GATE_32_STEPS_HOST_AND_DEVICE_ARGMAX_MUST_AGREE_ON_REAL_LOGITS: usize =
+    32;
+
+fn g4_serving_feed_device_argmax_env_default_off_because_every_published_ladder_number_is_a_host_feed(
+) -> bool {
+    std::env::var(NV_G4_SERVING_DEVICE_ARGMAX_ENV).ok().as_deref() == Some("1")
+}
 
 fn free_vram_bytes_after_touching_the_current_stream(device: &Device) -> usize {
     if let Device::Cuda(d) = device {
@@ -106,12 +114,19 @@ fn gemma4_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_or_page
     let max_pos = model.config().max_position_embeddings;
     let vocab = model.config().vocab_size;
     let bs = SERVING_BLOCK_SIZE_16_SAME_AS_BUILD_GEMMA4_BATCH_ENGINE_IN_CHAT_ENGINE_BATCH_RS;
+    let device_feed =
+        g4_serving_feed_device_argmax_env_default_off_because_every_published_ladder_number_is_a_host_feed();
 
     for &depth in &depths {
         let total_slots = depth
             + ctx_timing_common::WORST_CASE_PLATEAU_WARMUP_200_STEPS_SIZES_KV_SLOT_HEADROOM
             + TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN
-            + KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS;
+            + KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS
+            + if device_feed {
+                G4_STREAM_IDENTITY_GATE_32_STEPS_HOST_AND_DEVICE_ARGMAX_MUST_AGREE_ON_REAL_LOGITS
+            } else {
+                0
+            };
         assert!(
             total_slots < max_pos,
             "depth {depth} + decode steps exceeds max_position_embeddings {max_pos}; a model \
@@ -166,8 +181,10 @@ fn gemma4_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_or_page
 
             let mut tok = argmax(&last_row);
             let mut pos = depth;
-            let (warmup_steps, step_ms) = ctx_timing_common::warmup_to_plateau_then_time_steps(
-                || {
+            if device_feed {
+                for _ in
+                    0..G4_STREAM_IDENTITY_GATE_32_STEPS_HOST_AND_DEVICE_ARGMAX_MUST_AGREE_ON_REAL_LOGITS
+                {
                     let rows = family
                         .step(&[SlotUpdate {
                             token: tok,
@@ -177,11 +194,49 @@ fn gemma4_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_or_page
                             lora_slot: -1,
                         }])
                         .unwrap_or_else(|e| {
+                            panic!("identity-gate graphed decode at depth {pos}: {e:#}")
+                        });
+                    let host_tok = argmax(&rows[0]);
+                    let dev_tok = family
+                        .device_argmax_rows_of_the_last_step_logits(1)
+                        .unwrap_or_else(|e| panic!("identity-gate device argmax at {pos}: {e:#}"))
+                        [0];
+                    assert_eq!(
+                        dev_tok, host_tok,
+                        "device argmax exit diverged from the host argmax on the SAME step's \
+                         logits at pos {pos}; the device-fed ladder would measure a different \
+                         token stream (cast_bf16_f32 widens exactly, argmax_f32_rows skips \
+                         non-finite and breaks ties lowest-index)"
+                    );
+                    tok = host_tok;
+                    pos += 1;
+                }
+            }
+            let (warmup_steps, step_ms) = ctx_timing_common::warmup_to_plateau_then_time_steps(
+                || {
+                    let upd = SlotUpdate {
+                        token: tok,
+                        pos: pos as i32,
+                        n_total: pos as i32 + 1,
+                        block_table: table.clone(),
+                        lora_slot: -1,
+                    };
+                    if device_feed {
+                        let toks = family
+                            .step_argmax_tokens_on_device_skipping_the_rows_dtoh_and_bf16_to_f32_host_convert(&[upd])
+                            .unwrap_or_else(|e| {
+                                panic!("graphed serving decode (device argmax) at depth {pos}: {e:#}")
+                            });
+                        assert_eq!(toks.len(), 1, "bucket-1 step returns one token");
+                        tok = toks[0];
+                    } else {
+                        let rows = family.step(&[upd]).unwrap_or_else(|e| {
                             panic!("graphed serving decode at depth {pos}: {e:#}")
                         });
-                    assert_eq!(rows.len(), 1, "bucket-1 step returns one row");
-                    assert_eq!(rows[0].len(), vocab, "logit row width");
-                    tok = argmax(&rows[0]);
+                        assert_eq!(rows.len(), 1, "bucket-1 step returns one row");
+                        assert_eq!(rows[0].len(), vocab, "logit row width");
+                        tok = argmax(&rows[0]);
+                    }
                     pos += 1;
                 },
                 TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN,
@@ -193,8 +248,13 @@ fn gemma4_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_or_page
                 family.replays()
             );
             let (median, mean) = median_mean_of_sorted(step_ms);
+            let feed_basis = if device_feed {
+                "device_argmax_f32_rows_4_byte_exit"
+            } else {
+                "host_rows_dtoh_plus_host_argmax"
+            };
             eprintln!(
-                "CTX-SCALING gemma4-cuda-serving depth={depth} basis=graphed_paged_fp8_Gemma4BatchGraphFamily_bucket1_host_rows_included captures={} replays={} median_ms_tok={median:.3} mean_ms_tok={mean:.3} tok_s={:.1} prefill_s={prefill_s:.1} prefill_chunk={} pool_gb={:.1} free_gb_at_choice={:.1} steps={} warmup_steps={warmup_steps}",
+                "CTX-SCALING gemma4-cuda-serving depth={depth} basis=graphed_paged_fp8_Gemma4BatchGraphFamily_bucket1_host_rows_included argmax_feed={feed_basis} captures={} replays={} median_ms_tok={median:.3} mean_ms_tok={mean:.3} tok_s={:.1} prefill_s={prefill_s:.1} prefill_chunk={} pool_gb={:.1} free_gb_at_choice={:.1} steps={} warmup_steps={warmup_steps}",
                 family.captures(),
                 family.replays(),
                 1000.0 / median,
@@ -269,6 +329,134 @@ fn gemma4_cuda_serving_path_decode_ms_per_token_vs_context_depth_graphed_or_page
                 TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN
             );
         }
+    }
+}
+
+pub const THE_DEFAULT_PER_REQUEST_SERVING_DECODE_IS_GRAPHEDGEMMA4DECODER_OVER_A_WINDOWED_FP8_KV_CACHE_AND_THE_PAGED_BATCHGRAPHFAMILY_LADDER_ABOVE_TIMES_AN_OPT_IN_SHAPE: &str =
+    "rust/src/oapi/chat_engine/gemma4_loop.rs::run_sampling_gemma4 allocates \
+     Gemma4::new_kv_cache_fp8_windowed(kv_needed), chunk-prefills it at VERIFY_PREFILL_CHUNK \
+     through forward_with_cache_last, and then decodes every token through \
+     gemma4_graph::GraphedGemma4Decoder::forward_decode_logits, which replays a whole-step m=1 \
+     capture, copies the full f32 logits row to the host and argmaxes it there. \
+     Gemma4BatchGraphFamily is constructed only by chat_engine/batch.rs, and \
+     chat_engine/build.rs instantiates that engine only when NV_BATCH_ENGINE is set, so the \
+     paged-pool ladder in this file times a serving shape a default deployment never enters.";
+
+#[test]
+#[ignore = "loads the 31B; set NV_GEMMA4_SERVING_TEST=1 -- decode ms/token vs KV depth on the DEFAULT per-request serving shape: a GraphedGemma4Decoder whole-step m=1 capture over the windowed fp8 KV cache (sliding layers ring-limited, full layers contiguous), primed by a real chunked prefill at VERIFY_PREFILL_CHUNK, with the host logits row and host argmax included exactly as run_sampling_gemma4 pays for them"]
+fn gemma4_cuda_default_serving_decode_ms_per_token_vs_context_depth_graphed_decoder_windowed_fp8_kv(
+) {
+    if std::env::var("NV_GEMMA4_SERVING_TEST").ok().as_deref() != Some("1") {
+        if std::env::var("NV_MODELS_ALLOW_SKIP").as_deref() != Ok("1") {
+            panic!(
+                "set NV_GEMMA4_SERVING_TEST=1 to run this gate, or NV_MODELS_ALLOW_SKIP=1 to \
+                 skip it on purpose; a decode ladder that reports ok without ever running the \
+                 shape serving uses is the failure class this rung exists to close"
+            );
+        }
+        eprintln!("SKIP (NV_MODELS_ALLOW_SKIP=1): set NV_GEMMA4_SERVING_TEST=1 to run");
+        return;
+    }
+    let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
+    let dir = snapshot_dir_env_override_then_home_hub();
+    let device = Device::new_cuda_with_stream(0).expect("cuda");
+    let raw_cfg = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+    let cfg = Gemma4Config::from_hf_json_str(&raw_cfg).expect("parse config");
+    let qcfg = QuantizationConfig::from_hf_json_str(&raw_cfg).expect("parse qcfg");
+    let weights = WeightLoader::open_dir(&dir, &device).expect("weights");
+    let model = Gemma4::from_loader_quantized(cfg, &weights, &qcfg, &device).expect("model");
+    drop(weights);
+
+    let depths = ctx_tokens_from_env_default_256_8k_196k();
+    let max_pos = model.config().max_position_embeddings;
+    let vocab = model.config().vocab_size;
+
+    for &depth in &depths {
+        let kv_needed = depth
+            + ctx_timing_common::WORST_CASE_PLATEAU_WARMUP_200_STEPS_SIZES_KV_SLOT_HEADROOM
+            + TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN
+            + KV_SLOT_HEADROOM_16_BEYOND_THE_TIMED_STEPS;
+        assert!(
+            kv_needed < max_pos,
+            "depth {depth} + decode steps exceeds max_position_embeddings {max_pos}; a model \
+             declaring {max_pos} must serve this depth, so a trip here is a config bug"
+        );
+        let mut cache = model
+            .new_kv_cache_fp8_windowed(kv_needed)
+            .expect("windowed fp8 kv cache, the one run_sampling_gemma4 allocates");
+
+        let t_prefill = Instant::now();
+        let mut pos = 0usize;
+        let mut last_row: Vec<f32> = Vec::new();
+        while pos < depth {
+            let n = VERIFY_PREFILL_CHUNK.min(depth - pos);
+            let ids: Vec<u32> = (0..n).map(|i| 2000 + ((pos + i) as u32 % 30000)).collect();
+            let tokens = Tensor::from_vec(ids, (1usize, n), &device).expect("tokens");
+            let positions = Tensor::from_vec(
+                (pos as i32..(pos + n) as i32).collect::<Vec<_>>(),
+                n,
+                &device,
+            )
+            .expect("positions");
+            let logits = model
+                .forward_with_cache_last(&tokens, &positions, &mut cache)
+                .unwrap_or_else(|e| panic!("prefill chunk at pos {pos}: {e:#}"));
+            pos += n;
+            if pos >= depth {
+                last_row = logits
+                    .to_dtype(DType::F32)
+                    .expect("f32")
+                    .flatten_all()
+                    .expect("flatten")
+                    .to_vec1()
+                    .expect("host");
+            }
+        }
+        device.synchronize().expect("sync before stopping the prefill clock");
+        let prefill_s = t_prefill.elapsed().as_secs_f64();
+        assert_eq!(
+            cache.current_len(),
+            depth,
+            "chunked prefill must leave the windowed fp8 cache at the primed depth"
+        );
+        assert_eq!(
+            last_row.len(),
+            vocab,
+            "prefill must hand the decode loop one full logits row"
+        );
+
+        let mut tok = argmax(&last_row);
+        let mut graphed =
+            nv_models::gemma4_graph::GraphedGemma4Decoder::new(&model, cache, &device)
+                .expect("GraphedGemma4Decoder, the decoder run_sampling_gemma4 builds");
+        let (warmup_steps, step_ms) = ctx_timing_common::warmup_to_plateau_then_time_steps(
+            || {
+                tok = graphed
+                    .forward_decode_logits(tok)
+                    .unwrap_or_else(|e| panic!("default serving decode at depth {depth}: {e:#}"));
+            },
+            TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN,
+        );
+        assert!(
+            graphed.capture_active(),
+            "the default serving decode basis requires a live capture; call_count={} means this \
+             ladder timed an uncaptured eager replay and is not the serving shape",
+            graphed.call_count()
+        );
+        assert!(
+            graphed.call_count() >= TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN as u64,
+            "graphed basis requires replayed steps, got call_count={}",
+            graphed.call_count()
+        );
+        let (median, mean) = median_mean_of_sorted(step_ms);
+        eprintln!(
+            "CTX-SCALING gemma4-cuda-default-serving depth={depth} basis=graphed_gemma4_decoder_windowed_fp8_kv_bs1_host_logits_row_and_host_argmax_included nodes={} calls={} median_ms_tok={median:.3} mean_ms_tok={mean:.3} tok_s={:.1} prefill_s={prefill_s:.1} prefill_chunk={} kv_needed={kv_needed} steps={} warmup_steps={warmup_steps}",
+            graphed.captured_node_count(),
+            graphed.call_count(),
+            1000.0 / median,
+            VERIFY_PREFILL_CHUNK,
+            TIMED_DECODE_STEPS_64_ENOUGH_FOR_A_STABLE_MEDIAN
+        );
     }
 }
 

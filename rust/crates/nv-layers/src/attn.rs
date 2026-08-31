@@ -182,7 +182,7 @@ fn sdpa_masked(
         }
     };
 
-    let probs = candle_nn::ops::softmax_last_dim(&scores).map_err(|e| anyhow::anyhow!(e))?;
+    let probs = softmax_last_dim_that_keeps_q_and_k_on_the_graph(&scores)?;
     let out = probs
         .contiguous()
         .map_err(|e| anyhow::anyhow!(e))?
@@ -196,6 +196,31 @@ fn sdpa_masked(
         .contiguous()
         .map_err(|e| anyhow::anyhow!(e))?;
     out.to_dtype(orig_dtype).map_err(|e| anyhow::anyhow!(e))
+}
+
+pub const CANDLE_INSTALLS_SOFTMAX_LAST_DIM_WITH_APPLY_OP1_NO_BWD_SO_THE_PROBABILITIES_ARE_A_GRAPH_LEAF_AND_ONLY_V_WOULD_TRAIN: &str =
+    "candle_nn::ops::softmax_last_dim is `xs.apply_op1_no_bwd(&SoftmaxLastDim)`: the fused kernel \
+     is fast and exact but its output carries BackpropOp::none, so scores -- and with them q and \
+     k -- are unreachable from the loss and receive no gradient entry at all, while v still gets \
+     one through the `probs @ v` matmul that comes after. A trainer that scores attention through \
+     the fused kernel therefore optimises the value projection alone, does not error, and reports \
+     a falling loss the whole time; a LoRA fitted on q_proj/k_proj under it keeps its zero-init B \
+     forever and merges as an exact no-op. The composed candle softmax (max_keepdim, \
+     broadcast_sub, exp, sum_keepdim, broadcast_div) is the same function built from tracked \
+     primitives, and its backward is the softmax Jacobian-vector product dx = p * (dy - sum(p * \
+     dy)) -- the max subtraction contributes exactly zero because sum_j p_j (dy_j - sum(p dy)) is \
+     identically zero. Serving never takes it: this_call_is_building_an_autograd_graph is the same \
+     predicate candle's own BackpropOp::new1 applies, so on an untracked score tensor -- every \
+     tensor any decoder ever passes -- the fused kernel is still the only thing that runs and the \
+     served probabilities are bit-identical.";
+
+pub fn softmax_last_dim_that_keeps_q_and_k_on_the_graph(scores: &Tensor) -> Result<Tensor> {
+    if crate::linear::this_call_is_building_an_autograd_graph(scores) {
+        let _ = CANDLE_INSTALLS_SOFTMAX_LAST_DIM_WITH_APPLY_OP1_NO_BWD_SO_THE_PROBABILITIES_ARE_A_GRAPH_LEAF_AND_ONLY_V_WOULD_TRAIN;
+        return candle_nn::ops::softmax(scores, candle_core::D::Minus1)
+            .map_err(|e| anyhow::anyhow!(e));
+    }
+    candle_nn::ops::softmax_last_dim(scores).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn build_causal_mask_windowed(

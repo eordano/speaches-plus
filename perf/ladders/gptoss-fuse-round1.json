@@ -1,0 +1,67 @@
+{
+  "ladder": "gptoss-fuse-r1",
+  "mode": "ours",
+  "base_args": {
+    "build-name": "gptoss fuse",
+    "model": "gpt-oss-20b",
+    "backend": "wgpu-vulkan",
+    "pkg": "nv-models",
+    "features": "cuda,wgpu",
+    "suite": "gpt_oss_wgpu_ctx_synthfill",
+    "exact": "gptoss_wgpu_decode_ms_per_token_vs_context_depth_synthetic_state_fill_pos_is_the_only_depth_state",
+    "parse": "ctx-scaling",
+    "timeout": "1800"
+  },
+  "base_env": {
+    "NV_GPTOSS_CTX_TEST": "1"
+  },
+  "depth_env": "NV_CTX_TOKENS",
+  "depths": [
+    256
+  ],
+  "depths_per_run": false,
+  "notes": "fusion-arm ladder vs llamacpp-vulkan 267 @256",
+  "baseline_arm": "baseline",
+  "arms": [
+    {
+      "name": "baseline",
+      "env": {}
+    },
+    {
+      "name": "rtf",
+      "env": {
+        "NV_GOW_MOE_ROUTER_TOPK_FUSE": "1"
+      }
+    },
+    {
+      "name": "dncomb",
+      "env": {
+        "NV_GOW_MOE_DNCOMB_FUSE": "1"
+      }
+    },
+    {
+      "name": "xstage-gusw",
+      "env": {
+        "NV_GOW_MX_SG_XSTAGE": "1",
+        "NV_GOW_MX_SG_GUSW": "1"
+      }
+    },
+    {
+      "name": "rms-sglat",
+      "env": {
+        "NV_GOW_RMSRES_SGLAT": "1"
+      }
+    },
+    {
+      "name": "allfuse",
+      "env": {
+        "NV_GOW_MOE_ROUTER_TOPK_FUSE": "1",
+        "NV_GOW_MOE_DNCOMB_FUSE": "1",
+        "NV_GOW_MX_SG_XSTAGE": "1",
+        "NV_GOW_MX_SG_GUSW": "1",
+        "NV_GOW_RMSRES_SGLAT": "1"
+      }
+    }
+  ],
+  "null_pair_waived_because": "predates the null-pair rule; this spec's arm deltas were read against no measured floor, so treat any margin under ~5.5% as unresolved until a null pair is added and re-run"
+}

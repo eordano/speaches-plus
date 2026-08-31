@@ -21,6 +21,8 @@ const G4MOE_196K_BOUND_IS_70_BECAUSE_MEASURED_55_4_MS_TOK_WITH_THE_GATED_FLASH_D
     f64 = 70.0;
 const LAGUNA_196K_BOUND_IS_33_BECAUSE_TASK_106_MEASURED_25_8_MS_TOK_ON_THE_DEFAULT_EAGER_ARM_NO_GATED_ARM_NEEDED:
     f64 = 33.0;
+const Q35_196K_BOUND_IS_21_BECAUSE_THIS_RUNG_MEASURED_17_0_MS_TOK_ON_THE_GRAPHED_DENSE_ENGINE_WITH_THE_GATED_SPLITK_DECODE_FIX_ARM_AND_THE_SERIAL_SMEM_DEFAULT_IS_TWO_ORDERS_OVER_SO_THE_GATE_RUNS_THE_ARM:
+    f64 = 21.0;
 
 fn per_depth_extra_slots_warmup_plus_timed_plus_headroom() -> usize {
     ctx_timing_common::WORST_CASE_PLATEAU_WARMUP_200_STEPS_SIZES_KV_SLOT_HEADROOM
@@ -684,17 +686,77 @@ fn ctx196k_laguna_xs21_cuda_eager_synthfill_meets_bound() {
     );
 }
 
+#[cfg(feature = "cuda")]
 #[test]
-#[ignore = "RED LIST, never run as a timing rung: Qwen3.5-9B declares max_position_embeddings 262144 but has no 196k-capable serving path -- the only cuda arm is the eager dense forward_with_cache, which decodes far past any serving bound at depth (qwen35_9b_cuda_decode_ms_per_token_vs_context_depth_eager_dense_chunked_prefill_primed; current numbers: perf/runs.jsonl), there is no graphed engine and no splitk decode route for this family; running this test documents the blocker by panicking, which is the point: a model on the red list is a bug to fix, not a silent skip"]
-fn ctx196k_qwen35_9b_red_list_no_196k_capable_serving_path() {
-    panic!(
-        "Qwen3.5-9B is on the 196k conformance RED LIST: max_position_embeddings 262144 with \
-         no serving-class 196k path. Blocker: the family has only the eager dense cuda arm \
-         (from_loader_dense_quantized + forward_with_cache), which measures orders of \
-         magnitude over the serving bar at depth (current numbers: perf/runs.jsonl), \
-         and no GraphedQwen3Moe-class captured decode or \
-         splitk flash decode route is wired for it. Fix is to give the 9B the graphed dense \
-         serving engine the 27B already has, then move this rung off the red list by giving \
-         it a bound constant and a synthfill body like the other rungs in this file."
+#[ignore = "loads the ~9.6 GiB ig1 Qwen3.5-9B NVFP4 dense arm GRAPHED; set NV_CTX196K_CONFORMANCE=1 -- the task #106 executable standard at 196608: synthetic KV fill, captured graphed free-running decode, median ms/tok under the bound constant; the gate itself sets NV_Q36_GRAPHED_DECODE_FIX=1 because that splitk arm is what serving should run; run in its own process"]
+fn ctx196k_qwen35_9b_cuda_graphed_dense_serving_synthfill_meets_bound() {
+    use candle_core::Device;
+    use nv_models::graph_engine::GraphedQwen3Moe;
+    use nv_models::qwen3_5_moe::{Qwen3Moe, Qwen3_5DenseConfig};
+    use nv_weights::{QuantizationConfig, WeightLoader};
+    if !suite_gate_runs_or_skips_loudly("qwen35-9b") {
+        return;
+    }
+    gate_sets_the_arm_env_because_the_gate_documents_what_serving_should_run(
+        "NV_Q36_GRAPHED_DECODE_FIX",
+        "routes decode_attention_fp8 to the splitk flash_decode_fused_fp8kv kernel; the \
+         serial_smem default this family shipped with reads the whole KV window per head and \
+         is what put this rung on the red list (current numbers: perf/runs.jsonl)",
+    );
+    let _one_gpu_test_at_a_time = ctx_timing_common::serialize_tests_sharing_the_gpu_because_libtest_threads_double_book_the_card_reading_2x_slow_and_a_sibling_engines_teardown_surfaces_a_one_shot_cuda_error_invalid_value();
+    let dir = common::ig1_qwen35_9b_nvfp4_snapshot_dir_env_override_then_home_hub();
+    let device = Device::new_cuda_with_stream(0).expect("cuda");
+    let raw_cfg = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+    let cfg = Qwen3_5DenseConfig::from_hf_json_str(&raw_cfg).expect("parse dense config");
+    let qcfg = QuantizationConfig::from_hf_json_str(&raw_cfg).expect("parse qcfg");
+    let weights = WeightLoader::open_dir(&dir, &device).expect("weights");
+    let model = Qwen3Moe::from_loader_dense_quantized(cfg.clone(), &weights, &qcfg, &device)
+        .expect("build Qwen3.5-9B on the dense arm for the graphed conformance rung");
+    drop(weights);
+    assert_eq!(
+        model.dense_intermediate(),
+        Some(cfg.intermediate_size),
+        "from_loader_dense_quantized did not carry intermediate_size, so this is not the dense \
+         arm the opt-in NV_QWEN35_DENSE_CUDA_SERVE serving path builds"
+    );
+
+    let depth =
+        DEPTH_196608_THE_CONFORMANCE_STANDARD_RUNG_EVERY_262144_MAX_POS_SERVING_MODEL_MUST_PASS;
+    let max_pos = model.config().max_position_embeddings;
+    let extra = per_depth_extra_slots_warmup_plus_timed_plus_headroom();
+    assert!(
+        depth + extra < max_pos,
+        "depth {depth} + decode steps exceeds max_position_embeddings {max_pos}; a model \
+         declaring {max_pos} must serve this depth, so a trip here is a config bug"
+    );
+    let n_kv = model.config().num_key_value_heads;
+    let hd = model.config().head_dim;
+    let mut eng = GraphedQwen3Moe::new(model, &device, depth + extra)
+        .unwrap_or_else(|e| panic!("GraphedQwen3Moe with {} kv slots: {e:#}", depth + extra));
+
+    let chunk = SYNTHETIC_FILL_CHUNK_512_MATCHES_THE_PROVEN_QWEN_PREFILL_BLOCK;
+    let (k_template, v_template) = bf16_kv_chunk_templates(&device, chunk, n_kv, hd);
+    eng.set_moe_dispatch(None);
+    eng.reset().expect("engine reset");
+    let fill_s =
+        synth_fill_graphed_qwen_engine_to_depth(&mut eng, &k_template, &v_template, chunk, depth);
+    eng.install_grouped_moe()
+        .expect("dense branch of install_grouped_moe arms capture without a dispatch");
+    assert!(
+        eng.moe_dispatch_ref().is_none(),
+        "the dense arm must not carry a MoE dispatch"
+    );
+
+    let (warmup_steps, step_ms) = timed_graphed_free_running_decode(&mut eng, depth);
+    let median = median_of_timed_steps(&step_ms);
+    emit_conformance_line_then_assert_bound(
+        "qwen35-9b",
+        "graphed_dense+NV_Q36_GRAPHED_DECODE_FIX=1_splitk_flash",
+        "captured_graphed_free_running_decode_argmax_feed_includes_logits_host_synthetic_kv_fill",
+        median,
+        Q35_196K_BOUND_IS_21_BECAUSE_THIS_RUNG_MEASURED_17_0_MS_TOK_ON_THE_GRAPHED_DENSE_ENGINE_WITH_THE_GATED_SPLITK_DECODE_FIX_ARM_AND_THE_SERIAL_SMEM_DEFAULT_IS_TWO_ORDERS_OVER_SO_THE_GATE_RUNS_THE_ARM,
+        fill_s,
+        warmup_steps,
+        step_ms.len(),
     );
 }
