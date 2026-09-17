@@ -214,6 +214,8 @@ mod cuda {
         handle: sys::cublasLtHandle_t,
         workspace: CudaSlice<u8>,
         workspace_bytes: usize,
+        workspace_stream_key: usize,
+        workspace_override: Option<Arc<std::sync::Mutex<CudaSlice<u8>>>>,
         stream: Arc<CudaStream>,
     }
 
@@ -230,8 +232,74 @@ mod cuda {
                 handle,
                 workspace,
                 workspace_bytes,
+                workspace_stream_key: crate::stream_cache_key(&stream),
+                workspace_override: None,
                 stream,
             })
+        }
+    }
+
+    struct RestoreFp8Stream<'a> {
+        runner: &'a mut Fp8GemmRunner,
+        stream: Arc<CudaStream>,
+        workspace: Option<Arc<std::sync::Mutex<CudaSlice<u8>>>>,
+    }
+
+    impl Drop for RestoreFp8Stream<'_> {
+        fn drop(&mut self) {
+            std::mem::swap(&mut self.runner.stream, &mut self.stream);
+            std::mem::swap(&mut self.runner.workspace_override, &mut self.workspace);
+        }
+    }
+
+    impl Fp8GemmRunner {
+        pub fn with_stream<R>(
+            &mut self,
+            stream: &Arc<CudaStream>,
+            run: impl FnOnce(&mut Self) -> Result<R>,
+        ) -> Result<R> {
+            anyhow::ensure!(
+                Arc::ptr_eq(self.workspace.context(), stream.context()),
+                "FP8 caller stream must belong to the runner's CUDA context"
+            );
+            stream
+                .context()
+                .bind_to_thread()
+                .map_err(|e| anyhow::anyhow!("FP8 caller context bind failed: {e:?}"))?;
+            let workspace = if crate::stream_cache_key(stream) == self.workspace_stream_key {
+                None
+            } else {
+                let mut status =
+                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+                let rc = unsafe {
+                    cudarc::driver::sys::cuStreamIsCapturing(stream.cu_stream(), &mut status)
+                };
+                anyhow::ensure!(rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                    && status != cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED,
+                    "FP8 caller stream capture state is invalid: {rc:?} {status:?}");
+                let shared = crate::nvfp4::workspace_handle(stream)?;
+                {
+                    let ws = shared
+                        .lock()
+                        .map_err(|e| anyhow::anyhow!("FP8 stream workspace poisoned: {e}"))?;
+                    anyhow::ensure!(
+                        Arc::ptr_eq(ws.context(), stream.context())
+                            && crate::stream_cache_key(ws.stream())
+                                == crate::stream_cache_key(stream)
+                            && ws.len() >= self.workspace_bytes,
+                        "FP8 caller stream workspace has the wrong context, stream or capacity"
+                    );
+                }
+                Some(shared)
+            };
+            let previous_stream = std::mem::replace(&mut self.stream, stream.clone());
+            let previous_workspace = std::mem::replace(&mut self.workspace_override, workspace);
+            let scope = RestoreFp8Stream {
+                runner: self,
+                stream: previous_stream,
+                workspace: previous_workspace,
+            };
+            run(&mut *scope.runner)
         }
     }
 
@@ -366,9 +434,8 @@ mod cuda {
             scale_mode: Fp8ScaleMode,
         ) -> Result<()> {
             if std::env::var("NV_DEBUG_FP8_LT_SHAPES").as_deref() == Ok("1") {
-                static SEEN: std::sync::Mutex<
-                    std::collections::BTreeSet<(u64, u64, u64, u64)>,
-                > = std::sync::Mutex::new(std::collections::BTreeSet::new());
+                static SEEN: std::sync::Mutex<std::collections::BTreeSet<(u64, u64, u64, u64)>> =
+                    std::sync::Mutex::new(std::collections::BTreeSet::new());
                 if SEEN.lock().unwrap().insert((m, plan_rows, n, k)) {
                     eprintln!(
                         "[fp8-lt-shape] m={m} plan_rows={plan_rows} n={n} k={k} \
@@ -456,12 +523,12 @@ mod cuda {
                 Some((pb, pd)) => (pb, pd),
                 None => (b_layout, d_layout),
             };
-            let nows_pin_because_the_default_splitk_pick_reads_1212_vs_1415_gbs_on_this_shape =
+            let nows_pin_default_on_signed_off_2026_09_02_because_the_splitk_pick_reads_1212_vs_1415_gbs_here_set_nv_fp8_lt_nows_12288_0_for_the_heuristic_pick_and_its_memsets =
                 m <= 8
                     && n == 12288
                     && k == 5120
-                    && std::env::var("NV_FP8_LT_NOWS_12288").as_deref() == Ok("1");
-            let heur = if nows_pin_because_the_default_splitk_pick_reads_1212_vs_1415_gbs_on_this_shape
+                    && std::env::var("NV_FP8_LT_NOWS_12288").as_deref() != Ok("0");
+            let heur = if nows_pin_default_on_signed_off_2026_09_02_because_the_splitk_pick_reads_1212_vs_1415_gbs_here_set_nv_fp8_lt_nows_12288_0_for_the_heuristic_pick_and_its_memsets
             {
                 let mut cands: [sys::cublasLtMatmulHeuristicResult_t; 8] = mem::zeroed();
                 let mut count: i32 = 0;
@@ -515,7 +582,16 @@ mod cuda {
             let (b_ptr, _gb) = b_weight.device_ptr(&self.stream);
             let (d_base, _gd) = d.device_ptr_mut(&self.stream);
             let d_ptr = d_base + row_start * n * 2;
-            let (ws_ptr, _gw) = self.workspace.device_ptr_mut(&self.stream);
+            let shared = self.workspace_override.clone();
+            let mut guard = shared
+                .as_ref()
+                .map(|w| {
+                    w.lock()
+                        .map_err(|e| anyhow::anyhow!("FP8 stream workspace poisoned: {e}"))
+                })
+                .transpose()?;
+            let workspace = guard.as_deref_mut().unwrap_or(&mut self.workspace);
+            let (ws_ptr, _gw) = workspace.device_ptr_mut(&self.stream);
 
             let rc = cublaslt::matmul(
                 handle,
@@ -672,6 +748,76 @@ mod cuda {
         match v {
             Fp8Variant::E4M3 => sys::cudaDataType_t::CUDA_R_8F_E4M3,
             Fp8Variant::E5M2 => sys::cudaDataType_t::CUDA_R_8F_E5M2,
+        }
+    }
+
+    #[cfg(test)]
+    mod caller_stream_tests {
+        use super::*;
+
+        #[test]
+        #[ignore = "real CUDA allocation/capture lifecycle; set NV_FP8_STREAM_TEST=1"]
+        fn caller_stream_scope_restores_on_error_and_unwind_and_refuses_cold_capture() {
+            assert_eq!(
+                std::env::var("NV_FP8_STREAM_TEST").as_deref(),
+                Ok("1"),
+                "this gate must not silently skip"
+            );
+            let ctx = cudarc::driver::CudaContext::new(0).expect("real CUDA context required");
+            unsafe { ctx.disable_event_tracking() };
+            let original = ctx.new_stream().unwrap();
+            let other = ctx.new_stream().unwrap();
+            let cold = ctx.new_stream().unwrap();
+            let mut runner = Fp8GemmRunner::new(original.clone()).unwrap();
+            let before = runner.workspace.device_ptr(&original).0;
+            let failure: Result<()> = runner.with_stream(&other, |r| {
+                assert_eq!(r.stream.cu_stream(), other.cu_stream());
+                assert!(r.workspace_override.is_some());
+                r.with_stream(&original, |nested| {
+                    assert_eq!(nested.stream.cu_stream(), original.cu_stream());
+                    assert!(nested.workspace_override.is_none());
+                    Ok(())
+                })?;
+                assert_eq!(r.stream.cu_stream(), other.cu_stream());
+                anyhow::bail!("planned caller error")
+            });
+            assert!(failure
+                .unwrap_err()
+                .to_string()
+                .contains("planned caller error"));
+            assert_eq!(runner.stream.cu_stream(), original.cu_stream());
+            assert!(runner.workspace_override.is_none());
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: Result<()> = runner.with_stream(&other, |_| panic!("planned unwind"));
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(runner.stream.cu_stream(), original.cu_stream());
+            assert!(runner.workspace_override.is_none());
+            assert_eq!(runner.workspace.device_ptr(&original).0, before);
+            let different_owner = cudarc::driver::CudaContext::new(0).unwrap();
+            assert!(runner
+                .with_stream(&different_owner.default_stream(), |_| Ok(()))
+                .is_err());
+            let mut graph = nv_kernels::graph::CudaGraphRunner::new(cold.clone());
+            let mut closure_entered = false;
+            let refused = graph.run(1, |s| {
+                runner.with_stream(s, |_| {
+                    closure_entered = true;
+                    Ok(())
+                })
+            });
+            assert!(
+                refused.is_err(),
+                "cold capture must not allocate a stream workspace"
+            );
+            assert!(!closure_entered);
+            assert!(!graph.has_cached());
+            assert_eq!(runner.stream.cu_stream(), original.cu_stream());
+            runner.with_stream(&cold, |_| Ok(())).unwrap();
+            for stream in [&original, &other, &cold] {
+                stream.synchronize().unwrap();
+                crate::release_stream_resources(crate::stream_cache_key(stream));
+            }
         }
     }
 }
@@ -986,7 +1132,8 @@ mod tests {
                 0
             };
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "encode_ue4m3_dev({p:e}) = {got:#04x} ({:e}); the nearest e4m3fn code is \
                  {want:#04x} ({:e})",
                 decode_ue4m3_dev(got),

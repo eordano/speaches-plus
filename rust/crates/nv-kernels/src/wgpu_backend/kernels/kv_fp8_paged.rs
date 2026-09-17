@@ -1,11 +1,13 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dequant::bytes_to_words;
-use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
+use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::kv_fp8::{decode_e4m3, encode_e4m3, FP8_E4M3_MAX};
+use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
+use crate::wgpu_backend::pack::{
+    pack_u16_even_min_one_word as pack_bf16, unpack_u16_pairs_clamped as unpack_bf16,
+};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_even_min_one_word as pack_bf16, unpack_u16_pairs_clamped as unpack_bf16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/kv_fp8_paged.wgsl");
 

@@ -8,7 +8,7 @@ mv`-ed one level up; no build change is required.
 Port-wide context -- strategy, wavefront-64 audit, C ABI coverage,
 NVFP4-vs-MXFP4 decision, per-arch matrix-core dispatch -- lives in
 `docs/book/05.5-rocm-port-status.md` (below: "05.5"). This note keeps
-only what is specific to porting group **G5**, its five sources:
+only what is specific to porting group **G5**, its four sources:
 
 | CUDA source | state | file here |
 | --- | --- | --- |
@@ -16,7 +16,6 @@ only what is specific to porting group **G5**, its five sources:
 | `cuda/cutlass_probe.cu` | **ported, compiles, promotable** | `cutlass_probe.hip.cpp` |
 | `cuda_sm120/moe_grouped_fp4_gemm.cu` | rewrite required; ABI stub + preserved layout kernel | `moe_grouped_fp4_gemm.hip.cpp` |
 | `cuda_sm120/cutlass_fp4_gemm.cu` | rewrite required; ABI stub + NVFP4 decode prologue | `cutlass_fp4_gemm.hip.cpp` |
-| `cuda_sm120/gemv_blockscaled_probe.cu` | **delete under `rocm`** -- see §4 | none |
 
 Verification performed (ROCm 7.2.3 / LLVM 22.0.0 from the nix store,
 no `/opt/rocm`, no ROCm-capable dGPU on this machine):
@@ -158,7 +157,7 @@ build, the natural repurposing is hipblaslt's or Composable Kernel's
 version -- but both are unrealised `.drv`s in this store (05.5 §6), so
 that is a flake change, not a code change.
 
-## 4. The three `cuda_sm120` files are rewrites, not ports
+## 4. The CUTLASS `cuda_sm120` files are rewrites, not ports
 
 Running `hipify-perl` on them is worse than useless, and the output is
 deliberately **not** checked in. Measured on this tree:
@@ -174,8 +173,6 @@ deliberately **not** checked in. Measured on this tree:
   does not exist on AMD, while the macro, the
   `flashinfer/gemm/fp4_gemm_template_sm120.h` include and every
   `cute::Int<>` tile parameter stay NVIDIA-only.
-- `gemv_blockscaled_probe.cu` -- **zero-line diff**; its entire
-  content is CUTLASS type aliases.
 
 CUTLASS has no AMD backend. The analogues are Composable Kernel
 (tile-level, closest structural match to CUTLASS collectives) and
@@ -228,21 +225,6 @@ Two changes were required:
 contract still holds. It also carries a working
 `nvfp4_decode_to_bf16_prologue` kernel (§5), the piece the real
 implementation will reuse.
-
-### `gemv_blockscaled_probe.cu` should be deleted under `rocm`
-
-Its only symbol appears exactly once in the tree, at its own
-definition; it is absent from `include/nv_kernels.h`, so no Rust
-caller can exist (05.5 §2.1). Its body is a link-time canary for
-`cutlass::gemm::device::GemvBlockScaled`, which has no AMD analogue.
-No file is provided; the `rocm` build should simply lack the symbol.
-If a build-time canary for AMD matrix cores is wanted instead, the
-per-arch MFMA/WMMA builtin dispatch verified to compile with this
-toolchain -- including the two traps (the RDNA WMMA builtin bakes the
-wavefront width into its name, and the accumulator fragment is `f32x8`
-on wave32 vs `f32x4` on wave64) and the rocWMMA recommendation -- is
-recorded in 05.5 §8.2. gfx1036 (RDNA2) has *neither* MFMA nor WMMA
-and needs a scalar `#else` fallback, not an `#error`.
 
 ## 5. NVFP4 on AMD
 

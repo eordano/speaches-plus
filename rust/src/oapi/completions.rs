@@ -274,7 +274,7 @@ async fn completions_impl(state: ChatAppState, req: CompletionRequest) -> Respon
     let _ = &req.stop_token_ids;
     stop.retain(|s| !s.is_empty());
 
-    let max_new_tokens = crate::oapi::chat::resolve_max_new_tokens(
+    let max_new_tokens = crate::oapi::generation_limits::resolve_max_new_tokens(
         req.max_tokens,
         crate::oapi::chat::default_max_tokens(),
         crate::oapi::chat::max_max_tokens(),

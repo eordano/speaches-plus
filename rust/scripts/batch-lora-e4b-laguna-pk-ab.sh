@@ -31,7 +31,10 @@ GATE_LOG="$LOG_DIR/lora-pk-ab-$STAMP-gates.log"
 NVK_LANE="$LANE" NVK_PKG=nv-models NVK_FEATURES=cuda,wgpu,laguna-wip \
   "$REPO/scripts/nvk.sh" test --no-fail-fast \
   --test lora_e4b_wgpu --test lora_laguna_wgpu --test lora_q3d_wgpu -- --test-threads=1 \
-  >"$GATE_LOG" 2>&1 || { tail -40 "$GATE_LOG"; exit 3; }
+  >"$GATE_LOG" 2>&1 || {
+  tail -40 "$GATE_LOG"
+  exit 3
+}
 grep -E "test result" "$GATE_LOG"
 
 PERF_FAIL=0

@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <limits.h>
 #include <math.h>
 
 #include "nv_kernels.h"
@@ -58,26 +59,35 @@ __device__ __forceinline__ float decode_ue4m3_dev(uint8_t b) {
     return (1.f + mant / 8.f) * exp2f((float)(biased - 7));
 }
 
-__device__ __forceinline__ int swizzled_scale_dst(int m, int kb, int k_blocks) {
+__device__ __forceinline__ int swizzled_scale_dst_blk(int m, int kb, int k_blocks,
+                                                      int blk_rows) {
     int k_tiles = (k_blocks + 3) / 4;
-    int m_tile = m / 128;
-    int d2 = (m / 32) & 3;
+    int sub = blk_rows / 32;
+    int m_tile = m / blk_rows;
+    int d2 = (m / 32) % sub;
     int d3 = m & 31;
     int k_tile = kb / 4;
     int d5 = kb & 3;
-    return ((m_tile * k_tiles + k_tile) * 32 + d3) * 16 + d2 * 4 + d5;
+    return ((m_tile * k_tiles + k_tile) * 32 + d3) * (sub * 4) + d2 * 4 + d5;
+}
+
+__device__ __forceinline__ int swizzled_scale_dst(int m, int kb, int k_blocks) {
+    return swizzled_scale_dst_blk(m, kb, k_blocks, 128);
 }
 
 }
 
+template <bool SiluCandle>
 __global__ void quantize_nvfp4_bf16_kernel(
     const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ up,
     uint8_t* __restrict__ packed_out,
     uint8_t* __restrict__ scales_out,
     float stored_global,
     int m_padded,
     int m_logical,
-    int K
+    int K,
+    int sf_blk_rows
 ) {
     int row = blockIdx.x;
     if (row >= m_padded) return;
@@ -93,7 +103,15 @@ __global__ void quantize_nvfp4_bf16_kernel(
         float amax = 0.f;
         #pragma unroll
         for (int i = 0; i < 16; ++i) {
-            float v = row_in_range ? __bfloat162float(xrow[kb * 16 + i]) : 0.f;
+            float v = 0.f;
+            if (row_in_range) {
+                __nv_bfloat16 value = xrow[kb * 16 + i];
+                if constexpr (SiluCandle) {
+                    __nv_bfloat16 s = value / (static_cast<__nv_bfloat16>(1) + hexp(-value));
+                    value = s * up[(size_t)row * K + kb * 16 + i];
+                }
+                v = __bfloat162float(value);
+            }
             vals[i] = v;
             float av = fabsf(v);
             if (av > amax) amax = av;
@@ -114,7 +132,7 @@ __global__ void quantize_nvfp4_bf16_kernel(
             pblock[i] = (uint8_t)((hi << 4) | (lo & 0x0F));
         }
 
-        int dst = swizzled_scale_dst(row, kb, blocks_per_row);
+        int dst = swizzled_scale_dst_blk(row, kb, blocks_per_row, sf_blk_rows);
         scales_out[dst] = scale_byte;
     }
 }
@@ -338,12 +356,12 @@ extern "C" int nv_kernels_quantize_nvfp4_bf16_rows(
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     dim3 grid(m_rows);
     dim3 block(256);
-    quantize_nvfp4_bf16_kernel<<<grid, block, 0, s>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+    quantize_nvfp4_bf16_kernel<false><<<grid, block, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), nullptr,
         packed_out,
         scales_out_swizzled,
         stored_global,
-        m_rows, m_rows, K
+        m_rows, m_rows, K, 128
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
@@ -365,13 +383,67 @@ extern "C" int nv_kernels_quantize_nvfp4_bf16(
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     dim3 grid(m_padded);
     dim3 block(256);
-    quantize_nvfp4_bf16_kernel<<<grid, block, 0, s>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+    quantize_nvfp4_bf16_kernel<false><<<grid, block, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), nullptr,
         packed_out,
         scales_out_swizzled,
         stored_global,
-        m_padded, m_logical, K
+        m_padded, m_logical, K, 128
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+extern "C" int nv_kernels_quantize_nvfp4_bf16_sf96(
+    void* stream,
+    const uint16_t* x_bf16,
+    uint8_t* packed_out,
+    uint8_t* scales_out_swizzled,
+    float stored_global,
+    int m_logical,
+    int K
+) {
+    if (m_logical <= 0 || K <= 0) return 0;
+    if ((K % 16) != 0) return -1;
+    int m_padded = ((m_logical + 95) / 96) * 96;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    dim3 grid(m_padded);
+    dim3 block(256);
+    quantize_nvfp4_bf16_kernel<false><<<grid, block, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16), nullptr,
+        packed_out,
+        scales_out_swizzled,
+        stored_global,
+        m_padded, m_logical, K, 96
+    );
+    cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+extern "C" int nv_kernels_quantize_nvfp4_silu_candle_bf16(
+    void* stream,
+    const uint16_t* gate,
+    const uint16_t* up,
+    uint8_t* packed_out,
+    uint8_t* scales_out,
+    float stored_global,
+    int m_padded,
+    int m_logical,
+    int K,
+    int sf_blk_rows
+) {
+    if (m_padded <= 0 || K <= 0) return 0;
+    if (m_logical < 0 || m_logical > m_padded) return -2;
+    if ((K % 16) != 0) return -1;
+    if (sf_blk_rows != 96 && sf_blk_rows != 128) return -3;
+    int64_t scale_elements = ((int64_t)m_padded + sf_blk_rows - 1) / sf_blk_rows
+        * sf_blk_rows * (((int64_t)K / 16 + 3) / 4) * 4;
+    if (scale_elements > INT_MAX) return -5;
+    if (!stream || !gate || !up || !packed_out || !scales_out) return -4;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    quantize_nvfp4_bf16_kernel<true><<<m_padded, 256, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(gate),
+        reinterpret_cast<const __nv_bfloat16*>(up),
+        packed_out, scales_out, stored_global, m_padded, m_logical, K, sf_blk_rows);
+    return (int)cudaGetLastError();
 }

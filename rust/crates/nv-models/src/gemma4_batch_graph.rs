@@ -327,7 +327,7 @@ mod graphed {
                 .map_err(|e| anyhow!(e))?;
             let rows_host =
                 CachedPinnedHostStaging::alloc_cu_mem_host_alloc_flags0_cached_page_locked(
-                    &capture_stream.context(),
+                    capture_stream.context(),
                     b_max * vocab,
                 )?;
             capture_stream.synchronize().map_err(|e| anyhow!(e))?;
@@ -474,7 +474,7 @@ mod graphed {
             let stream = self.capture.stream().clone();
             if self.argmax_exit.is_none() {
                 self.argmax_exit = Some(DeviceArgmaxTokenExit::alloc_scratch_and_sync_rows(
-                    &stream.context(),
+                    stream.context(),
                     &stream,
                     self.plan.max_bucket(),
                     self.vocab,
@@ -628,7 +628,7 @@ mod graphed {
             let td = super::graph_teardown::GraphTeardown::for_capture(&self.capture);
             let runners = &mut self.runners;
             td.run(|| {
-                for (_, r) in runners.iter_mut() {
+                for r in runners.values_mut() {
                     r.invalidate();
                 }
             });
@@ -761,7 +761,7 @@ mod graphed {
         if crate::hadamard_kv::hadamard_kv_enabled() {
             return Ok(None);
         }
-        if hd % 2 != 0 || hd > 4096 || rope.config().head_dim != hd {
+        if !hd.is_multiple_of(2) || hd > 4096 || rope.config().head_dim != hd {
             return Ok(None);
         }
         let eps = attn.q_norm.eps();

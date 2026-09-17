@@ -94,7 +94,7 @@ EAGLE3 = {"repo": "models--RedHatAI--gemma-4-31B-it-speculator.eagle3"}
 
 AUX_SAFETENSORS = {
     "qwen3-embedding-0.6b": "models--Qwen--Qwen3-Embedding-0.6B",
-    "qwen3-tts-0.6b": "models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "qwen3-tts-0.6b": "models--Qwen--Qwen3-TTS-12Hz-0.6B-Base",
     "dots-ocr": "models--rednote-hilab--dots.ocr",
     "deepseek-ocr-2": "models--deepseek-ai--DeepSeek-OCR-2",
 }

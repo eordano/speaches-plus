@@ -76,7 +76,8 @@ fn cache() -> &'static Mutex<Vec<CacheRow>> {
 }
 
 fn build(ctx: &WgpuContext) -> Result<Arc<CausalSteelPipelines>> {
-    let _ = PREFILL_STEEL_IS_THE_VISION_KERNEL_WITH_DO_CAUSAL_TRUE_AND_QL_OFF_CARRYING_THE_CHUNK_BASE;
+    let _ =
+        PREFILL_STEEL_IS_THE_VISION_KERNEL_WITH_DO_CAUSAL_TRUE_AND_QL_OFF_CARRYING_THE_CHUNK_BASE;
     let src: &'static str = Box::leak(causal_source().into_boxed_str());
     let module = na::msl_module(ctx, "dg-steel-causal", &[(CAUSAL_ENTRY, (128, 1, 1))], src)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -104,16 +105,17 @@ fn build(ctx: &WgpuContext) -> Result<Arc<CausalSteelPipelines>> {
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
-    let pipeline = Arc::new(ctx.device.create_compute_pipeline(
-        &wgpu::ComputePipelineDescriptor {
-            label: Some(CAUSAL_ENTRY),
-            layout: Some(&layout),
-            module: &module,
-            entry_point: Some(CAUSAL_ENTRY),
-            compilation_options: Default::default(),
-            cache: None,
-        },
-    ));
+    let pipeline = Arc::new(
+        ctx.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(CAUSAL_ENTRY),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some(CAUSAL_ENTRY),
+                compilation_options: Default::default(),
+                cache: None,
+            }),
+    );
     if let Some(err) = pollster::block_on(scope.pop()) {
         anyhow::bail!("dg-steel-causal pipeline: {err}");
     }

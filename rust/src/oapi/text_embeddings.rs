@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::oapi;
 use crate::oapi::deadline;
+use crate::oapi::cold_tier::ColdSlot;
 use crate::oapi::gate::SurfaceGate;
 
 #[derive(Debug, Deserialize)]
@@ -216,7 +217,8 @@ mod backend {
     }
 }
 
-static EMBEDDER: OnceLock<Option<Arc<backend::QwenEmbedder>>> = OnceLock::new();
+static EMBEDDER: OnceLock<Option<Arc<ColdSlot<backend::QwenEmbedder>>>> = OnceLock::new();
+const MIB: u64 = 1024 * 1024;
 static EMBED_GATE: OnceLock<SurfaceGate> = OnceLock::new();
 
 fn new_embed_gate() -> SurfaceGate {
@@ -239,23 +241,37 @@ fn embedding_dir_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn get_embedder() -> Option<Arc<backend::QwenEmbedder>> {
+fn load_embedder_from_env() -> Option<Arc<backend::QwenEmbedder>> {
+    let dir = embedding_dir_from_env()?;
+    match backend::QwenEmbedder::load(&dir) {
+        Ok(e) => Some(Arc::new(e)),
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                path = %dir.display(),
+                "text embedding model load failed"
+            );
+            None
+        }
+    }
+}
+
+fn embedder_slot() -> Option<Arc<ColdSlot<backend::QwenEmbedder>>> {
     EMBEDDER
         .get_or_init(|| {
-            let dir = embedding_dir_from_env()?;
-            match backend::QwenEmbedder::load(&dir) {
-                Ok(e) => Some(Arc::new(e)),
-                Err(err) => {
-                    tracing::warn!(
-                        error = %format!("{err:#}"),
-                        path = %dir.display(),
-                        "text embedding model load failed"
-                    );
-                    None
-                }
-            }
+            embedding_dir_from_env()?;
+            Some(ColdSlot::demand(
+                "text-embedding",
+                oapi::vram_plan::AUX_EMBEDDING_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS
+                    * MIB,
+                Arc::new(load_embedder_from_env),
+            ))
         })
         .clone()
+}
+
+async fn get_embedder() -> Option<Arc<backend::QwenEmbedder>> {
+    embedder_slot()?.get().await
 }
 
 pub fn embedding_model_id() -> Option<String> {
@@ -263,16 +279,24 @@ pub fn embedding_model_id() -> Option<String> {
     Some(oapi::model_ids::model_id_for_dir(&dir))
 }
 
-pub fn loaded_embedding_model_id() -> Option<String> {
-    match EMBEDDER.get() {
-        Some(Some(_)) => embedding_model_id(),
-        _ => None,
+pub fn served_embedding_model_id() -> Option<String> {
+    let slot = embedder_slot()?;
+    if slot.load_failed() {
+        return None;
     }
+    embedding_model_id()
 }
 
-pub fn warm_embedder_at_boot() -> Option<String> {
-    embedding_dir_from_env()?;
-    match get_embedder() {
+pub async fn warm_embedder_at_boot() -> Option<String> {
+    let slot = embedder_slot()?;
+    if !oapi::cold_tier::preload_requested() {
+        tracing::info!(
+            model = %embedding_model_id().unwrap_or_default(),
+            "text embedding model is cold-tier: it loads on the first /v1/embeddings request"
+        );
+        return embedding_model_id();
+    }
+    match slot.get().await {
         Some(embedder) => {
             let started = std::time::Instant::now();
             match embedder.embed("warmup") {
@@ -367,10 +391,10 @@ pub async fn text_embeddings_post_with_headers(
         );
     }
 
-    let Some(embedder) = get_embedder() else {
+    let Some(embedder) = get_embedder().await else {
         return oapi::openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "text embedding model not loaded; set NV_EMBEDDING_MODEL_DIR",
+            "text embedding model not loaded; set NV_EMBEDDING_MODEL_DIR, or its load failed (see the server log)",
             oapi::kind::SERVICE_UNAVAIL,
             None,
             Some("model_not_loaded"),
@@ -506,7 +530,11 @@ mod tests {
         let t = std::time::Instant::now();
         for text in texts {
             let (v, seq) = embedder.embed(text).expect("embed real text");
-            assert_eq!(v.len(), QWEN3_EMBEDDING_0_6B_HIDDEN_SIZE, "wrong vector dim");
+            assert_eq!(
+                v.len(),
+                QWEN3_EMBEDDING_0_6B_HIDDEN_SIZE,
+                "wrong vector dim"
+            );
             assert!(v.iter().all(|x| x.is_finite()), "vector has NaN or inf");
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!(

@@ -9,7 +9,7 @@ pub const G4MOE_SERVE_QAT_Q4_OPT_IN_ENV: &str = "NV_G4MOE_SERVE_QAT_Q4";
 pub const QAT_Q4_GGUF_STAYS_OPT_IN_TOP1_ACC_0_4531_VS_BF16_0_5254_SAME_SESSION: &str =
     "the qat q4 gguf weights arm scored top-1 acc 0.4531 / ppl 32.344 against the same-session \
      bf16 arm's 0.5254 / 31.900 on g4moe_chat_wrapped_continuation_teacher_forced_ppl_via_wgpu_serving_decode \
-     (perf/runs.jsonl rows pr-20260820-110824-17060-0 vs pr-20260820-104659-4092313-0); accuracy \
+     (private run ledger); accuracy \
      fell out of the recorded 0.5195-0.5254 band, so this weights source must never become the \
      silent default -- the suspected mechanism is double quantization, Q4_K dequant then the \
      wgpu w4 gs=32 requant";
@@ -106,13 +106,21 @@ pub fn verify_qat_q4_gguf_serves_this_snapshot(
         }
         Ok(())
     };
-    same("hidden_size", gc.base.hidden_size, snapshot_cfg.base.hidden_size)?;
+    same(
+        "hidden_size",
+        gc.base.hidden_size,
+        snapshot_cfg.base.hidden_size,
+    )?;
     same(
         "num_hidden_layers",
         gc.base.num_hidden_layers,
         snapshot_cfg.base.num_hidden_layers,
     )?;
-    same("vocab_size", gc.base.vocab_size, snapshot_cfg.base.vocab_size)?;
+    same(
+        "vocab_size",
+        gc.base.vocab_size,
+        snapshot_cfg.base.vocab_size,
+    )?;
     same("num_experts", gc.num_experts, snapshot_cfg.num_experts)?;
     same(
         "moe_intermediate_size",

@@ -121,7 +121,8 @@ pub const CLOSED_FORM_SCALE_STEPS_BELOW_NEAREST_BECAUSE_CLIPPING_THE_BLOCK_AMAX_
 
 pub const CLOSED_FORM_SCALE_STEPS_ABOVE_NEAREST_BECAUSE_E2M1_STEPS_BY_HALF_BELOW_TWO_AND_BY_TWO_ABOVE_FOUR_SO_PARKING_THE_BLOCK_AMAX_ON_SIX_IS_THE_WORST_PLACE_FOR_IT: i32 = 10;
 
-pub const UE4M3_DECODE_IS_MONOTONIC_IN_THE_BYTE_SO_ONE_GRID_STEP_IS_PLUS_ONE_BYTE: (u8, u8) = (1, 0x7E);
+pub const UE4M3_DECODE_IS_MONOTONIC_IN_THE_BYTE_SO_ONE_GRID_STEP_IS_PLUS_ONE_BYTE: (u8, u8) =
+    (1, 0x7E);
 
 fn stored_global_or_one(stored_global: f32) -> f32 {
     if stored_global == 0.0 || !stored_global.is_finite() {
@@ -134,7 +135,11 @@ fn stored_global_or_one(stored_global: f32) -> f32 {
 pub fn block_reconstruction_sq_error(values: &[f32], scale_byte: u8, stored_global: f32) -> f64 {
     let stored = stored_global_or_one(stored_global);
     let decoded = decode_ue4m3(scale_byte);
-    let inv = if decoded == 0.0 { 1.0 } else { stored / decoded };
+    let inv = if decoded == 0.0 {
+        1.0
+    } else {
+        stored / decoded
+    };
     let back = decoded / stored;
     values
         .iter()
@@ -154,7 +159,8 @@ pub fn closed_form_scale_byte(values: &[f32], stored_global: f32) -> u8 {
     if amax == 0.0 {
         return nearest as u8;
     }
-    let (lo_byte, hi_byte) = UE4M3_DECODE_IS_MONOTONIC_IN_THE_BYTE_SO_ONE_GRID_STEP_IS_PLUS_ONE_BYTE;
+    let (lo_byte, hi_byte) =
+        UE4M3_DECODE_IS_MONOTONIC_IN_THE_BYTE_SO_ONE_GRID_STEP_IS_PLUS_ONE_BYTE;
     let mut best = nearest.clamp(lo_byte as i32, hi_byte as i32) as u8;
     let mut best_err = f64::INFINITY;
     for step in -CLOSED_FORM_SCALE_STEPS_BELOW_NEAREST_BECAUSE_CLIPPING_THE_BLOCK_AMAX_BUYS_INTERIOR_RESOLUTION
@@ -170,10 +176,7 @@ pub fn closed_form_scale_byte(values: &[f32], stored_global: f32) -> u8 {
     best
 }
 
-pub fn quantize_block_with_global_closed_form(
-    values: &[f32],
-    stored_global: f32,
-) -> (Vec<u8>, u8) {
+pub fn quantize_block_with_global_closed_form(values: &[f32], stored_global: f32) -> (Vec<u8>, u8) {
     assert_eq!(values.len(), BLOCK_SIZE);
     let stored = stored_global_or_one(stored_global);
     let scale_byte = closed_form_scale_byte(values, stored);
@@ -311,6 +314,60 @@ impl Nvfp4Tensor {
     }
 }
 
+pub fn diagfold_from(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+pub const DIAGFOLD_EXPONENTS_ARE_WHOLE_POWERS_OF_TWO_BECAUSE_POW2_SCALING_LEAVES_EVERY_BF16_AND_F32_MANTISSA_UNTOUCHED_SO_THE_COMPOSED_UNQUANTIZED_NETWORK_IS_BIT_IDENTICAL: () = ();
+
+pub const DIAGFOLD_EXP_CLAMP_BOUNDS_THE_COMPENSATED_SIDES_SCALE_SHIFT_AWAY_FROM_UE4M3_SUBNORMALS_AND_THE_448_CEILING: i32 = 3;
+
+pub fn diagfold_pow2_exponents_equalizing_column_amax(rows: &[Vec<f32>], clamp: i32) -> Vec<i32> {
+    let cols = rows[0].len();
+    let mut amax = vec![0f32; cols];
+    for row in rows {
+        assert_eq!(row.len(), cols, "diagfold: ragged rows");
+        for (a, v) in amax.iter_mut().zip(row.iter()) {
+            *a = a.max(v.abs());
+        }
+    }
+    let (sum, n) = amax
+        .iter()
+        .filter(|a| **a > 0.0)
+        .fold((0f64, 0usize), |(s, c), a| (s + a.log2() as f64, c + 1));
+    if n == 0 {
+        return vec![0; cols];
+    }
+    let target = sum / n as f64;
+    amax.iter()
+        .map(|a| {
+            if *a > 0.0 {
+                ((target - a.log2() as f64).round() as i32).clamp(-clamp, clamp)
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+pub fn diagfold_scale_cols_pow2(rows: &mut [Vec<f32>], exps: &[i32]) {
+    for row in rows {
+        for (v, e) in row.iter_mut().zip(exps.iter()) {
+            *v *= (2f32).powi(*e);
+        }
+    }
+}
+
+pub fn diagfold_scale_rows_pow2_negated(rows: &mut [Vec<f32>], exps: &[i32]) {
+    assert_eq!(rows.len(), exps.len(), "diagfold: one exponent per row");
+    for (row, e) in rows.iter_mut().zip(exps.iter()) {
+        let s = (2f32).powi(-*e);
+        for v in row.iter_mut() {
+            *v *= s;
+        }
+    }
+}
+
 pub fn skinny_lt_from(raw: Option<&str>) -> bool {
     raw != Some("0")
 }
@@ -419,7 +476,7 @@ mod cuda {
     use cudarc::driver::sys::CUdeviceptr;
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use half::bf16;
-    use std::collections::HashMap;
+    use std::collections::{hash_map::Entry, HashMap};
     use std::ffi::c_void;
     use std::mem;
     use std::sync::Arc;
@@ -490,7 +547,9 @@ mod cuda {
         workspace_handle(stream).map(|_| ())
     }
 
-    fn workspace_handle(stream: &Arc<CudaStream>) -> Result<Arc<std::sync::Mutex<CudaSlice<u8>>>> {
+    pub(crate) fn workspace_handle(
+        stream: &Arc<CudaStream>,
+    ) -> Result<Arc<std::sync::Mutex<CudaSlice<u8>>>> {
         let key = crate::stream_cache_key(stream);
         let mut map = workspace_map()
             .lock()
@@ -546,7 +605,7 @@ mod cuda {
 
     fn v192_12warp_cta_env_opt_in_never_default_until_certified() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("NV_NVFP4_V192").map_or(false, |v| v == "1"))
+        *ON.get_or_init(|| std::env::var("NV_NVFP4_V192").is_ok_and(|v| v == "1"))
     }
 
     fn streamk_k256_enabled() -> bool {
@@ -575,7 +634,7 @@ mod cuda {
 
     fn lt_algo_log() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("NV_NVFP4_LT_ALGO_LOG").map_or(false, |v| v != "0"))
+        *ON.get_or_init(|| std::env::var("NV_NVFP4_LT_ALGO_LOG").is_ok_and(|v| v != "0"))
     }
 
     pub(crate) unsafe fn algo_config_summary(algo: &sys::cublasLtMatmulAlgo_t) -> String {
@@ -646,9 +705,9 @@ mod cuda {
         }
 
         fn cutlass_supports_shape(m: u64, n: u64, k: u64) -> bool {
-            (m <= CUTLASS_SM120_TILE_M || m % CUTLASS_SM120_TILE_M == 0)
-                && n % CUTLASS_SM120_TILE_N == 0
-                && k % CUTLASS_SM120_TILE_K == 0
+            (m <= CUTLASS_SM120_TILE_M || m.is_multiple_of(CUTLASS_SM120_TILE_M))
+                && n.is_multiple_of(CUTLASS_SM120_TILE_N)
+                && k.is_multiple_of(CUTLASS_SM120_TILE_K)
         }
 
         pub fn supports_true_m(&self, m: u64, n: u64, k: u64) -> bool {
@@ -668,7 +727,7 @@ mod cuda {
             alpha_dev: &CudaSlice<f32>,
             alpha_host: f32,
         ) -> Result<()> {
-            if k % BLOCK_SIZE as u64 != 0 {
+            if !k.is_multiple_of(BLOCK_SIZE as u64) {
                 anyhow::bail!("k={k} must be a multiple of {BLOCK_SIZE}");
             }
             let min = MIN_TILE as u64;
@@ -732,7 +791,8 @@ mod cuda {
             }
         }
 
-        pub const LT_NARROW_M_FLOOR_SET_BY_FP4_LT_B_DIM_GRANULARITY_SCALES_STILL_PAD_ROWS_TO_128: u64 = 16;
+        pub const LT_NARROW_M_FLOOR_SET_BY_FP4_LT_B_DIM_GRANULARITY_SCALES_STILL_PAD_ROWS_TO_128:
+            u64 = 16;
 
         pub fn matmul_scaled_lt_narrow_m(
             &mut self,
@@ -746,11 +806,11 @@ mod cuda {
             k: u64,
             alpha_host: f32,
         ) -> Result<()> {
-            if k % BLOCK_SIZE as u64 != 0 {
+            if !k.is_multiple_of(BLOCK_SIZE as u64) {
                 anyhow::bail!("k={k} must be a multiple of {BLOCK_SIZE}");
             }
             let floor = Self::LT_NARROW_M_FLOOR_SET_BY_FP4_LT_B_DIM_GRANULARITY_SCALES_STILL_PAD_ROWS_TO_128;
-            if m < floor || m % floor != 0 || n < MIN_TILE as u64 || k < MIN_TILE as u64 {
+            if m < floor || !m.is_multiple_of(floor) || n < MIN_TILE as u64 || k < MIN_TILE as u64 {
                 anyhow::bail!(
                     "NVFP4 LT narrow-m route requires m a multiple of {floor} and n,k >= \
                      {MIN_TILE}; got m={m} n={n} k={k}"
@@ -894,7 +954,7 @@ mod cuda {
                 workspace_bytes,
             )
         } else if stream_k {
-            if k % 256 == 0 && streamk_k256_enabled() {
+            if k.is_multiple_of(256) && streamk_k256_enabled() {
                 nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
                     stream_raw,
                     a_ptr as *const c_void,
@@ -927,7 +987,9 @@ mod cuda {
                     workspace_bytes,
                 )
             }
-        } else if k % 128 == 0 && v192_12warp_cta_env_opt_in_never_default_until_certified() {
+        } else if k.is_multiple_of(128)
+            && v192_12warp_cta_env_opt_in_never_default_until_certified()
+        {
             nv_kernels::cuda::nvfp4_gemm_sm120_v192_bf16(
                 stream_raw,
                 a_ptr as *const c_void,
@@ -941,7 +1003,7 @@ mod cuda {
                 k as i32,
             )
             .map(|()| 0usize)
-        } else if k % 256 == 0 && k256_enabled() {
+        } else if k.is_multiple_of(256) && k256_enabled() {
             nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
                 stream_raw,
                 a_ptr as *const c_void,
@@ -1009,7 +1071,7 @@ mod cuda {
                 a_scale_ptr: a_scale_ptr_val,
             };
 
-            if !self.desc_cache.contains_key(&key) {
+            if let Entry::Vacant(entry) = self.desc_cache.entry(key) {
                 let dtype_fp4 = sys::cudaDataType_t::CUDA_R_4F_E2M1;
                 let dtype_bf16 = sys::cudaDataType_t::CUDA_R_16BF;
                 let compute = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
@@ -1133,16 +1195,13 @@ mod cuda {
                 };
                 cublaslt::destroy_matmul_pref(pref)?;
 
-                self.desc_cache.insert(
-                    key,
-                    CachedDesc {
-                        desc,
-                        a_layout,
-                        b_layout,
-                        d_layout,
-                        algo,
-                    },
-                );
+                entry.insert(CachedDesc {
+                    desc,
+                    a_layout,
+                    b_layout,
+                    d_layout,
+                    algo,
+                });
             }
 
             let cached = self.desc_cache.get(&key).expect("just inserted");
@@ -1399,18 +1458,6 @@ mod ue4m3_tests {
 mod paper_validation {
 
     use super::*;
-
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-
-    fn spec_e4m3_decode(byte: u8) -> f32 {
-        let exp = ((byte >> 3) & 0x0F) as i32;
-        let mant = (byte & 0x07) as f32;
-        if exp == 0 {
-            (mant / 8.0) * (2f32).powi(-6)
-        } else {
-            (1.0 + mant / 8.0) * (2f32).powi(exp - 7)
-        }
-    }
 
     #[test]
     fn e2m1_codebook_is_the_nvfp4_value_set_and_roundtrips() {

@@ -1,10 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dequant::bytes_to_words;
+use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
+use crate::wgpu_backend::pack::{
+    pack_u16_even_min_one_word as pack_bf16, unpack_u16_pairs_clamped as unpack_bf16,
+};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_even_min_one_word as pack_bf16, unpack_u16_pairs_clamped as unpack_bf16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/kv_fp8.wgsl");
 
@@ -23,10 +25,11 @@ pub fn e4m3_encode_helpers_sliced_verbatim_from_wgsl_so_the_rn_division_and_roun
     let const_start = WGSL
         .find("const KV_FP8_E4M3_MAX")
         .expect("kv_fp8.wgsl lost const KV_FP8_E4M3_MAX");
-    let const_line = &WGSL[const_start..const_start
-        + WGSL[const_start..]
-            .find('\n')
-            .expect("kv_fp8.wgsl const KV_FP8_E4M3_MAX line unterminated")];
+    let const_line = &WGSL[const_start
+        ..const_start
+            + WGSL[const_start..]
+                .find('\n')
+                .expect("kv_fp8.wgsl const KV_FP8_E4M3_MAX line unterminated")];
     let div_start = WGSL
         .find("fn kv_div_rn")
         .expect("kv_fp8.wgsl lost fn kv_div_rn");

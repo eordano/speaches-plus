@@ -33,8 +33,8 @@ mode is gated on `--target <url>` and a model being loaded.
 
 ## Input artifacts
 
-All synthesized programmatically (`generate_audio.py` in each fixture
-directory). The placeholder audio is a sine burst pattern — the aligner
+All synthesized deterministically by `conformance/tools/generate-audio.py`
+(gitignored; `tools/regenerate-fixtures.sh` rewrites them). The placeholder audio is a sine burst pattern — the aligner
 accepts any decodable WAV, so audio-vs-transcript correctness is not part
 of the placeholder assertion; only SRT/diarized-JSON *shape* is.
 
@@ -42,7 +42,7 @@ of the placeholder assertion; only SRT/diarized-JSON *shape* is.
 | --------------------------------------------------------- | -------- | ------------------------------------ |
 | `040-align-en-words/audio.wav`                            | 2.0 s    | 3 sine bursts (440/523.25/659.25 Hz) |
 | `040-align-zh-segments/audio.wav`                         | 3.0 s    | 2 sine bursts (392/466.16 Hz)        |
-| `040-align-multi-lang-de-es-fr/audio_{de,es,fr}.wav`      | 1.5 s ea | single sine each                     |
+| `040-align-multi-lang-de-es-fr/audio_{de,es,fr}.wav`      | 1.5 s ea | single sine each (392/440/466.16 Hz) |
 
 ## Discovery
 

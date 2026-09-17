@@ -7,9 +7,9 @@ use nv_layers::mlp::Mlp;
 use nv_layers::moe_bf16_grouped::Bf16GroupedExperts;
 use nv_layers::norm::RmsNorm;
 
-use crate::qwen3_5_moe::{AttentionLayer, Qwen3Moe, Qwen3MoeConfig};
 #[cfg(feature = "cuda")]
 use crate::graph_engine::GraphedQwen3Moe;
+use crate::qwen3_5_moe::{AttentionLayer, Qwen3Moe, Qwen3MoeConfig};
 #[cfg(feature = "cuda")]
 use crate::qwen3_5_moe::{GroupedMoeDispatch, MoeDispatch, Qwen3MoeKvCache};
 
@@ -613,6 +613,12 @@ pub trait MtpMoeServingRounds {
     fn round_fits(&self) -> bool;
     fn round(&mut self) -> Result<Vec<u32>>;
     fn stats(&self) -> &MtpSpecStats;
+    fn suffix_rounds_drafted_accepted(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+    fn acceptance_tracking_k2_k3_switches(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
     fn arm_name(&self) -> &'static str;
     fn capture_active(&self) -> bool;
 }
@@ -653,7 +659,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
              keeps, so there is nothing to shorten"
         );
         anyhow::ensure!(
-            prompt.len() + k + 1 <= max_seq,
+            prompt.len() + k < max_seq,
             "moe mtp session: prompt {} + k+1 {} > max_seq {max_seq}",
             prompt.len(),
             k + 1
@@ -719,7 +725,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
     }
 
     pub fn round_fits(&self) -> bool {
-        self.cache.current_len() + self.k + 1 <= self.max_seq
+        self.cache.current_len() + self.k < self.max_seq
     }
 
     pub fn round(&mut self) -> Result<Vec<u32>> {
@@ -745,7 +751,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         let l = self.cache.current_len();
         let k = self.k;
         anyhow::ensure!(
-            l + k + 1 <= self.max_seq,
+            l + k < self.max_seq,
             "moe mtp verify overflow: committed={l} + k+1={} > max_seq={}",
             k + 1,
             self.max_seq
@@ -761,9 +767,9 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         for j in 0..k {
             let position = (l + j) as i32;
             if let Some(pmin) = p_min_cut {
-                let (d, p, dhidden) =
-                    self.mtp
-                        .forward_draft_tok_with_top_prob(self.base, &h, tok, position)?;
+                let (d, p, dhidden) = self
+                    .mtp
+                    .forward_draft_tok_with_top_prob(self.base, &h, tok, position)?;
                 drafts.push(d);
                 draft_top_probs.push(p);
                 tok = d;
@@ -827,7 +833,10 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         let commit_t0 = std::time::Instant::now();
         let (accepted, bonus) = accept_prefix_len_then_bonus(&drafts, &greedy);
         let consumed = accepted + 1;
-        if self.p_min_drafter_confidence_cut_none_means_fixed_k.is_some() {
+        if self
+            .p_min_drafter_confidence_cut_none_means_fixed_k
+            .is_some()
+        {
             let vocab = vlogits.dim(D::Minus1)?;
             let flat: Vec<f32> = vlogits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
             for r in 0..consumed {
@@ -889,8 +898,8 @@ impl MtpMoeServingRounds for MtpMoeEagerDecodeSession<'_> {
 }
 
 #[cfg(feature = "cuda")]
-pub const GRAPHED_SESSION_PREFILL_CHUNK_512_MATCHES_THE_PROVEN_QWEN36_CTX_SCALING_PPL_BLOCK:
-    usize = 512;
+pub const GRAPHED_SESSION_PREFILL_CHUNK_512_MATCHES_THE_PROVEN_QWEN36_CTX_SCALING_PPL_BLOCK: usize =
+    512;
 
 #[cfg(feature = "cuda")]
 pub const THE_GROUPED_MULTI_TOKEN_VERIFY_CAPTURES_NOW_THAT_ITS_HOST_STALL_IS_THE_OPT_IN_DIAGNOSTIC_NV_MOE_MT_STALL:
@@ -928,13 +937,14 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         anyhow::ensure!(k >= 1, "graphed moe mtp session: k must be >= 1");
         let max_seq = engine.cache().max_seq_len();
         anyhow::ensure!(
-            prompt.len() + k + 1 <= max_seq,
+            prompt.len() + k < max_seq,
             "graphed moe mtp session: prompt {} + k+1 {} > max_seq {max_seq}",
             prompt.len(),
             k + 1
         );
-        if let Err(the_one_shot_invalid_value_a_captured_graph_teardown_leaves_under_the_decode_fix_arm) =
-            engine.reset()
+        if let Err(
+            the_one_shot_invalid_value_a_captured_graph_teardown_leaves_under_the_decode_fix_arm,
+        ) = engine.reset()
         {
             eprintln!(
                 "[q36-mtp-graphed-session] reset retry absorbing the one-shot #96 teardown residual: {the_one_shot_invalid_value_a_captured_graph_teardown_leaves_under_the_decode_fix_arm:#}"
@@ -948,7 +958,8 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         }
         let stashed_hook_matching_prefill_routes_host_because_the_grouped_multi_token_cost_explodes_with_m =
             engine.take_moe_dispatch_for_host_routed_prefill_then_restore_reinstalling_would_drop_and_rebuild_the_folded_weights_a_torn_down_graph_baked();
-        let chunk = GRAPHED_SESSION_PREFILL_CHUNK_512_MATCHES_THE_PROVEN_QWEN36_CTX_SCALING_PPL_BLOCK;
+        let chunk =
+            GRAPHED_SESSION_PREFILL_CHUNK_512_MATCHES_THE_PROVEN_QWEN36_CTX_SCALING_PPL_BLOCK;
         let mut fed = 0usize;
         while prompt.len() - fed > chunk {
             let _ = engine.prefill(&prompt[fed..fed + chunk])?;
@@ -1006,7 +1017,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
     }
 
     pub fn round_fits(&self) -> bool {
-        self.engine.current_pos() + self.k + 1 <= self.max_seq
+        self.engine.current_pos() + self.k < self.max_seq
     }
 
     pub fn round(&mut self) -> Result<Vec<u32>> {
@@ -1032,7 +1043,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         let l = self.engine.current_pos();
         let k = self.k;
         anyhow::ensure!(
-            l + k + 1 <= self.max_seq,
+            l + k < self.max_seq,
             "graphed moe mtp verify overflow: committed={l} + k+1={} > max_seq={}",
             k + 1,
             self.max_seq

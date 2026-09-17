@@ -120,5 +120,4 @@ wallclock -> `response.done`.
   whisper.cpp bind the GPU backend already linked into
   `libwhisper.dylib`/`.so` -- Metal on Darwin, cuBLAS on `nix develop
   .#cuda`, no-op on linux-cpu. Net effect on Apple Silicon is ~13x
-  c=1 throughput vs the ct2 (CPU) backend; see
-  `docs/book/08.4-PERFORMANCE.md` § "STT smoke benchmark".
+  c=1 throughput vs the ct2 (CPU) backend.

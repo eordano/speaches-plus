@@ -4,8 +4,11 @@ use std::sync::OnceLock;
 
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
+pub use crate::wgpu_backend::pack::{
+    pack_u16_odd_tail_zeroed_min_one_word as pack_bf16_words,
+    unpack_u16_first_n as unpack_bf16_words,
+};
 use crate::wgpu_backend::{compose, Result, WgpuError};
-pub use crate::wgpu_backend::pack::{pack_u16_odd_tail_zeroed_min_one_word as pack_bf16_words, unpack_u16_first_n as unpack_bf16_words};
 
 pub const WGSL: &str = include_str!("../../../wgsl/depthwise_conv1d_silu_bf16.wgsl");
 

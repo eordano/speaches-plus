@@ -435,7 +435,7 @@ Run with `nix develop --command python3 test_review_fixes.py`. Output ends with 
 The flake bundles every HF repo we ship via [`nix-hug.fetchModel`](../nix-hug), pinned by commit hash + filetree sha. Runtime never hits the network.
 
 ```bash
-nix run path:../nix-hug -- fetch <org>/<repo>
+nix run github:eordano/nix-hug -- fetch <org>/<repo>
 ```
 
 Paste the printed expression into `mkPackages` in `flake.nix` and have the wrapper export the corresponding env vars.

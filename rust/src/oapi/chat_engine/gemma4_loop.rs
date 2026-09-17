@@ -152,7 +152,9 @@ pub(crate) async fn run_gemma4_via_engine(
     }
 
     if !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
                 let _ = tx.send(ChatEvent::TextDelta(tail)).await;
@@ -436,7 +438,6 @@ pub(crate) async fn run_sampling_gemma4(
     let mut completion_tokens: u32 = 0;
     let mut finish_reason = "length".to_string();
 
-
     let mut total_detok_ms = 0.0f64;
     let mut total_send_ms = 0.0f64;
     let mut total_fwd_ms = 0.0f64;
@@ -578,7 +579,9 @@ pub(crate) async fn run_sampling_gemma4(
     drop(permit.take());
 
     if !aborted && !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
                 let _ = push_event_async(tx, ChatEvent::TextDelta(tail), send_timeout).await;
@@ -2474,7 +2477,9 @@ pub(crate) async fn run_sampling_gemma4_spec_ungraphed(
     }
 
     if !aborted && !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
                 let _ = push_event_async(tx, ChatEvent::TextDelta(tail), send_timeout).await;
@@ -2594,18 +2599,51 @@ pub(crate) async fn run_sampling_gemma4_e4b(
         vec![None; model.config().num_hidden_layers];
     let mut last_logits = None;
     let mut off = 0usize;
-    while off < prompt_ids.len() {
-        let c = (prompt_ids.len() - off).min(PREFILL_CHUNK);
-        last_logits = Some(match &mm_embeds {
-            Some(e) => model.forward_step_embeds(
+    if nv_models::gemma4_e4b::prefill_fixed_cache_env_opted_in() {
+        let mut fixed = model.prefill_fixed_cache(prompt_ids.len())?;
+        while off < prompt_ids.len() {
+            let c = (prompt_ids.len() - off).min(PREFILL_CHUNK);
+            let final_chunk = off + c == prompt_ids.len();
+            let rows = if final_chunk {
+                if nv_models::gemma4_e4b::prefill_lm_head_last_row_env_opted_in() {
+                    nv_models::gemma4_e4b::PrefillLogitsRows::LastRow
+                } else {
+                    nv_models::gemma4_e4b::PrefillLogitsRows::AllRows
+                }
+            } else {
+                nv_models::gemma4_e4b::PrefillLogitsRows::Discarded
+            };
+            let embeds = mm_embeds
+                .as_ref()
+                .map(|e| e.narrow(0, off, c))
+                .transpose()?;
+            let logits = model.forward_step_fixed_rows(
                 &prompt_ids[off..off + c],
-                &e.narrow(0, off, c)?,
+                embeds.as_ref(),
                 off,
-                &mut cache,
-            )?,
-            None => model.forward_step(&prompt_ids[off..off + c], off, &mut cache)?,
-        });
-        off += c;
+                &mut fixed,
+                rows,
+            )?;
+            if final_chunk {
+                last_logits = logits;
+            }
+            off += c;
+        }
+        cache = fixed.cat_views()?;
+    } else {
+        while off < prompt_ids.len() {
+            let c = (prompt_ids.len() - off).min(PREFILL_CHUNK);
+            last_logits = Some(match &mm_embeds {
+                Some(e) => model.forward_step_embeds(
+                    &prompt_ids[off..off + c],
+                    &e.narrow(0, off, c)?,
+                    off,
+                    &mut cache,
+                )?,
+                None => model.forward_step(&prompt_ids[off..off + c], off, &mut cache)?,
+            });
+            off += c;
+        }
     }
     let row: Vec<f32> = last_logits
         .expect("non-empty prompt")
@@ -2645,10 +2683,9 @@ pub(crate) async fn run_sampling_gemma4_e4b(
                     completion_tokens = generated_ids.len() as u32;
                     let new_text = detok.push(last)?;
                     let (piece, stop_hit) = emitter.step(new_text);
-                    if !piece.is_empty()
-                        && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
-                            return Ok(());
-                        }
+                    if !piece.is_empty() && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
+                        return Ok(());
+                    }
                     yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
                     if stop_hit {
                         finish_reason = "stop".into();
@@ -2674,7 +2711,10 @@ pub(crate) async fn run_sampling_gemma4_e4b(
                     };
                 }
                 if !generated_ids.is_empty() {
-                    if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+                    if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(
+                        &tokenizer,
+                        &generated_ids,
+                    ) {
                         let tail = emitter.finish(&full);
                         if !tail.is_empty() {
                             let _ = tx.send(ChatEvent::TextDelta(tail)).await;
@@ -2711,10 +2751,9 @@ pub(crate) async fn run_sampling_gemma4_e4b(
 
         let new_text = detok.push(last)?;
         let (piece, stop_hit) = emitter.step(new_text);
-        if !piece.is_empty()
-            && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
-                return Ok(());
-            }
+        if !piece.is_empty() && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
+            return Ok(());
+        }
         if req.logprobs
             && tx
                 .send(ChatEvent::Logprob(build_logprob_entry(
@@ -2747,7 +2786,9 @@ pub(crate) async fn run_sampling_gemma4_e4b(
     }
 
     if !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
                 let _ = tx.send(ChatEvent::TextDelta(tail)).await;

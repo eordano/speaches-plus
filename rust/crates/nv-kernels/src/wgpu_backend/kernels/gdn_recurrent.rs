@@ -146,7 +146,11 @@ pub fn gdn_recurrent_f32_with_arm(
 
     let pair_groups = dispatch::workgroup_count_1d(ctx, pairs as u64, 1);
     let (label, entry, groups) = match arm {
-        ScanArm::Barrier128 => ("nv_kernels_gdn_recurrent_f32", "gdn_recurrent_f32", pair_groups),
+        ScanArm::Barrier128 => (
+            "nv_kernels_gdn_recurrent_f32",
+            "gdn_recurrent_f32",
+            pair_groups,
+        ),
         ScanArm::Warp32Smem => (
             "nv_kernels_gdn_recurrent_f32_w32",
             W32_ENTRY,

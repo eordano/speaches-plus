@@ -1,10 +1,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::wgpu_backend::device::WgpuContext;
-use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
 use crate::wgpu_backend::kernels::gemv_nvfp4;
+use crate::wgpu_backend::pack::pack_u16_even_min_one_word as pack_words;
+use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_even_min_one_word as pack_words};
 
 pub const WGSL: &str = include_str!("../../../wgsl/quantize_nvfp4_bf16.wgsl");
 

@@ -107,9 +107,13 @@ mod tests {
     fn env_arm_set_to_anything_but_0_is_off_when_unset_or_literal_zero_only() {
         let name = "NV_CFG_TEST_SET_NOT0_REREAD";
         std::env::remove_var(name);
-        assert!(!env_arm_opt_in_set_to_anything_but_0_reread_every_call(name));
+        assert!(!env_arm_opt_in_set_to_anything_but_0_reread_every_call(
+            name
+        ));
         std::env::set_var(name, "0");
-        assert!(!env_arm_opt_in_set_to_anything_but_0_reread_every_call(name));
+        assert!(!env_arm_opt_in_set_to_anything_but_0_reread_every_call(
+            name
+        ));
         std::env::set_var(name, "off");
         assert!(env_arm_opt_in_set_to_anything_but_0_reread_every_call(name));
         std::env::set_var(name, "");

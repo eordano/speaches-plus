@@ -20,6 +20,7 @@ use nv_ocr::{
     LayoutPageResult, OcrEngine, OcrResult, ResolutionHint,
 };
 
+use super::cold_tier::ColdSlot;
 use super::gate::SurfaceGate;
 use super::ocr_batch::{decode_rgb, BatchOptions, DsocrScheduler, JobInput, OcrJob};
 use super::{kind, openai_error};
@@ -27,9 +28,35 @@ use super::{kind, openai_error};
 #[derive(Clone, Default)]
 pub struct OcrAppState {
     pub tesseract: Option<Arc<OcrEngine>>,
-    pub deepseek: Option<Arc<OcrEngine>>,
-    pub dots: Option<Arc<OcrEngine>>,
-    pub got: Option<Arc<OcrEngine>>,
+    pub deepseek: Option<Arc<ColdSlot<OcrEngine>>>,
+    pub dots: Option<Arc<ColdSlot<OcrEngine>>>,
+    pub got: Option<Arc<ColdSlot<OcrEngine>>>,
+}
+
+const MIB: u64 = 1024 * 1024;
+const DEEPSEEK_RESIDENT_ESTIMATE: u64 =
+    super::vram_plan::AUX_DEEPSEEK_OCR2_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB * MIB;
+const DOTS_RESIDENT_ESTIMATE: u64 =
+    super::vram_plan::AUX_DOTS_OCR_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB * MIB;
+
+pub(super) async fn demand(slot: &Option<Arc<ColdSlot<OcrEngine>>>) -> Option<Arc<OcrEngine>> {
+    match slot {
+        Some(s) => s.get().await,
+        None => None,
+    }
+}
+
+pub(super) fn load_failed_response(backend: Backend) -> Response {
+    openai_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!(
+            "ocr backend {} is configured but its load failed; see the server log, the load is retried shortly",
+            backend_name(backend)
+        ),
+        kind::SERVICE_UNAVAIL,
+        Some("backend"),
+        Some("ocr_backend_load_failed"),
+    )
 }
 
 #[derive(Clone)]
@@ -115,16 +142,25 @@ impl From<OcrAppState> for OcrRuntime {
 pub fn router_from_env() -> Router {
     let state = OcrAppState {
         tesseract: load_tesseract_from_env(),
-        deepseek: load_deepseek_from_env(),
-        dots: load_dots_from_env(),
-        got: load_got_from_env(),
+        deepseek: deepseek_dir().map(|_| {
+            ColdSlot::demand(
+                "ocr-deepseek",
+                DEEPSEEK_RESIDENT_ESTIMATE,
+                Arc::new(load_deepseek_from_env),
+            )
+        }),
+        dots: dots_dir()
+            .map(|_| ColdSlot::demand("ocr-dots", DOTS_RESIDENT_ESTIMATE, Arc::new(load_dots_from_env))),
+        got: got_dir().map(|_| {
+            ColdSlot::demand("ocr-got", DEEPSEEK_RESIDENT_ESTIMATE, Arc::new(load_got_from_env))
+        }),
     };
     log_default_backend_at_boot(&state);
     router(state)
 }
 
 fn log_default_backend_at_boot(state: &OcrAppState) {
-    let loaded = loaded_backends(state);
+    let loaded = configured_backends(state);
     let configured = configured_default_backend();
     match pick_default_backend(&loaded, configured) {
         Ok(b) => info!(
@@ -164,7 +200,7 @@ struct OcrLoadLoraBody {
     lora_path: String,
 }
 
-fn ocr_lora_gate_or_dots(rt: &OcrRuntime) -> Result<Arc<OcrEngine>, Response> {
+async fn ocr_lora_gate_or_dots(rt: &OcrRuntime) -> Result<Arc<OcrEngine>, Response> {
     if !super::lora_runtime::enabled() {
         return Err(openai_error(
             StatusCode::FORBIDDEN,
@@ -174,27 +210,40 @@ fn ocr_lora_gate_or_dots(rt: &OcrRuntime) -> Result<Arc<OcrEngine>, Response> {
             Some("runtime_lora_disabled"),
         ));
     }
-    rt.app.dots.clone().ok_or_else(|| {
-        openai_error(
+    let Some(slot) = rt.app.dots.clone() else {
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "ocr backend not loaded: dots -- set NV_OCR_DOTS_DIR or NV_OCR_DOTS=1",
             kind::INVALID_REQUEST,
             None,
             Some("ocr_backend_not_loaded"),
-        )
-    })
+        ));
+    };
+    slot.get()
+        .await
+        .ok_or_else(|| load_failed_response(Backend::Dots))
 }
 
 async fn handle_ocr_load_lora(
     State(rt): State<OcrRuntime>,
+    headers: HeaderMap,
     Json(body): Json<OcrLoadLoraBody>,
 ) -> Response {
-    let engine = match ocr_lora_gate_or_dots(&rt) {
+    let engine = match ocr_lora_gate_or_dots(&rt).await {
         Ok(e) => e,
         Err(resp) => return resp,
     };
+    let permit = match rt
+        .generative
+        .acquire_with_deadline(crate::oapi::deadline::from_headers(&headers))
+        .await
+    {
+        Ok(permit) => permit,
+        Err(busy) => return busy.into_response(),
+    };
     let dir = PathBuf::from(&body.lora_path);
     let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         engine.dots_reload_adapter(Some(dir.as_path()))
     })
     .await;
@@ -222,12 +271,24 @@ async fn handle_ocr_load_lora(
     }
 }
 
-async fn handle_ocr_unload_lora(State(rt): State<OcrRuntime>) -> Response {
-    let engine = match ocr_lora_gate_or_dots(&rt) {
+async fn handle_ocr_unload_lora(State(rt): State<OcrRuntime>, headers: HeaderMap) -> Response {
+    let engine = match ocr_lora_gate_or_dots(&rt).await {
         Ok(e) => e,
         Err(resp) => return resp,
     };
-    let joined = tokio::task::spawn_blocking(move || engine.dots_reload_adapter(None)).await;
+    let permit = match rt
+        .generative
+        .acquire_with_deadline(crate::oapi::deadline::from_headers(&headers))
+        .await
+    {
+        Ok(permit) => permit,
+        Err(busy) => return busy.into_response(),
+    };
+    let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        engine.dots_reload_adapter(None)
+    })
+    .await;
     match joined {
         Ok(Ok(resident)) => Json(serde_json::json!({
             "loaded": false,
@@ -827,7 +888,10 @@ fn ocr_chain_appends_cpu(first_is_cpu: bool, cpu_fallback: bool) -> bool {
     !first_is_cpu && cpu_fallback
 }
 
-fn ocr_device_chain_from(first: candle_core::Device, cpu_fallback: bool) -> Vec<candle_core::Device> {
+fn ocr_device_chain_from(
+    first: candle_core::Device,
+    cpu_fallback: bool,
+) -> Vec<candle_core::Device> {
     let first_is_cpu = matches!(first, candle_core::Device::Cpu);
     if ocr_chain_appends_cpu(first_is_cpu, cpu_fallback) {
         vec![first, candle_core::Device::Cpu]
@@ -988,12 +1052,34 @@ impl DotsOcrModel for DotsPipelineModel {
         mode: DotsOcrMode,
         max_new_override: Option<usize>,
     ) -> Result<nv_ocr::DotsPageResult, nv_ocr::Error> {
+        self.recognize_layout_hinted(
+            image_bytes,
+            mode,
+            max_new_override,
+            nv_ocr::DotsTierHint::Auto,
+        )
+    }
+
+    fn recognize_layout_hinted(
+        &self,
+        image_bytes: &[u8],
+        mode: DotsOcrMode,
+        max_new_override: Option<usize>,
+        tier_hint: nv_ocr::DotsTierHint,
+    ) -> Result<nv_ocr::DotsPageResult, nv_ocr::Error> {
+        use nv_models::dots_ocr::TierPolicy;
         let effective = max_new_override.unwrap_or(self.max_new_tokens);
         let img = decode_rgb(image_bytes).map_err(|e| nv_ocr::Error::Decode(format!("{e:#}")))?;
         let img = super::ocr_orient::maybe_auto_orient(img);
         let opts = GenerateOptions {
             max_new_tokens: effective,
             ..Default::default()
+        };
+        let (policy_override, force_screen_detour) = match tier_hint {
+            nv_ocr::DotsTierHint::Auto => (None, false),
+            nv_ocr::DotsTierHint::Off => (Some(TierPolicy::Off), false),
+            nv_ocr::DotsTierHint::Force => (Some(TierPolicy::Always), false),
+            nv_ocr::DotsTierHint::Screen => (None, true),
         };
         let guard = self.pipeline.lock().unwrap_or_else(|e| {
             tracing::warn!(
@@ -1004,7 +1090,13 @@ impl DotsOcrModel for DotsPipelineModel {
             e.into_inner()
         });
         let res = guard
-            .recognize_auto(&img, dots_mode(mode), &opts)
+            .recognize_auto_with_policy(
+                &img,
+                dots_mode(mode),
+                &opts,
+                policy_override,
+                force_screen_detour,
+            )
             .map_err(|e| nv_ocr::Error::Backend(format!("dots.ocr: {e:#}")))?;
         drop(guard);
         warn_if_prefill_bound(&res);
@@ -1169,7 +1261,10 @@ fn got_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("NV_OCR_GOT_DIR") {
         return Some(PathBuf::from(d));
     }
-    if std::env::var("NV_OCR_GOT").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("NV_OCR_GOT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         let found = hub_snapshot(GOT_HUB_REPO);
         if found.is_none() {
             tracing::error!(
@@ -1261,7 +1356,7 @@ pub(super) fn parse_backend(s: &str) -> Option<Backend> {
     }
 }
 
-pub(super) fn loaded_backends(state: &OcrAppState) -> Vec<Backend> {
+pub(super) fn configured_backends(state: &OcrAppState) -> Vec<Backend> {
     let mut out = Vec::with_capacity(3);
     if state.tesseract.is_some() {
         out.push(Backend::Tesseract);
@@ -1471,6 +1566,7 @@ async fn handle_ocr(
     let mut mode: Option<ModeReq> = None;
     let mut format: Option<Format> = None;
     let mut hint = ResolutionHint::Auto;
+    let mut tier_hint = nv_ocr::DotsTierHint::Auto;
     let mut rotate = super::ocr_orient::ContentRotation::Upright;
     let mut expected_script = super::ocr_suspect::ExpectedScript::Any;
     let mut max_new_override: Option<usize> = None;
@@ -1554,6 +1650,18 @@ async fn handle_ocr(
                     return bad_request(format!("reading resolution field: {err}"), "resolution")
                 }
             },
+            "tiering" => match field.text().await.as_deref() {
+                Ok(v) => match nv_ocr::DotsTierHint::parse(v.trim()) {
+                    Some(h) => tier_hint = h,
+                    None => {
+                        return bad_request(
+                            format!("unknown tiering {v:?}; expected auto, off, force, or screen"),
+                            "tiering",
+                        );
+                    }
+                },
+                Err(err) => return bad_request(format!("reading tiering field: {err}"), "tiering"),
+            },
             "max_new_tokens" => match field.text().await.as_deref() {
                 Ok(v) => match parse_max_new_tokens(v) {
                     Ok(None) => {}
@@ -1613,7 +1721,7 @@ async fn handle_ocr(
     let backend = match backend {
         Some(b) => b,
         None => {
-            let loaded = loaded_backends(state);
+            let loaded = configured_backends(state);
             match pick_default_backend(&loaded, configured_default_backend()) {
                 Ok(b) => b,
                 Err(err) => {
@@ -1650,6 +1758,7 @@ async fn handle_ocr(
         mode = mode_name(mode),
         format = format_name(format),
         resolution = hint.as_str(),
+        tiering = tier_hint.as_str(),
         max_new_tokens = max_new_override.unwrap_or(0),
         bytes = image_bytes.len(),
         "ocr request accepted"
@@ -1662,6 +1771,12 @@ async fn handle_ocr(
     }
     if format == Format::JsonBoxes && !backend_emits_word_boxes(backend) {
         return bad_request(json_boxes_unsupported(backend), "format");
+    }
+    if tier_hint != nv_ocr::DotsTierHint::Auto && backend != Backend::Dots {
+        return bad_request(
+            "tiering applies to backend=dots only; it routes the dots.ocr tiered path".into(),
+            "tiering",
+        );
     }
     if hint != ResolutionHint::Auto && backend != Backend::DeepSeek {
         return bad_request(
@@ -1703,12 +1818,15 @@ async fn handle_ocr(
         );
     }
 
-    let engine = match backend {
-        Backend::Tesseract => state.tesseract.clone(),
-        Backend::DeepSeek => state.deepseek.clone(),
-        Backend::Dots => state.dots.clone(),
-        Backend::Got => state.got.clone(),
+    let (configured, engine) = match backend {
+        Backend::Tesseract => (state.tesseract.is_some(), state.tesseract.clone()),
+        Backend::DeepSeek => (state.deepseek.is_some(), demand(&state.deepseek).await),
+        Backend::Dots => (state.dots.is_some(), demand(&state.dots).await),
+        Backend::Got => (state.got.is_some(), demand(&state.got).await),
     };
+    if configured && engine.is_none() {
+        return load_failed_response(backend);
+    }
     let Some(engine) = engine else {
         let message = match backend {
             Backend::Tesseract => {
@@ -1733,7 +1851,7 @@ async fn handle_ocr(
         );
     };
 
-    let _permit = match rt.gate_for(backend) {
+    let permit = match rt.gate_for(backend) {
         None => None,
         Some(gate) => match gate.acquire_with_deadline(client).await {
             Ok(permit) => Some(permit),
@@ -1756,10 +1874,16 @@ async fn handle_ocr(
         Backend::Dots => {
             let dmode = dots_mode_req;
             let joined = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let input_near_blank = near_blank_input(&image_bytes);
                 (
                     input_near_blank,
-                    engine.recognize_dots_layout_budgeted(&image_bytes, dmode, max_new_override),
+                    engine.recognize_dots_layout_hinted(
+                        &image_bytes,
+                        dmode,
+                        max_new_override,
+                        tier_hint,
+                    ),
                 )
             })
             .await;
@@ -1823,6 +1947,7 @@ async fn handle_ocr(
             }
             let generative = backend != Backend::Tesseract;
             let joined = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let input_near_blank = generative && near_blank_input(&image_bytes);
                 (
                     input_near_blank,
@@ -1952,6 +2077,101 @@ fn ocr_error_response(err: nv_ocr::Error) -> Response {
 mod tests {
     use super::*;
 
+    struct PausedDots {
+        entered: Arc<tokio::sync::Notify>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl DotsOcrModel for PausedDots {
+        fn recognize_page(&self, _: &[u8], _: DotsOcrMode) -> Result<OcrResult, nv_ocr::Error> {
+            self.entered.notify_one();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+            Err(nv_ocr::Error::Backend("released test worker".into()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_ocr_keeps_admission_until_the_blocking_worker_finishes() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        for streaming in [false, true] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (resume, receiver) = std::sync::mpsc::channel();
+            let engine = OcrEngine::from_dots(Box::new(PausedDots {
+                entered: entered.clone(),
+                resume: Mutex::new(receiver),
+            }));
+            let rt = OcrRuntime::with_gates(
+                OcrAppState {
+                    dots: Some(ColdSlot::resident("ocr-dots", Arc::new(engine))),
+                    ..Default::default()
+                },
+                SurfaceGate::new("ocr-cancel-test", 1, 50),
+                None,
+            );
+            let gate = rt.generative.clone();
+            let app = Router::new()
+                .route("/v1/ocr", post(handle_ocr))
+                .route(
+                    "/v1/ocr/stream",
+                    post(super::super::ocr_stream::handle_ocr_stream),
+                )
+                .with_state(rt);
+            let mut body = b"--cancel\r\nContent-Disposition: form-data; name=\"file\"; filename=\"x.png\"\r\nContent-Type: image/png\r\n\r\n".to_vec();
+            body.extend_from_slice(&tiny_png());
+            body.extend_from_slice(b"\r\n--cancel\r\nContent-Disposition: form-data; name=\"backend\"\r\n\r\ndots\r\n--cancel--\r\n");
+            let task = tokio::spawn(
+                app.oneshot(
+                    Request::post(if streaming {
+                        "/v1/ocr/stream"
+                    } else {
+                        "/v1/ocr"
+                    })
+                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=cancel")
+                    .body(Body::from(body))
+                    .unwrap(),
+                ),
+            );
+            if streaming {
+                let response = task.await.unwrap().unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                    .await
+                    .unwrap();
+                drop(response);
+            } else {
+                tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                    .await
+                    .unwrap();
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            let still_busy = gate
+                .acquire_with_deadline(Some(Duration::from_millis(if streaming {
+                    1500
+                } else {
+                    50
+                })))
+                .await;
+            resume.send(()).unwrap();
+            assert!(
+                still_busy.is_err(),
+                "streaming={streaming}: cancellation released a live worker's permit"
+            );
+            let recovered = gate
+                .acquire_with_deadline(Some(Duration::from_secs(2)))
+                .await
+                .expect("the completed worker releases admission");
+            drop(recovered);
+        }
+    }
+
     #[test]
     fn ocr_device_auto_prefers_an_accelerator_over_cpu() {
         assert_eq!(device_pref(""), DevicePref::Auto);
@@ -2036,7 +2256,10 @@ mod tests {
         for v in ["0", "-1", "abc", "1.5", "4096tokens", "1e4"] {
             let err = parse_max_new_tokens(v)
                 .expect_err("a budget the surface cannot honour must 400, never fall back");
-            assert_eq!(err, "max_new_tokens must be a positive integer", "input {v:?}");
+            assert_eq!(
+                err, "max_new_tokens must be a positive integer",
+                "input {v:?}"
+            );
         }
     }
 
@@ -2071,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_loaded_backends_refuse_to_default_positionally() {
+    fn multiple_configured_backends_refuse_to_default_positionally() {
         for loaded in [
             vec![Backend::Tesseract, Backend::DeepSeek, Backend::Dots],
             vec![Backend::DeepSeek, Backend::Dots],
@@ -2365,11 +2588,9 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_on_a_real_png_reaches_backend_selection_not_a_decode_error() {
-        let resp = post_ocr_with_binary_file(
-            &tiny_png(),
-            &[("backend", "deepseek"), ("rotate", "cw90")],
-        )
-        .await;
+        let resp =
+            post_ocr_with_binary_file(&tiny_png(), &[("backend", "deepseek"), ("rotate", "cw90")])
+                .await;
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2395,11 +2616,9 @@ mod tests {
 
     #[tokio::test]
     async fn script_prior_on_a_real_png_reaches_backend_selection() {
-        let resp = post_ocr_with_binary_file(
-            &tiny_png(),
-            &[("backend", "got"), ("script", "latin")],
-        )
-        .await;
+        let resp =
+            post_ocr_with_binary_file(&tiny_png(), &[("backend", "got"), ("script", "latin")])
+                .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let v = envelope(resp).await;
         assert_eq!(v["error"]["code"], "ocr_backend_not_loaded");
@@ -2633,8 +2852,8 @@ mod tests {
     }
 
     #[test]
-    fn loaded_backends_reflects_state() {
-        assert!(loaded_backends(&OcrAppState::default()).is_empty());
+    fn configured_backends_reflects_state() {
+        assert!(configured_backends(&OcrAppState::default()).is_empty());
         assert_eq!(describe_backends(&[]), "none");
         assert_eq!(
             describe_backends(&[Backend::DeepSeek, Backend::Dots]),
@@ -2642,8 +2861,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_adapter_routes_gate_on_the_runtime_env_then_on_the_dots_backend() {
+    #[tokio::test]
+    async fn the_adapter_routes_gate_on_the_runtime_env_then_on_the_dots_backend() {
         let _env = crate::oapi::lock_serializing_every_test_that_mutates_the_process_global_env();
         let rt = OcrRuntime::with_gates(
             OcrAppState::default(),
@@ -2651,14 +2870,14 @@ mod tests {
             None,
         );
         std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV);
-        let err = match ocr_lora_gate_or_dots(&rt) {
+        let err = match ocr_lora_gate_or_dots(&rt).await {
             Err(resp) => resp,
             Ok(_) => panic!("disabled env must refuse"),
         };
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         std::env::set_var(super::super::lora_runtime::RUNTIME_LORA_ENV, "1");
-        let err = match ocr_lora_gate_or_dots(&rt) {
+        let err = match ocr_lora_gate_or_dots(&rt).await {
             Err(resp) => resp,
             Ok(_) => panic!("no dots backend must refuse"),
         };

@@ -10,11 +10,14 @@ use tracing::warn;
 
 use crate::audio::decode_any_to_16k_mono;
 use crate::oapi::{fastapi_validation_error, kind, missing_field, openai_error};
-use nv_tts::{SpeakerEncoder, VoiceProfile, VoiceProfileStore};
+use nv_tts::{SpeakerEncoder, VoiceProfile, VoiceProfileStore, VoiceStoreHandle};
 
 pub const VOICE_PROFILE_SCHEMA_VERSION: u32 = 2;
 
 pub fn voice_profile_root() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("NV_VOICES_DATA_DIR") {
+        return std::path::PathBuf::from(dir).join("voices");
+    }
     if let Ok(dir) = std::env::var("SPEACHES_PLUS_VOICE_PROFILES_DIR") {
         return std::path::PathBuf::from(dir);
     }
@@ -26,15 +29,15 @@ pub fn voice_profile_root() -> std::path::PathBuf {
 
 #[derive(Clone)]
 pub struct VoiceProfilesAppState {
-    pub store: Arc<VoiceProfileStore>,
+    pub store: Arc<VoiceStoreHandle>,
 
     pub encoder: Option<Arc<SpeakerEncoder>>,
 }
 
 impl VoiceProfilesAppState {
-    pub fn new(store: VoiceProfileStore) -> Self {
+    pub fn new(store: Arc<VoiceStoreHandle>) -> Self {
         Self {
-            store: Arc::new(store),
+            store,
             encoder: None,
         }
     }
@@ -52,10 +55,7 @@ pub struct VoiceProfileResponse {
     pub schema_version: u32,
     pub embedding_dim: usize,
 
-    #[cfg_attr(
-        feature = "ts-bindings",
-        ts(type = "\"encoded\" | \"no_encoder\"")
-    )]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "\"encoded\" | \"no_encoder\""))]
     pub embedding_state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-bindings", ts(optional))]
@@ -85,6 +85,34 @@ pub struct ListVoiceProfilesResponse {
     #[cfg_attr(feature = "ts-bindings", ts(type = "\"list\""))]
     pub object: &'static str,
     pub data: Vec<VoiceProfileResponse>,
+}
+
+async fn with_store<T: Send + 'static>(
+    state: &VoiceProfilesAppState,
+    op: impl FnOnce(&VoiceProfileStore) -> T + Send + 'static,
+) -> Result<T, Response> {
+    let handle = state.store.clone();
+    let opened = tokio::task::spawn_blocking(move || handle.get().map(|store| op(&store)))
+        .await
+        .map_err(|err| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("voice profile store task: {err}"),
+                kind::SERVER,
+                None,
+                Some("store_task_error"),
+            )
+        })?;
+    opened.map_err(|err| {
+        warn!(error = %err, "voice-profile store unavailable");
+        openai_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{err:#}"),
+            kind::SERVICE_UNAVAIL,
+            None,
+            Some("voice_store_unavailable"),
+        )
+    })
 }
 
 pub async fn handle_create(
@@ -153,6 +181,21 @@ pub async fn handle_create(
             Some("invalid_name"),
         );
     }
+    if name != crate::oapi::audio_speech_nvtts::DEFAULT_PROFILE
+        && crate::oapi::audio_speech_nvtts::is_default_voice_alias(&name)
+    {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "name {name:?} is an OpenAI voice alias and would never be selected; the \
+                 aliases resolve to the profile named {:?}",
+                crate::oapi::audio_speech_nvtts::DEFAULT_PROFILE
+            ),
+            kind::INVALID_REQUEST,
+            Some("name"),
+            Some("reserved_name"),
+        );
+    }
 
     let Some(bytes) = audio_bytes else {
         return fastapi_validation_error(vec![missing_field(&["body", "file"])]);
@@ -203,7 +246,15 @@ pub async fn handle_create(
         design_params,
     };
 
-    if let Err(err) = state.store.put(&profile) {
+    let put = {
+        let profile = profile.clone();
+        with_store(&state, move |store| store.put(&profile)).await
+    };
+    let put = match put {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Err(err) = put {
         warn!(error = %err, name=%name, "voice-profile store put failed");
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -222,9 +273,23 @@ pub async fn handle_create(
 }
 
 pub async fn handle_list(State(state): State<VoiceProfilesAppState>) -> Response {
-    let names = match state.store.list() {
-        Ok(v) => v,
-        Err(err) => {
+    let listed = with_store(&state, |store| {
+        let names = store.list()?;
+        let mut data = Vec::with_capacity(names.len());
+        for name in names {
+            match store.get(&name) {
+                Ok(p) => data.push(VoiceProfileResponse::from(&p)),
+                Err(err) => {
+                    warn!(error = %err, name=%name, "voice-profile read during list failed");
+                }
+            }
+        }
+        anyhow::Ok(data)
+    })
+    .await;
+    let data = match listed {
+        Ok(Ok(data)) => data,
+        Ok(Err(err)) => {
             warn!(error = %err, "voice-profile list failed");
             return openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -234,16 +299,8 @@ pub async fn handle_list(State(state): State<VoiceProfilesAppState>) -> Response
                 Some("store_read_error"),
             );
         }
+        Err(resp) => return resp,
     };
-    let mut data = Vec::with_capacity(names.len());
-    for name in names {
-        match state.store.get(&name) {
-            Ok(p) => data.push(VoiceProfileResponse::from(&p)),
-            Err(err) => {
-                warn!(error = %err, name=%name, "voice-profile read during list failed");
-            }
-        }
-    }
     Json(ListVoiceProfilesResponse {
         object: "list",
         data,
@@ -264,9 +321,14 @@ pub async fn handle_get(
             Some("invalid_name"),
         );
     }
-    match state.store.get(&name) {
-        Ok(p) => Json(VoiceProfileResponse::from(&p)).into_response(),
-        Err(err) => {
+    let got = {
+        let name = name.clone();
+        with_store(&state, move |store| store.get(&name)).await
+    };
+    match got {
+        Err(resp) => resp,
+        Ok(Ok(p)) => Json(VoiceProfileResponse::from(&p)).into_response(),
+        Ok(Err(err)) => {
             if is_not_found(&err) {
                 openai_error(
                     StatusCode::NOT_FOUND,
@@ -311,8 +373,21 @@ pub async fn handle_delete(
         );
     }
 
-    let path = state.store.path_for(&name);
-    if !path.exists() {
+    let deleted = {
+        let name = name.clone();
+        with_store(&state, move |store| {
+            if !store.path_for(&name).exists() {
+                return Ok(false);
+            }
+            store.delete(&name).map(|()| true)
+        })
+        .await
+    };
+    let deleted = match deleted {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if let Ok(false) = deleted {
         return openai_error(
             StatusCode::NOT_FOUND,
             format!("voice profile not found: {name}"),
@@ -321,7 +396,7 @@ pub async fn handle_delete(
             Some("voice_profile_not_found"),
         );
     }
-    if let Err(err) = state.store.delete(&name) {
+    if let Err(err) = deleted {
         warn!(error = %err, name=%name, "voice-profile delete failed");
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -336,7 +411,7 @@ pub async fn handle_delete(
 
 const MIN_ENROLL_SECONDS_16K: usize = 8_000;
 
-fn extract_embedding(
+pub fn extract_embedding(
     encoder: &Arc<SpeakerEncoder>,
     samples_16k: &[f32],
 ) -> anyhow::Result<Vec<f32>> {
@@ -354,7 +429,7 @@ fn extract_embedding(
         .map_err(|e| anyhow::anyhow!("encoder.encode_pcm_24k: {e}"))
 }
 
-fn is_safe_name(name: &str) -> bool {
+pub(crate) fn is_safe_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name

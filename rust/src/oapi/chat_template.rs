@@ -11,15 +11,14 @@ pub const REASONING_EFFORT_KWARG: &str = "reasoning_effort";
 
 pub const Q38_REASONING_EFFORT_ENV: &str = "NV_Q38_REASONING_EFFORT";
 
-pub const REASONING_EFFORT_VALUES_THE_QWEN38_TEMPLATE_ACCEPTS_WITH_HIGH_ALIASED_TO_XHIGH:
-    [&str; 4] = ["low", "medium", "high", "xhigh"];
+pub const REASONING_EFFORT_VALUES_THE_QWEN38_TEMPLATE_ACCEPTS_WITH_HIGH_ALIASED_TO_XHIGH: [&str;
+    4] = ["low", "medium", "high", "xhigh"];
 
 pub const SERVED_DEFAULT_REASONING_EFFORT_MEDIUM_NOT_THE_TEMPLATES_XHIGH_BECAUSE_A_DEFAULT_XHIGH_IS_WILLISON_OVERTHINKING_LONG_THOUGHT_SPIRALS_ON_TRIVIAL_TURNS_SO_XHIGH_STAYS_ONE_EXPLICIT_REQUEST_AWAY:
     &str = "medium";
 
 pub fn validate_reasoning_effort(v: &str) -> Result<(), String> {
-    if REASONING_EFFORT_VALUES_THE_QWEN38_TEMPLATE_ACCEPTS_WITH_HIGH_ALIASED_TO_XHIGH.contains(&v)
-    {
+    if REASONING_EFFORT_VALUES_THE_QWEN38_TEMPLATE_ACCEPTS_WITH_HIGH_ALIASED_TO_XHIGH.contains(&v) {
         Ok(())
     } else {
         Err(format!(
@@ -96,6 +95,30 @@ pub fn forget_load_attempts() {
     }
 }
 
+fn template_tojson(
+    value: &JinjaValue,
+    indent: Option<JinjaValue>,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<JinjaValue, minijinja::Error> {
+    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let serialized = minijinja::filters::tojson(value, indent, kwargs)?;
+    if ensure_ascii != Some(true) {
+        return Ok(serialized);
+    }
+    let mut escaped = String::new();
+    for c in serialized.to_string().chars() {
+        if c.is_ascii() {
+            escaped.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                use std::fmt::Write;
+                write!(escaped, "\\u{unit:04x}").unwrap();
+            }
+        }
+    }
+    Ok(JinjaValue::from_safe_string(escaped))
+}
+
 impl ChatTemplate {
     pub fn load(model_dir: &Path) -> Option<Arc<ChatTemplate>> {
         match Self::load_reason(model_dir) {
@@ -128,6 +151,7 @@ impl ChatTemplate {
         let default_kwargs = read_default_chat_template_kwargs(model_dir);
         let mut env = Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_filter("tojson", template_tojson);
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
         let source = strip_generation_tags(&source);
@@ -333,9 +357,10 @@ fn tool_call_arguments_parsed_from_openai_wire_strings(messages: &Value) -> Opti
         m.get("tool_calls")
             .and_then(Value::as_array)
             .is_some_and(|calls| {
-                calls
-                    .iter()
-                    .any(|c| c.pointer("/function/arguments").is_some_and(Value::is_string))
+                calls.iter().any(|c| {
+                    c.pointer("/function/arguments")
+                        .is_some_and(Value::is_string)
+                })
             })
     });
     if !needs_parse {
@@ -827,6 +852,81 @@ mod tests {
     }
 
     #[test]
+    fn laguna_tool_history_serializes_non_string_arguments_without_fallback() {
+        let d = tmp("laguna-tool-history-json");
+        write(
+            &d,
+            "chat_template.jinja",
+            r#"
+{%- for message in messages -%}
+{%- for tool_call in message.tool_calls | default([]) -%}
+{%- set function_data = tool_call.function -%}
+{{- '<tool_call>' + function_data.name -}}
+{%- for k, v in function_data.arguments.items() -%}
+{{- '<arg_key>' ~ k ~ '</arg_key><arg_value>' -}}
+{{- v | tojson(ensure_ascii=False) if v is not string else v -}}
+{{- '</arg_value>' -}}
+{%- endfor -%}
+{{- '</tool_call>' -}}
+{%- endfor -%}
+{%- endfor -%}"#,
+        );
+        let t = ChatTemplate::load(&d).unwrap();
+        for value in [
+            json!(50),
+            json!(true),
+            json!(null),
+            json!([1, "é"]),
+            json!({"city":"東京"}),
+        ] {
+            let messages = json!([{"role":"assistant","tool_calls":[{"function":{
+                "name":"tmux_read","arguments":{"lines":value}
+            }}]}]);
+            let out = t.render(&messages, None, true).unwrap();
+            assert_eq!(out, format!(
+                "<tool_call>tmux_read<arg_key>lines</arg_key><arg_value>{value}</arg_value></tool_call>"
+            ));
+        }
+    }
+
+    #[test]
+    fn template_json_ascii_option_preserves_unicode_and_existing_filter_contract() {
+        let d = tmp("json-ascii-options");
+        write(
+            &d,
+            "chat_template.jinja",
+            "{{ messages[0].content | tojson(ensure_ascii=ascii, indent=2) }}",
+        );
+        let t = ChatTemplate::load(&d).unwrap();
+        for ascii in [false, true] {
+            let out = t
+                .render_with_kwargs(
+                    &json!([{"content":{"text":"é😀<"}}]),
+                    None,
+                    false,
+                    &BTreeMap::from([("ascii".into(), json!(ascii))]),
+                )
+                .unwrap();
+            assert_eq!(out.is_ascii(), ascii);
+            assert_eq!(
+                serde_json::from_str::<Value>(&out).unwrap(),
+                json!({"text":"é😀<"})
+            );
+            assert!(out.contains("\n  "));
+            assert!(out.contains("\\u003c"));
+        }
+        write(
+            &d,
+            "chat_template.jinja",
+            "{{ 50 | tojson(unknown_option=true) }}",
+        );
+        assert!(ChatTemplate::load(&d)
+            .unwrap()
+            .render(&json!([]), None, false)
+            .is_err());
+    }
+
+    #[test]
     fn supports_tools_probes_the_rendered_output() {
         let with = tmp("tools-yes");
         write(
@@ -1043,7 +1143,6 @@ mod tests {
 
     #[test]
     fn a_completion_that_never_reached_its_final_channel_still_has_its_reasoning() {
-
         let truncated = "<|channel|>analysis<|message|>Count: 1, 2, 3";
         assert_eq!(harmony_final_text(truncated), "");
         assert_eq!(harmony_reasoning_text(truncated), "Count: 1, 2, 3");
@@ -1105,7 +1204,10 @@ mod tests {
                 "safe prefix {safe:?} at cut {cut} is not a prefix of the final reasoning {want:?}"
             );
             for m in HARMONY_MARKERS {
-                assert!(!safe.contains(m), "marker {m} leaked at cut {cut}: {safe:?}");
+                assert!(
+                    !safe.contains(m),
+                    "marker {m} leaked at cut {cut}: {safe:?}"
+                );
             }
             prev_safe = safe.to_string();
         }
@@ -1698,7 +1800,11 @@ mod tests {
         );
 
         let no_effort = tmp("no-effort");
-        write(&no_effort, "chat_template.jinja", "{{ messages[0]['content'] }}");
+        write(
+            &no_effort,
+            "chat_template.jinja",
+            "{{ messages[0]['content'] }}",
+        );
         write(
             &no_effort,
             "tokenizer_config.json",
@@ -1788,7 +1894,10 @@ mod tests {
             ("medium", None),
         ] {
             let mut kw = std::collections::BTreeMap::new();
-            kw.insert(REASONING_EFFORT_KWARG.to_string(), serde_json::json!(effort));
+            kw.insert(
+                REASONING_EFFORT_KWARG.to_string(),
+                serde_json::json!(effort),
+            );
             let out = t.render_with_kwargs(&msgs, None, true, &kw).unwrap();
             match expect_line {
                 Some(line) => assert!(

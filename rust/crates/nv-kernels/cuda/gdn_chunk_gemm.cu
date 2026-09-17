@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cublasLt.h>
 #include <mma.h>
 #include <cstdint>
@@ -23,7 +24,7 @@ constexpr size_t LT_WORKSPACE_BYTES_32M_MATCHES_THE_NV_QUANT_DET_HANDLE = 32u * 
 struct WsLayout {
     int n;
     size_t cg, kr, qr, kk, qk, amat, tinv, attn, rhs, wu, kc, stack_a, stack_c, stack_d, sbeta,
-        sstate, ltws;
+        sstate, ltws, aw_fp8, ak_fp8, aw_scale, ak_scale;
     size_t total;
 };
 
@@ -61,6 +62,16 @@ WsLayout layout(int T, int H, int HK) {
     l.sbeta = take_f32(P * H);
     l.sstate = take_f32((size_t)H * 128 * 128);
     l.ltws = take_f32(LT_WORKSPACE_BYTES_32M_MATCHES_THE_NV_QUANT_DET_HANDLE / sizeof(float));
+    auto take_fp8 = [&off](size_t elems) {
+        off = (off + 3) & ~(size_t)3;
+        size_t at = off;
+        off += (elems + 3) / 4;
+        return at;
+    };
+    l.aw_fp8 = take_fp8((size_t)l.n * H * C * 128);
+    l.ak_fp8 = take_fp8((size_t)l.n * H * C * 128);
+    l.aw_scale = take_f32((size_t)l.n * H * C);
+    l.ak_scale = take_f32((size_t)l.n * H * C);
     l.total = off;
     return l;
 }
@@ -109,24 +120,6 @@ static cublasLtHandle_t g_handle = nullptr;
 static std::mutex g_mu;
 static std::map<PlanKey, Plan> g_plans;
 
-static bool fwdh_env_read_per_call_so_one_process_can_ab_stack_carry_vs_state_resident() {
-    const char*
-        FWDH_REPLACES_THE_STACK_CARRY_WITH_ONE_STATE_RESIDENT_KERNEL_BECAUSE_THE_STACKS_COST_10X_SCAN_TRAFFIC =
-            "NV_Q38_GDN_CHUNK_GEMM_FWDH";
-    const char* v = getenv(
-        FWDH_REPLACES_THE_STACK_CARRY_WITH_ONE_STATE_RESIDENT_KERNEL_BECAUSE_THE_STACKS_COST_10X_SCAN_TRAFFIC);
-    return v && strcmp(v, "1") == 0;
-}
-
-static bool mma_env_read_per_call_so_one_process_can_ab_fragment_tail_vs_the_scalar_tails() {
-    const char*
-        MMA_REPLACES_THE_SCALAR_FMA_SUBCHUNK_GEMMS_WITH_BF16_FRAGMENT_TENSOR_CORE_TILES_THE_ONE_CAUSE_LEFT_BY_THE_THREE_BANKED_NEGATIVES =
-            "NV_Q38_GDN_CHUNK_GEMM_MMA";
-    const char* v = getenv(
-        MMA_REPLACES_THE_SCALAR_FMA_SUBCHUNK_GEMMS_WITH_BF16_FRAGMENT_TENSOR_CORE_TILES_THE_ONE_CAUSE_LEFT_BY_THE_THREE_BANKED_NEGATIVES);
-    return v && strcmp(v, "1") == 0;
-}
-
 static bool v3_env_read_per_call_so_one_process_can_ab_split_ladder_vs_inline_out_tails() {
     const char*
         V3_DEFAULT_ON_THE_CHAMPION_TAIL_ROWS_Q38_TAILCHAMP_10_OF_10_P_0_002_OVER_MMA_AND_ZERO_RESTORES_THE_OPT_IN_MMA_FWDH_GRAPH_SCALAR_SELECTION =
@@ -134,6 +127,80 @@ static bool v3_env_read_per_call_so_one_process_can_ab_split_ladder_vs_inline_ou
     const char* v = getenv(
         V3_DEFAULT_ON_THE_CHAMPION_TAIL_ROWS_Q38_TAILCHAMP_10_OF_10_P_0_002_OVER_MMA_AND_ZERO_RESTORES_THE_OPT_IN_MMA_FWDH_GRAPH_SCALAR_SELECTION);
     return !(v && strcmp(v, "0") == 0);
+}
+
+static int ckpt_lowp_env_read_per_call_opt_in_fp8_operands_and_16bit_state_in_the_checkpoint_scan() {
+    const char* v = getenv("NV_Q38_GDN_V3_CKPT_LOWP");
+    if (v == nullptr) return 0;
+    if (strcmp(v, "1") == 0) return 1;
+    if (strcmp(v, "f16") == 0 || strcmp(v, "2") == 0) return 2;
+    if (strcmp(v, "3") == 0) return 3;
+    if (strcmp(v, "4") == 0) return 4;
+    return 0;
+}
+
+static bool ckpt_lowp_mma_env_read_per_call_opt_in_the_fp8_mma_two_blocks_per_sm_perf_kernel() {
+    const char* v = getenv("NV_Q38_GDN_V3_CKPT_LOWP_MMA");
+    return v && strcmp(v, "1") == 0;
+}
+
+static bool ckpt_fp8_env_read_per_call_opt_in_native_e4m3_mma_fp8_state_and_operands_no_convert() {
+    const char* v = getenv("NV_Q38_GDN_V3_CKPT_FP8");
+    return v && strcmp(v, "1") == 0;
+}
+
+static bool ckpt_bf16_default_on_user_signoff_20260912_native_bf16_checkpoint_unset_is_on_0_restores_the_f32_state_kernel() {
+    const char* v = getenv("NV_Q38_GDN_V3_CKPT_BF16");
+    return !(v && strcmp(v, "0") == 0);
+}
+
+static bool ckpt_kstream_env_read_per_call_opt_in_bf16_two_blocks_per_sm_one_reused_operand_buffer() {
+    const char* v = getenv("NV_Q38_GDN_V3_CKPT_KSTREAM");
+    return v && strcmp(v, "1") == 0;
+}
+
+static bool fold_rearrange_env_read_per_call_default_on_unless_0() {
+    const char* v = getenv("NV_Q38_GDN_PREFILL_FOLD_REARRANGE");
+    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+}
+
+static constexpr bool tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(const char* v) {
+    return v == nullptr || (v[0] == '1' && v[1] == '\0');
+}
+
+static_assert(tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(nullptr));
+static_assert(tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("1"));
+static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("0"));
+static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(""));
+static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("gate"));
+static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(" 1"));
+static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("1 "));
+
+static bool tc_env_read_per_call_so_one_process_can_ab_fused_wmma_head_vs_the_cublas_head() {
+    const char*
+        TC_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_XPPL_FAMILY_CERT_PR_20260912_033755_292843_ZERO_RESTORES_CUBLAS_HEAD =
+            "NV_Q38_GDN_PREFILL_TC";
+    const char* v = getenv(
+        TC_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_XPPL_FAMILY_CERT_PR_20260912_033755_292843_ZERO_RESTORES_CUBLAS_HEAD);
+    return tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(v);
+}
+
+static int run_tc_head(
+    cudaStream_t s, const WsLayout& l, float* workspace, const float* beta,
+    int T, int H, int HK, StageProf* prof
+) {
+    __nv_bfloat16* kr = (__nv_bfloat16*)(workspace + l.kr);
+    __nv_bfloat16* qr = (__nv_bfloat16*)(workspace + l.qr);
+    __nv_bfloat16* rhs = (__nv_bfloat16*)(workspace + l.rhs);
+    __nv_bfloat16* attn = (__nv_bfloat16*)(workspace + l.attn);
+    __nv_bfloat16* wu = (__nv_bfloat16*)(workspace + l.wu);
+    float* cg = workspace + l.cg;
+    int rc = nv_kernels_gdn_prefill_tc_fused_head(
+        (void*)s, (const uint16_t*)kr, (const uint16_t*)qr, (const uint16_t*)rhs, beta, cg,
+        (uint16_t*)attn, (uint16_t*)wu, T, H, HK, l.n);
+    if (rc != 0) return rc;
+    if (prof) prof->lap("tc_fused_head");
+    return 0;
 }
 
 static bool graph_env_read_per_call_so_one_process_can_ab_replay_vs_uncaptured() {
@@ -303,7 +370,8 @@ __global__ void materialize_rhs_qb_kc_kernel(
     const float* __restrict__ qn, const float* __restrict__ kn,
     const __nv_bfloat16* __restrict__ mixed, const float* __restrict__ beta,
     const float* __restrict__ cg, __nv_bfloat16* __restrict__ rhs, float* __restrict__ stack_a,
-    __nv_bfloat16* __restrict__ kc, int T, int H, int HK, int conv_dim, int v_channel_offset
+    __nv_bfloat16* __restrict__ kc, int T, int H, int HK, int conv_dim, int v_channel_offset,
+    __nv_bfloat16* __restrict__ qr, __nv_bfloat16* __restrict__ kr
 ) {
     const int C = 64;
     const int R = 192;
@@ -317,14 +385,20 @@ __global__ void materialize_rhs_qb_kc_kernel(
     size_t rhs_at = (sh * C + c) * 256;
     size_t qb_at = sh * R * 128 + (size_t)(128 + c) * 128;
     size_t kc_at = (sh * C + c) * 128;
+    int kh = h / (H / HK);
+    const bool kv_group_leader_writes_the_rearranged_qk_once_per_kh = (qr != nullptr) && (h % (H / HK) == 0);
+    size_t qr_dst = (((size_t)s * HK + kh) * C + c) * 128 + i;
     if (t >= T) {
         rhs[rhs_at + i] = __float2bfloat16(0.f);
         rhs[rhs_at + 128 + i] = __float2bfloat16(0.f);
         if (stack_a != nullptr) stack_a[qb_at + i] = 0.f;
         kc[kc_at + i] = __float2bfloat16(0.f);
+        if (kv_group_leader_writes_the_rearranged_qk_once_per_kh) {
+            qr[qr_dst] = __float2bfloat16(0.f);
+            kr[qr_dst] = __float2bfloat16(0.f);
+        }
         return;
     }
-    int kh = h / (H / HK);
     float cg_c = cg[sh * C + c];
     float cg_last = cg[sh * C + (C - 1)];
     float bt = beta[(size_t)t * H + h];
@@ -335,6 +409,10 @@ __global__ void materialize_rhs_qb_kc_kernel(
     rhs[rhs_at + 128 + i] = __float2bfloat16(bt * vv);
     if (stack_a != nullptr) stack_a[qb_at + i] = expf(cg_c) * qv;
     kc[kc_at + i] = __float2bfloat16(expf(cg_last - cg_c) * kv);
+    if (kv_group_leader_writes_the_rearranged_qk_once_per_kh) {
+        qr[qr_dst] = __float2bfloat16(qv);
+        kr[qr_dst] = __float2bfloat16(kv);
+    }
 }
 
 __global__ void mask_scale_a_attn_kernel(
@@ -419,176 +497,6 @@ __global__ void writeback_out_bf16_kernel(
     out[((size_t)t * H + h) * 128 + i] = __float2bfloat16(stack_d[src]);
 }
 
-constexpr int FWDH_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID = 32;
-constexpr int FWDH_THREADS_512_SIXTEEN_WARPS_HIDE_SMEM_LATENCY_AT_ONE_BLOCK_PER_SM =
-    512;
-
-__global__ void fwdh_state_resident_carry_kernel(
-    const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
-    const __nv_bfloat16* __restrict__ attn, const __nv_bfloat16* __restrict__ qr,
-    const float* __restrict__ cg, float* __restrict__ state_inout,
-    __nv_bfloat16* __restrict__ out, int T, int H, int HK, int n
-) {
-    const int C = 64;
-    const int D = 128;
-    const int TC = FWDH_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
-    const int KB = 16;
-    const int tile = blockIdx.x;
-    const int h = blockIdx.y;
-    const int j0 = tile * TC;
-    const int kh = h / (H / HK);
-    const int tid = threadIdx.x;
-    const int j = tid & 31;
-    const int wid = tid >> 5;
-    extern __shared__ unsigned char smem_raw[];
-    float* S = (float*)smem_raw;
-    float* vnew = S + D * TC;
-    float* ec = vnew + C * TC;
-    __nv_bfloat16* wsm = (__nv_bfloat16*)(ec + C);
-    __nv_bfloat16* qsm = wsm + C * D;
-    __nv_bfloat16* ksm = qsm + C * D;
-    __nv_bfloat16* atsm = ksm + C * D;
-    __nv_bfloat16* usm = atsm + C * C;
-    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
-        int k = idx / TC;
-        int jj = idx % TC;
-        S[idx] = state_inout[((size_t)h * D + k) * D + j0 + jj];
-    }
-    for (int sc = 0; sc < n; ++sc) {
-        size_t sh = (size_t)sc * H + h;
-        if (tid < C) ec[tid] = expf(cg[sh * C + tid]);
-        const __nv_bfloat162* wrow = (const __nv_bfloat162*)(wu + sh * C * 256);
-        for (int idx = tid; idx < C * 64; idx += blockDim.x) {
-            int c = idx >> 6;
-            int p = idx & 63;
-            ((__nv_bfloat162*)wsm)[idx] = wrow[c * 128 + p];
-        }
-        for (int idx = tid; idx < C * (TC / 2); idx += blockDim.x) {
-            int c = idx / (TC / 2);
-            int p = idx % (TC / 2);
-            ((__nv_bfloat162*)usm)[idx] = wrow[c * 128 + (128 + j0) / 2 + p];
-        }
-        const __nv_bfloat162* qrow =
-            (const __nv_bfloat162*)(qr + (((size_t)sc * HK + kh) * C) * 128);
-        const __nv_bfloat162* krow = (const __nv_bfloat162*)(kc + sh * C * 128);
-        for (int idx = tid; idx < C * 64; idx += blockDim.x) {
-            ((__nv_bfloat162*)qsm)[idx] = qrow[idx];
-            ((__nv_bfloat162*)ksm)[idx] = krow[idx];
-        }
-        const __nv_bfloat162* arow = (const __nv_bfloat162*)(attn + sh * C * C);
-        for (int idx = tid; idx < C * (C / 2); idx += blockDim.x) {
-            ((__nv_bfloat162*)atsm)[idx] = arow[idx];
-        }
-        __syncthreads();
-        const int c0 = wid * 4;
-        float acc[4];
-#pragma unroll
-        for (int r = 0; r < 4; ++r) acc[r] = 0.f;
-        for (int kb = 0; kb < D; kb += KB) {
-            float sreg[KB];
-#pragma unroll
-            for (int kk = 0; kk < KB; ++kk) sreg[kk] = S[(kb + kk) * TC + j];
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                const __nv_bfloat162* w2 = (const __nv_bfloat162*)(wsm + (c0 + r) * D + kb);
-#pragma unroll
-                for (int kk = 0; kk < KB / 2; ++kk) {
-                    float2 wf = __bfloat1622float2(w2[kk]);
-                    acc[r] += wf.x * sreg[2 * kk];
-                    acc[r] += wf.y * sreg[2 * kk + 1];
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            int c = c0 + r;
-            vnew[c * TC + j] = __bfloat162float(usm[c * TC + j]) - acc[r];
-        }
-        __syncthreads();
-        float accq[4];
-#pragma unroll
-        for (int r = 0; r < 4; ++r) accq[r] = 0.f;
-        for (int kb = 0; kb < D; kb += KB) {
-            float sreg[KB];
-#pragma unroll
-            for (int kk = 0; kk < KB; ++kk) sreg[kk] = S[(kb + kk) * TC + j];
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                const __nv_bfloat162* q2 = (const __nv_bfloat162*)(qsm + (c0 + r) * D + kb);
-#pragma unroll
-                for (int kk = 0; kk < KB / 2; ++kk) {
-                    float2 qf = __bfloat1622float2(q2[kk]);
-                    accq[r] += qf.x * sreg[2 * kk];
-                    accq[r] += qf.y * sreg[2 * kk + 1];
-                }
-            }
-        }
-        float acco[4];
-#pragma unroll
-        for (int r = 0; r < 4; ++r) acco[r] = 0.f;
-        for (int mb = 0; mb < C; mb += KB) {
-            float vreg[KB];
-#pragma unroll
-            for (int kk = 0; kk < KB; ++kk) vreg[kk] = vnew[(mb + kk) * TC + j];
-#pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                const __nv_bfloat162* a2 = (const __nv_bfloat162*)(atsm + (c0 + r) * C + mb);
-#pragma unroll
-                for (int kk = 0; kk < KB / 2; ++kk) {
-                    float2 af = __bfloat1622float2(a2[kk]);
-                    acco[r] += af.x * vreg[2 * kk];
-                    acco[r] += af.y * vreg[2 * kk + 1];
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            int c = c0 + r;
-            int t = sc * C + c;
-            if (t < T) {
-                out[((size_t)t * H + h) * D + j0 + j] =
-                    __float2bfloat16(ec[c] * accq[r] + acco[r]);
-            }
-        }
-        __syncthreads();
-        const int k0 = wid * 8;
-        float acck[8];
-#pragma unroll
-        for (int r = 0; r < 8; ++r) acck[r] = 0.f;
-        for (int cb = 0; cb < C; cb += KB) {
-            float vreg[KB];
-#pragma unroll
-            for (int kk = 0; kk < KB; ++kk) vreg[kk] = vnew[(cb + kk) * TC + j];
-#pragma unroll
-            for (int kk = 0; kk < KB; ++kk) {
-                const __nv_bfloat162* k2 = (const __nv_bfloat162*)(ksm + (cb + kk) * D + k0);
-#pragma unroll
-                for (int r = 0; r < 4; ++r) {
-                    float2 kf = __bfloat1622float2(k2[r]);
-                    acck[2 * r] += kf.x * vreg[kk];
-                    acck[2 * r + 1] += kf.y * vreg[kk];
-                }
-            }
-        }
-        float b_last = ec[C - 1];
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            int k = k0 + r;
-            S[k * TC + j] = b_last * S[k * TC + j] + acck[r];
-        }
-        __syncthreads();
-    }
-    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
-        int k = idx / TC;
-        int jj = idx % TC;
-        state_inout[((size_t)h * D + k) * D + j0 + jj] = S[idx];
-    }
-}
-
-constexpr size_t FWDH_SMEM_BYTES_84K_NEEDS_THE_OPT_IN_ATTRIBUTE_ABOVE_THE_48K_STATIC_CAP =
-    (size_t)(128 * 32 + 64 * 32 + 64) * sizeof(float) +
-    (size_t)(3 * 64 * 128 + 64 * 64 + 64 * 32) * sizeof(__nv_bfloat16);
-
 constexpr int MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID = 32;
 constexpr int MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP = 256;
 constexpr int MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS = 40;
@@ -609,202 +517,58 @@ __device__ __forceinline__ void mma_cp_async_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-__global__ void mma_fragment_state_resident_carry_kernel(
-    const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
-    const __nv_bfloat16* __restrict__ attn, const __nv_bfloat16* __restrict__ qr,
-    const float* __restrict__ cg, float* __restrict__ state_inout,
-    __nv_bfloat16* __restrict__ out, int T, int H, int HK, int n
-) {
-    using namespace nvcuda;
-    const int C = 64;
-    const int D = 128;
-    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
-    const int SLD = MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
-    const int ALD = MMA_OPERAND_LD_136_PADS_THE_128_COL_STAGE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
-    const int ATLD = MMA_ATTN_LD_72_PADS_THE_64_COL_STAGE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
-    const int tile = blockIdx.x;
-    const int h = blockIdx.y;
-    const int j0 = tile * TC;
-    const int kh = h / (H / HK);
-    const int tid = threadIdx.x;
-    const int wid = tid >> 5;
-    extern __shared__ unsigned char smem_raw[];
-    float* S = (float*)smem_raw;
-    float* scr = S + D * SLD;
-    float* ec = scr + C * SLD;
-    __nv_bfloat16* Sb = (__nv_bfloat16*)(ec + C);
-    __nv_bfloat16* Ab0 = Sb + D * SLD;
-    __nv_bfloat16* Ab1 = Ab0 + C * ALD;
-    __nv_bfloat16* At = Ab1 + C * ALD;
-    __nv_bfloat16* Us = At + C * ATLD;
-    __nv_bfloat16* Vn = Us + C * SLD;
-
-    auto stage_wide = [&](__nv_bfloat16* dst, const __nv_bfloat16* src_row0, int src_ld) {
-        for (int i = tid; i < C * 16; i += (int)blockDim.x) {
-            int c = i >> 4;
-            int seg = i & 15;
-            mma_cp_async16(dst + c * ALD + seg * 8, src_row0 + (size_t)c * src_ld + seg * 8);
-        }
-    };
-
-    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
-        int k = idx / TC;
-        int j = idx % TC;
-        float v = state_inout[((size_t)h * D + k) * D + j0 + j];
-        S[k * SLD + j] = v;
-        Sb[k * SLD + j] = __float2bfloat16(v);
-    }
-    {
-        const __nv_bfloat16* arow = attn + (size_t)h * C * C;
-        for (int i = tid; i < C * 8; i += (int)blockDim.x) {
-            int c = i >> 3;
-            int seg = i & 7;
-            mma_cp_async16(At + c * ATLD + seg * 8, arow + (size_t)c * C + seg * 8);
-        }
-        mma_cp_async_commit();
-        const __nv_bfloat16* wrow = wu + (size_t)h * C * 256;
-        stage_wide(Ab0, wrow, 256);
-        for (int i = tid; i < C * 4; i += (int)blockDim.x) {
-            int c = i >> 2;
-            int seg = i & 3;
-            mma_cp_async16(Us + c * SLD + seg * 8, wrow + (size_t)c * 256 + D + j0 + seg * 8);
-        }
-        mma_cp_async_commit();
-    }
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> fat;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> fb;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> facc;
-
-    const int m0 = (wid >> 1) * 16;
-    const int n0 = (wid & 1) * 16;
-    const int sm0 = wid * 16;
-
-    for (int sc = 0; sc < n; ++sc) {
-        size_t sh = (size_t)sc * H + h;
-        __nv_bfloat16* AbW = (sc & 1) ? Ab1 : Ab0;
-        __nv_bfloat16* AbQ = (sc & 1) ? Ab0 : Ab1;
-        const __nv_bfloat16* qrow = qr + (((size_t)sc * HK + kh) * C) * D;
-        stage_wide(AbQ, qrow, D);
-        mma_cp_async_commit();
-        if (tid < C) ec[tid] = expf(cg[sh * C + tid]);
-        mma_cp_async_wait<1>();
-        __syncthreads();
-
-        wmma::fill_fragment(facc, 0.f);
-        for (int kt = 0; kt < D / 16; ++kt) {
-            wmma::load_matrix_sync(fa, AbW + m0 * ALD + kt * 16, ALD);
-            wmma::load_matrix_sync(fb, Sb + kt * 16 * SLD + n0, SLD);
-            wmma::mma_sync(facc, fa, fb, facc);
-        }
-        wmma::store_matrix_sync(scr + m0 * SLD + n0, facc, SLD, wmma::mem_row_major);
-        __syncthreads();
-
-        const __nv_bfloat16* krow = kc + sh * C * D;
-        stage_wide(AbW, krow, D);
-        mma_cp_async_commit();
-        for (int idx = tid; idx < C * TC; idx += blockDim.x) {
-            int c = idx / TC;
-            int j = idx % TC;
-            Vn[c * SLD + j] =
-                __float2bfloat16(__bfloat162float(Us[c * SLD + j]) - scr[c * SLD + j]);
-        }
-        mma_cp_async_wait<1>();
-        __syncthreads();
-
-        for (int idx = tid; idx < C * D; idx += blockDim.x) {
-            int c = idx >> 7;
-            int d = idx & 127;
-            AbQ[c * ALD + d] =
-                __float2bfloat16(ec[c] * __bfloat162float(AbQ[c * ALD + d]));
-        }
-        __syncthreads();
-
-        wmma::fill_fragment(facc, 0.f);
-        for (int kt = 0; kt < D / 16; ++kt) {
-            wmma::load_matrix_sync(fa, AbQ + m0 * ALD + kt * 16, ALD);
-            wmma::load_matrix_sync(fb, Sb + kt * 16 * SLD + n0, SLD);
-            wmma::mma_sync(facc, fa, fb, facc);
-        }
-        for (int kt = 0; kt < C / 16; ++kt) {
-            wmma::load_matrix_sync(fa, At + m0 * ATLD + kt * 16, ATLD);
-            wmma::load_matrix_sync(fb, Vn + kt * 16 * SLD + n0, SLD);
-            wmma::mma_sync(facc, fa, fb, facc);
-        }
-        wmma::store_matrix_sync(scr + m0 * SLD + n0, facc, SLD, wmma::mem_row_major);
-        __syncthreads();
-
-        for (int idx = tid; idx < C * TC; idx += blockDim.x) {
-            int c = idx / TC;
-            int j = idx % TC;
-            int t = sc * C + c;
-            if (t < T) {
-                out[((size_t)t * H + h) * D + j0 + j] = __float2bfloat16(scr[c * SLD + j]);
-            }
-        }
-        if (sc + 1 < n) {
-            size_t sh1 = (size_t)(sc + 1) * H + h;
-            const __nv_bfloat16* arow = attn + sh1 * C * C;
-            for (int i = tid; i < C * 8; i += (int)blockDim.x) {
-                int c = i >> 3;
-                int seg = i & 7;
-                mma_cp_async16(At + c * ATLD + seg * 8, arow + (size_t)c * C + seg * 8);
-            }
-            mma_cp_async_commit();
-            const __nv_bfloat16* wrow = wu + sh1 * C * 256;
-            stage_wide(AbQ, wrow, 256);
-            for (int i = tid; i < C * 4; i += (int)blockDim.x) {
-                int c = i >> 2;
-                int seg = i & 3;
-                mma_cp_async16(Us + c * SLD + seg * 8,
-                               wrow + (size_t)c * 256 + D + j0 + seg * 8);
-            }
-            mma_cp_async_commit();
-            mma_cp_async_wait<2>();
-        } else {
-            mma_cp_async_wait<0>();
-        }
-        __syncthreads();
-
-        float b_last = ec[C - 1];
-        for (int nt = 0; nt < TC / 16; ++nt) {
-            wmma::load_matrix_sync(facc, S + sm0 * SLD + nt * 16, SLD, wmma::mem_row_major);
-            for (int i = 0; i < facc.num_elements; ++i) facc.x[i] *= b_last;
-            for (int kt = 0; kt < C / 16; ++kt) {
-                wmma::load_matrix_sync(fat, AbW + kt * 16 * ALD + sm0, ALD);
-                wmma::load_matrix_sync(fb, Vn + kt * 16 * SLD + nt * 16, SLD);
-                wmma::mma_sync(facc, fat, fb, facc);
-            }
-            wmma::store_matrix_sync(S + sm0 * SLD + nt * 16, facc, SLD, wmma::mem_row_major);
-        }
-        __syncwarp();
-        for (int idx = tid & 31; idx < 16 * TC; idx += 32) {
-            int r = idx / TC;
-            int j = idx % TC;
-            Sb[(sm0 + r) * SLD + j] = __float2bfloat16(S[(sm0 + r) * SLD + j]);
-        }
-        __syncthreads();
-    }
-    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
-        int k = idx / TC;
-        int j = idx % TC;
-        state_inout[((size_t)h * D + k) * D + j0 + j] = S[k * SLD + j];
-    }
-}
-
-constexpr size_t MMA_SMEM_BYTES_93K_NEEDS_THE_OPT_IN_ATTRIBUTE_ABOVE_THE_48K_STATIC_CAP =
-    (size_t)(128 * 40 + 64 * 40 + 64) * sizeof(float) +
-    (size_t)(128 * 40 + 2 * 64 * 136 + 64 * 72 + 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16);
-
 constexpr size_t
     V3_CHECKPOINTS_ALIAS_THE_STACK_A_RESERVATION_STATE_16384_PLUS_VNEW_8192_BF16_IS_HALF_ITS_F32_ROWS =
         (size_t)128 * 128;
 
+__global__ void gdn_lowp_quantize_operands_kernel(
+    const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
+    __nv_fp8_e4m3* __restrict__ aw_fp8, __nv_fp8_e4m3* __restrict__ ak_fp8,
+    float* __restrict__ aw_scale, float* __restrict__ ak_scale, int H
+) {
+    const int C = 64;
+    const int D = 128;
+    const int sc = blockIdx.x;
+    const int h = blockIdx.y;
+    const size_t sh = (size_t)sc * H + h;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    __shared__ float aws[64];
+    __shared__ float aks[64];
+    for (int c = wid; c < C; c += 8) {
+        float ma = 0.f, mk = 0.f;
+        for (int col = lane; col < D; col += 32) {
+            ma = fmaxf(ma, fabsf(__bfloat162float(wu[sh * C * 256 + (size_t)c * 256 + col])));
+            mk = fmaxf(mk, fabsf(__bfloat162float(kc[(sh * C + c) * D + col])));
+        }
+        for (int o = 16; o > 0; o >>= 1) {
+            ma = fmaxf(ma, __shfl_xor_sync(0xffffffffu, ma, o));
+            mk = fmaxf(mk, __shfl_xor_sync(0xffffffffu, mk, o));
+        }
+        if (lane == 0) {
+            aws[c] = (ma > 1e-12f) ? 448.f / ma : 1.f;
+            aks[c] = (mk > 1e-12f) ? 448.f / mk : 1.f;
+        }
+    }
+    __syncthreads();
+    if (tid < C) {
+        aw_scale[sh * C + tid] = aws[tid];
+        ak_scale[sh * C + tid] = aks[tid];
+    }
+    for (int i = tid; i < C * D; i += (int)blockDim.x) {
+        int c = i / D, col = i % D;
+        float wa = __bfloat162float(wu[sh * C * 256 + (size_t)c * 256 + col]) * aws[c];
+        float ka = __bfloat162float(kc[(sh * C + c) * D + col]) * aks[c];
+        aw_fp8[(sh * C + c) * D + col] = (__nv_fp8_e4m3)fmaxf(-448.f, fminf(448.f, wa));
+        ak_fp8[(sh * C + c) * D + col] = (__nv_fp8_e4m3)fmaxf(-448.f, fminf(448.f, ka));
+    }
+}
+
 __global__ void v3_ladder_state_checkpoint_kernel(
     const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
     const float* __restrict__ cg, float* __restrict__ state_inout,
-    __nv_bfloat16* __restrict__ schk, __nv_bfloat16* __restrict__ vchk, int H, int n
+    __nv_bfloat16* __restrict__ schk, __nv_bfloat16* __restrict__ vchk, int H, int n, int lowp
 ) {
     using namespace nvcuda;
     const int C = 64;
@@ -843,12 +607,35 @@ __global__ void v3_ladder_state_checkpoint_kernel(
         }
     };
 
+    const int lane_for_fp8 = tid & 31;
+    auto round_operand_fp8_e4m3_perrow_scale_simulates_the_staged_fp8_operand_precision = [&](__nv_bfloat16* buf) {
+        if (!(lowp == 1 || lowp == 2 || lowp == 3)) return;
+        for (int r = wid; r < C; r += 8) {
+            float mx = 0.f;
+            for (int c = lane_for_fp8; c < D; c += 32)
+                mx = fmaxf(mx, fabsf(__bfloat162float(buf[r * ALD + c])));
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            if (lane_for_fp8 == 0) scr[r] = (mx > 1e-12f) ? 448.f / mx : 1.f;
+        }
+        __syncthreads();
+        for (int i = tid; i < C * D; i += (int)blockDim.x) {
+            int r = i / D, c = i % D;
+            float s = scr[r];
+            float f = __bfloat162float(buf[r * ALD + c]);
+            float sc = fmaxf(-448.f, fminf(448.f, f * s));
+            __nv_fp8_e4m3 q = (__nv_fp8_e4m3)sc;
+            buf[r * ALD + c] = __float2bfloat16((float)q / s);
+        }
+        __syncthreads();
+    };
+
     for (int idx = tid; idx < D * TC; idx += blockDim.x) {
         int k = idx / TC;
         int j = idx % TC;
         float v = state_inout[((size_t)h * D + k) * D + j0 + j];
-        S[k * SLD + j] = v;
         __nv_bfloat16 vb = __float2bfloat16(v);
+        S[k * SLD + j] = (lowp == 1 || lowp == 4) ? __bfloat162float(vb)
+                         : (lowp == 2 ? __half2float(__float2half(v)) : v);
         Sb[k * SLD + j] = vb;
         schk[((size_t)h * D + k) * D + j0 + j] = vb;
     }
@@ -876,6 +663,7 @@ __global__ void v3_ladder_state_checkpoint_kernel(
         if (tid == 0) ecl[0] = expf(cg[sh * C + (C - 1)]);
         mma_cp_async_wait<1>();
         __syncthreads();
+        round_operand_fp8_e4m3_perrow_scale_simulates_the_staged_fp8_operand_precision(Aw);
 
         wmma::fill_fragment(facc, 0.f);
         for (int kt = 0; kt < D / 16; ++kt) {
@@ -905,6 +693,7 @@ __global__ void v3_ladder_state_checkpoint_kernel(
             mma_cp_async_wait<0>();
         }
         __syncthreads();
+        round_operand_fp8_e4m3_perrow_scale_simulates_the_staged_fp8_operand_precision(Ak);
 
         float b_last = ecl[0];
         for (int nt = 0; nt < TC / 16; ++nt) {
@@ -921,8 +710,11 @@ __global__ void v3_ladder_state_checkpoint_kernel(
         for (int idx = tid & 31; idx < 16 * TC; idx += 32) {
             int r = idx / TC;
             int j = idx % TC;
-            __nv_bfloat16 vb = __float2bfloat16(S[(sm0 + r) * SLD + j]);
+            float sval = S[(sm0 + r) * SLD + j];
+            __nv_bfloat16 vb = __float2bfloat16(sval);
             Sb[(sm0 + r) * SLD + j] = vb;
+            if (lowp == 1 || lowp == 4) S[(sm0 + r) * SLD + j] = __bfloat162float(vb);
+            else if (lowp == 2) S[(sm0 + r) * SLD + j] = __half2float(__float2half(sval));
             if (sc + 1 < n) {
                 schk[(((size_t)(sc + 1) * H + h) * D + sm0 + r) * D + j0 + j] = vb;
             }
@@ -943,6 +735,834 @@ __global__ void v3_ladder_state_checkpoint_kernel(
 constexpr size_t V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K =
     (size_t)(128 * 40 + 64 * 40 + 4) * sizeof(float) +
     (size_t)(128 * 40 + 2 * 64 * 136 + 2 * 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16);
+
+constexpr int V3_LOWP_OPERAND_LD_128_FP8_UNPADDED_KEEPS_16B_CP_ASYNC_ALIGNMENT = 128;
+
+__device__ __forceinline__ unsigned lowp_fp8x2_to_half2_bits(unsigned packed16) {
+    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)packed16, __NV_E4M3);
+    return *reinterpret_cast<unsigned*>(&hr);
+}
+__device__ __forceinline__ unsigned lowp_bf16x2_to_half2_bits(unsigned lo_bits, unsigned hi_bits) {
+    __nv_bfloat16 lo = *reinterpret_cast<__nv_bfloat16*>(&lo_bits);
+    __nv_bfloat16 hi = *reinterpret_cast<__nv_bfloat16*>(&hi_bits);
+    __half2 h = __floats2half2_rn(__bfloat162float(lo), __bfloat162float(hi));
+    return *reinterpret_cast<unsigned*>(&h);
+}
+__device__ __forceinline__ unsigned lowp_scale_half2(unsigned h2bits, float inv0, float inv1) {
+    __half2 h = *reinterpret_cast<__half2*>(&h2bits);
+    float2 f = __half22float2(h);
+    __half2 r = __floats2half2_rn(f.x * inv0, f.y * inv1);
+    return *reinterpret_cast<unsigned*>(&r);
+}
+__device__ __forceinline__ void lowp_mma_m16n8k16_f16(
+    float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void lowp_mma_m16n8k32_e4m3(
+    float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ unsigned lowp_quant_e4m3x4(float f0, float f1, float f2, float f3) {
+    __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(make_float2(f0, f1), __NV_SATFINITE, __NV_E4M3);
+    __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(make_float2(f2, f3), __NV_SATFINITE, __NV_E4M3);
+    return (unsigned)lo | ((unsigned)hi << 16);
+}
+
+constexpr size_t V3_LOWP_SMEM_BYTES_45K_FP8_OPERANDS_PLUS_BF16_STATE_LET_TWO_BLOCKS_CORESIDE_WITH_THE_CP_ASYNC_DOUBLE_BUFFER_AND_SLD40_KEPT =
+    (size_t)(128 * 40 + 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16) +
+    (size_t)(64 * 128 + 64 * 128) * sizeof(__nv_fp8_e4m3) +
+    (size_t)(2 * 64) * sizeof(float);
+
+__global__ void __launch_bounds__(256, 2) v3_ladder_state_checkpoint_lowp_kernel(
+    const __nv_fp8_e4m3* __restrict__ aw_fp8, const __nv_fp8_e4m3* __restrict__ ak_fp8,
+    const float* __restrict__ aw_scale, const float* __restrict__ ak_scale,
+    const __nv_bfloat16* __restrict__ wu, const float* __restrict__ cg,
+    float* __restrict__ state_inout, __nv_bfloat16* __restrict__ schk,
+    __nv_bfloat16* __restrict__ vchk, int H, int n
+) {
+    using namespace nvcuda;
+    const int C = 64;
+    const int D = 128;
+    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
+    const int SLD = MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
+    const int AL = V3_LOWP_OPERAND_LD_128_FP8_UNPADDED_KEEPS_16B_CP_ASYNC_ALIGNMENT;
+    const int tile = blockIdx.x;
+    const int h = blockIdx.y;
+    const int j0 = tile * TC;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    extern __shared__ unsigned char smem_raw[];
+    __nv_bfloat16* S = (__nv_bfloat16*)smem_raw;
+    __nv_fp8_e4m3* Aw = (__nv_fp8_e4m3*)(S + D * SLD);
+    __nv_fp8_e4m3* Ak = Aw + C * AL;
+    __nv_bfloat16* Us = (__nv_bfloat16*)(Ak + C * AL);
+    __nv_bfloat16* Vn = Us + C * SLD;
+    float* awsc = (float*)(Vn + C * SLD);
+    float* aksc = awsc + C;
+
+    auto stage_fp8 = [&](__nv_fp8_e4m3* dst, const __nv_fp8_e4m3* src) {
+        for (int i = tid; i < C * 8; i += (int)blockDim.x) {
+            int c = i >> 3;
+            int seg = i & 7;
+            mma_cp_async16(dst + c * AL + seg * 16, src + (size_t)c * 128 + seg * 16);
+        }
+    };
+    auto stage_us = [&](const __nv_bfloat16* wrow) {
+        for (int i = tid; i < C * 4; i += (int)blockDim.x) {
+            int c = i >> 2;
+            int seg = i & 3;
+            mma_cp_async16(Us + c * SLD + seg * 8, wrow + (size_t)c * 256 + D + j0 + seg * 8);
+        }
+    };
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC;
+        int j = idx % TC;
+        __nv_bfloat16 vb = __float2bfloat16(state_inout[((size_t)h * D + k) * D + j0 + j]);
+        S[k * SLD + j] = vb;
+        schk[((size_t)h * D + k) * D + j0 + j] = vb;
+    }
+    {
+        stage_fp8(Aw, aw_fp8 + (size_t)h * C * 128);
+        stage_us(wu + (size_t)h * C * 256);
+        mma_cp_async_commit();
+        stage_fp8(Ak, ak_fp8 + (size_t)h * C * 128);
+        mma_cp_async_commit();
+    }
+
+    const int sm0 = wid * 16;
+
+    for (int sc = 0; sc < n; ++sc) {
+        size_t sh = (size_t)sc * H + h;
+        float b_last = expf(cg[sh * C + (C - 1)]);
+        if (tid < C) {
+            awsc[tid] = aw_scale[sh * C + tid];
+            aksc[tid] = ak_scale[sh * C + tid];
+        }
+        mma_cp_async_wait<1>();
+        __syncthreads();
+
+        {
+            const int gid = lane >> 2;
+            const int tg = lane & 3;
+            const int mt = wid >> 1;
+            const int ntb = (wid & 1) * 2;
+            const int r0 = mt * 16 + gid;
+            const int r8 = r0 + 8;
+            float c0[4] = {0.f, 0.f, 0.f, 0.f};
+            float c1[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int kt = 0; kt < D / 16; ++kt) {
+                int kc = kt * 16 + tg * 2;
+                unsigned a0 = lowp_fp8x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&Aw[(size_t)r0 * AL + kc]));
+                unsigned a2 = lowp_fp8x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&Aw[(size_t)r0 * AL + kc + 8]));
+                unsigned a1 = lowp_fp8x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&Aw[(size_t)r8 * AL + kc]));
+                unsigned a3 = lowp_fp8x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&Aw[(size_t)r8 * AL + kc + 8]));
+                int nn0 = ntb * 8 + gid;
+                int nn1 = (ntb + 1) * 8 + gid;
+                unsigned b00 = lowp_bf16x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&S[kc * SLD + nn0]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kc + 1) * SLD + nn0]));
+                unsigned b01 = lowp_bf16x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&S[(kc + 8) * SLD + nn0]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kc + 9) * SLD + nn0]));
+                unsigned b10 = lowp_bf16x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&S[kc * SLD + nn1]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kc + 1) * SLD + nn1]));
+                unsigned b11 = lowp_bf16x2_to_half2_bits(
+                    *reinterpret_cast<const unsigned short*>(&S[(kc + 8) * SLD + nn1]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kc + 9) * SLD + nn1]));
+                lowp_mma_m16n8k16_f16(c0, a0, a1, a2, a3, b00, b01);
+                lowp_mma_m16n8k16_f16(c1, a0, a1, a2, a3, b10, b11);
+            }
+            float inv0 = 1.0f / awsc[r0];
+            float inv8 = 1.0f / awsc[r8];
+            int co = tg * 2;
+            const float* cc[2] = {c0, c1};
+            for (int nt2 = 0; nt2 < 2; ++nt2) {
+                int nbase = (ntb + nt2) * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = (e < 2) ? r0 : r8;
+                    float invv = (e < 2) ? inv0 : inv8;
+                    int col = nbase + co + (e & 1);
+                    float scrv = cc[nt2][e] * invv;
+                    __nv_bfloat16 vb =
+                        __float2bfloat16(__bfloat162float(Us[rr * SLD + col]) - scrv);
+                    Vn[rr * SLD + col] = vb;
+                    vchk[(sh * C + rr) * D + j0 + col] = vb;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (sc + 1 < n) {
+            size_t sh1 = (size_t)(sc + 1) * H + h;
+            stage_fp8(Aw, aw_fp8 + sh1 * C * 128);
+            stage_us(wu + sh1 * C * 256);
+            mma_cp_async_commit();
+            mma_cp_async_wait<1>();
+        } else {
+            mma_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        {
+            const int gid = lane >> 2;
+            const int tg = lane & 3;
+            float cc0[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc1[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc2[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc3[4] = {0.f, 0.f, 0.f, 0.f};
+            float* ccs[4] = {cc0, cc1, cc2, cc3};
+            const unsigned char* Akb = reinterpret_cast<const unsigned char*>(Ak);
+            for (int kt = 0; kt < C / 16; ++kt) {
+                int cc = kt * 16 + tg * 2;
+                int d0 = sm0 + gid;
+                int d8 = d0 + 8;
+                auto la = [&](int cidx, int d) -> unsigned {
+                    unsigned raw = (unsigned)Akb[(size_t)(cidx + 1) * AL + d] << 8 |
+                                   (unsigned)Akb[(size_t)cidx * AL + d];
+                    return lowp_scale_half2(lowp_fp8x2_to_half2_bits(raw), 1.f / aksc[cidx],
+                                            1.f / aksc[cidx + 1]);
+                };
+                unsigned a0 = la(cc, d0);
+                unsigned a1 = la(cc, d8);
+                unsigned a2 = la(cc + 8, d0);
+                unsigned a3 = la(cc + 8, d8);
+                for (int nt2 = 0; nt2 < 4; ++nt2) {
+                    int n = nt2 * 8 + gid;
+                    unsigned b0 = lowp_bf16x2_to_half2_bits(
+                        *reinterpret_cast<const unsigned short*>(&Vn[cc * SLD + n]),
+                        *reinterpret_cast<const unsigned short*>(&Vn[(cc + 1) * SLD + n]));
+                    unsigned b1 = lowp_bf16x2_to_half2_bits(
+                        *reinterpret_cast<const unsigned short*>(&Vn[(cc + 8) * SLD + n]),
+                        *reinterpret_cast<const unsigned short*>(&Vn[(cc + 9) * SLD + n]));
+                    lowp_mma_m16n8k16_f16(ccs[nt2], a0, a1, a2, a3, b0, b1);
+                }
+            }
+            int co = tg * 2;
+            for (int nt2 = 0; nt2 < 4; ++nt2) {
+                int nbase = nt2 * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = sm0 + gid + ((e < 2) ? 0 : 8);
+                    int jj = nbase + co + (e & 1);
+                    float snew = __bfloat162float(S[rr * SLD + jj]) * b_last + ccs[nt2][e];
+                    S[rr * SLD + jj] = __float2bfloat16(snew);
+                }
+            }
+            __syncwarp();
+        }
+        for (int idx = lane; idx < 16 * TC; idx += 32) {
+            int r = idx / TC;
+            int j = idx % TC;
+            if (sc + 1 < n) {
+                schk[(((size_t)(sc + 1) * H + h) * D + sm0 + r) * D + j0 + j] =
+                    S[(sm0 + r) * SLD + j];
+            }
+        }
+        __syncthreads();
+        if (sc + 1 < n) {
+            stage_fp8(Ak, ak_fp8 + ((size_t)(sc + 1) * H + h) * C * 128);
+            mma_cp_async_commit();
+        }
+    }
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC;
+        int j = idx % TC;
+        state_inout[((size_t)h * D + k) * D + j0 + j] = __bfloat162float(S[k * SLD + j]);
+    }
+}
+
+constexpr size_t V3_FP8_SMEM_BYTES_44K_FP8_STATE_AND_OPERANDS_THROUGH_THE_NATIVE_E4M3_MMA_NO_CONVERT =
+    (size_t)(128 * 40 + 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16) +
+    (size_t)(128 * 40 + 64 * 128 + 64 * 128 + 64 * 40) * sizeof(__nv_fp8_e4m3) +
+    (size_t)(2 * 64 + 8) * sizeof(float);
+
+__device__ __forceinline__ float lowp_block_absmax(float v, float* red, int tid) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if ((tid & 31) == 0) red[tid >> 5] = v;
+    __syncthreads();
+    float m = 0.f;
+    for (int w = 0; w < 8; ++w) m = fmaxf(m, red[w]);
+    return m;
+}
+
+__global__ void __launch_bounds__(256, 2) v3_ladder_state_checkpoint_fp8_kernel(
+    const __nv_fp8_e4m3* __restrict__ aw_fp8, const __nv_fp8_e4m3* __restrict__ ak_fp8,
+    const float* __restrict__ aw_scale, const float* __restrict__ ak_scale,
+    const __nv_bfloat16* __restrict__ wu, const float* __restrict__ cg,
+    float* __restrict__ state_inout, __nv_bfloat16* __restrict__ schk,
+    __nv_bfloat16* __restrict__ vchk, int H, int n
+) {
+    const int C = 64;
+    const int D = 128;
+    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
+    const int SLD = MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
+    const int AL = V3_LOWP_OPERAND_LD_128_FP8_UNPADDED_KEEPS_16B_CP_ASYNC_ALIGNMENT;
+    const int tile = blockIdx.x;
+    const int h = blockIdx.y;
+    const int j0 = tile * TC;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    const int gid = lane >> 2;
+    const int tg = lane & 3;
+    extern __shared__ unsigned char smem_raw[];
+    __nv_bfloat16* S = (__nv_bfloat16*)smem_raw;
+    __nv_bfloat16* Us = S + D * SLD;
+    __nv_bfloat16* Vn = Us + C * SLD;
+    __nv_fp8_e4m3* Sf8 = (__nv_fp8_e4m3*)(Vn + C * SLD);
+    __nv_fp8_e4m3* Aw = Sf8 + D * SLD;
+    __nv_fp8_e4m3* Ak = Aw + C * AL;
+    __nv_fp8_e4m3* Vf8 = Ak + C * AL;
+    float* awsc = (float*)(Vf8 + C * SLD);
+    float* aksc = awsc + C;
+    float* red = aksc + C;
+
+    auto stage_fp8 = [&](__nv_fp8_e4m3* dst, const __nv_fp8_e4m3* src) {
+        for (int i = tid; i < C * 8; i += (int)blockDim.x) {
+            int c = i >> 3, seg = i & 7;
+            mma_cp_async16(dst + c * AL + seg * 16, src + (size_t)c * 128 + seg * 16);
+        }
+    };
+    auto stage_us = [&](const __nv_bfloat16* wrow) {
+        for (int i = tid; i < C * 4; i += (int)blockDim.x) {
+            int c = i >> 2, seg = i & 3;
+            mma_cp_async16(Us + c * SLD + seg * 8, wrow + (size_t)c * 256 + D + j0 + seg * 8);
+        }
+    };
+
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC, j = idx % TC;
+        __nv_bfloat16 vb = __float2bfloat16(state_inout[((size_t)h * D + k) * D + j0 + j]);
+        S[k * SLD + j] = vb;
+        schk[((size_t)h * D + k) * D + j0 + j] = vb;
+    }
+    {
+        stage_fp8(Aw, aw_fp8 + (size_t)h * C * 128);
+        stage_us(wu + (size_t)h * C * 256);
+        mma_cp_async_commit();
+        stage_fp8(Ak, ak_fp8 + (size_t)h * C * 128);
+        mma_cp_async_commit();
+    }
+
+    const int sm0 = wid * 16;
+    for (int sc = 0; sc < n; ++sc) {
+        size_t sh = (size_t)sc * H + h;
+        float b_last = expf(cg[sh * C + (C - 1)]);
+        if (tid < C) {
+            awsc[tid] = aw_scale[sh * C + tid];
+            aksc[tid] = ak_scale[sh * C + tid];
+        }
+        mma_cp_async_wait<1>();
+        __syncthreads();
+
+        float smax = 0.f;
+        for (int idx = tid; idx < D * TC; idx += blockDim.x)
+            smax = fmaxf(smax, fabsf(__bfloat162float(S[(idx / TC) * SLD + idx % TC])));
+        smax = lowp_block_absmax(smax, red, tid);
+        float sscale = (smax > 1e-12f) ? 448.f / smax : 1.f;
+        float sinv = 1.f / sscale;
+        __syncthreads();
+        for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+            int k = idx / TC, j = idx % TC;
+            Sf8[k * SLD + j] = (__nv_fp8_e4m3)(__bfloat162float(S[k * SLD + j]) * sscale);
+        }
+        __syncthreads();
+
+        {
+            const int mt = wid >> 1;
+            const int ntb = (wid & 1) * 2;
+            const int r0 = mt * 16 + gid, r8 = r0 + 8;
+            float c0[4] = {0, 0, 0, 0}, c1[4] = {0, 0, 0, 0};
+            for (int kt = 0; kt < D / 32; ++kt) {
+                int kk = kt * 32 + tg * 4;
+                unsigned a0 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r0 * AL + kk]);
+                unsigned a1 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r8 * AL + kk]);
+                unsigned a2 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r0 * AL + kk + 16]);
+                unsigned a3 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r8 * AL + kk + 16]);
+                auto lb = [&](int nn) -> uint2 {
+                    const unsigned char* p = reinterpret_cast<const unsigned char*>(Sf8);
+                    unsigned lo = 0, hi = 0;
+                    for (int e = 0; e < 4; ++e) {
+                        lo |= (unsigned)p[(size_t)(kk + e) * SLD + nn] << (8 * e);
+                        hi |= (unsigned)p[(size_t)(kk + 16 + e) * SLD + nn] << (8 * e);
+                    }
+                    return make_uint2(lo, hi);
+                };
+                uint2 b0v = lb(ntb * 8 + gid);
+                uint2 b1v = lb((ntb + 1) * 8 + gid);
+                lowp_mma_m16n8k32_e4m3(c0, a0, a1, a2, a3, b0v.x, b0v.y);
+                lowp_mma_m16n8k32_e4m3(c1, a0, a1, a2, a3, b1v.x, b1v.y);
+            }
+            float inv0 = sinv / awsc[r0], inv8 = sinv / awsc[r8];
+            const float* cc[2] = {c0, c1};
+            for (int nt2 = 0; nt2 < 2; ++nt2) {
+                int nbase = (ntb + nt2) * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = (e < 2) ? r0 : r8;
+                    float invv = (e < 2) ? inv0 : inv8;
+                    int col = nbase + tg * 2 + (e & 1);
+                    __nv_bfloat16 vb = __float2bfloat16(__bfloat162float(Us[rr * SLD + col]) -
+                                                        cc[nt2][e] * invv);
+                    Vn[rr * SLD + col] = vb;
+                    vchk[(sh * C + rr) * D + j0 + col] = vb;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (sc + 1 < n) {
+            size_t sh1 = (size_t)(sc + 1) * H + h;
+            stage_fp8(Aw, aw_fp8 + sh1 * C * 128);
+            stage_us(wu + sh1 * C * 256);
+            mma_cp_async_commit();
+            mma_cp_async_wait<1>();
+        } else {
+            mma_cp_async_wait<0>();
+        }
+
+        float vmax = 0.f;
+        for (int idx = tid; idx < C * TC; idx += blockDim.x) {
+            int c = idx / TC, j = idx % TC;
+            vmax = fmaxf(vmax, fabsf(__bfloat162float(Vn[c * SLD + j]) / aksc[c]));
+        }
+        vmax = lowp_block_absmax(vmax, red, tid);
+        float vscale = (vmax > 1e-12f) ? 448.f / vmax : 1.f;
+        float vinv = 1.f / vscale;
+        __syncthreads();
+        for (int idx = tid; idx < C * TC; idx += blockDim.x) {
+            int c = idx / TC, j = idx % TC;
+            Vf8[c * SLD + j] = (__nv_fp8_e4m3)(__bfloat162float(Vn[c * SLD + j]) / aksc[c] * vscale);
+        }
+        __syncthreads();
+
+        {
+            float cc0[4] = {0, 0, 0, 0}, cc1[4] = {0, 0, 0, 0};
+            float cc2[4] = {0, 0, 0, 0}, cc3[4] = {0, 0, 0, 0};
+            float* ccs[4] = {cc0, cc1, cc2, cc3};
+            const unsigned char* Akb = reinterpret_cast<const unsigned char*>(Ak);
+            const unsigned char* Vb = reinterpret_cast<const unsigned char*>(Vf8);
+            for (int kt = 0; kt < C / 32; ++kt) {
+                int cbase = kt * 32 + tg * 4;
+                int d0 = sm0 + gid, d8 = d0 + 8;
+                auto la = [&](int d) -> uint2 {
+                    unsigned lo = 0, hi = 0;
+                    for (int e = 0; e < 4; ++e) {
+                        lo |= (unsigned)Akb[(size_t)(cbase + e) * AL + d] << (8 * e);
+                        hi |= (unsigned)Akb[(size_t)(cbase + 16 + e) * AL + d] << (8 * e);
+                    }
+                    return make_uint2(lo, hi);
+                };
+                uint2 a0v = la(d0);
+                uint2 a1v = la(d8);
+                for (int nt2 = 0; nt2 < 4; ++nt2) {
+                    int nn = nt2 * 8 + gid;
+                    unsigned lo = 0, hi = 0;
+                    for (int e = 0; e < 4; ++e) {
+                        lo |= (unsigned)Vb[(size_t)(cbase + e) * SLD + nn] << (8 * e);
+                        hi |= (unsigned)Vb[(size_t)(cbase + 16 + e) * SLD + nn] << (8 * e);
+                    }
+                    lowp_mma_m16n8k32_e4m3(ccs[nt2], a0v.x, a1v.x, a0v.y, a1v.y, lo, hi);
+                }
+            }
+            for (int nt2 = 0; nt2 < 4; ++nt2) {
+                int nbase = nt2 * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = sm0 + gid + ((e < 2) ? 0 : 8);
+                    int jj = nbase + tg * 2 + (e & 1);
+                    float snew = __bfloat162float(S[rr * SLD + jj]) * b_last + ccs[nt2][e] * vinv;
+                    S[rr * SLD + jj] = __float2bfloat16(snew);
+                }
+            }
+            __syncwarp();
+        }
+        for (int idx = lane; idx < 16 * TC; idx += 32) {
+            int r = idx / TC, j = idx % TC;
+            if (sc + 1 < n)
+                schk[(((size_t)(sc + 1) * H + h) * D + sm0 + r) * D + j0 + j] = S[(sm0 + r) * SLD + j];
+        }
+        __syncthreads();
+        if (sc + 1 < n) {
+            stage_fp8(Ak, ak_fp8 + ((size_t)(sc + 1) * H + h) * C * 128);
+            mma_cp_async_commit();
+        }
+    }
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC, j = idx % TC;
+        state_inout[((size_t)h * D + k) * D + j0 + j] = __bfloat162float(S[k * SLD + j]);
+    }
+}
+
+__device__ __forceinline__ unsigned pack_bf16x2(unsigned short lo, unsigned short hi) {
+    return (unsigned)lo | ((unsigned)hi << 16);
+}
+__device__ __forceinline__ void mma_m16n8k16_bf16(
+    float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+constexpr size_t V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST =
+    (size_t)(128 * 40 + 2 * 64 * 136 + 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16);
+
+__global__ void v3_ladder_state_checkpoint_bf16_kernel(
+    const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
+    const float* __restrict__ cg, float* __restrict__ state_inout,
+    __nv_bfloat16* __restrict__ schk, __nv_bfloat16* __restrict__ vchk, int H, int n
+) {
+    const int C = 64;
+    const int D = 128;
+    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
+    const int SLD = MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
+    const int ALD = MMA_OPERAND_LD_136_PADS_THE_128_COL_STAGE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
+    const int tile = blockIdx.x;
+    const int h = blockIdx.y;
+    const int j0 = tile * TC;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    extern __shared__ unsigned char smem_raw[];
+    __nv_bfloat16* S = (__nv_bfloat16*)smem_raw;
+    __nv_bfloat16* Aw = S + D * SLD;
+    __nv_bfloat16* Ak = Aw + C * ALD;
+    __nv_bfloat16* Us = Ak + C * ALD;
+    __nv_bfloat16* Vn = Us + C * SLD;
+
+    auto stage_wide = [&](__nv_bfloat16* dst, const __nv_bfloat16* src_row0, int src_ld) {
+        for (int i = tid; i < C * 16; i += (int)blockDim.x) {
+            int c = i >> 4, seg = i & 15;
+            mma_cp_async16(dst + c * ALD + seg * 8, src_row0 + (size_t)c * src_ld + seg * 8);
+        }
+    };
+    auto stage_us = [&](const __nv_bfloat16* wrow) {
+        for (int i = tid; i < C * 4; i += (int)blockDim.x) {
+            int c = i >> 2, seg = i & 3;
+            mma_cp_async16(Us + c * SLD + seg * 8, wrow + (size_t)c * 256 + D + j0 + seg * 8);
+        }
+    };
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC, j = idx % TC;
+        __nv_bfloat16 vb = __float2bfloat16(state_inout[((size_t)h * D + k) * D + j0 + j]);
+        S[k * SLD + j] = vb;
+        schk[((size_t)h * D + k) * D + j0 + j] = vb;
+    }
+    {
+        stage_wide(Aw, wu + (size_t)h * C * 256, 256);
+        stage_us(wu + (size_t)h * C * 256);
+        mma_cp_async_commit();
+        stage_wide(Ak, kc + (size_t)h * C * D, D);
+        mma_cp_async_commit();
+    }
+
+    const int sm0 = wid * 16;
+
+    for (int sc = 0; sc < n; ++sc) {
+        size_t sh = (size_t)sc * H + h;
+        float b_last = expf(cg[sh * C + (C - 1)]);
+        mma_cp_async_wait<1>();
+        __syncthreads();
+
+        {
+            const int gid = lane >> 2;
+            const int tg = lane & 3;
+            const int mt = wid >> 1;
+            const int ntb = (wid & 1) * 2;
+            const int r0 = mt * 16 + gid;
+            const int r8 = r0 + 8;
+            float c0[4] = {0.f, 0.f, 0.f, 0.f};
+            float c1[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int kt = 0; kt < D / 16; ++kt) {
+                int kk = kt * 16 + tg * 2;
+                unsigned a0 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r0 * ALD + kk]);
+                unsigned a2 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r0 * ALD + kk + 8]);
+                unsigned a1 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r8 * ALD + kk]);
+                unsigned a3 = *reinterpret_cast<const unsigned*>(&Aw[(size_t)r8 * ALD + kk + 8]);
+                int nn0 = ntb * 8 + gid;
+                int nn1 = (ntb + 1) * 8 + gid;
+                unsigned b00 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[kk * SLD + nn0]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 1) * SLD + nn0]));
+                unsigned b01 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 8) * SLD + nn0]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 9) * SLD + nn0]));
+                unsigned b10 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[kk * SLD + nn1]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 1) * SLD + nn1]));
+                unsigned b11 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 8) * SLD + nn1]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 9) * SLD + nn1]));
+                mma_m16n8k16_bf16(c0, a0, a1, a2, a3, b00, b01);
+                mma_m16n8k16_bf16(c1, a0, a1, a2, a3, b10, b11);
+            }
+            int co = tg * 2;
+            const float* cc[2] = {c0, c1};
+            for (int nt2 = 0; nt2 < 2; ++nt2) {
+                int nbase = (ntb + nt2) * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = (e < 2) ? r0 : r8;
+                    int col = nbase + co + (e & 1);
+                    __nv_bfloat16 vb =
+                        __float2bfloat16(__bfloat162float(Us[rr * SLD + col]) - cc[nt2][e]);
+                    Vn[rr * SLD + col] = vb;
+                    vchk[(sh * C + rr) * D + j0 + col] = vb;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (sc + 1 < n) {
+            size_t sh1 = (size_t)(sc + 1) * H + h;
+            stage_wide(Aw, wu + sh1 * C * 256, 256);
+            stage_us(wu + sh1 * C * 256);
+            mma_cp_async_commit();
+            mma_cp_async_wait<1>();
+        } else {
+            mma_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        {
+            const int gid = lane >> 2;
+            const int tg = lane & 3;
+            float cc0[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc1[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc2[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc3[4] = {0.f, 0.f, 0.f, 0.f};
+            float* ccs[4] = {cc0, cc1, cc2, cc3};
+            for (int kt = 0; kt < C / 16; ++kt) {
+                int ck = kt * 16 + tg * 2;
+                int d0 = sm0 + gid;
+                int d8 = d0 + 8;
+                auto la = [&](int cidx, int d) -> unsigned {
+                    return pack_bf16x2(
+                        *reinterpret_cast<const unsigned short*>(&Ak[(size_t)cidx * ALD + d]),
+                        *reinterpret_cast<const unsigned short*>(&Ak[(size_t)(cidx + 1) * ALD + d]));
+                };
+                unsigned a0 = la(ck, d0);
+                unsigned a1 = la(ck, d8);
+                unsigned a2 = la(ck + 8, d0);
+                unsigned a3 = la(ck + 8, d8);
+                for (int nt2 = 0; nt2 < 4; ++nt2) {
+                    int nn = nt2 * 8 + gid;
+                    unsigned b0 = pack_bf16x2(
+                        *reinterpret_cast<const unsigned short*>(&Vn[ck * SLD + nn]),
+                        *reinterpret_cast<const unsigned short*>(&Vn[(ck + 1) * SLD + nn]));
+                    unsigned b1 = pack_bf16x2(
+                        *reinterpret_cast<const unsigned short*>(&Vn[(ck + 8) * SLD + nn]),
+                        *reinterpret_cast<const unsigned short*>(&Vn[(ck + 9) * SLD + nn]));
+                    mma_m16n8k16_bf16(ccs[nt2], a0, a1, a2, a3, b0, b1);
+                }
+            }
+            int co = tg * 2;
+            for (int nt2 = 0; nt2 < 4; ++nt2) {
+                int nbase = nt2 * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = sm0 + gid + ((e < 2) ? 0 : 8);
+                    int jj = nbase + co + (e & 1);
+                    float snew = __bfloat162float(S[rr * SLD + jj]) * b_last + ccs[nt2][e];
+                    S[rr * SLD + jj] = __float2bfloat16(snew);
+                }
+            }
+            __syncwarp();
+        }
+        for (int idx = lane; idx < 16 * TC; idx += 32) {
+            int r = idx / TC, j = idx % TC;
+            if (sc + 1 < n)
+                schk[(((size_t)(sc + 1) * H + h) * D + sm0 + r) * D + j0 + j] = S[(sm0 + r) * SLD + j];
+        }
+        __syncthreads();
+        if (sc + 1 < n) {
+            stage_wide(Ak, kc + ((size_t)(sc + 1) * H + h) * C * D, D);
+            mma_cp_async_commit();
+        }
+    }
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC, j = idx % TC;
+        state_inout[((size_t)h * D + k) * D + j0 + j] = __bfloat162float(S[k * SLD + j]);
+    }
+}
+
+constexpr size_t V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE =
+    (size_t)(128 * 40 + 64 * 136 + 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16);
+
+__global__ void __launch_bounds__(256, 2) v3_ladder_state_checkpoint_kstream_kernel(
+    const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
+    const float* __restrict__ cg, float* __restrict__ state_inout,
+    __nv_bfloat16* __restrict__ schk, __nv_bfloat16* __restrict__ vchk, int H, int n
+) {
+    const int C = 64;
+    const int D = 128;
+    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
+    const int SLD = MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
+    const int ALD = MMA_OPERAND_LD_136_PADS_THE_128_COL_STAGE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
+    const int tile = blockIdx.x;
+    const int h = blockIdx.y;
+    const int j0 = tile * TC;
+    const int tid = threadIdx.x;
+    const int wid = tid >> 5;
+    const int lane = tid & 31;
+    extern __shared__ unsigned char smem_raw[];
+    __nv_bfloat16* S = (__nv_bfloat16*)smem_raw;
+    __nv_bfloat16* Op = S + D * SLD;
+    __nv_bfloat16* Us = Op + C * ALD;
+    __nv_bfloat16* Vn = Us + C * SLD;
+
+    auto stage_wide = [&](const __nv_bfloat16* src_row0, int src_ld) {
+        for (int i = tid; i < C * 16; i += (int)blockDim.x) {
+            int c = i >> 4, seg = i & 15;
+            mma_cp_async16(Op + c * ALD + seg * 8, src_row0 + (size_t)c * src_ld + seg * 8);
+        }
+    };
+    auto stage_us = [&](const __nv_bfloat16* wrow) {
+        for (int i = tid; i < C * 4; i += (int)blockDim.x) {
+            int c = i >> 2, seg = i & 3;
+            mma_cp_async16(Us + c * SLD + seg * 8, wrow + (size_t)c * 256 + D + j0 + seg * 8);
+        }
+    };
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC, j = idx % TC;
+        __nv_bfloat16 vb = __float2bfloat16(state_inout[((size_t)h * D + k) * D + j0 + j]);
+        S[k * SLD + j] = vb;
+        schk[((size_t)h * D + k) * D + j0 + j] = vb;
+    }
+
+    const int sm0 = wid * 16;
+    const int gid = lane >> 2;
+    const int tg = lane & 3;
+
+    for (int sc = 0; sc < n; ++sc) {
+        size_t sh = (size_t)sc * H + h;
+        float b_last = expf(cg[sh * C + (C - 1)]);
+        const __nv_bfloat16* wrow = wu + sh * C * 256;
+        stage_wide(wrow, 256);
+        stage_us(wrow);
+        mma_cp_async_commit();
+        mma_cp_async_wait<0>();
+        __syncthreads();
+
+        {
+            const int mt = wid >> 1;
+            const int ntb = (wid & 1) * 2;
+            const int r0 = mt * 16 + gid;
+            const int r8 = r0 + 8;
+            float c0[4] = {0.f, 0.f, 0.f, 0.f};
+            float c1[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int kt = 0; kt < D / 16; ++kt) {
+                int kk = kt * 16 + tg * 2;
+                unsigned a0 = *reinterpret_cast<const unsigned*>(&Op[(size_t)r0 * ALD + kk]);
+                unsigned a2 = *reinterpret_cast<const unsigned*>(&Op[(size_t)r0 * ALD + kk + 8]);
+                unsigned a1 = *reinterpret_cast<const unsigned*>(&Op[(size_t)r8 * ALD + kk]);
+                unsigned a3 = *reinterpret_cast<const unsigned*>(&Op[(size_t)r8 * ALD + kk + 8]);
+                int nn0 = ntb * 8 + gid;
+                int nn1 = (ntb + 1) * 8 + gid;
+                unsigned b00 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[kk * SLD + nn0]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 1) * SLD + nn0]));
+                unsigned b01 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 8) * SLD + nn0]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 9) * SLD + nn0]));
+                unsigned b10 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[kk * SLD + nn1]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 1) * SLD + nn1]));
+                unsigned b11 = pack_bf16x2(
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 8) * SLD + nn1]),
+                    *reinterpret_cast<const unsigned short*>(&S[(kk + 9) * SLD + nn1]));
+                mma_m16n8k16_bf16(c0, a0, a1, a2, a3, b00, b01);
+                mma_m16n8k16_bf16(c1, a0, a1, a2, a3, b10, b11);
+            }
+            int co = tg * 2;
+            const float* cc[2] = {c0, c1};
+            for (int nt2 = 0; nt2 < 2; ++nt2) {
+                int nbase = (ntb + nt2) * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = (e < 2) ? r0 : r8;
+                    int col = nbase + co + (e & 1);
+                    __nv_bfloat16 vb =
+                        __float2bfloat16(__bfloat162float(Us[rr * SLD + col]) - cc[nt2][e]);
+                    Vn[rr * SLD + col] = vb;
+                    vchk[(sh * C + rr) * D + j0 + col] = vb;
+                }
+            }
+        }
+        __syncthreads();
+
+        stage_wide(kc + sh * C * D, D);
+        mma_cp_async_commit();
+        mma_cp_async_wait<0>();
+        __syncthreads();
+
+        {
+            float cc0[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc1[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc2[4] = {0.f, 0.f, 0.f, 0.f};
+            float cc3[4] = {0.f, 0.f, 0.f, 0.f};
+            float* ccs[4] = {cc0, cc1, cc2, cc3};
+            for (int kt = 0; kt < C / 16; ++kt) {
+                int ck = kt * 16 + tg * 2;
+                int d0 = sm0 + gid;
+                int d8 = d0 + 8;
+                auto la = [&](int cidx, int d) -> unsigned {
+                    return pack_bf16x2(
+                        *reinterpret_cast<const unsigned short*>(&Op[(size_t)cidx * ALD + d]),
+                        *reinterpret_cast<const unsigned short*>(&Op[(size_t)(cidx + 1) * ALD + d]));
+                };
+                unsigned a0 = la(ck, d0);
+                unsigned a1 = la(ck, d8);
+                unsigned a2 = la(ck + 8, d0);
+                unsigned a3 = la(ck + 8, d8);
+                for (int nt2 = 0; nt2 < 4; ++nt2) {
+                    int nn = nt2 * 8 + gid;
+                    unsigned b0 = pack_bf16x2(
+                        *reinterpret_cast<const unsigned short*>(&Vn[ck * SLD + nn]),
+                        *reinterpret_cast<const unsigned short*>(&Vn[(ck + 1) * SLD + nn]));
+                    unsigned b1 = pack_bf16x2(
+                        *reinterpret_cast<const unsigned short*>(&Vn[(ck + 8) * SLD + nn]),
+                        *reinterpret_cast<const unsigned short*>(&Vn[(ck + 9) * SLD + nn]));
+                    mma_m16n8k16_bf16(ccs[nt2], a0, a1, a2, a3, b0, b1);
+                }
+            }
+            int co = tg * 2;
+            for (int nt2 = 0; nt2 < 4; ++nt2) {
+                int nbase = nt2 * 8;
+                for (int e = 0; e < 4; ++e) {
+                    int rr = sm0 + gid + ((e < 2) ? 0 : 8);
+                    int jj = nbase + co + (e & 1);
+                    float snew = __bfloat162float(S[rr * SLD + jj]) * b_last + ccs[nt2][e];
+                    S[rr * SLD + jj] = __float2bfloat16(snew);
+                }
+            }
+            __syncwarp();
+        }
+        for (int idx = lane; idx < 16 * TC; idx += 32) {
+            int r = idx / TC, j = idx % TC;
+            if (sc + 1 < n)
+                schk[(((size_t)(sc + 1) * H + h) * D + sm0 + r) * D + j0 + j] = S[(sm0 + r) * SLD + j];
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
+        int k = idx / TC, j = idx % TC;
+        state_inout[((size_t)h * D + k) * D + j0 + j] = __bfloat162float(S[k * SLD + j]);
+    }
+}
 
 constexpr int V3_OUT_SCR_LD_20_PADS_THE_16_COL_WARP_TILE_SO_F32_STORES_SPREAD_BANKS = 20;
 
@@ -1084,63 +1704,6 @@ static int run_head(
     return 0;
 }
 
-static int run_fwdh_tail(
-    cudaStream_t s, const WsLayout& l, float* workspace, float* state_inout, __nv_bfloat16* out,
-    int T, int H, int HK
-) {
-    const int TC = FWDH_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
-    static std::once_flag smem_once;
-    static cudaError_t smem_rc = cudaSuccess;
-    std::call_once(smem_once, []() {
-        smem_rc = cudaFuncSetAttribute(
-            fwdh_state_resident_carry_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)FWDH_SMEM_BYTES_84K_NEEDS_THE_OPT_IN_ATTRIBUTE_ABOVE_THE_48K_STATIC_CAP);
-    });
-    if (smem_rc != cudaSuccess) return (int)smem_rc;
-    __nv_bfloat16* attn = (__nv_bfloat16*)(workspace + l.attn);
-    __nv_bfloat16* wu = (__nv_bfloat16*)(workspace + l.wu);
-    __nv_bfloat16* kc = (__nv_bfloat16*)(workspace + l.kc);
-    __nv_bfloat16* qr = (__nv_bfloat16*)(workspace + l.qr);
-    float* cg = workspace + l.cg;
-    dim3 grid(128 / TC, H);
-    fwdh_state_resident_carry_kernel<<<
-        grid, FWDH_THREADS_512_SIXTEEN_WARPS_HIDE_SMEM_LATENCY_AT_ONE_BLOCK_PER_SM,
-        FWDH_SMEM_BYTES_84K_NEEDS_THE_OPT_IN_ATTRIBUTE_ABOVE_THE_48K_STATIC_CAP, s>>>(
-        wu, kc, attn, qr, cg, state_inout, out, T, H, HK, l.n);
-    cudaError_t ce = cudaGetLastError();
-    if (ce != cudaSuccess) return (int)ce;
-    return 0;
-}
-
-static int run_mma_tail(
-    cudaStream_t s, const WsLayout& l, float* workspace, float* state_inout, __nv_bfloat16* out,
-    int T, int H, int HK
-) {
-    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
-    static std::once_flag smem_once;
-    static cudaError_t smem_rc = cudaSuccess;
-    std::call_once(smem_once, []() {
-        smem_rc = cudaFuncSetAttribute(
-            mma_fragment_state_resident_carry_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)MMA_SMEM_BYTES_93K_NEEDS_THE_OPT_IN_ATTRIBUTE_ABOVE_THE_48K_STATIC_CAP);
-    });
-    if (smem_rc != cudaSuccess) return (int)smem_rc;
-    __nv_bfloat16* attn = (__nv_bfloat16*)(workspace + l.attn);
-    __nv_bfloat16* wu = (__nv_bfloat16*)(workspace + l.wu);
-    __nv_bfloat16* kc = (__nv_bfloat16*)(workspace + l.kc);
-    __nv_bfloat16* qr = (__nv_bfloat16*)(workspace + l.qr);
-    float* cg = workspace + l.cg;
-    dim3 grid(128 / TC, H);
-    mma_fragment_state_resident_carry_kernel<<<
-        grid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
-        MMA_SMEM_BYTES_93K_NEEDS_THE_OPT_IN_ATTRIBUTE_ABOVE_THE_48K_STATIC_CAP, s>>>(
-        wu, kc, attn, qr, cg, state_inout, out, T, H, HK, l.n);
-    cudaError_t ce = cudaGetLastError();
-    if (ce != cudaSuccess) return (int)ce;
-    return 0;
-}
-
 static int run_v3_tail(
     cudaStream_t s, const WsLayout& l, float* workspace, float* state_inout, __nv_bfloat16* out,
     int T, int H, int HK, StageProf* prof
@@ -1156,6 +1719,22 @@ static int run_v3_tail(
         smem_rc = cudaFuncSetAttribute(
             v3_output_from_checkpoints_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)V3_OUT_SMEM_BYTES_87K_ONE_SHOT_STAGE_NO_PIPELINE_BLOCKS_OVERLAP_EACH_OTHER);
+        if (smem_rc != cudaSuccess) return;
+        smem_rc = cudaFuncSetAttribute(
+            v3_ladder_state_checkpoint_lowp_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)V3_LOWP_SMEM_BYTES_45K_FP8_OPERANDS_PLUS_BF16_STATE_LET_TWO_BLOCKS_CORESIDE_WITH_THE_CP_ASYNC_DOUBLE_BUFFER_AND_SLD40_KEPT);
+        if (smem_rc != cudaSuccess) return;
+        smem_rc = cudaFuncSetAttribute(
+            v3_ladder_state_checkpoint_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)V3_FP8_SMEM_BYTES_44K_FP8_STATE_AND_OPERANDS_THROUGH_THE_NATIVE_E4M3_MMA_NO_CONVERT);
+        if (smem_rc != cudaSuccess) return;
+        smem_rc = cudaFuncSetAttribute(
+            v3_ladder_state_checkpoint_bf16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST);
+        if (smem_rc != cudaSuccess) return;
+        smem_rc = cudaFuncSetAttribute(
+            v3_ladder_state_checkpoint_kstream_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE);
     });
     if (smem_rc != cudaSuccess) return (int)smem_rc;
     __nv_bfloat16* attn = (__nv_bfloat16*)(workspace + l.attn);
@@ -1167,11 +1746,70 @@ static int run_v3_tail(
     __nv_bfloat16* vchk =
         schk + (size_t)l.n * H * V3_CHECKPOINTS_ALIAS_THE_STACK_A_RESERVATION_STATE_16384_PLUS_VNEW_8192_BF16_IS_HALF_ITS_F32_ROWS;
     dim3 lgrid(128 / TC, H);
-    v3_ladder_state_checkpoint_kernel<<<
-        lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
-        V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K, s>>>(
-        wu, kc, cg, state_inout, schk, vchk, H, l.n);
-    cudaError_t ce = cudaGetLastError();
+    const int lowp =
+        ckpt_lowp_env_read_per_call_opt_in_fp8_operands_and_16bit_state_in_the_checkpoint_scan();
+    cudaError_t ce;
+    if (getenv("NV_Q38_GDN_V3_CKPT_LOWP_MMA_OCC")) {
+        int occ_lowp = 0, occ_def = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_lowp, v3_ladder_state_checkpoint_lowp_kernel, 256,
+            (int)V3_LOWP_SMEM_BYTES_45K_FP8_OPERANDS_PLUS_BF16_STATE_LET_TWO_BLOCKS_CORESIDE_WITH_THE_CP_ASYNC_DOUBLE_BUFFER_AND_SLD40_KEPT);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_def, v3_ladder_state_checkpoint_kernel, 256,
+            (int)V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K);
+        int occ_bf16 = 0, occ_ks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_bf16, v3_ladder_state_checkpoint_bf16_kernel, 256,
+            (int)V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &occ_ks, v3_ladder_state_checkpoint_kstream_kernel, 256,
+            (int)V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE);
+        fprintf(stderr, "[v3-lowp-occ] lowp_mma=%d/SM default=%d/SM bf16=%d/SM kstream=%d/SM smem_bf16=%zu smem_ks=%zu\n",
+                occ_lowp, occ_def, occ_bf16, occ_ks,
+                V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST,
+                V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE);
+    }
+    const bool ckpt_fp8 =
+        ckpt_fp8_env_read_per_call_opt_in_native_e4m3_mma_fp8_state_and_operands_no_convert();
+    if (ckpt_kstream_env_read_per_call_opt_in_bf16_two_blocks_per_sm_one_reused_operand_buffer()) {
+        v3_ladder_state_checkpoint_kstream_kernel<<<
+            lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
+            V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE,
+            s>>>(wu, kc, cg, state_inout, schk, vchk, H, l.n);
+    } else if (ckpt_lowp_mma_env_read_per_call_opt_in_the_fp8_mma_two_blocks_per_sm_perf_kernel() ||
+        ckpt_fp8) {
+        __nv_fp8_e4m3* aw8 = (__nv_fp8_e4m3*)(workspace + l.aw_fp8);
+        __nv_fp8_e4m3* ak8 = (__nv_fp8_e4m3*)(workspace + l.ak_fp8);
+        float* awsc = workspace + l.aw_scale;
+        float* aksc = workspace + l.ak_scale;
+        gdn_lowp_quantize_operands_kernel<<<dim3(l.n, H), 256, 0, s>>>(
+            wu, kc, aw8, ak8, awsc, aksc, H);
+        ce = cudaGetLastError();
+        if (ce != cudaSuccess) return (int)ce;
+        if (prof) prof->lap("v3_lowp_quantize");
+        if (ckpt_fp8) {
+            v3_ladder_state_checkpoint_fp8_kernel<<<
+                lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
+                V3_FP8_SMEM_BYTES_44K_FP8_STATE_AND_OPERANDS_THROUGH_THE_NATIVE_E4M3_MMA_NO_CONVERT,
+                s>>>(aw8, ak8, awsc, aksc, wu, cg, state_inout, schk, vchk, H, l.n);
+        } else {
+            v3_ladder_state_checkpoint_lowp_kernel<<<
+                lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
+                V3_LOWP_SMEM_BYTES_45K_FP8_OPERANDS_PLUS_BF16_STATE_LET_TWO_BLOCKS_CORESIDE_WITH_THE_CP_ASYNC_DOUBLE_BUFFER_AND_SLD40_KEPT,
+                s>>>(aw8, ak8, awsc, aksc, wu, cg, state_inout, schk, vchk, H, l.n);
+        }
+    } else if (ckpt_bf16_default_on_user_signoff_20260912_native_bf16_checkpoint_unset_is_on_0_restores_the_f32_state_kernel()) {
+        v3_ladder_state_checkpoint_bf16_kernel<<<
+            lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
+            V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST,
+            s>>>(wu, kc, cg, state_inout, schk, vchk, H, l.n);
+    } else {
+        v3_ladder_state_checkpoint_kernel<<<
+            lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
+            V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K, s>>>(
+            wu, kc, cg, state_inout, schk, vchk, H, l.n, lowp);
+    }
+    ce = cudaGetLastError();
     if (ce != cudaSuccess) return (int)ce;
     if (prof) prof->lap("v3_ladder_state_checkpoint");
     dim3 ogrid(l.n, H);
@@ -1323,6 +1961,65 @@ extern "C" long long nv_kernels_gdn_chunk_gemm_graph_replays_total() {
     return gdn_chunk_gemm::g_graph_replays.load(std::memory_order_relaxed);
 }
 
+constexpr long long TREE_MAT_ELEMS_128X128_ONE_CHUNK_CARRY_TRANSITION_IS_A_FULL_STATE_SQUARE_MATRIX =
+    128 * 128;
+
+extern "C" long long nv_kernels_gdn_scan_tree_compose_floor_workspace_elems(int n, int H) {
+    if (n <= 0 || H <= 0) return 0;
+    long long mats = (long long)n * H * 2 + (long long)(n / 2 + 1) * H * 2;
+    return mats * TREE_MAT_ELEMS_128X128_ONE_CHUNK_CARRY_TRANSITION_IS_A_FULL_STATE_SQUARE_MATRIX / 2;
+}
+
+extern "C" int nv_kernels_gdn_scan_tree_compose_floor(
+    void* stream, float* workspace, long long workspace_elems, int n, int H
+) {
+    using namespace gdn_chunk_gemm;
+    if (n <= 0 || H <= 0) return -2;
+    if (workspace == nullptr ||
+        workspace_elems < nv_kernels_gdn_scan_tree_compose_floor_workspace_elems(n, H))
+        return -5;
+    cudaStream_t s = (cudaStream_t)stream;
+    const long long ME =
+        TREE_MAT_ELEMS_128X128_ONE_CHUNK_CARRY_TRANSITION_IS_A_FULL_STATE_SQUARE_MATRIX;
+    __nv_bfloat16* cur_m = (__nv_bfloat16*)workspace;
+    __nv_bfloat16* cur_n = cur_m + (long long)n * H * ME;
+    __nv_bfloat16* nxt_m = cur_n + (long long)n * H * ME;
+    __nv_bfloat16* nxt_n = nxt_m + (long long)(n / 2 + 1) * H * ME;
+    float* ltws = workspace;
+    const GemmMode bf_all = GEMM_BF16_ALL_TENSOR_CORES_WITH_F32_ACCUM;
+    cublasStatus_t st;
+    st = gemm_rm(s, ltws, 128, 128, 64, false, false, bf_all, 1.f, nxt_m, 64, (long long)0,
+                 nxt_n, 128, (long long)0, 0.f, cur_m, cur_m, 128, ME, n * H);
+    if (st != CUBLAS_STATUS_SUCCESS) return -6;
+    st = gemm_rm(s, ltws, 128, 128, 64, false, false, bf_all, 1.f, nxt_m, 64, (long long)0,
+                 nxt_n, 128, (long long)0, 0.f, cur_n, cur_n, 128, ME, n * H);
+    if (st != CUBLAS_STATUS_SUCCESS) return -6;
+    for (int sweep = 0; sweep < 2; ++sweep) {
+        __nv_bfloat16* am = cur_m;
+        __nv_bfloat16* an = cur_n;
+        __nv_bfloat16* bm = nxt_m;
+        __nv_bfloat16* bn = nxt_n;
+        for (int m = n / 2; m >= 1; m /= 2) {
+            st = gemm_rm(s, ltws, 128, 128, 128, false, false, bf_all, 1.f, am + ME, 128,
+                         2 * ME, am, 128, 2 * ME, 0.f, bm, bm, 128, ME, m * H);
+            if (st != CUBLAS_STATUS_SUCCESS) return -6;
+            st = gemm_rm(s, ltws, 128, 128, 128, false, false, bf_all, 1.f, am + ME, 128,
+                         2 * ME, an, 128, 2 * ME, 1.f, an + ME, bn, 128, ME, m * H);
+            if (st != CUBLAS_STATUS_SUCCESS) return -6;
+            __nv_bfloat16* tm = am;
+            __nv_bfloat16* tn = an;
+            am = bm;
+            an = bn;
+            bm = tm;
+            bn = tn;
+        }
+    }
+    st = gemm_rm(s, ltws, 64, 128, 128, false, false, bf_all, 1.f, nxt_m, 128, ME, cur_m, 128,
+                 ME, 0.f, cur_n, cur_n, 128, (long long)(ME / 2), n * H);
+    if (st != CUBLAS_STATUS_SUCCESS) return -6;
+    return 0;
+}
+
 extern "C" int nv_kernels_gdn_chunk_gemm_scan_f32(
     void* stream,
     const float* qn,
@@ -1365,45 +2062,32 @@ extern "C" int nv_kernels_gdn_chunk_gemm_scan_f32(
                    s, std::chrono::steady_clock::now()};
     const bool v3_armed =
         v3_env_read_per_call_so_one_process_can_ab_split_ladder_vs_inline_out_tails();
-    const bool mma_armed =
-        !v3_armed && mma_env_read_per_call_so_one_process_can_ab_fragment_tail_vs_the_scalar_tails();
-    const bool fwdh_armed =
-        !v3_armed && !mma_armed &&
-        fwdh_env_read_per_call_so_one_process_can_ab_stack_carry_vs_state_resident();
+    const bool tc_armed =
+        tc_env_read_per_call_so_one_process_can_ab_fused_wmma_head_vs_the_cublas_head();
+    const bool fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads =
+        fold_rearrange_env_read_per_call_default_on_unless_0();
     cumsum_log_decay_kernel<<<n * H, C, 0, s>>>(g_exp, cg, T, H);
-    rearrange_qk_padded_kernel<<<n * C * HK, 128, 0, s>>>(qn, kn, qr, kr, T, HK);
+    if (!fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads) {
+        rearrange_qk_padded_kernel<<<n * C * HK, 128, 0, s>>>(qn, kn, qr, kr, T, HK);
+    }
     materialize_rhs_qb_kc_kernel<<<n * C * H, 128, 0, s>>>(
         qn, kn, (const __nv_bfloat16*)mixed, beta, cg, rhs,
-        (v3_armed || mma_armed || fwdh_armed) ? nullptr : stack_a, kc, T, H, HK, conv_dim,
-        v_channel_offset);
+        v3_armed ? nullptr : stack_a, kc, T, H, HK,
+        conv_dim, v_channel_offset,
+        fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads ? qr : nullptr,
+        fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads ? kr : nullptr);
     cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) return (int)ce;
     prof.lap("materialize");
 
     if (v3_armed) {
-        int rc = run_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr);
+        int rc = tc_armed
+            ? run_tc_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr)
+            : run_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr);
         if (rc != 0) return rc;
         rc = run_v3_tail(s, l, workspace, state_inout, (__nv_bfloat16*)out, T, H, HK,
                          prof.on ? &prof : nullptr);
         if (rc != 0) return rc;
-        return 0;
-    }
-
-    if (mma_armed) {
-        int rc = run_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr);
-        if (rc != 0) return rc;
-        rc = run_mma_tail(s, l, workspace, state_inout, (__nv_bfloat16*)out, T, H, HK);
-        if (rc != 0) return rc;
-        prof.lap("mma_fragment_state_resident_carry");
-        return 0;
-    }
-
-    if (fwdh_armed) {
-        int rc = run_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr);
-        if (rc != 0) return rc;
-        rc = run_fwdh_tail(s, l, workspace, state_inout, (__nv_bfloat16*)out, T, H, HK);
-        if (rc != 0) return rc;
-        prof.lap("fwdh_state_resident_carry");
         return 0;
     }
 

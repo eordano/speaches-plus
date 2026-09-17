@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include "nvk_grid.cuh"
 #include "nvk_pdl.cuh"
 
@@ -47,8 +48,41 @@ __device__ __forceinline__ int swizzled_scale_dst(int m, int kb, int k_blocks) {
     return ((m_tile * k_tiles + k_tile) * 32 + d3) * 16 + d2 * 4 + d5;
 }
 
+bool fp4_dp4a_enabled() {
+    const char* value = getenv("NV_MOE_FP4_DP4A");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+__device__ __forceinline__ void nibbles8_to_doubled_e2m1_int8_lanes(
+    unsigned w, unsigned& lo, unsigned& hi
+) {
+    constexpr unsigned kMag0to3 = 0x03020100u;
+    constexpr unsigned kMag4to7 = 0x0C080604u;
+    unsigned mag_sel = w & 0x77777777u;
+    unsigned sgn_sel = (w >> 3) & 0x11111111u;
+    unsigned mag_lo = __byte_perm(kMag0to3, kMag4to7, mag_sel);
+    unsigned sgn_lo = __byte_perm(0x0000FF00u, 0u, sgn_sel);
+    lo = __vsub4(mag_lo ^ sgn_lo, sgn_lo);
+    unsigned mag_hi = __byte_perm(kMag0to3, kMag4to7, mag_sel >> 16);
+    unsigned sgn_hi = __byte_perm(0x0000FF00u, 0u, sgn_sel >> 16);
+    hi = __vsub4(mag_hi ^ sgn_hi, sgn_hi);
+}
+
+template <bool DP4A>
 __device__ __forceinline__ float dot16_e2m1(unsigned long long wq,
                                             unsigned long long aq) {
+    if constexpr (DP4A) {
+        unsigned wi[4], ai[4];
+        nibbles8_to_doubled_e2m1_int8_lanes((unsigned)wq, wi[0], wi[1]);
+        nibbles8_to_doubled_e2m1_int8_lanes((unsigned)(wq >> 32), wi[2], wi[3]);
+        nibbles8_to_doubled_e2m1_int8_lanes((unsigned)aq, ai[0], ai[1]);
+        nibbles8_to_doubled_e2m1_int8_lanes((unsigned)(aq >> 32), ai[2], ai[3]);
+        int d = __dp4a((int)wi[0], (int)ai[0], 0);
+        d = __dp4a((int)wi[1], (int)ai[1], d);
+        d = __dp4a((int)wi[2], (int)ai[2], d);
+        d = __dp4a((int)wi[3], (int)ai[3], d);
+        return (float)d * 0.25f;
+    }
     unsigned we[4];
     unsigned ae[4];
     nibbles8_to_fp8_bytes_via_prmt_because_sm120_fp4_cvt_is_emulated(
@@ -75,6 +109,7 @@ __device__ __forceinline__ float dot16_e2m1(unsigned long long wq,
     return d;
 }
 
+template <bool DP4A>
 __global__ void moe_grouped_fp4_gemv_m1_bf16_kernel(
     const uint8_t* __restrict__ a_packed,
     const uint8_t* __restrict__ a_scales,
@@ -126,7 +161,7 @@ __global__ void moe_grouped_fp4_gemv_m1_bf16_kernel(
         float a_scale = decode_ue4m3_dev(__ldg(&a_sf[(kb / 4) * 512 + (kb & 3)]));
         unsigned long long wq = __ldg(&w_row[kb]);
         unsigned long long aq = __ldg(&a_row[kb]);
-        acc += (w_scale * a_scale) * dot16_e2m1(wq, aq);
+        acc += (w_scale * a_scale) * dot16_e2m1<DP4A>(wq, aq);
     }
 
     #pragma unroll
@@ -183,6 +218,7 @@ __device__ __forceinline__ uint8_t gvq_encode_ue4m3(float scale) {
 
 constexpr int kGusqBlockN = 16;
 
+template <bool DP4A>
 __global__ void moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel(
     const uint8_t* __restrict__ a_packed,
     const uint8_t* __restrict__ a_scales,
@@ -244,8 +280,8 @@ __global__ void moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel(
             unsigned long long wqg = __ldg(&wg_row[kb]);
             unsigned long long wqu = __ldg(&wu_row[kb]);
             unsigned long long aq = __ldg(&a_row[kb]);
-            acc_g += (wg_scale * a_scale) * dot16_e2m1(wqg, aq);
-            acc_u += (wu_scale * a_scale) * dot16_e2m1(wqu, aq);
+            acc_g += (wg_scale * a_scale) * dot16_e2m1<DP4A>(wqg, aq);
+            acc_u += (wu_scale * a_scale) * dot16_e2m1<DP4A>(wqu, aq);
         }
 
         #pragma unroll
@@ -305,7 +341,8 @@ __global__ void moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel(
 
 }
 
-extern "C" int nv_kernels_moe_grouped_fp4_gemv_m1_bf16(
+template <bool DP4A>
+int launch_moe_grouped_fp4_gemv_m1_bf16(
     void* stream,
     const uint8_t* a_packed,
     const uint8_t* a_scales,
@@ -332,7 +369,7 @@ extern "C" int nv_kernels_moe_grouped_fp4_gemv_m1_bf16(
               (unsigned)num_groups);
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(cfg, grid, dim3(kBlockDim), 0, s);
-        cudaLaunchKernelEx(&cfg, moe_grouped_fp4_gemv_m1_bf16_kernel,
+        cudaLaunchKernelEx(&cfg, moe_grouped_fp4_gemv_m1_bf16_kernel<DP4A>,
             a_packed,
             a_scales,
             b_packed,
@@ -346,7 +383,7 @@ extern "C" int nv_kernels_moe_grouped_fp4_gemv_m1_bf16(
             a_tile_stride_rows,
             d_group_stride_elems);
     } else {
-        moe_grouped_fp4_gemv_m1_bf16_kernel<<<grid, dim3(kBlockDim), 0, s>>>(
+        moe_grouped_fp4_gemv_m1_bf16_kernel<DP4A><<<grid, dim3(kBlockDim), 0, s>>>(
             a_packed,
             a_scales,
             b_packed,
@@ -363,7 +400,8 @@ extern "C" int nv_kernels_moe_grouped_fp4_gemv_m1_bf16(
     return (int)cudaGetLastError();
 }
 
-extern "C" int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
+template <bool DP4A>
+int launch_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
     void* stream,
     const uint8_t* a_packed,
     const uint8_t* a_scales,
@@ -393,7 +431,7 @@ extern "C" int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
     dim3 grid((unsigned)(n / kGusqBlockN), (unsigned)num_groups);
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(cfg, grid, dim3(kGusqBlockN * kWarpSize), 0, s);
-        cudaLaunchKernelEx(&cfg, moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel,
+        cudaLaunchKernelEx(&cfg, moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel<DP4A>,
             a_packed,
             a_scales,
             gate_w,
@@ -411,7 +449,7 @@ extern "C" int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
             k,
             a_tile_stride_rows);
     } else {
-        moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel<<<grid,
+        moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_kernel<DP4A><<<grid,
                                                                 dim3(kGusqBlockN * kWarpSize),
                                                                 0, s>>>(
             a_packed,
@@ -432,4 +470,46 @@ extern "C" int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
             a_tile_stride_rows);
     }
     return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_moe_grouped_fp4_gemv_m1_bf16(
+    void* stream, const uint8_t* a_packed, const uint8_t* a_scales,
+    const uint8_t* b_packed, const uint8_t* b_scales, const float* alphas,
+    uint16_t* d_bf16, const int32_t* group_expert_ids,
+    int num_groups, int num_experts_total, int n, int k,
+    int a_tile_stride_rows, long long d_group_stride_elems
+) {
+    if (fp4_dp4a_enabled()) {
+        return launch_moe_grouped_fp4_gemv_m1_bf16<true>(
+            stream, a_packed, a_scales, b_packed, b_scales, alphas, d_bf16,
+            group_expert_ids, num_groups, num_experts_total, n, k,
+            a_tile_stride_rows, d_group_stride_elems);
+    }
+    return launch_moe_grouped_fp4_gemv_m1_bf16<false>(
+        stream, a_packed, a_scales, b_packed, b_scales, alphas, d_bf16,
+        group_expert_ids, num_groups, num_experts_total, n, k,
+        a_tile_stride_rows, d_group_stride_elems);
+}
+
+extern "C" int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
+    void* stream, const uint8_t* a_packed, const uint8_t* a_scales,
+    const uint8_t* gate_w, const uint8_t* gate_sf, const float* gate_alphas,
+    const uint8_t* up_w, const uint8_t* up_sf, const float* up_alphas,
+    const float* dn_mini, const int32_t* group_expert_ids,
+    uint8_t* y_act_fp4, uint8_t* y_act_sf,
+    int num_groups, int num_experts_total, int n, int k,
+    int a_tile_stride_rows
+) {
+    if (fp4_dp4a_enabled()) {
+        return launch_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m<true>(
+            stream, a_packed, a_scales, gate_w, gate_sf, gate_alphas,
+            up_w, up_sf, up_alphas, dn_mini, group_expert_ids,
+            y_act_fp4, y_act_sf, num_groups, num_experts_total, n, k,
+            a_tile_stride_rows);
+    }
+    return launch_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m<false>(
+        stream, a_packed, a_scales, gate_w, gate_sf, gate_alphas,
+        up_w, up_sf, up_alphas, dn_mini, group_expert_ids,
+        y_act_fp4, y_act_sf, num_groups, num_experts_total, n, k,
+        a_tile_stride_rows);
 }

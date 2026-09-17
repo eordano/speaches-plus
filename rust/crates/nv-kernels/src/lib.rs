@@ -118,6 +118,10 @@ pub mod shift_decode_fold;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_backend;
 
+#[cfg(feature = "wgpu")]
+#[path = "wgpu/mod.rs"]
+pub mod wgpu_qlora;
+
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod cuda {
     use super::sys;
@@ -154,12 +158,34 @@ pub mod cuda {
         (unsafe { sys::nv_kernels_flash_splitk_scratch_elems(nh, hd) }) as usize
     }
 
+    pub fn flash_decode_gqa4_hd512_scratch_elems(nh: i32, capacity: i32) -> usize {
+        (unsafe { sys::nv_kernels_flash_decode_gqa4_hd512_scratch_elems(nh, capacity) }) as usize
+    }
+
     pub fn gdn_chunk_gemm_scan_workspace_elems(t: i32, h: i32, hk: i32) -> usize {
         (unsafe { sys::nv_kernels_gdn_chunk_gemm_scan_workspace_elems(t, h, hk) }) as usize
     }
 
     pub fn gdn_chunk_gemm_graph_replays_total() -> i64 {
         unsafe { sys::nv_kernels_gdn_chunk_gemm_graph_replays_total() }
+    }
+
+    pub fn gdn_prefill_tc_head_launches_total() -> i64 {
+        unsafe { sys::nv_kernels_gdn_prefill_tc_head_launches_total() }
+    }
+
+    pub fn gdn_scan_tree_compose_floor_workspace_elems(n: i32, h: i32) -> usize {
+        (unsafe { sys::nv_kernels_gdn_scan_tree_compose_floor_workspace_elems(n, h) }) as usize
+    }
+
+    pub unsafe fn gdn_scan_tree_compose_floor(
+        stream: *mut std::ffi::c_void,
+        workspace: *mut f32,
+        workspace_elems: i64,
+        n: i32,
+        h: i32,
+    ) -> i32 {
+        sys::nv_kernels_gdn_scan_tree_compose_floor(stream, workspace, workspace_elems, n, h)
     }
 
     pub fn flash_depthgate_knee_tokens() -> usize {
@@ -186,10 +212,6 @@ pub mod cuda {
 
     pub fn flash_sm_count() -> i32 {
         unsafe { sys::nv_kernels_flash_sm_count() }
-    }
-
-    pub fn flash_gshare_scratch_elems(nh: i32, hd: i32) -> usize {
-        (unsafe { sys::nv_kernels_flash_gshare_scratch_elems(nh, hd) }) as usize
     }
 
     pub fn gqa512_scratch_elems(nh: i32, m: i32, splits: i32) -> usize {
@@ -545,7 +567,6 @@ pub mod cuda {
     pub fn flash_splitk_scratch_elems_mk(nh: i32, hd: i32, m: i32) -> usize {
         (unsafe { sys::nv_kernels_flash_splitk_scratch_elems_mk(nh, hd, m) }) as usize
     }
-
 }
 
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
@@ -673,5 +694,4 @@ pub mod cuda {
     ) -> Result<usize, i32> {
         Err(-1)
     }
-
 }

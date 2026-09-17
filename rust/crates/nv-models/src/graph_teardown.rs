@@ -1,4 +1,3 @@
-
 use crate::gemma4_batch_graph::capture_stream::CaptureStream;
 use cudarc::driver::{CudaContext, CudaStream};
 use std::sync::Arc;
@@ -91,7 +90,6 @@ impl Drop for CtorForkGuard {
 #[must_use = "a GraphTeardown that is never .run() leaves the graph mempool untrimmed and \
               nv_quant's per-stream caches stale, which poisons the next component in this process"]
 pub struct GraphTeardown {
-
     owned: Vec<Arc<CudaStream>>,
     borrowed_and_shared_with_every_other_engine: Vec<Arc<CudaStream>>,
 
@@ -162,6 +160,16 @@ impl GraphTeardown {
         self.probe("trimmed");
     }
 
+    pub fn run_owned_streams_only(self, invalidate: impl FnOnce()) {
+        self.quiesce();
+        invalidate();
+        self.quiesce();
+        for s in &self.owned {
+            nv_quant::release_stream_resources(s.cu_stream() as usize);
+        }
+        self.trim();
+    }
+
     fn trim(&self) {
         if let Ok(devh) = cudarc::driver::result::device::get(self.ordinal as i32) {
             let _ = unsafe { cudarc::driver::sys::cuDeviceGraphMemTrim(devh) };
@@ -179,6 +187,28 @@ impl GraphTeardown {
         let (reserved, used) = graph_mem(self.ordinal);
         eprintln!("[graph-teardown] {tag}: {deferred} graphmem reserved={reserved} used={used}");
     }
+}
+
+fn graph_mem(ordinal: usize) -> (u64, u64) {
+    use cudarc::driver::sys;
+    let Ok(devh) = cudarc::driver::result::device::get(ordinal as i32) else {
+        return (0, 0);
+    };
+    let mut reserved: u64 = 0;
+    let mut used: u64 = 0;
+    unsafe {
+        let _ = sys::cuDeviceGetGraphMemAttribute(
+            devh,
+            sys::CUgraphMem_attribute::CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT,
+            &mut reserved as *mut u64 as *mut std::ffi::c_void,
+        );
+        let _ = sys::cuDeviceGetGraphMemAttribute(
+            devh,
+            sys::CUgraphMem_attribute::CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT,
+            &mut used as *mut u64 as *mut std::ffi::c_void,
+        );
+    }
+    (reserved, used)
 }
 
 #[cfg(test)]
@@ -346,26 +376,4 @@ mod tests {
              {ONLY_THE_ENGINE_THAT_FORKED_A_STREAM_MAY_RELEASE_ITS_QUANT_CACHES}"
         );
     }
-}
-
-fn graph_mem(ordinal: usize) -> (u64, u64) {
-    use cudarc::driver::sys;
-    let Ok(devh) = cudarc::driver::result::device::get(ordinal as i32) else {
-        return (0, 0);
-    };
-    let mut reserved: u64 = 0;
-    let mut used: u64 = 0;
-    unsafe {
-        let _ = sys::cuDeviceGetGraphMemAttribute(
-            devh,
-            sys::CUgraphMem_attribute::CU_GRAPH_MEM_ATTR_RESERVED_MEM_CURRENT,
-            &mut reserved as *mut u64 as *mut std::ffi::c_void,
-        );
-        let _ = sys::cuDeviceGetGraphMemAttribute(
-            devh,
-            sys::CUgraphMem_attribute::CU_GRAPH_MEM_ATTR_USED_MEM_CURRENT,
-            &mut used as *mut u64 as *mut std::ffi::c_void,
-        );
-    }
-    (reserved, used)
 }

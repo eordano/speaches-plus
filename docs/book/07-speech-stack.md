@@ -18,7 +18,7 @@ Routes are enumerated in `06-serving-surface.md`; this chapter is what
 happens behind them. The normative contract for the realtime protocol is
 `docs/book/07.1-barge-turn-spec-rfc-v3.md`, the RFC below: where it states a
 rule, this chapter names the code implementing it rather than restating it.
-Rates and accuracies live in `perf/runs.jsonl` per `08.4-PERFORMANCE.md`.
+Rates and accuracies live in the private run ledger per the basis-tuple quoting rule (numbers live in the private run ledger).
 
 ## One canonical audio format
 
@@ -478,7 +478,7 @@ Every rule below is backed by a harness under `client/perf/` --
 `fusion_extract.py`, `fusion_train.py`, `fusion_verify.py`,
 `text_head_probe.py`, `text_head_fnv.py`, `context_probe.py`,
 `eot_pause_exposure.py`, `eot_silence_ab.py` -- and rates and accuracies live in
-`perf/runs.jsonl`. The probes hash features, so reproducing one needs
+the private run ledger. The probes hash features, so reproducing one needs
 `PYTHONHASHSEED=0`.
 
 **The committed utterance carries its silence tail.** smart-turn is trained on
@@ -778,10 +778,22 @@ Three conditioning mechanisms exist and the checkpoint decides which are
 available: `tts_model_type` is read from the checkpoint's `config.json`, and
 `profiles_supported` is true only for `base`.
 
-**Built-in speakers.** `resolve_speaker_embed` looks the requested voice up
-in `talker.config().spk_id`; the "embedding" is the talker's codec embedding
-row for that speaker's token id. OpenAI voice aliases (`alloy`, `echo`, …)
-fall back to a default speaker with a warning.
+**Built-in speakers.** `SpeakerResolver::resolve` looks the requested voice
+up in `talker.config().spk_id`; the "embedding" is the talker's codec
+embedding row for that speaker's token id. OpenAI voice aliases (`alloy`,
+`echo`, …), `default` and an empty voice land on `serena` when the checkpoint
+has built-in speakers. A Base checkpoint has none (`spk_id = {}`), and there
+they resolve to the voice profile named `default` (`DEFAULT_PROFILE`) when
+one is enrolled and otherwise to the built-in x-vector compiled from
+`rust/voices/qwen3-tts-0_6b-default.xvector.json` (`builtin_default_xvector`,
+matched by talker width); a prefix without a speaker row is not a default
+voice but a layout the talker never saw, so a width with no shipped vector is
+refused with a 400 that names `POST /v1/voice-profiles`. Any other name is a
+profile lookup, made only on a Base talker. The tests in
+`audio_speech_nvtts.rs` pin this on fabricated talkers of both shapes, the
+unreachable-store degradation included, and the `#[ignore]`
+`real_base_checkpoint_serves_aliases_from_the_builtin_then_the_default_profile`
+repeats it on the real weights.
 
 **Voice profiles (custom voice).** `nv-tts/src/speaker_encoder.rs` is an
 ECAPA-TDNN: SE-Res2Net blocks with dilated TDNN convolutions, multi-layer
@@ -789,9 +801,11 @@ feature aggregation, attentive statistics pooling over `[x, mean, std]`, and
 a final projection to a 1024-d x-vector. Its frontend, `spk_mel.rs`, is a
 hand-rolled 128-mel log-magnitude spectrogram at 24 kHz with a Slaney
 filterbank and center-mode reflect padding. The weights live under
-`speaker_encoder.` in the checkpoint; loading errors explicitly say
-CustomVoice and VoiceDesign checkpoints carry no encoder and that enrollment
-needs a Base checkpoint.
+`speaker_encoder.` in a Base checkpoint; `SpeakerEncoderSource::choose` falls
+back to a standalone encoder directory (`NV_TTS_SPEAKER_ENCODER_DIR`) only for
+a `base` talker of matching width, and otherwise reports that CustomVoice and
+VoiceDesign checkpoints carry no encoder and that enrollment needs a Base
+checkpoint (chapter 7.2).
 
 `rust/src/oapi/voice_profiles.rs` serves enrollment. `POST /v1/voice-profiles`
 takes `name`, reference audio and an opaque `design_params` JSON blob;
@@ -866,7 +880,15 @@ logically identical in both languages (`rust/src/tts/phonemize_glue.c`,
 sets the voice by name, and loops `espeak_TextToPhonemes` with the IPA flag,
 returning a negative sentinel with the required size when the caller's buffer
 is too small. Both bindings implement the grow-and-retry and cache the
-current voice so it is re-set only when it changes.
+current voice so it is re-set only when it changes. espeak consumes one clause
+per call and drops the punctuation that ended it, so the shim re-attaches that
+terminator (`.` `,` `;` `:` `!` `?` `…`, skipping closing quotes and brackets)
+to the clause's phonemes before the joining space: Kokoro's pauses come from
+its punctuation tokens, and a phoneme string without them runs sentences
+together. The speech route's `language` picks the espeak voice: `es`/`es-ES`
+is Castilian (`θ`, `ʎ`), `es-AR`/`es-419` is Latin American with seseo and
+yeísmo (`s`, `ʝ`), and the fit request's `language` is passed to the
+phonemizer unmapped, so a Rioplatense voice is fitted with `es-419`.
 
 **Voice packs** are `.npz` files parsed by hand (`rust/src/tts/npz.rs`): a
 zip of `.npy` arrays, one per voice, with a header scanner rejecting Fortran
@@ -880,7 +902,10 @@ the number of tokens — which is why the pack's leading dimension and
 punctuation set, the ASCII letters and an IPA inventory, assigning sequential
 ids. `clean_phonemes` applies two literal fixes for the word "kokoro", maps a
 handful of IPA characters onto in-vocabulary ones, then drops every rune not
-in the vocabulary.
+in the vocabulary. The `r` to `ɹ` and `x` to `k` remaps are English-only
+(`english_r_and_x_remap`): Spanish keeps espeak's trill `r`, tap `ɾ` and the
+velar fricative `x` of "jamón", which are all in the vocabulary and are what
+the Spanish stock voices were trained on.
 
 **Text handling** is where Kokoro differs most from nv-tts.
 `rust/src/tts/text.rs` strips emoji by Unicode range, strips markdown
@@ -967,6 +992,9 @@ speculative transcript if one was promoted or runs STT on a blocking task,
 applies the noise gate, and emits
 `conversation.item.input_audio_transcription.completed` (or `.failed`). Short
 utterances are treated as backchannels and suppress the response entirely.
+The completed event also carries `speaker: {id, name, score} | null`, the
+utterance's match against the voices workspace registry (see 7.2, "Who is
+speaking"); clients that ignore unknown fields are unaffected.
 
 **Respond.** `run_response` opens the response brackets and sets a
 `wire_opened` flag — the exact flag barge-in later consults to decide whether

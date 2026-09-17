@@ -45,9 +45,48 @@ pub fn load_voices(path: &Path) -> Result<HashMap<String, Voice>> {
     Ok(out)
 }
 
+pub fn write_npz(path: &Path, entries: &[(String, Vec<usize>, Vec<f32>)]) -> Result<()> {
+    use std::io::Write;
+    let file = std::fs::File::create(path).with_context(|| format!("create {path:?}"))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, shape, data) in entries {
+        zip.start_file(format!("{name}.npy"), opts)?;
+        zip.write_all(&npy_bytes(shape, data))?;
+    }
+    zip.finish()?;
+    Ok(())
+}
+
+pub fn npy_bytes(shape: &[usize], data: &[f32]) -> Vec<u8> {
+    let dims = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shape_s = if shape.len() == 1 {
+        format!("({dims},)")
+    } else {
+        format!("({dims})")
+    };
+    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_s}, }}");
+    let pad = 64 - ((10 + header.len() + 1) % 64);
+    header.push_str(&" ".repeat(pad % 64));
+    header.push('\n');
+    let mut out = Vec::with_capacity(10 + header.len() + data.len() * 4);
+    out.extend_from_slice(b"\x93NUMPY\x01\x00");
+    out.extend_from_slice(&(header.len() as u16).to_le_bytes());
+    out.extend_from_slice(header.as_bytes());
+    for v in data {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
 const NPY_MAGIC: &[u8; 6] = b"\x93NUMPY";
 
-fn parse_npy(b: &[u8]) -> Result<Voice> {
+pub(crate) fn parse_npy(b: &[u8]) -> Result<Voice> {
     if b.len() < 10 || &b[..6] != NPY_MAGIC {
         return Err(anyhow!("not an .npy file"));
     }

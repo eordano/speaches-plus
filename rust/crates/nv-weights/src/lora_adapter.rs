@@ -196,7 +196,23 @@ impl LoraAdapter {
         let config = PeftConfig::from_dir(dir)?;
         let st_path = dir.join("adapter_model.safetensors");
         let loader = WeightLoader::open_file(&st_path, device)?;
+        Self::from_loader(config, &loader)
+    }
 
+    pub fn from_named_bytes(
+        config_json: &str,
+        adapter_safetensors: Vec<u8>,
+        device: &Device,
+    ) -> Result<Self> {
+        let config = PeftConfig::from_json_str(config_json)?;
+        let loader = WeightLoader::open_from_named_bytes(
+            [("adapter_model.safetensors".to_string(), adapter_safetensors)],
+            device,
+        )?;
+        Self::from_loader(config, &loader)
+    }
+
+    fn from_loader(config: PeftConfig, loader: &WeightLoader) -> Result<Self> {
         let mut pending: BTreeMap<String, PendingModule> = BTreeMap::new();
         for name in loader.names() {
             if name.contains("lora_magnitude_vector") {

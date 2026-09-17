@@ -92,6 +92,25 @@ Band-specific gates:
 - 060: `cd go && go test ./internal/eou/...`
 - 070 / 071: `cargo test -p nv-ocr`, `cargo test -p nv-models deepseek_ocr`
 
+## Regenerating
+
+Generated inputs (every `input.png` except the two 1892 scans, every `.wav`)
+are gitignored, 8.5 MiB of binaries. Rebuild them after a fresh clone:
+
+```sh
+nix-shell -p imagemagick fontconfig dejavu_fonts liberation_ttf \
+  'python3.withPackages (ps: [ps.pillow ps.numpy])' \
+  --run conformance/tools/regenerate-fixtures.sh
+```
+
+070 (ImageMagick + DejaVu, seeded noise), 071 (PIL + DejaVu) and the sine WAVs
+reproduce the original bytes; 090/091 render with Liberation Sans/Mono
+(metric-compatible with the Arial/Courier originals) and rewrite their tracked
+`fixture.json` region boxes. Fonts resolve from `FONT`/`FONTS`/`FONT_REG`/
+`FONT_BOLD`/`FONT_MONO`, else `fc-list`. `050-diarization-multispeaker/audio.wav`
+needs the Kokoro voice bank: set `DIAR_FIXTURE_KOKORO_MODEL` (see its README) or
+the script prints the recipe and skips it.
+
 ## Adding a new fixture
 
 Common to every band: create `conformance/fixtures/<NNN>-<family>-<name>/`,
@@ -127,7 +146,8 @@ scripts go in `conformance/tools/`, never as a test-time dependency).
 2. Write `fixture.json` with the common head (`name`, `family`,
    `description`, `comparison_strategy`, `skip_when_no_model`) plus the
    family's payload keys.
-3. Commit input artifacts so the consuming test is hermetic.
+3. Put input artifacts in the fixture directory; generated PNG/WAV files are
+   gitignored and must be reproducible by `tools/regenerate-fixtures.sh`.
 4. Point the consuming Go/Rust test at
    `<repo>/conformance/fixtures/<dir>` -- no per-family subdirectory.
 5. Run `./conformance/runner/run_endpoint_fixture.py` plus the band's own

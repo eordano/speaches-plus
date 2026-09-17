@@ -47,7 +47,10 @@ fn read_safetensors_index(path: &Path) -> Result<BTreeMap<String, TensorEntry>> 
         let offs = ent["data_offsets"]
             .as_array()
             .ok_or_else(|| anyhow!("{name}: missing data_offsets"))?;
-        let begin = data_base + offs[0].as_u64().ok_or_else(|| anyhow!("{name}: bad begin"))?;
+        let begin = data_base
+            + offs[0]
+                .as_u64()
+                .ok_or_else(|| anyhow!("{name}: bad begin"))?;
         let end = data_base + offs[1].as_u64().ok_or_else(|| anyhow!("{name}: bad end"))?;
         out.insert(
             name.clone(),

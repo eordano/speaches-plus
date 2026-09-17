@@ -11,8 +11,8 @@ pub use crate::gpt_oss::{
 };
 pub use crate::qwen3_5_dense_wgpu::ImageRowSplice;
 
-use crate::gpt_oss::{bf16_val, load_bf16, load_layer};
 use crate::gemma4_wgpu_shared::pack_pairs;
+use crate::gpt_oss::{bf16_val, load_bf16, load_layer};
 use crate::wgpu_ledger::VramLedger;
 const MAX_HEAD_DIM: usize = 256;
 const MAX_TOPK: usize = 16;
@@ -86,6 +86,12 @@ pub const MOE_TOPK_SG32_ENTRY: &str = "gow_router_topk_sg32";
 
 pub const MOE_ROUTER_TOPK_FUSE_ENV: &str = "NV_GOW_MOE_ROUTER_TOPK_FUSE";
 
+pub const MOE_TOPK_FUSED_PAR_ENV: &str = "NV_GOW_TOPK_FUSED";
+
+pub const MOE_TOPK_FUSED_PAR_ENTRY: &str = "gow_fu_router_topk_par";
+
+const FU_ROUTER_TOPK_PAR_STAGES_X_IN_THE_512_VEC4_SHARED_ARRAY: usize = 512;
+
 pub const MOE_DNCOMB_FUSE_ENV: &str = "NV_GOW_MOE_DNCOMB_FUSE";
 
 pub const NULL_DISPATCH_ENV: &str = "NV_GOW_NULLDISP";
@@ -103,19 +109,21 @@ pub fn null_dispatch_repeat_prices_a_dependent_dispatch_inside_this_graph_instea
 
 pub const MX_SG_XV4_R2_LUT_XS_DNCOMB_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb";
 
-pub const MX_SG_XV4_R2_LUT_XS_DNCOMB_WG64_ENTRY: &str =
-    "gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb_wg64";
+pub const MX_SG_XV4_R2_LUT_XS_DNCOMB_WG64_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb_wg64";
 
 const DNCOMB_WG64_ROWS_PER_WG_RESTORES_THE_SPLIT_PASSES_720_RESIDENT_WORKGROUPS: usize = 4;
 
 pub const MOE_DNCOMB_WG64_ENV: &str = "NV_GOW_MOE_DNCOMB_WG64";
 
-pub const MX_SG_XV4_R2_LUT_DNCOMB_SGSLOT_ENTRY: &str =
-    "gow_gemv_mx_sg_xv4_r2_lut_dncomb_sgslot";
+pub const MX_SG_XV4_R2_LUT_DNCOMB_SGSLOT_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2_lut_dncomb_sgslot";
 
 pub const MOE_DNCOMB_SGSLOT_ENV: &str = "NV_GOW_MOE_DNCOMB_SGSLOT";
 
 const DNCOMB_SGSLOT_KEEPS_EVERY_ROW_SLOT_PAIR_ON_ITS_OWN_SUBGROUP_SO_THE_RESIDENT_THREAD_COUNT_AND_MEMORY_LEVEL_PARALLELISM_MATCH_THE_SPLIT_PASS: usize = 4;
+
+fn arm_env_opt_out_default_on_unless_eq_0(env: &str) -> bool {
+    !std::env::var(env).is_ok_and(|v| v.trim() == "0")
+}
 
 fn arm_env_opt_in_default_off(env: &str) -> bool {
     std::env::var(env).is_ok_and(|v| v.trim() == "1")
@@ -142,8 +150,13 @@ pub fn mx_sg_xv4_r2_enabled() -> bool {
     arm_env_opt_in_default_off(MX_SG_XV4_R2_ENV)
 }
 
+pub const GOW_MOE_TOPK_SG32_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_GPTOSS_TOPKFUSED_218P7_202P3_117P9_VS_206P7_191P2_116P5_TOK_S_AT_256_8K_122K_PLUS_5P8_5P8_1P2_PCT_16X_THE_0P35_NULL_FLOOR_BITWISE_IN_BIT_ARMS_AND_ZERO_RESTORES_THE_SPLIT_TOPK: bool = true;
+
 pub fn moe_topk_sg32_enabled() -> bool {
-    arm_env_opt_in_default_off(MOE_TOPK_SG32_ENV)
+    match std::env::var(MOE_TOPK_SG32_ENV) {
+        Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
+        Err(_) => GOW_MOE_TOPK_SG32_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_GPTOSS_TOPKFUSED_218P7_202P3_117P9_VS_206P7_191P2_116P5_TOK_S_AT_256_8K_122K_PLUS_5P8_5P8_1P2_PCT_16X_THE_0P35_NULL_FLOOR_BITWISE_IN_BIT_ARMS_AND_ZERO_RESTORES_THE_SPLIT_TOPK,
+    }
 }
 
 pub fn mx_sg_xstage_enabled() -> bool {
@@ -201,7 +214,10 @@ fn mx_kpre_x_loads(j_off: usize, indent: &str) -> String {
 
 fn mx_kpre_r2_xs_source_issuing_both_rows_streams_before_the_fma_chains(blocks: usize) -> String {
     use std::fmt::Write as _;
-    assert!(blocks >= 1, "kpre needs at least one mx block, got {blocks}");
+    assert!(
+        blocks >= 1,
+        "kpre needs at least one mx block, got {blocks}"
+    );
     let n_full = blocks / 32;
     let rem = blocks % 32;
     let mut b = String::new();
@@ -234,14 +250,12 @@ fn mx_kpre_r2_xs_source_issuing_both_rows_streams_before_the_fma_chains(blocks: 
                 writeln!(b, "        var sw{r}_{j}: u32;").unwrap();
             }
         }
-        if rem > 0 || guard {
-            if rem > 0 {
-                writeln!(b, "        var wv{r}_r: vec4<u32>;").unwrap();
-                writeln!(b, "        var sw{r}_r: u32;").unwrap();
-            }
+        if rem > 0 {
+            writeln!(b, "        var wv{r}_r: vec4<u32>;").unwrap();
+            writeln!(b, "        var sw{r}_r: u32;").unwrap();
         }
         let (open, pad) = if guard {
-            (format!("        if (live1) {{\n"), "            ")
+            ("        if (live1) {\n".to_owned(), "            ")
         } else {
             (String::new(), "        ")
         };
@@ -340,9 +354,14 @@ fn mx_kpre_r2_xs_source_issuing_both_rows_streams_before_the_fma_chains(blocks: 
     b
 }
 
-fn mx_kpre_r4sw_source_issuing_all_four_rows_streams_before_the_fma_chains(blocks: usize) -> String {
+fn mx_kpre_r4sw_source_issuing_all_four_rows_streams_before_the_fma_chains(
+    blocks: usize,
+) -> String {
     use std::fmt::Write as _;
-    assert!(blocks >= 1, "kpre needs at least one mx block, got {blocks}");
+    assert!(
+        blocks >= 1,
+        "kpre needs at least one mx block, got {blocks}"
+    );
     let n_full = blocks / 32;
     let rem = blocks % 32;
     let mut b = String::new();
@@ -474,23 +493,30 @@ pub const QKV_FUSE_KV8_ROWS_ENTRY: &str = "gow_fu_rope_kvrows";
 
 pub fn qkv_fuse_kv8_enabled_one_fused_qkv_gemv_plus_one_rope_row_writer_replaces_the_kv8_layers_six_dispatch_split_chain(
 ) -> bool {
-    arm_env_opt_in_default_off(QKV_FUSE_KV8_ENV)
+    arm_env_opt_out_default_on_unless_eq_0(QKV_FUSE_KV8_ENV)
 }
 
 pub const LMHEAD_I8_ENV: &str = "NV_GOW_LMHEAD_I8";
 
 pub const LMHEAD_I8_ENTRY: &str = "gow_lmhead_i8_sg";
 
+pub const LMHEAD_I8_SHIPS_ON_SIGNED_OFF_2026_09_02_CLAIMING_THE_DEPTH_GAIN_ONLY_ROWS_GPTOSS_LMHEAD_I8_GATED_156P6_TO_166P1_TOK_S_AT_8192_OVER_A_DEAD_FLAT_NULL_THE_256_CELL_IS_SUB_FLOOR_UNRESOLVED_AND_ZERO_RESTORES_THE_BF16_HEAD: bool =
+    true;
+
 pub fn lmhead_i8_enabled_rowwise_int8_head_halves_vocab_gemv_bytes_and_is_ppl_gated_not_bitwise(
 ) -> bool {
-    arm_env_opt_in_default_off(LMHEAD_I8_ENV)
+    match std::env::var(LMHEAD_I8_ENV) {
+        Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
+        Err(_) => LMHEAD_I8_SHIPS_ON_SIGNED_OFF_2026_09_02_CLAIMING_THE_DEPTH_GAIN_ONLY_ROWS_GPTOSS_LMHEAD_I8_GATED_156P6_TO_166P1_TOK_S_AT_8192_OVER_A_DEAD_FLAT_NULL_THE_256_CELL_IS_SUB_FLOOR_UNRESOLVED_AND_ZERO_RESTORES_THE_BF16_HEAD,
+    }
 }
 
 pub const GEMV_SG_R2_ENV: &str = "NV_GOW_GEMV_SG_R2";
 
 pub const GEMV_SG_R2_ENTRY: &str = "gow_fu_gemv_bf16_sg_r2";
 
-const GEMV_SG_R2_ROWS_PER_WG_16_TWO_CONSECUTIVE_ROWS_PER_SUBGROUP_KEEP_EACH_ROWS_LANE_CHAIN: usize = 16;
+const GEMV_SG_R2_ROWS_PER_WG_16_TWO_CONSECUTIVE_ROWS_PER_SUBGROUP_KEEP_EACH_ROWS_LANE_CHAIN: usize =
+    16;
 
 pub fn gemv_sg_r2_enabled() -> bool {
     arm_env_opt_in_default_off(GEMV_SG_R2_ENV)
@@ -507,7 +533,8 @@ fn gemv_bf16_sg_entry_and_rows_per_wg(s: &Sources, k_v4: usize) -> (String, usiz
             GEMV_SG_R2_ENTRY.to_string(),
             GEMV_SG_R2_ROWS_PER_WG_16_TWO_CONSECUTIVE_ROWS_PER_SUBGROUP_KEEP_EACH_ROWS_LANE_CHAIN,
         )
-    } else if gemv_sg_xstage_enabled() && k_v4 <= GEMV_SG_XS_KV4_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY
+    } else if gemv_sg_xstage_enabled()
+        && k_v4 <= GEMV_SG_XS_KV4_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY
     {
         (
             GEMV_SG_XS_ENTRY.to_string(),
@@ -546,7 +573,12 @@ fn gemv_sg_kpre_source_issuing_every_weight_load_before_the_fma_chain(k_v4: usiz
     b.push_str("        let wbase = row * gsg_p.w_row_v4;\n");
     b.push_str("        let xo = gsg_p.x_off_v4;\n");
     for j in 0..n_full {
-        writeln!(b, "        let wv{j} = gsg_w[wbase + (lane + {}u)];", 32 * j).unwrap();
+        writeln!(
+            b,
+            "        let wv{j} = gsg_w[wbase + (lane + {}u)];",
+            32 * j
+        )
+        .unwrap();
     }
     if rem > 0 {
         b.push_str("        var wvr: vec4<u32>;\n");
@@ -600,6 +632,11 @@ fn gemv_sg_kpre_source_issuing_every_weight_load_before_the_fma_chain(k_v4: usiz
 
 pub fn moe_router_topk_fuse_enabled() -> bool {
     arm_env_opt_in_default_off(MOE_ROUTER_TOPK_FUSE_ENV)
+}
+
+pub fn moe_topk_fused_par_enabled_all_router_rows_ride_one_workgroup_as_8lane_clusters_reproducing_the_lane32_chains_and_butterfly_tree_so_the_row_serialization_that_banked_gow_fu_router_topk_negative_is_gone(
+) -> bool {
+    arm_env_opt_in_default_off(MOE_TOPK_FUSED_PAR_ENV)
 }
 
 pub fn moe_dncomb_fuse_enabled_the_down_gemv_keeps_each_expert_row_in_a_register_and_folds_the_same_ascending_fma_chain_gow_moe_combine_would_have_run(
@@ -707,8 +744,8 @@ const _: () = assert!(
         <= FLASH_STAGE2_PAR_SPLIT_CACHE_512_MUST_MATCH_THE_WGSL_WORKGROUP_ARRAY_BOUND
 );
 
-pub fn flash_stage2_module_source_carries_the_serial_scc_and_par_entries_side_by_side() -> &'static str
-{
+pub fn flash_stage2_module_source_carries_the_serial_scc_and_par_entries_side_by_side(
+) -> &'static str {
     FLASH_WGSL
 }
 
@@ -1270,13 +1307,102 @@ fn gow_fu_router_topk(
         gsg_topk_w[j] = chosen[j] / s;
     }
 }
+
+@compute @workgroup_size(256)
+fn gow_fu_router_topk_par(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_invocation_id) lane: u32
+) {
+    for (var i = lid.x; i < gsg_p.k_v4; i = i + 256u) {
+        gsg_xsh[i] = gsg_x[gsg_p.x_off_v4 + i];
+    }
+    workgroupBarrier();
+    let row = sgid * 4u + (lane >> 3u);
+    let t = lane & 7u;
+    let live = row < gsg_p.n_rows;
+    let kv4 = select(0u, gsg_p.k_v4, live);
+    let wbase = select(0u, row * gsg_p.w_row_v4, live);
+    var p0 = 0.0;
+    var p1 = 0.0;
+    var p2 = 0.0;
+    var p3 = 0.0;
+    for (var i = t; i < kv4; i = i + 32u) {
+        p0 = p0 + gsg_dot8(gsg_w[wbase + i], gsg_xsh[i]);
+    }
+    for (var i = t + 8u; i < kv4; i = i + 32u) {
+        p1 = p1 + gsg_dot8(gsg_w[wbase + i], gsg_xsh[i]);
+    }
+    for (var i = t + 16u; i < kv4; i = i + 32u) {
+        p2 = p2 + gsg_dot8(gsg_w[wbase + i], gsg_xsh[i]);
+    }
+    for (var i = t + 24u; i < kv4; i = i + 32u) {
+        p3 = p3 + gsg_dot8(gsg_w[wbase + i], gsg_xsh[i]);
+    }
+    var a = (p0 + p2) + (p1 + p3);
+    a = a + subgroupShuffleXor(a, 4u);
+    a = a + subgroupShuffleXor(a, 2u);
+    a = a + subgroupShuffleXor(a, 1u);
+    if (t == 0u && live) {
+        let v = a * gsg_p.alpha + gsg_bias(row);
+        gsg_rt_logits_each_row_dot_keeps_the_lane32_stride_and_butterfly_of_gow_fu_gemv_bf16_sg_so_fused_bits_equal_the_two_pass_chain[row] = v;
+        gsg_y[gsg_p.y_off_words + row] = bitcast<u32>(v);
+    }
+    workgroupBarrier();
+    if (sgid != 0u) {
+        return;
+    }
+    let e_live = lane < gsg_p.n_rows;
+    var v = -3.4028235e38;
+    if (e_live) {
+        v = gsg_rt_logits_each_row_dot_keeps_the_lane32_stride_and_butterfly_of_gow_fu_gemv_bf16_sg_so_fused_bits_equal_the_two_pass_chain[lane];
+    }
+    var taken = !e_live;
+    var chosen: array<f32, 16>;
+    for (var j = 0u; j < gsg_p.topk_k; j = j + 1u) {
+        var bv = select(v, -3.4028235e38, taken);
+        var bi = lane;
+        for (var s = 16u; s > 0u; s = s >> 1u) {
+            let ov = subgroupShuffleXor(bv, s);
+            let oi = subgroupShuffleXor(bi, s);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == bi) {
+            taken = true;
+        }
+        if (lane == 0u) {
+            gsg_topk_ids[j] = bi;
+        }
+        chosen[j] = bv;
+    }
+    if (lane != 0u) {
+        return;
+    }
+    var m = chosen[0];
+    for (var j = 1u; j < gsg_p.topk_k; j = j + 1u) {
+        m = max(m, chosen[j]);
+    }
+    var s = 0.0;
+    for (var j = 0u; j < gsg_p.topk_k; j = j + 1u) {
+        let e = exp(chosen[j] - m);
+        chosen[j] = e;
+        s = s + e;
+    }
+    for (var j = 0u; j < gsg_p.topk_k; j = j + 1u) {
+        gsg_topk_w[j] = chosen[j] / s;
+    }
+}
 "#;
 
 const FLASH_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_flash_decode.wgsl");
 
 pub const FLASH_DECODE_ENV: &str = "NV_GPTOSS_WGPU_FLASH_DECODE";
 
-pub const FLASH_SPLITS_64_KVSHARE_GRID_IS_N_KV_X_SPLITS_AND_43TOKS_AT_120K_BEAT_S16_BY_1P6X: u32 = 64;
+pub const FLASH_SPLITS_64_KVSHARE_GRID_IS_N_KV_X_SPLITS_AND_43TOKS_AT_120K_BEAT_S16_BY_1P6X: u32 =
+    64;
 
 const FLASH_WORKGROUP_BYTES_QSH256_RED256_SM8_SL8_SACC2048_F32: u32 =
     (256 + 256 + 8 + 8 + 2048) * 4;
@@ -1304,7 +1430,7 @@ pub fn flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build() -
                 panic!("NV_GPTOSS_WGPU_FLASH_SPLITS={v}: expected an integer split count")
             });
             assert!(
-                n >= 1 && n <= FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH,
+                (1..=FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH).contains(&n),
                 "NV_GPTOSS_WGPU_FLASH_SPLITS={n} out of 1..={}: stage2 scans splits serially per \
                  head and the scratch buffer carries splits*(head_dim+2) f32 rows per head",
                 FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH
@@ -1343,7 +1469,7 @@ fn flash_depthgate_forced_deep_splits_env_overrides_every_band_above_the_knee() 
         panic!("{FLASH_DEPTHGATE_SPLITS_ENV}={v}: expected an integer split count")
     });
     assert!(
-        n >= 1 && n <= FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH,
+        (1..=FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH).contains(&n),
         "{FLASH_DEPTHGATE_SPLITS_ENV}={n} out of 1..={}: stage2 scans splits serially per head \
          and the scratch buffer carries splits*(head_dim+2) f32 rows per head",
         FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH
@@ -1355,7 +1481,8 @@ pub fn flash_depthgate_splits_for_context_tokens(tokens: u32, shallow_splits: u3
     if tokens < FLASH_DEPTHGATE_KNEE_TOKENS_1280_IS_WHERE_SPLITS_8_AND_64_TIE_AND_BELOW_IT_8_WINS {
         return shallow_splits;
     }
-    if let Some(forced) = flash_depthgate_forced_deep_splits_env_overrides_every_band_above_the_knee()
+    if let Some(forced) =
+        flash_depthgate_forced_deep_splits_env_overrides_every_band_above_the_knee()
     {
         return forced;
     }
@@ -1376,7 +1503,8 @@ pub fn flash_depthgate_scratch_splits_must_cover_every_band_the_gate_can_pick(
     if !flash_depthgate_enabled_shallow_tuned_splits_starve_the_grid_at_depth() {
         return shallow_splits;
     }
-    let banded = match flash_depthgate_forced_deep_splits_env_overrides_every_band_above_the_knee() {
+    let banded = match flash_depthgate_forced_deep_splits_env_overrides_every_band_above_the_knee()
+    {
         Some(forced) => forced,
         None => FLASH_SPLITS_64_KVSHARE_GRID_IS_N_KV_X_SPLITS_AND_43TOKS_AT_120K_BEAT_S16_BY_1P6X
             .max(FLASH_DEPTHGATE_BAND1_SPLITS_24_IS_ONE_WORKGROUP_PER_SM_AT_8_KV_HEADS_ON_188_SMS)
@@ -1395,7 +1523,8 @@ pub const FLASH_KPRE_MAX_UNROLL_8_BOUNDS_THE_LIVE_SCORE_FILE_AT_FOLD_TIMES_UNROL
 
 pub const FLASH_KPRE_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS: u32 = 128;
 
-pub fn flash_kpre_banked_negative_preloading_four_rounds_costs_more_warp_residency_than_the_loads_in_flight_buy() -> bool {
+pub fn flash_kpre_banked_negative_preloading_four_rounds_costs_more_warp_residency_than_the_loads_in_flight_buy(
+) -> bool {
     arm_env_opt_in_default_off(FLASH_KPRE_ENV)
 }
 
@@ -1410,7 +1539,7 @@ pub fn flash_kpre_unroll() -> u32 {
         }
     };
     assert!(
-        n >= 1 && n <= FLASH_KPRE_MAX_UNROLL_8_BOUNDS_THE_LIVE_SCORE_FILE_AT_FOLD_TIMES_UNROLL,
+        (1..=FLASH_KPRE_MAX_UNROLL_8_BOUNDS_THE_LIVE_SCORE_FILE_AT_FOLD_TIMES_UNROLL).contains(&n),
         "{FLASH_KPRE_UNROLL_ENV}={n} out of 1..={}: every unrolled round keeps one score per \
          folded query head live across the preload, so the register file bounds the unroll",
         FLASH_KPRE_MAX_UNROLL_8_BOUNDS_THE_LIVE_SCORE_FILE_AT_FOLD_TIMES_UNROLL
@@ -1437,8 +1566,8 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
     use std::fmt::Write as _;
     assert!(
         hd.is_multiple_of(32)
-            && hd >= 32
-            && hd <= FLASH_KPRE_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS,
+            && (32..=FLASH_KPRE_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS)
+                .contains(&hd),
         "the gow kpre stage1 gives each of the first head_dim/4 lanes exactly one packed \
          fp8 word, so head_dim must be a multiple of 32 up to \
          {FLASH_KPRE_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS}, got {hd}"
@@ -1530,16 +1659,8 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
             writeln!(b, "        var vw{t}_{i} = 0u;").unwrap();
         }
         writeln!(b, "        if (live{t}) {{").unwrap();
-        writeln!(
-            b,
-            "            ks{t} = fd_k_scales[sp{t} * nkv + kvh]{sd};"
-        )
-        .unwrap();
-        writeln!(
-            b,
-            "            vs{t} = fd_v_scales[sp{t} * nkv + kvh]{sd};"
-        )
-        .unwrap();
+        writeln!(b, "            ks{t} = fd_k_scales[sp{t} * nkv + kvh]{sd};").unwrap();
+        writeln!(b, "            vs{t} = fd_v_scales[sp{t} * nkv + kvh]{sd};").unwrap();
         writeln!(
             b,
             "            if (lane < n4) {{ kw{t} = fd_k_words[(kb{t} >> 2u) + lane]; }}"
@@ -1729,8 +1850,8 @@ pub fn flash_lanepos_mode_unset_gates_at_the_measured_knee_1_always_0_restores_f
     }
 }
 
-pub fn flash_lanepos_one_lane_owns_one_positions_whole_dot_so_no_per_position_reduce_exists(
-) -> bool {
+pub fn flash_lanepos_one_lane_owns_one_positions_whole_dot_so_no_per_position_reduce_exists() -> bool
+{
     flash_lanepos_mode_unset_gates_at_the_measured_knee_1_always_0_restores_fdf_only()
         == FlashLaneposMode::Always
 }
@@ -1746,7 +1867,8 @@ pub const FLASH_ROWPAIR_ENV: &str = "NV_GOW_FLASH_ROWPAIR";
 
 pub const FLASH_ROWPAIR_LANES_PER_ROW_16_IS_HEAD_DIM_64_PACKED_FOUR_FP8_TO_A_WORD: u32 = 16;
 
-pub fn flash_rowpair_banked_neutral_two_rows_per_warp_round_fills_the_idle_lanes_and_halves_the_rounds_for_no_wall() -> bool {
+pub fn flash_rowpair_banked_neutral_two_rows_per_warp_round_fills_the_idle_lanes_and_halves_the_rounds_for_no_wall(
+) -> bool {
     arm_env_opt_in_default_off(FLASH_ROWPAIR_ENV)
 }
 
@@ -1845,11 +1967,7 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
         writeln!(b, "        var pt{j} = 0.0;").unwrap();
     }
     writeln!(b, "        if (livem) {{").unwrap();
-    writeln!(
-        b,
-        "            for (var t = 0u; t < wpl; t = t + 1u) {{"
-    )
-    .unwrap();
+    writeln!(b, "            for (var t = 0u; t < wpl; t = t + 1u) {{").unwrap();
     writeln!(b, "                let wi = sub * wpl + t;").unwrap();
     writeln!(b, "                let kwv = fd_k_words[(kbm >> 2u) + wi];").unwrap();
     for i in 0..4u32 {
@@ -1974,7 +2092,7 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
     writeln!(b, "}}").unwrap();
     assert!(
         b.matches(&format!("{entry}_red16(")).count() as u32 == fold + 1
-            && b.matches(&format!("subgroupShuffleXor(rd")).count() as u32 == fold
+            && b.matches("subgroupShuffleXor(rd").count() as u32 == fold
             && b.contains(&format!("{p}_epilogue("))
             && b.matches("0x7B800000").count() == 4,
         "the gow rowpair stage1 must reduce each folded head over the 16 lanes that own one KV \
@@ -2043,8 +2161,8 @@ pub fn flash_acc_stage1_source_sd(
     use std::fmt::Write as _;
     assert!(
         hd.is_multiple_of(32)
-            && hd >= 32
-            && hd <= FLASH_ACC_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS,
+            && (32..=FLASH_ACC_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS)
+                .contains(&hd),
         "the gow accumulator-file stage1 gives each of the first head_dim/4 lanes exactly one \
          packed fp8 word and holds that lane's four query components per folded head, so \
          head_dim must be a multiple of 32 up to \
@@ -2113,11 +2231,7 @@ pub fn flash_acc_stage1_source_sd(
     if qreg {
         for j in 0..fold {
             for c in 0..4u32 {
-                writeln!(
-                    b,
-                    "    let qr{j}_{c} = {p}_qsh[{j}u * hd + qb + {c}u];"
-                )
-                .unwrap();
+                writeln!(b, "    let qr{j}_{c} = {p}_qsh[{j}u * hd + qb + {c}u];").unwrap();
             }
         }
     }
@@ -2330,7 +2444,7 @@ pub fn flash_kvline_slots() -> u32 {
         }
     };
     assert!(
-        n >= 1 && n <= FLASH_KVLINE_MAX_SLOTS_4_BOUNDS_THE_WORKGROUP_AT_1024_INVOCATIONS,
+        (1..=FLASH_KVLINE_MAX_SLOTS_4_BOUNDS_THE_WORKGROUP_AT_1024_INVOCATIONS).contains(&n),
         "{FLASH_KVLINE_SLOTS_ENV}={n} out of 1..={}: the kvline workgroup is 32 x n_kv x slots \
          invocations and a device workgroup holds at most 1024",
         FLASH_KVLINE_MAX_SLOTS_4_BOUNDS_THE_WORKGROUP_AT_1024_INVOCATIONS
@@ -2355,8 +2469,8 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
     use std::fmt::Write as _;
     assert!(
         hd.is_multiple_of(32)
-            && hd >= 32
-            && hd <= FLASH_ACC_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS
+            && (32..=FLASH_ACC_STAGE1_IS_SPECIALIZED_TO_HEAD_DIM_AT_MOST_FOUR_LANE_WORDS)
+                .contains(&hd)
             && nkv >= 1
             && group >= 1,
         "the gow kvline stage1 gives each of the first head_dim/4 lanes one packed fp8 word, so \
@@ -2446,7 +2560,11 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
     writeln!(b, "        if (live) {{").unwrap();
     writeln!(b, "            ks = fd_k_scales[sp * nkv + kvh]{sd};").unwrap();
     writeln!(b, "            if (hot) {{").unwrap();
-    writeln!(b, "                let kw = fd_k_words[(kbase >> 2u) + lane];").unwrap();
+    writeln!(
+        b,
+        "                let kw = fd_k_words[(kbase >> 2u) + lane];"
+    )
+    .unwrap();
     for c in 0..4u32 {
         writeln!(
             b,
@@ -2577,7 +2695,8 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
 
 pub const KV_FP8_ENV: &str = "NV_GOW_KV_FP8";
 
-pub const GOW_KV_FP8_DEFAULT_ON_THE_DEPTH_STACK_DOMINATES_SERIAL_AT_EVERY_MEASURED_DEPTH: bool = true;
+pub const GOW_KV_FP8_DEFAULT_ON_THE_DEPTH_STACK_DOMINATES_SERIAL_AT_EVERY_MEASURED_DEPTH: bool =
+    true;
 
 pub fn kv_fp8_enabled() -> bool {
     match std::env::var(KV_FP8_ENV) {
@@ -2999,9 +3118,10 @@ impl Builder {
             .iter()
             .filter(|(_, buf)| buf.usage().contains(wgpu::BufferUsages::STORAGE))
             .map(|(slot, buf)| {
-                let w = wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
-                    source, *slot,
-                );
+                let w =
+                    wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
+                        source, *slot,
+                    );
                 (self.intern_storage_buffer(buf), w)
             })
             .collect();
@@ -3093,6 +3213,12 @@ pub fn verify_audit_sources() -> Vec<(&'static str, String)> {
 }
 
 #[doc(hidden)]
+pub fn fused_module_source_carries_the_router_topk_par_entry_for_its_device_parity_gate() -> String
+{
+    compose(FUSED_WGSL)
+}
+
+#[doc(hidden)]
 pub fn nozi_audit_sources() -> Vec<(&'static str, String)> {
     vec![
         ("gow:gemv", compose(GEMV_WGSL)),
@@ -3118,9 +3244,8 @@ impl Sources {
         }
         let mut fused_src = String::from(FUSED_WGSL);
         for &kv4 in &gemv_kpre_kv4s {
-            fused_src.push_str(&gemv_sg_kpre_source_issuing_every_weight_load_before_the_fma_chain(
-                kv4,
-            ));
+            fused_src
+                .push_str(&gemv_sg_kpre_source_issuing_every_weight_load_before_the_fma_chain(kv4));
         }
         let mut mx_kpre_blocks: Vec<usize> = Vec::new();
         if mx_kpre_enabled_baked_block_entries_issue_the_expert_weight_and_scale_stream_before_the_fma_chain()
@@ -3148,12 +3273,12 @@ impl Sources {
         };
         let mut mx_src = String::from(mx_base);
         for &blocks in &mx_kpre_blocks {
-            mx_src.push_str(&mx_kpre_r2_xs_source_issuing_both_rows_streams_before_the_fma_chains(
-                blocks,
-            ));
-            mx_src.push_str(&mx_kpre_r4sw_source_issuing_all_four_rows_streams_before_the_fma_chains(
-                blocks,
-            ));
+            mx_src.push_str(
+                &mx_kpre_r2_xs_source_issuing_both_rows_streams_before_the_fma_chains(blocks),
+            );
+            mx_src.push_str(
+                &mx_kpre_r4sw_source_issuing_all_four_rows_streams_before_the_fma_chains(blocks),
+            );
         }
         Self {
             gemv: compose(GEMV_WGSL),
@@ -3505,8 +3630,8 @@ impl GptOssWgpu {
                 };
                 (b.uni("gow-at-fl-p", p), p)
             });
-        let kv8_geometry_ok = cfg.head_dim.is_multiple_of(32)
-            && cfg.head_dim <= wk::flash_decode::MAX_HEAD_DIM;
+        let kv8_geometry_ok =
+            cfg.head_dim.is_multiple_of(32) && cfg.head_dim <= wk::flash_decode::MAX_HEAD_DIM;
         if kv_fp8_enabled() && !kv8_geometry_ok {
             eprintln!(
                 "[gow-wgpu] kv-fp8 depth stack needs head_dim a multiple of 32 up to the fold \
@@ -3746,10 +3871,7 @@ impl GptOssWgpu {
                         .any(|t| matches!(t, GptOssLayerType::Sliding)) =>
             {
                 let mut p = *base;
-                p.splits = p
-                    .splits
-                    .min((cfg.sliding_window as u32).div_ceil(8))
-                    .max(1);
+                p.splits = p.splits.min((cfg.sliding_window as u32).div_ceil(8)).max(1);
                 Some((b.uni("gow-at-fl-sw-p", p), p, cfg.sliding_window as u32))
             }
             _ => None,
@@ -4068,9 +4190,9 @@ impl GptOssWgpu {
             vocab * hidden
         );
         let dummy_bias = b.upload_u32("gow-dummy-bias", &[0u32]);
-        let head_i8 = lmhead_i8_enabled_rowwise_int8_head_halves_vocab_gemv_bytes_and_is_ppl_gated_not_bitwise()
-            && s.gemv_sg_on
-            && hidden.is_multiple_of(16);
+        let head_i8 =
+            lmhead_i8_enabled_rowwise_int8_head_halves_vocab_gemv_bytes_and_is_ppl_gated_not_bitwise(
+            ) && s.gemv_sg_on && hidden.is_multiple_of(16);
         let mut lm_chunks: Vec<(wgpu::Buffer, usize, usize)> = Vec::new();
         let mut off = 0usize;
         while head_i8 && off < vocab {
@@ -4103,7 +4225,13 @@ impl GptOssWgpu {
                 "gow-lmhead",
                 &s.fused,
                 LMHEAD_I8_ENTRY,
-                &[(30, &wbuf), (31, &final_x), (32, &p), (33, &logits), (37, &sbuf)],
+                &[
+                    (30, &wbuf),
+                    (31, &final_x),
+                    (32, &p),
+                    (33, &logits),
+                    (37, &sbuf),
+                ],
                 grid,
             )?;
             off += rows;
@@ -4212,9 +4340,7 @@ impl GptOssWgpu {
 
         let verify = match pf.as_ref() {
             Some(sc)
-                if !b.pf_passes.is_empty()
-                    && verify_rows(sc.m) > 0
-                    && !lm_chunks.is_empty() =>
+                if !b.pf_passes.is_empty() && verify_rows(sc.m) > 0 && !lm_chunks.is_empty() =>
             {
                 let rows = verify_rows(sc.m);
                 b.to_verify = true;
@@ -4443,9 +4569,7 @@ impl GptOssWgpu {
             .queue
             .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
         if let Some(knee) = self.lanepos_gate_knee {
-            let want_deep = (self.pos + 1) as u32
-                >= knee
-                && !self.lanepos_alt_flash1.is_empty();
+            let want_deep = (self.pos + 1) as u32 >= knee && !self.lanepos_alt_flash1.is_empty();
             if want_deep != self.lanepos_deep_active {
                 for (slot, i) in self.depthgate_flash1_passes.iter().enumerate() {
                     std::mem::swap(&mut self.passes[*i], &mut self.lanepos_alt_flash1[slot]);
@@ -4453,14 +4577,13 @@ impl GptOssWgpu {
                 self.lanepos_deep_active = want_deep;
             }
         }
-        let depthgate_splits = (self.depthgate_on
-            && !self.depthgate_flash1_passes.is_empty())
-        .then(|| {
-            flash_depthgate_splits_for_context_tokens(
-                (self.pos + 1) as u32,
-                self.depthgate_shallow_splits,
-            )
-        });
+        let depthgate_splits = (self.depthgate_on && !self.depthgate_flash1_passes.is_empty())
+            .then(|| {
+                flash_depthgate_splits_for_context_tokens(
+                    (self.pos + 1) as u32,
+                    self.depthgate_shallow_splits,
+                )
+            });
         if let Some((buf, base)) = &self.flash_fd {
             let mut p = *base;
             p.total = (self.pos + 1) as u32;
@@ -4652,8 +4775,7 @@ impl GptOssWgpu {
                 0,
                 bytemuck::bytes_of(&PfKvqParams {
                     tokens: live as u32,
-                    x_stride_elems: (self.config.num_key_value_heads * self.config.head_dim)
-                        as u32,
+                    x_stride_elems: (self.config.num_key_value_heads * self.config.head_dim) as u32,
                     ..Default::default()
                 }),
             );
@@ -5038,21 +5160,19 @@ fn push_gemv_mx(
         },
     );
     anyhow::ensure!(slots <= w.e, "more slots than experts");
-    let entry: String = if s.mx_kpre_blocks.contains(&k_blocks)
-        && s.mx_entry == MX_SG_XV4_R2_LUT_XS_ENTRY
-    {
-        mx_kpre_r2_xs_entry_name(k_blocks)
-    } else {
-        s.mx_entry.to_string()
-    };
+    let entry: String =
+        if s.mx_kpre_blocks.contains(&k_blocks) && s.mx_entry == MX_SG_XV4_R2_LUT_XS_ENTRY {
+            mx_kpre_r2_xs_entry_name(k_blocks)
+        } else {
+            s.mx_entry.to_string()
+        };
     anyhow::ensure!(
         !entry.starts_with(MX_SG_XV4_ENTRY) || x_slot_stride_words.is_multiple_of(4),
         "the xv4 mx arms rebind x as vec4 words, so slot stride {x_slot_stride_words} must be a \
          multiple of 4"
     );
     anyhow::ensure!(
-        !entry.contains("_xs")
-            || k_blocks <= MX_XS_K_BLOCK_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY,
+        !entry.contains("_xs") || k_blocks <= MX_XS_K_BLOCK_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY,
         "the xstage arms hold all of x in an 8 KiB shared array, so k_blocks {k_blocks} must \
          stay within the staged capacity"
     );
@@ -5488,7 +5608,16 @@ fn build_attn(
         let qkv_lin = qkv_concat_host(a)?;
         let qkv_raw = b.zeros("gow-at-qkvraw", (qkv_lin.n * 2) as u64);
         let wqkv = upload_bf16(b, "gow-at-qkv", &qkv_lin);
-        push_gemv_bf16(b, s, "gow-at-qkvproj", &wqkv, x, &qkv_raw, false, &dummy_bias)?;
+        push_gemv_bf16(
+            b,
+            s,
+            "gow-at-qkvproj",
+            &wqkv,
+            x,
+            &qkv_raw,
+            false,
+            &dummy_bias,
+        )?;
         let frp = b.uni(
             "gow-at-furope-p",
             FusedRopeParams {
@@ -5518,7 +5647,16 @@ fn build_attn(
         let qkv_lin = qkv_concat_host(a)?;
         let qkv_raw = b.zeros("gow-at-qkvraw", (qkv_lin.n * 2) as u64);
         let wqkv = upload_bf16(b, "gow-at-qkv", &qkv_lin);
-        push_gemv_bf16(b, s, "gow-at-qkvproj", &wqkv, x, &qkv_raw, false, &dummy_bias)?;
+        push_gemv_bf16(
+            b,
+            s,
+            "gow-at-qkvproj",
+            &wqkv,
+            x,
+            &qkv_raw,
+            false,
+            &dummy_bias,
+        )?;
         let k_rows = b.zeros("gow-at-k", (n_kv * hd * 2) as u64);
         let v_rows = b.zeros("gow-at-vraw", (n_kv * hd * 2) as u64);
         let frp = b.uni(
@@ -6205,12 +6343,49 @@ fn build_moe(
     let rlogits = b.zeros("gow-moe-rlogits", (e * 4) as u64);
     let ids = b.zeros("gow-moe-ids", (k_top * 4) as u64);
     let wts = b.zeros("gow-moe-wts", (k_top * 4) as u64);
+    let router_topk_fused_par = moe_topk_fused_par_enabled_all_router_rows_ride_one_workgroup_as_8lane_clusters_reproducing_the_lane32_chains_and_butterfly_tree_so_the_row_serialization_that_banked_gow_fu_router_topk_negative_is_gone()
+        && s.gemv_sg_on
+        && e <= 32
+        && k_top <= MAX_TOPK
+        && hidden.is_multiple_of(8)
+        && hidden / 8 <= FU_ROUTER_TOPK_PAR_STAGES_X_IN_THE_512_VEC4_SHARED_ARRAY;
     let router_topk_fused = moe_router_topk_fuse_enabled()
         && s.gemv_sg_on
         && e <= 64
         && k_top <= MAX_TOPK
         && hidden.is_multiple_of(8);
-    if router_topk_fused {
+    if router_topk_fused_par {
+        let p = b.uni(
+            "gow-moe-rtfp-p",
+            GemvSgParams {
+                n_rows: e as u32,
+                k_v4: (hidden / 8) as u32,
+                groups_x: 1,
+                out_f32: 1,
+                w_row_v4: (hidden / 8) as u32,
+                has_bias: u32::from(router.bias.is_some()),
+                alpha: 1.0,
+                topk_k: k_top as u32,
+                ..Default::default()
+            },
+        );
+        let bias = router.bias.as_ref().unwrap_or(&dummy_bias);
+        b.push(
+            "gow-moe-router-topk-par",
+            &s.fused,
+            MOE_TOPK_FUSED_PAR_ENTRY,
+            &[
+                (30, &router.w),
+                (31, x),
+                (32, &p),
+                (33, &rlogits),
+                (34, bias),
+                (35, &ids),
+                (36, &wts),
+            ],
+            (1, 1, 1),
+        )?;
+    } else if router_topk_fused {
         let p = b.uni(
             "gow-moe-rtf-p",
             GemvSgParams {
@@ -6260,7 +6435,7 @@ fn build_moe(
                 ..Default::default()
             },
         );
-        let topk_sg32 = moe_topk_sg32_enabled() && e <= 32;
+        let topk_sg32 = moe_topk_sg32_enabled() && s.gemv_sg_on && e <= 32;
         b.push(
             "gow-moe-topk",
             &s.moe,

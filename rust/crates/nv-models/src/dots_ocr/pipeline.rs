@@ -5,16 +5,20 @@ use candle_core::{DType, Device, Tensor};
 use nv_weights::WeightLoader;
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "wgpu")]
+use super::decoder::EOS_TOKEN_IDS;
 use super::decoder::{
     build_prompt_tokens, DotsDecoder, DotsDecoderConfig, GenerateOptions, GenerateOutcome,
-    PromptStyle, EOS_TOKEN_IDS,
+    PromptStyle,
 };
 #[cfg(feature = "wgpu")]
 use super::decoder_wgpu::DotsQ3dDecoder;
 #[cfg(feature = "wgpu")]
 use super::decoder_wgpu_graph::{DotsDecoderWgpuGraph, DotsGraphQuant};
 use super::parse::{parse_layout_json, plain_text_fallback, LayoutElement, LayoutPage};
-use super::preprocess::{prepare, sample_ink, InkPoints, PixelBudget, PreparedImage, DEFAULT_MIN_PIXELS};
+use super::preprocess::{
+    prepare, sample_ink, InkPoints, PixelBudget, PreparedImage, DEFAULT_MIN_PIXELS,
+};
 use super::regions::{
     category_prefix, env_pixels, layout_is_usable, plan_regions, CROP_MAX_PIXELS_ENV,
     DEFAULT_CROP_MAX_PIXELS_500K_IS_ABOUT_640_VISION_TOKENS,
@@ -101,16 +105,11 @@ pub const DOTS_FAST_PATH_DEFAULTS_ARE_SCOPED_TO_METAL_BECAUSE_THAT_IS_THE_ONLY_A
      the serving device and not the feature flag. NV_DOTS_VISION_BACKEND and NV_DOTS_DEC_ENGINE \
      still name either arm explicitly on any device, and =candle restores the pre-flip path.";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DotsVisionBackend {
+    #[default]
     Candle,
     Wgpu,
-}
-
-impl Default for DotsVisionBackend {
-    fn default() -> Self {
-        DotsVisionBackend::Candle
-    }
 }
 
 impl DotsVisionBackend {
@@ -150,8 +149,8 @@ impl DotsVisionBackend {
     }
 }
 
-pub const LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING: &str =
-    "graph_generate returns None only when there is no graph, so a live graph serves EVERY
+pub const LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING:
+    &str = "graph_generate returns None only when there is no graph, so a live graph serves EVERY
      generate and the candle decoder beside it is never called. Building it anyway put a second
      full copy of the trunk in memory -- about 3 GiB of bf16 beside the graph's own 7.1 GiB --
      which is why the decoder is built only when the graph is not serving. This mattered the
@@ -162,17 +161,59 @@ pub const LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TR
 
 pub const DOTS_DEC_ENGINE_ENV: &str = "NV_DOTS_DEC_ENGINE";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub const DOTS_VISION_HANDOFF_ENV: &str = "NV_DOTS_VISION_HANDOFF";
+
+pub const VISION_HANDOFF_STAYS_ON_DEVICE_BECAUSE_TOWER_AND_GRAPH_SHARE_ONE_WGPU_QUEUE: &str =
+    "The wgpu tower and the graph decoder both run on WgpuContext::shared(), so the merged \
+     features never need the host: encode_resident packs them to the bf16 words the prefill \
+     splice consumes and generate_gpu_rows copies them buffer-to-buffer, deleting the 21 MB \
+     merger readback, the candle bf16 staging round trip (a third Metal context), the 21 MB \
+     download back to host, the host repack and the 10.5 MB splice re-upload on an invoice-size \
+     page. The splice words are byte-identical to the shipped host chain because every host hop \
+     only ever rounded once (see HANDOFF_SPLICE_WORDS_MATCH...). NV_DOTS_VISION_HANDOFF=0 \
+     restores the host handoff everywhere, region crops included.";
+
+#[cfg(feature = "wgpu")]
+fn vision_handoff_enabled() -> bool {
+    let _ = VISION_HANDOFF_STAYS_ON_DEVICE_BECAUSE_TOWER_AND_GRAPH_SHARE_ONE_WGPU_QUEUE;
+    std::env::var(DOTS_VISION_HANDOFF_ENV).ok().as_deref() != Some("0")
+}
+
+pub const DOTS_REGION_HANDOFF_ENV: &str = "NV_DOTS_REGION_HANDOFF";
+
+pub const REGION_CROPS_RIDE_THE_SAME_RESIDENT_SPLICE_BECAUSE_THE_TIERED_PATH_PAID_THE_HOST_HOP_PER_CROP: &str =
+    "The tiered route hands vision rows to the decoder once per crop, so the host seam the \
+     whole-page handoff deleted once per page multiplied by the region count: batch-encoded \
+     crops staged through candle and re-downloaded before the prefill repack, bucket-miss \
+     crops rode the full candle round trip, and the batched-region prefill re-packed every \
+     row on the host. encode_batch_resident packs the batched merger output per crop with \
+     the gated dvh pack pass, encode_resident serves bucket misses, and region_prefill \
+     splices buffer-to-buffer -- the same once-rounded bf16 words either way (see \
+     HANDOFF_SPLICE_WORDS_MATCH...). NV_DOTS_REGION_HANDOFF=0 restores the host rows on \
+     region paths alone; NV_DOTS_VISION_HANDOFF=0 restores them everywhere. q3d and candle \
+     engines never see gpu rows -- the producer gates on the graph serving alone.";
+
+#[cfg(feature = "wgpu")]
+fn region_handoff_enabled() -> bool {
+    let _ = REGION_CROPS_RIDE_THE_SAME_RESIDENT_SPLICE_BECAUSE_THE_TIERED_PATH_PAID_THE_HOST_HOP_PER_CROP;
+    vision_handoff_enabled() && std::env::var(DOTS_REGION_HANDOFF_ENV).ok().as_deref() != Some("0")
+}
+
+#[cfg(feature = "wgpu")]
+enum PreRows {
+    Host(Vec<f32>),
+    Gpu(super::decoder_wgpu_graph::VisionRowsGpu),
+}
+
+#[cfg(not(feature = "wgpu"))]
+type PreRows = Vec<f32>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DotsDecoderEngine {
+    #[default]
     Candle,
     Graph,
     Q3d,
-}
-
-impl Default for DotsDecoderEngine {
-    fn default() -> Self {
-        DotsDecoderEngine::Candle
-    }
 }
 
 impl DotsDecoderEngine {
@@ -269,7 +310,8 @@ pub struct DotsPageResult {
     pub grid: (usize, usize),
 }
 
-pub const INK_RECALL_RESCUES_SPARSE_SHEETS_THE_PAGE_AREA_FLOOR_WRONGLY_SENDS_BACK_TO_SINGLE_PASS: &str =
+pub const INK_RECALL_RESCUES_SPARSE_SHEETS_THE_PAGE_AREA_FLOOR_WRONGLY_SENDS_BACK_TO_SINGLE_PASS:
+    &str =
     "layout_is_usable gates on region area over PAGE area (0.15), which reads a large sheet \
      with small text -- an A0 plan at 50MP measures 0.02 -- as a detector miss and falls back \
      to the whole-page pass that cannot resolve exactly that input. The ink check accepts the \
@@ -336,18 +378,90 @@ struct RegionOcr {
 }
 
 pub const T1_BATCH_ENV: &str = "NV_DOTS_T1_BATCH";
+pub const SCREEN_DETOUR_ENV: &str = "NV_DOTS_SCREEN_DETOUR";
+pub const T1_HANDOFF_ENV: &str = "NV_DOTS_T1_HANDOFF";
 
-pub const T1_BATCH_MAX_CROP_VISION_TOKENS_256_MEASURED_ON_THE_4K_SCREEN_REGRESSION: usize = 256;
+pub const T1_HANDOFF_DEFAULT_0_LIVE_ROWS_KEEPS_THE_BATCH_TO_ITS_LAST_ROW: usize = 0;
+
+pub const A_THIN_BATCH_TAIL_KEEPS_BATCHING_BECAUSE_THE_GAZETTE_LADDER_MEASURED_EVERY_HANDOFF_THRESHOLD_LOSING: &str =
+    "the sparse-batch red predicted a win from retiring a thin batch tail (under the ~5.2 \
+     live-row break-even) into serial continuation -- each survivor re-prefills its prompt \
+     plus generated-so-far through the steel serial path over its already-encoded vision \
+     rows and decodes on at the serial per-token price. The interleaved gazette ladder \
+     measured the opposite: thresholds 2/3/5 read 19.69/19.70/20.00 s against 19.50-19.53 s \
+     with the handoff off, token-identical output (gen 3147, ncer 0.0194) on every arm -- at \
+     drain time the survivors' remaining tails are short, so the re-prefill costs more than \
+     the thin bsteps it replaces. The handoff therefore defaults off; NV_DOTS_T1_HANDOFF=N \
+     retires survivors at N live rows for pages whose drain holds a long-generation \
+     straggler, the unmeasured win case. A handed-off continuation re-argues ngram bans \
+     against real logits like any serial generation, but its ban window restarts at the \
+     handoff and the prefill-vs-decode trunk reassociation makes the tail token-equal \
+     class, never bitwise -- covered by the tiered quality suites.";
+
+#[cfg(feature = "wgpu")]
+fn t1_handoff_max_live_rows() -> usize {
+    std::env::var(T1_HANDOFF_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(T1_HANDOFF_DEFAULT_0_LIVE_ROWS_KEEPS_THE_BATCH_TO_ITS_LAST_ROW)
+}
+
+pub const DARK_INVERT_ENV: &str = "NV_DOTS_DARK_INVERT";
+
+pub const DARK_PAGES_INVERT_BEFORE_THE_TOWER_BECAUSE_THE_MODEL_WAS_TRAINED_ON_INK_OVER_LIGHT: &str =
+    "a dark theme is a light page inverted, and the tower, the scout and the tier ladder \
+     were all measured on ink-over-light: the 4K dark screen reads recall 0.6667 / ncer \
+     0.3196 in 41 s native (one boxed region, truncated) against 0.9444 / 0.1300 in 7.2 s \
+     inverted (nine regions, tiling engages). recognize_auto therefore inverts a detected \
+     dark page before any routing, for PlainOcr only -- layout modes are unmeasured and \
+     keep the native read. The inversion is PREPROCESSING, not routing: it composes with \
+     every tiering policy and caller hint unchanged, and NV_DOTS_DARK_INVERT=0 is its own \
+     operator kill-switch restoring the native read. Detection is the scout's paired ink \
+     reads (page_is_dark_themed), gated so the corpus and every light fixture answer \
+     false; the single-pass recognize() entry is untouched, so the family band cannot \
+     move. The remaining unmeasured edge: sub-threshold dark pages that are not \
+     screen-like invert and then ride the single pass.";
+
+pub const SERIAL_CROP_ENCODES_BATCH_BY_GRID_BECAUSE_TOWER_COST_IS_PER_CALL_NOT_PER_PATCH: &str =
+    "a page under the 24-region floor decodes serially by the sparse-batch rule, but its \
+     crops still paid one tower call each (~49 ms fixed upload/dispatch/readback against \
+     under 1 ms compute on a small crop), so the serial path buckets same-grid crops \
+     through the same encode_batch the batched-decode path rides -- gated bitwise against \
+     single encodes -- and stages the rows through the identical bf16 tensor conversion, \
+     leaving decode arithmetic untouched byte for byte. NV_DOTS_T1_BATCH=0 restores \
+     per-crop encodes together with sequential decode.";
+
+pub const T1_BATCH_MAX_CROP_VISION_TOKENS_896_IS_THE_STRIDE_BOUND_NOW_THAT_RANGED_PREFILL_IS_STEEL: usize =
+    896;
+
+pub const T1_BATCH_MIN_REGIONS_24_A_STEP_COSTS_THE_FULL_TRUNK_SO_SPARSE_BATCHES_LOSE_TO_SERIAL:
+    usize = 24;
+
+pub const SPARSE_BATCHES_LOSE_BECAUSE_THE_TRUNK_PRICE_IS_PER_STEP_NOT_PER_ROW: &str =
+    "a batched step costs the full m=32 trunk (~40-45 ms) whether one row or thirty-two are \
+     live, so the win requires enough live rows on average: the 130-entry gazette keeps the \
+     batch full (~98 steps for ~3145 tokens, 22.6 s end-to-end vs 37.5 sequential) while \
+     the 4K screen's 11 skew-length regions average two or three live rows and read 10.8 s \
+     batched against 6.5 serial. Pages under 24 regions take the serial crop path; the \
+     refinement left on the table is straggler handoff, retiring a thin batch tail into \
+     serial continuation, which needs a serial step that reads a region's KV stride.";
+
+pub const A_BANNED_ROW_REDOES_SERIALLY_BECAUSE_THE_BATCH_KEEPS_NO_PER_ROW_LOGITS_TO_REARGUE: &str =
+    "the serial path answers a fired ngram ban by re-argmaxing the step's logits with the \
+     banned tokens excluded and generating on; the batch persists only each row's argmax \
+     token, so a banned row stopping there kept its repetition and read ncer 0.24 against \
+     0.06 serial on the 1080p screen. A region whose ban fires is therefore retired and \
+     redone through the serial crop path, which restores exact serial semantics at the \
+     price of one crop re-run on the rare looping region.";
 
 pub const T1_BATCH_MAX_PROMPT_KEEPS_LONG_PROMPT_PAGES_ON_STEEL_PREFILL: &str =
-    "region prefill rides 32/128-row ranged chunks with the naive attention variant, while \
-     the serial path prefills a 640-960-vision-token crop as one padded steel chunk; on the \
-     4K screen (11 regions whose code pane runs to 640 vision tokens) the batched arm read \
-     10.9 s against 6.5 serial -- the big crops' prefill loss outweighed the decode win, \
-     and a median gate hid them behind the tiny sidebar crops. ANY crop over 256 vision \
-     tokens keeps the whole page serial; the gazette class (90-130 tokens a crop, where \
-     decode dominates and batching measured 22.9 s against 37.5 sequential) engages. The \
-     open lever is a steel-ranged prefill arm, which would lift this ceiling.";
+    "region prefill rides the steel causal path through ranged KV mirror conversion and \
+     prices UNDER the serial padded-chunk prefill (0.87x at 200-token prompts, 0.74x at \
+     700), so the ceiling is no longer the naive-attention regression that once kept any \
+     crop over 256 vision tokens serial (4K screen: 10.9 s batched vs 6.5 serial in that \
+     era); it is the 1024-row stride itself: 896 vision tokens plus the text prompt and a \
+     generation floor must fit under the region's reserved-row cap, and any crop over the \
+     bound still sends the whole page down the serial path.";
 
 pub const BATCHED_T1_RIDES_THE_GRAPHS_REGION_MACHINERY_AND_ESCAPES_TO_SERIAL_CROPS: &str =
     "crop decode is 54 percent of the sequential tiered wall and the graph's batched region \
@@ -369,32 +483,45 @@ pub const CROP_PACKING_IS_A_MEASURED_NEGATIVE_UNION_BOXES_SHIP_WHITESPACE_THROUG
      batched B>1 vision over SMALL crops (steel attention is batch-native) and \
      multi-sequence decode, which own 17 and 54 percent of the sequential wall.";
 
+pub const STACKED_HEADINGS_CHAIN_THE_MERGE_OR_A_CATEGORY_LESS_PAIR_STILL_BAITS_THE_ESSAY: &str =
+    "a title over a section line is two heading regions in reading order; merging the first \
+     into the second must keep the pair heading-like, because a merged pair whose category \
+     was erased could never merge into the body below it and became exactly the \
+     mostly-whitespace crop the heading merge exists to remove (measured on the dark \
+     document render: the title+section crop invented a nine-item watch-care essay). The \
+     chain stops at the first non-heading absorption, which erases the category as before \
+     so the crop reads as plain text and no heading token cap applies.";
+
 fn merge_headings_into_following_regions(
     regions: Vec<super::regions::Region>,
 ) -> Vec<super::regions::Region> {
+    let _ = STACKED_HEADINGS_CHAIN_THE_MERGE_OR_A_CATEGORY_LESS_PAIR_STILL_BAITS_THE_ESSAY;
     let mut out: Vec<super::regions::Region> = Vec::with_capacity(regions.len());
     let mut it = regions.into_iter().peekable();
-    while let Some(r) = it.next() {
-        if heading_like(r.category.as_deref()) {
-            if let Some(next) = it.peek() {
-                let gap = next.bbox[1] - r.bbox[3];
-                let x_overlap = next.bbox[0] < r.bbox[2] && r.bbox[0] < next.bbox[2];
-                if x_overlap
-                    && gap > -r.height()
-                    && gap < r.height() * HEADING_MERGE_MAX_GAP_2X_HEADING_HEIGHT
-                {
-                    let mut merged = it.next().expect("peeked region present");
-                    merged.bbox = [
-                        r.bbox[0].min(merged.bbox[0]),
-                        r.bbox[1].min(merged.bbox[1]),
-                        r.bbox[2].max(merged.bbox[2]),
-                        r.bbox[3].max(merged.bbox[3]),
-                    ];
-                    merged.category = None;
-                    out.push(merged);
-                    continue;
-                }
+    while let Some(mut r) = it.next() {
+        while heading_like(r.category.as_deref()) {
+            let Some(next) = it.peek() else { break };
+            let gap = next.bbox[1] - r.bbox[3];
+            let x_overlap = next.bbox[0] < r.bbox[2] && r.bbox[0] < next.bbox[2];
+            if !(x_overlap
+                && gap > -r.height()
+                && gap < r.height() * HEADING_MERGE_MAX_GAP_2X_HEADING_HEIGHT)
+            {
+                break;
             }
+            let next = it.next().expect("peeked region present");
+            let absorbed_a_heading = heading_like(next.category.as_deref());
+            r.bbox = [
+                r.bbox[0].min(next.bbox[0]),
+                r.bbox[1].min(next.bbox[1]),
+                r.bbox[2].max(next.bbox[2]),
+                r.bbox[3].max(next.bbox[3]),
+            ];
+            r.category = if absorbed_a_heading {
+                next.category
+            } else {
+                None
+            };
         }
         out.push(r);
     }
@@ -410,6 +537,16 @@ pub const RELOAD_REBUILDS_BESIDE_THE_RESIDENT_DECODER_SO_PEAK_IS_TWICE_ONE_ARM: 
      true unload: the explicit argument wins over NV_DOTS_GRAPH_LORA_DIR, which only the \
      boot path reads.";
 
+pub const DOTS_GRAPH_FROM_MLX_ENV_SKIPS_THE_REDNOTE_BF16_INTERMEDIATE: &str =
+    "NV_DOTS_GRAPH_FROM_MLX";
+
+#[cfg(feature = "wgpu")]
+fn graph_from_mlx_enabled() -> bool {
+    std::env::var(DOTS_GRAPH_FROM_MLX_ENV_SKIPS_THE_REDNOTE_BF16_INTERMEDIATE)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 #[cfg(feature = "wgpu")]
 fn graph_quant_for(precision: DotsPrecision) -> Result<DotsGraphQuant> {
     match precision {
@@ -422,6 +559,16 @@ fn graph_quant_for(precision: DotsPrecision) -> Result<DotsGraphQuant> {
         ),
     }
 }
+
+pub const FROM_PARTS_IS_THE_BROWSER_SEAM_AND_MUST_STAY_THE_EXACT_METAL_SERVING_ARM: &str =
+    "from_parts_wgpu_graph_w4 is load_with_precision's Wgpu-tower + AffineW4-graph arm fed from \
+     an owned-bytes WeightLoader instead of a checkpoint dir, so a browser that downloaded the \
+     same safetensors builds the same tower and the same graph and its texts gate bitwise \
+     against the dir-loaded pipeline (nv-ocr-web tests/native_parity.rs). Anything this \
+     constructor decides differently from that arm -- backend, engine, quant, tokenizer \
+     sanitize -- breaks the parity gate, which is the point of having it. The candle Device is \
+     Cpu because the graph arm never stages activations through candle; adapter reload keeps \
+     the dir-based path and is not offered here.";
 
 pub struct DotsOcrPipeline {
     vision: VisionTower,
@@ -437,7 +584,9 @@ pub struct DotsOcrPipeline {
     style: PromptStyle,
     device: Device,
     precision: DotsPrecision,
+    #[cfg(feature = "wgpu")]
     dir: std::path::PathBuf,
+    gpu_handoff_crops: std::sync::atomic::AtomicU64,
 }
 
 pub fn dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(
@@ -522,13 +671,32 @@ impl DotsOcrPipeline {
             DotsDecoderEngine::Candle | DotsDecoderEngine::Q3d => None,
             DotsDecoderEngine::Graph => {
                 let quant = graph_quant_for(precision)?;
-                let g = DotsDecoderWgpuGraph::from_loader(
-                    cfg.clone(),
-                    &weights,
-                    default_rope_span(),
-                    quant,
-                )
-                .context("load dots.ocr graphed wgpu decoder")?;
+                let g = if quant == DotsGraphQuant::AffineW4 && graph_from_mlx_enabled() {
+                    let mlx_dir = super::decoder_wgpu::dots_mlx_snapshot_dir()?;
+                    let mlx_loader =
+                        WeightLoader::open_dir(&mlx_dir, &Device::Cpu).with_context(|| {
+                            format!("open mlx dots.ocr-4bit snapshot {}", mlx_dir.display())
+                        })?;
+                    eprintln!(
+                        "[dots] {DOTS_GRAPH_FROM_MLX_ENV_SKIPS_THE_REDNOTE_BF16_INTERMEDIATE}=1: \
+                         w4 graph from {}",
+                        mlx_dir.display()
+                    );
+                    DotsDecoderWgpuGraph::from_loader_mlx(
+                        cfg.clone(),
+                        &mlx_loader,
+                        default_rope_span(),
+                    )
+                    .context("load dots.ocr graphed wgpu decoder from the mlx snapshot")?
+                } else {
+                    DotsDecoderWgpuGraph::from_loader(
+                        cfg.clone(),
+                        &weights,
+                        default_rope_span(),
+                        quant,
+                    )
+                    .context("load dots.ocr graphed wgpu decoder")?
+                };
                 eprintln!(
                     "[dots] {DOTS_DEC_ENGINE_ENV}=graph: {} quant, {} passes per decode step, \
                      {:.3} GiB",
@@ -550,48 +718,49 @@ impl DotsOcrPipeline {
         let graph_serves_every_generate = graph.is_some() || q3d.is_some();
         #[cfg(not(feature = "wgpu"))]
         let graph_serves_every_generate = false;
-        let _ = LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING;
+        let _ =
+            LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING;
         let decoder = if graph_serves_every_generate {
             None
         } else {
             Some(match precision {
-            DotsPrecision::Bf16 => {
-                DotsDecoder::from_loader(cfg, &weights, device, dtype, default_rope_span())
-                    .context("load dots.ocr decoder bf16")?
-            }
-            DotsPrecision::Nvfp4 => {
-                #[cfg(feature = "cuda")]
-                {
-                    DotsDecoder::from_loader_nvfp4(cfg, &weights, device, default_rope_span())
-                        .context("load dots.ocr decoder nvfp4")?
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
+                DotsPrecision::Bf16 => {
                     DotsDecoder::from_loader(cfg, &weights, device, dtype, default_rope_span())
+                        .context("load dots.ocr decoder bf16")?
+                }
+                DotsPrecision::Nvfp4 => {
+                    #[cfg(feature = "cuda")]
+                    {
+                        DotsDecoder::from_loader_nvfp4(cfg, &weights, device, default_rope_span())
+                            .context("load dots.ocr decoder nvfp4")?
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        DotsDecoder::from_loader(cfg, &weights, device, dtype, default_rope_span())
                         .context(
                             "load the bf16 candle decoder that stands unused behind the graph's \
                              own nvfp4 arm, which is the one that serves on a non-cuda build",
                         )?
+                    }
                 }
-            }
-            DotsPrecision::W4 => DotsDecoder::from_loader_ggml(
-                cfg,
-                &weights,
-                device,
-                dtype,
-                candle_core::quantized::GgmlDType::Q4K,
-                default_rope_span(),
-            )
-            .context("load dots.ocr decoder w4 (ggml Q4K)")?,
-            DotsPrecision::W8 => DotsDecoder::from_loader_ggml(
-                cfg,
-                &weights,
-                device,
-                dtype,
-                candle_core::quantized::GgmlDType::Q8_0,
-                default_rope_span(),
-            )
-            .context("load dots.ocr decoder w8 (ggml Q8_0)")?,
+                DotsPrecision::W4 => DotsDecoder::from_loader_ggml(
+                    cfg,
+                    &weights,
+                    device,
+                    dtype,
+                    candle_core::quantized::GgmlDType::Q4K,
+                    default_rope_span(),
+                )
+                .context("load dots.ocr decoder w4 (ggml Q4K)")?,
+                DotsPrecision::W8 => DotsDecoder::from_loader_ggml(
+                    cfg,
+                    &weights,
+                    device,
+                    dtype,
+                    candle_core::quantized::GgmlDType::Q8_0,
+                    default_rope_span(),
+                )
+                .context("load dots.ocr decoder w8 (ggml Q8_0)")?,
             })
         };
         let tokenizer = nv_tokenizer::load_tokenizer(&dir.join("tokenizer.json"))
@@ -610,12 +779,207 @@ impl DotsOcrPipeline {
             style: PromptStyle::from_env(),
             device: device.clone(),
             precision,
+            #[cfg(feature = "wgpu")]
             dir: dir.to_path_buf(),
+            gpu_handoff_crops: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn from_parts_wgpu_graph_w4(
+        weights: &WeightLoader,
+        config_json: &str,
+        tokenizer_json: &[u8],
+        kv_span: usize,
+    ) -> Result<Self> {
+        Self::from_parts_wgpu_graph_w4_lora(weights, config_json, tokenizer_json, kv_span, None)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn from_parts_wgpu_graph_w4_lora(
+        weights: &WeightLoader,
+        config_json: &str,
+        tokenizer_json: &[u8],
+        kv_span: usize,
+        lora: Option<super::decoder_wgpu_graph::DgLora>,
+    ) -> Result<Self> {
+        Self::from_parts_wgpu_graph_w4_impl(
+            weights,
+            config_json,
+            tokenizer_json,
+            kv_span,
+            lora,
+            false,
+        )
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn from_parts_wgpu_graph_w4_mlx_lora(
+        weights: &WeightLoader,
+        config_json: &str,
+        tokenizer_json: &[u8],
+        kv_span: usize,
+        lora: Option<super::decoder_wgpu_graph::DgLora>,
+    ) -> Result<Self> {
+        Self::from_parts_wgpu_graph_w4_impl(
+            weights,
+            config_json,
+            tokenizer_json,
+            kv_span,
+            lora,
+            true,
+        )
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn from_parts_wgpu_graph_w4_impl(
+        weights: &WeightLoader,
+        config_json: &str,
+        tokenizer_json: &[u8],
+        kv_span: usize,
+        lora: Option<super::decoder_wgpu_graph::DgLora>,
+        from_mlx: bool,
+    ) -> Result<Self> {
+        let _ = FROM_PARTS_IS_THE_BROWSER_SEAM_AND_MUST_STAY_THE_EXACT_METAL_SERVING_ARM;
+        let cfg = DotsDecoderConfig::from_hf_json_str(config_json)
+            .context("parse dots.ocr config.json")?;
+        let vision = VisionTower::Wgpu(
+            DotsVisionTowerWgpu::from_loader(weights, "vision_tower.", DotsVisionConfig::default())
+                .context("load dots.ocr wgpu vision tower")?,
+        );
+        let lora = match lora {
+            Some(l) => Some(l),
+            None => super::decoder_wgpu_graph::DgLora::from_env(&cfg)?,
+        };
+        let graph = if from_mlx {
+            DotsDecoderWgpuGraph::from_loader_mlx_with_lora(cfg, weights, kv_span, lora)
+                .context("load dots.ocr graphed wgpu decoder from the mlx snapshot")?
+        } else {
+            DotsDecoderWgpuGraph::from_loader_with_lora(
+                cfg,
+                weights,
+                kv_span,
+                DotsGraphQuant::AffineW4,
+                lora,
+            )
+            .context("load dots.ocr graphed wgpu decoder")?
+        };
+        let mut tokenizer = Tokenizer::from_bytes(tokenizer_json)
+            .map_err(|e| anyhow::anyhow!("dots.ocr tokenizer.json from bytes: {e}"))?;
+        nv_tokenizer::sanitize_for_serving(&mut tokenizer);
+        Ok(Self {
+            vision,
+            vision_backend: DotsVisionBackend::Wgpu,
+            decoder: None,
+            engine: DotsDecoderEngine::Graph,
+            graph: Some(std::sync::Mutex::new(graph)),
+            q3d: None,
+            tokenizer,
+            budget: PixelBudget::from_env(),
+            style: PromptStyle::from_env(),
+            device: Device::Cpu,
+            precision: DotsPrecision::W4,
+            dir: std::path::PathBuf::new(),
+            gpu_handoff_crops: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     pub fn precision(&self) -> DotsPrecision {
         self.precision
+    }
+
+    pub fn gpu_handoff_crops(&self) -> u64 {
+        self.gpu_handoff_crops
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn visenc_packs(&self) -> u64 {
+        match &self.vision {
+            VisionTower::Wgpu(t) => t.visenc_packs(),
+            VisionTower::Candle(_) => 0,
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn rpf_chunks(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.rpf_chunks())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn rpf_packs(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.rpf_packs())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn bstep_bhead_steps(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.bstep_bhead_steps())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn bstep_bhead_mma_steps(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.bstep_bhead_mma_steps())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn trunk_splitk_families(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.trunk_splitk_families())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn battn_v2(&self) -> bool {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.battn_v2())
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn trunk_bf16out_families(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.trunk_bf16out_families())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn trunk_abf16_families(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.trunk_abf16_families())
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn brope_kvw_fused_layers(&self) -> u64 {
+        self.graph
+            .as_ref()
+            .and_then(|g| g.lock().ok())
+            .map(|g| g.brope_kvw_fused_layers())
+            .unwrap_or(0)
     }
 
     #[cfg(feature = "wgpu")]
@@ -655,9 +1019,10 @@ impl DotsOcrPipeline {
                     .map(|d| super::decoder_wgpu_graph::DgLora::from_peft_dir(d, &cfg))
                     .transpose()
                     .context("load dots graph lora adapter")?;
-                let weights = WeightLoader::open_dir(&self.dir, &self.device).with_context(
-                    || format!("reopen dots.ocr checkpoint dir {}", self.dir.display()),
-                )?;
+                let weights =
+                    WeightLoader::open_dir(&self.dir, &self.device).with_context(|| {
+                        format!("reopen dots.ocr checkpoint dir {}", self.dir.display())
+                    })?;
                 let quant = graph_quant_for(self.precision)?;
                 let resident = lora.is_some();
                 let g = DotsDecoderWgpuGraph::from_loader_with_lora(
@@ -691,7 +1056,8 @@ impl DotsOcrPipeline {
     }
 
     pub fn decoder(&self) -> Option<&DotsDecoder> {
-        let _ = LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING;
+        let _ =
+            LOADING_THE_CANDLE_DECODER_BESIDE_A_LIVE_GRAPH_DUPLICATES_THE_WHOLE_TRUNK_FOR_NOTHING;
         self.decoder.as_ref()
     }
 
@@ -712,6 +1078,14 @@ impl DotsOcrPipeline {
     }
 
     #[cfg(feature = "wgpu")]
+    pub fn graph_kv_cache_raw(&self) -> Option<Result<(usize, Vec<(Vec<u32>, Vec<u32>)>)>> {
+        self.graph.as_ref().map(|g| {
+            let g = g.lock().unwrap();
+            g.kv_cache_raw().map(|c| (g.current_pos(), c))
+        })
+    }
+
+    #[cfg(feature = "wgpu")]
     fn graph_generate(
         &self,
         tokens: &[u32],
@@ -726,27 +1100,27 @@ impl DotsOcrPipeline {
         }
         #[cfg(feature = "wgpu")]
         {
-        let Some(graph) = &self.graph else {
-            return Ok(None);
-        };
-        let t_dl = std::time::Instant::now();
-        let rows: Vec<f32> = feats.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        if super::decoder_wgpu_graph::page_profile_enabled() {
-            eprintln!(
-                "DOTS-PAGE-PROFILE   vision_download_to_host_s={:.3} ({} values)",
-                t_dl.elapsed().as_secs_f64(),
-                rows.len()
-            );
-        }
-        let mut graph = graph
-            .lock()
-            .map_err(|e| anyhow::anyhow!("dots.ocr graph decoder lock: {e}"))?;
-        Ok(Some(graph.generate(
-            tokens,
-            vision_start,
-            Some(&rows),
-            opts,
-        )?))
+            let Some(graph) = &self.graph else {
+                return Ok(None);
+            };
+            let t_dl = std::time::Instant::now();
+            let rows: Vec<f32> = feats.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+            if super::decoder_wgpu_graph::page_profile_enabled() {
+                eprintln!(
+                    "DOTS-PAGE-PROFILE   vision_download_to_host_s={:.3} ({} values)",
+                    t_dl.elapsed().as_secs_f64(),
+                    rows.len()
+                );
+            }
+            let mut graph = graph
+                .lock()
+                .map_err(|e| anyhow::anyhow!("dots.ocr graph decoder lock: {e}"))?;
+            Ok(Some(graph.generate(
+                tokens,
+                vision_start,
+                Some(&rows),
+                opts,
+            )?))
         }
     }
 
@@ -856,43 +1230,187 @@ impl DotsOcrPipeline {
         opts: &GenerateOptions,
         budget: PixelBudget,
     ) -> Result<DotsPageResult> {
+        let t0 = std::time::Instant::now();
+        let prep = prepare(img, budget)?;
+        let prepare_s = t0.elapsed().as_secs_f64();
+        self.recognize_prepared(&prep, mode, opts, None, prepare_s)
+    }
+
+    fn stage_precomputed_vision_rows(
+        &self,
+        merged: Vec<f32>,
+        prep: &PreparedImage,
+    ) -> Result<Tensor> {
+        let rows = prep.num_vision_tokens();
+        anyhow::ensure!(
+            rows > 0 && merged.len().is_multiple_of(rows),
+            "precomputed vision rows hold {} values across {rows} tokens",
+            merged.len()
+        );
+        let cols = merged.len() / rows;
+        #[cfg(feature = "wgpu")]
+        if let VisionTower::Wgpu(t) = &self.vision {
+            anyhow::ensure!(
+                cols == t.config().hidden_size,
+                "precomputed vision rows are {cols} wide, tower hidden is {}",
+                t.config().hidden_size
+            );
+        }
+        let dtype = dots_weight_dtype_bf16_on_every_device_whose_gemm_takes_it_which_is_cuda_and_metal_f32_only_on_cpu(&self.device);
+        Ok(Tensor::from_vec(merged, (rows, cols), &Device::Cpu)?
+            .to_dtype(dtype)?
+            .to_device(&self.device)?)
+    }
+
+    fn recognize_prepared(
+        &self,
+        prep: &PreparedImage,
+        mode: DotsMode,
+        opts: &GenerateOptions,
+        pre_rows: Option<PreRows>,
+        prepare_s: f64,
+    ) -> Result<DotsPageResult> {
+        let _ = SERIAL_CROP_ENCODES_BATCH_BY_GRID_BECAUSE_TOWER_COST_IS_PER_CALL_NOT_PER_PATCH;
         #[cfg(feature = "wgpu")]
         let profile = super::decoder_wgpu_graph::page_profile_enabled();
         #[cfg(not(feature = "wgpu"))]
         let profile = false;
         let t0 = std::time::Instant::now();
-        let prep = prepare(img, budget)?;
-        let prepare_s = t0.elapsed().as_secs_f64();
         let t1 = std::time::Instant::now();
-        let feats = self.encode_vision(&prep)?;
+        #[cfg(feature = "wgpu")]
+        let (pre_gpu, pre_host) = match pre_rows {
+            Some(PreRows::Gpu(g)) => (Some(g), None),
+            Some(PreRows::Host(v)) => (None, Some(v)),
+            None => (None, None),
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let pre_host = pre_rows;
+        #[cfg(feature = "wgpu")]
+        let gpu_rows = match pre_gpu {
+            Some(g) => {
+                anyhow::ensure!(
+                    self.graph.is_some() && self.q3d.is_none(),
+                    "pre-packed gpu vision rows engage only when the graph serves alone"
+                );
+                Some(g)
+            }
+            None if pre_host.is_none()
+                && self.graph.is_some()
+                && self.q3d.is_none()
+                && vision_handoff_enabled() =>
+            {
+                match &self.vision {
+                    VisionTower::Wgpu(t) => t.encode_resident(prep)?,
+                    _ => None,
+                }
+            }
+            None => None,
+        };
+        #[cfg(feature = "wgpu")]
+        let gpu_handoff = gpu_rows.is_some();
+        #[cfg(not(feature = "wgpu"))]
+        let gpu_handoff = false;
+        if gpu_handoff {
+            self.gpu_handoff_crops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let feats = if gpu_handoff {
+            None
+        } else {
+            Some(match pre_host {
+                Some(rows) => self.stage_precomputed_vision_rows(rows, prep)?,
+                None => self.encode_vision(prep)?,
+            })
+        };
         let vision_s = t1.elapsed().as_secs_f64();
         let n_vis = prep.num_vision_tokens();
-        anyhow::ensure!(
-            feats.dim(0)? == n_vis,
-            "vision produced {} tokens, expected {n_vis}",
-            feats.dim(0)?
-        );
+        #[cfg(feature = "wgpu")]
+        if let Some(gv) = &gpu_rows {
+            anyhow::ensure!(
+                gv.rows == n_vis,
+                "resident vision produced {} tokens, expected {n_vis}",
+                gv.rows
+            );
+        }
+        if let Some(feats) = &feats {
+            anyhow::ensure!(
+                feats.dim(0)? == n_vis,
+                "vision produced {} tokens, expected {n_vis}",
+                feats.dim(0)?
+            );
+        }
         let t2 = std::time::Instant::now();
         let (tokens, vision_start) =
             build_prompt_tokens(|s| self.encode_text(s), mode.prompt(), n_vis, self.style)?;
         let prompt_s = t2.elapsed().as_secs_f64();
         let t3 = std::time::Instant::now();
-        let outcome = match self.q3d_generate(&tokens, vision_start, &feats, opts)? {
-            Some(o) => o,
-            None => match self.graph_generate(&tokens, vision_start, &feats, opts)? {
+        #[cfg(feature = "wgpu")]
+        let outcome = if let Some(gv) = &gpu_rows {
+            let mut graph = self
+                .graph
+                .as_ref()
+                .expect("the resident handoff engages only with a live graph")
+                .lock()
+                .map_err(|e| anyhow::anyhow!("dots.ocr graph decoder lock: {e}"))?;
+            graph.generate_gpu_rows(&tokens, vision_start, gv, opts)?
+        } else {
+            let feats = feats.as_ref().expect("host handoff staged features");
+            match self.q3d_generate(&tokens, vision_start, feats, opts)? {
                 Some(o) => o,
-                None => self
-                    .decoder
-                    .as_ref()
-                    .context(
-                        "dots.ocr: no wgpu-engine outcome and no candle decoder; the candle \
-                         decoder is built only when neither wgpu engine is serving",
-                    )?
-                    .generate(&tokens, vision_start, Some(&feats), opts)?,
-            },
+                None => match self.graph_generate(&tokens, vision_start, feats, opts)? {
+                    Some(o) => o,
+                    None => self
+                        .decoder
+                        .as_ref()
+                        .context(
+                            "dots.ocr: no wgpu-engine outcome and no candle decoder; the candle \
+                             decoder is built only when neither wgpu engine is serving",
+                        )?
+                        .generate(&tokens, vision_start, Some(feats), opts)?,
+                },
+            }
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let outcome = {
+            let feats = feats.as_ref().expect("host handoff staged features");
+            match self.q3d_generate(&tokens, vision_start, feats, opts)? {
+                Some(o) => o,
+                None => match self.graph_generate(&tokens, vision_start, feats, opts)? {
+                    Some(o) => o,
+                    None => self
+                        .decoder
+                        .as_ref()
+                        .context(
+                            "dots.ocr: no wgpu-engine outcome and no candle decoder; the candle \
+                             decoder is built only when neither wgpu engine is serving",
+                        )?
+                        .generate(&tokens, vision_start, Some(feats), opts)?,
+                },
+            }
         };
         let generate_s = t3.elapsed().as_secs_f64();
         let t4 = std::time::Instant::now();
+        let result = self.page_result_from_outcome(prep, mode, tokens.len(), outcome)?;
+        if profile {
+            let post_s = t4.elapsed().as_secs_f64();
+            let wall = prepare_s + t0.elapsed().as_secs_f64();
+            eprintln!(
+                "DOTS-PAGE-PROFILE wall_s={wall:.3} = prepare {prepare_s:.3} + vision \
+                 {vision_s:.3} + prompt {prompt_s:.3} + generate {generate_s:.3} + post \
+                 {post_s:.3}  (residual {:.3})",
+                wall - prepare_s - vision_s - prompt_s - generate_s - post_s
+            );
+        }
+        Ok(result)
+    }
+
+    fn page_result_from_outcome(
+        &self,
+        prep: &PreparedImage,
+        mode: DotsMode,
+        prompt_len: usize,
+        outcome: GenerateOutcome,
+    ) -> Result<DotsPageResult> {
         let mut out_tokens = outcome.tokens;
         let looped = outcome.loop_detection.is_some();
         if let Some(d) = &outcome.loop_detection {
@@ -915,26 +1433,80 @@ impl DotsOcrPipeline {
             prep.orig_h as f32 / prep.resized_h as f32,
         );
         let text = page.to_plain_text();
-        if profile {
-            let post_s = t4.elapsed().as_secs_f64();
-            let wall = t0.elapsed().as_secs_f64();
-            eprintln!(
-                "DOTS-PAGE-PROFILE wall_s={wall:.3} = prepare {prepare_s:.3} + vision \
-                 {vision_s:.3} + prompt {prompt_s:.3} + generate {generate_s:.3} + post \
-                 {post_s:.3}  (residual {:.3})",
-                wall - prepare_s - vision_s - prompt_s - generate_s - post_s
-            );
-        }
         Ok(DotsPageResult {
             page,
             text,
             raw,
-            prompt_tokens: tokens.len(),
+            prompt_tokens: prompt_len,
             generated_tokens: out_tokens.len(),
             looped,
             hit_eos: outcome.hit_eos,
             grid: (prep.grid_h, prep.grid_w),
         })
+    }
+
+    pub const PUMPED_SERVING_IS_THE_GRAPH_PLUS_RESIDENT_TOWER_ARM_ALONE_BECAUSE_ONLY_ITS_READBACKS_ARE_ASYNC:
+        &'static str =
+        "recognize_pumped awaits every GPU->CPU readback (the browser event loop cannot host a \
+         blocking wait), and the only readbacks that have pumped twins are the graph decoder's \
+         token/logit fetches and the resident vision-row splice; the host-merger tower arm, the \
+         q3d engine and the candle decoder read back inside code with no async twin, so this \
+         entry refuses them instead of deadlocking a browser tab";
+
+    #[cfg(feature = "wgpu")]
+    pub async fn recognize_pumped(
+        &mut self,
+        img: &RgbImage,
+        mode: DotsMode,
+        opts: &GenerateOptions,
+    ) -> Result<DotsPageResult> {
+        let _ = Self::PUMPED_SERVING_IS_THE_GRAPH_PLUS_RESIDENT_TOWER_ARM_ALONE_BECAUSE_ONLY_ITS_READBACKS_ARE_ASYNC;
+        anyhow::ensure!(
+            self.graph.is_some() && self.q3d.is_none(),
+            "recognize_pumped serves only the wgpu graph decoder"
+        );
+        let prep = prepare(img, self.budget)?;
+        let gpu_rows = self.encode_resident_rows(&prep)?;
+        let Some(gv) = gpu_rows else {
+            anyhow::bail!(
+                "the tower produced no resident vision rows (host-merger arm or an ablation \
+                 env); {}",
+                Self::PUMPED_SERVING_IS_THE_GRAPH_PLUS_RESIDENT_TOWER_ARM_ALONE_BECAUSE_ONLY_ITS_READBACKS_ARE_ASYNC
+            )
+        };
+        let n_vis = prep.num_vision_tokens();
+        anyhow::ensure!(
+            gv.rows == n_vis,
+            "resident vision produced {} tokens, expected {n_vis}",
+            gv.rows
+        );
+        self.gpu_handoff_crops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tokens, vision_start) =
+            build_prompt_tokens(|s| self.encode_text(s), mode.prompt(), n_vis, self.style)?;
+        let outcome = {
+            let graph = self
+                .graph
+                .as_mut()
+                .expect("checked above")
+                .get_mut()
+                .map_err(|e| anyhow::anyhow!("dots.ocr graph decoder lock: {e}"))?;
+            graph
+                .generate_gpu_rows_pumped(&tokens, vision_start, &gv, opts)
+                .await?
+        };
+        self.page_result_from_outcome(&prep, mode, tokens.len(), outcome)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn encode_resident_rows(
+        &self,
+        prep: &PreparedImage,
+    ) -> Result<Option<super::decoder_wgpu_graph::VisionRowsGpu>> {
+        match &self.vision {
+            VisionTower::Wgpu(t) => t.encode_resident(prep),
+            _ => Ok(None),
+        }
     }
 
     pub fn recognize_auto(
@@ -943,8 +1515,49 @@ impl DotsOcrPipeline {
         mode: DotsMode,
         opts: &GenerateOptions,
     ) -> Result<DotsPageResult> {
+        self.recognize_auto_with_policy(img, mode, opts, None, false)
+    }
+
+    pub const THE_TIERING_HINT_IS_PER_REQUEST_AND_OUTRANKS_THE_TIERED_ENV_BUT_NOT_THE_DETOUR_KILL_SWITCH:
+        &'static str =
+        "an integrator who names its input class knows more than a machine-wide default, so an \
+         explicit per-request policy beats NV_DOTS_TIERED (a caller sending off or force has \
+         stated intent for this one page); the hint never reroutes LayoutOnly, whose boxes-only \
+         contract already refuses tiling, and force_screen_detour still answers only PlainOcr \
+         because the detour composes plain text. NV_DOTS_SCREEN_DETOUR=0 remains the operator \
+         kill-switch over the detour composition, hint or no hint -- an operator disabling a \
+         path outranks a caller requesting it. An absent hint is recognize_auto exactly.";
+
+    pub fn recognize_auto_with_policy(
+        &self,
+        img: &RgbImage,
+        mode: DotsMode,
+        opts: &GenerateOptions,
+        policy_override: Option<super::tiered::TierPolicy>,
+        force_screen_detour: bool,
+    ) -> Result<DotsPageResult> {
         let _ = LAYOUT_ONLY_STAYS_SINGLE_PASS_BECAUSE_A_BOXES_ONLY_CALLER_MUST_NOT_PAY_CROP_OCR;
-        let policy = super::tiered::TierPolicy::from_env()?;
+        let _ = Self::THE_TIERING_HINT_IS_PER_REQUEST_AND_OUTRANKS_THE_TIERED_ENV_BUT_NOT_THE_DETOUR_KILL_SWITCH;
+        let inverted_dark_page;
+        let img = if mode == DotsMode::PlainOcr
+            && std::env::var(DARK_INVERT_ENV).ok().as_deref() != Some("0")
+            && super::tiered::page_is_dark_themed(img)
+        {
+            let _ =
+                DARK_PAGES_INVERT_BEFORE_THE_TOWER_BECAUSE_THE_MODEL_WAS_TRAINED_ON_INK_OVER_LIGHT;
+            inverted_dark_page = RgbImage {
+                w: img.w,
+                h: img.h,
+                data: img.data.iter().map(|b| 255 - b).collect(),
+            };
+            &inverted_dark_page
+        } else {
+            img
+        };
+        let policy = match policy_override {
+            Some(p) => p,
+            None => super::tiered::TierPolicy::from_env()?,
+        };
         if mode != DotsMode::LayoutOnly
             && super::tiered::engages(img.w, img.h, self.budget, policy)?
         {
@@ -953,10 +1566,122 @@ impl DotsOcrPipeline {
                     return Ok(res);
                 }
             }
-            self.recognize_cropped(img, opts)
-        } else {
-            self.recognize(img, mode, opts)
+            return self.recognize_cropped(img, opts);
         }
+        let _ = super::tiered::SUB_THRESHOLD_SCREENS_DETOUR_TO_TILING_BECAUSE_NATIVE_READING_DROPS_A_THIRD_OF_THE_UI;
+        if mode == DotsMode::PlainOcr
+            && std::env::var(SCREEN_DETOUR_ENV).ok().as_deref() != Some("0")
+            && (force_screen_detour
+                || (policy == super::tiered::TierPolicy::Auto
+                    && super::tiered::classify_sub_threshold(img)
+                        == super::tiered::SubThresholdClass::ScreenLike))
+        {
+            if let Some(res) = self.recognize_tiled_classical(img, opts)? {
+                return Ok(res);
+            }
+            return self.recognize_cropped(img, opts);
+        }
+        self.recognize(img, mode, opts)
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn same_grid_batched_rows(
+        &self,
+        preps: &[PreparedImage],
+        resident: bool,
+    ) -> Result<Vec<Option<PreRows>>> {
+        let mut rows: Vec<Option<PreRows>> = (0..preps.len()).map(|_| None).collect();
+        let VisionTower::Wgpu(t) = &self.vision else {
+            return Ok(rows);
+        };
+        let mut buckets: std::collections::HashMap<(usize, usize), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, p) in preps.iter().enumerate() {
+            buckets.entry((p.grid_h, p.grid_w)).or_default().push(i);
+        }
+        let profile = super::decoder_wgpu_graph::page_profile_enabled();
+        let mut census: Vec<String> = Vec::new();
+        if resident {
+            if let Some(crops) = t.encode_pack_resident(preps)? {
+                for (i, crop) in crops.into_iter().enumerate() {
+                    rows[i] = Some(PreRows::Gpu(crop));
+                }
+                if profile {
+                    let mut b: Vec<_> = buckets
+                        .iter()
+                        .map(|((gh, gw), idxs)| (gh * gw, idxs.len()))
+                        .collect();
+                    b.sort_unstable();
+                    eprintln!(
+                        "DOTS-VISENC-PACKED crops={} rows_total={} buckets={b:?}",
+                        preps.len(),
+                        preps.iter().map(PreparedImage::num_patches).sum::<usize>(),
+                    );
+                }
+                return Ok(rows);
+            }
+        }
+        for idxs in buckets.values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            let refs: Vec<&PreparedImage> = idxs.iter().map(|&i| &preps[i]).collect();
+            let t_bucket = std::time::Instant::now();
+            if resident {
+                if let Some(crops) = t.encode_batch_resident(&refs)? {
+                    for (crop, &i) in crops.into_iter().zip(idxs.iter()) {
+                        rows[i] = Some(PreRows::Gpu(crop));
+                    }
+                    if profile {
+                        let p = &preps[idxs[0]];
+                        census.push(format!(
+                            "{}x{}:b{}:n{}:{:.4}s",
+                            p.grid_h,
+                            p.grid_w,
+                            idxs.len(),
+                            p.num_patches(),
+                            t_bucket.elapsed().as_secs_f64(),
+                        ));
+                    }
+                    continue;
+                }
+            }
+            if let Some(batched) = t.encode_batch(&refs)? {
+                for (k, &i) in idxs.iter().enumerate() {
+                    rows[i] = Some(PreRows::Host(batched[k].clone()));
+                }
+                if profile {
+                    let p = &preps[idxs[0]];
+                    census.push(format!(
+                        "{}x{}:b{}:n{}:host:{:.4}s",
+                        p.grid_h,
+                        p.grid_w,
+                        idxs.len(),
+                        p.num_patches(),
+                        t_bucket.elapsed().as_secs_f64(),
+                    ));
+                }
+            }
+        }
+        if profile {
+            let misses: Vec<usize> = buckets
+                .values()
+                .filter(|v| v.len() < 2)
+                .map(|v| preps[v[0]].num_patches())
+                .collect();
+            census.sort();
+            eprintln!(
+                "DOTS-VISENC-BUCKETS crops={} rows_total={} forwards={} miss_forwards={} \
+                 miss_rows={} buckets=[{}]",
+                preps.len(),
+                preps.iter().map(PreparedImage::num_patches).sum::<usize>(),
+                census.len(),
+                misses.len(),
+                misses.iter().sum::<usize>(),
+                census.join(" "),
+            );
+        }
+        Ok(rows)
     }
 
     #[cfg(feature = "wgpu")]
@@ -967,7 +1692,12 @@ impl DotsOcrPipeline {
         opts: &GenerateOptions,
     ) -> Result<Option<RegionOcr>> {
         let _ = BATCHED_T1_RIDES_THE_GRAPHS_REGION_MACHINERY_AND_ESCAPES_TO_SERIAL_CROPS;
-        if std::env::var(T1_BATCH_ENV).ok().as_deref() == Some("0") || regions.len() < 2 {
+        let _ =
+            T1_BATCH_MIN_REGIONS_24_A_STEP_COSTS_THE_FULL_TRUNK_SO_SPARSE_BATCHES_LOSE_TO_SERIAL;
+        if std::env::var(T1_BATCH_ENV).ok().as_deref() == Some("0")
+            || regions.len()
+                < T1_BATCH_MIN_REGIONS_24_A_STEP_COSTS_THE_FULL_TRUNK_SO_SPARSE_BATCHES_LOSE_TO_SERIAL
+        {
             return Ok(None);
         }
         let Some(graph) = &self.graph else {
@@ -979,6 +1709,8 @@ impl DotsOcrPipeline {
         let Some((slots, cap)) = graph.region_capacity() else {
             return Ok(None);
         };
+        let profile = super::decoder_wgpu_graph::page_profile_enabled();
+        let t_page = std::time::Instant::now();
         let crop_max = env_pixels(
             CROP_MAX_PIXELS_ENV,
             DEFAULT_CROP_MAX_PIXELS_500K_IS_ABOUT_640_VISION_TOKENS,
@@ -987,7 +1719,7 @@ impl DotsOcrPipeline {
         struct RegionJob {
             tokens: Vec<u32>,
             vision_start: usize,
-            rows: Vec<f32>,
+            rows: PreRows,
             max_new: usize,
             generated: Vec<u32>,
             hit_eos: bool,
@@ -1013,18 +1745,58 @@ impl DotsOcrPipeline {
         let _ = T1_BATCH_MAX_PROMPT_KEEPS_LONG_PROMPT_PAGES_ON_STEEL_PREFILL;
         if preps
             .iter()
-            .any(|p| p.num_vision_tokens() > T1_BATCH_MAX_CROP_VISION_TOKENS_256_MEASURED_ON_THE_4K_SCREEN_REGRESSION)
+            .any(|p| p.num_vision_tokens() > T1_BATCH_MAX_CROP_VISION_TOKENS_896_IS_THE_STRIDE_BOUND_NOW_THAT_RANGED_PREFILL_IS_STEEL)
         {
             return Ok(None);
         }
+        let resident = region_handoff_enabled();
+        let t_enc = std::time::Instant::now();
+        let vision_rows = self.same_grid_batched_rows(&preps, resident)?;
+        if profile {
+            graph.drain();
+        }
+        let enc_batch_s = t_enc.elapsed().as_secs_f64();
+        let batched_crops = vision_rows.iter().filter(|r| r.is_some()).count();
+        let mut enc_fallback_s = 0.0f64;
+        let mut rows_f32_total = 0usize;
         let mut jobs: Vec<RegionJob> = Vec::with_capacity(regions.len());
-        for (region, prep) in regions.iter().zip(&preps) {
-            let feats = self.encode_vision(prep)?;
-            let rows: Vec<f32> = feats
-                .to_dtype(candle_core::DType::F32)?
-                .flatten_all()?
-                .to_vec1()?;
+        for ((region, prep), pre_rows) in regions.iter().zip(&preps).zip(vision_rows) {
+            let rows: PreRows = match pre_rows {
+                Some(r) => r,
+                None => {
+                    let t_fb = std::time::Instant::now();
+                    let mut got: Option<PreRows> = None;
+                    if resident {
+                        if let VisionTower::Wgpu(t) = &self.vision {
+                            got = t.encode_resident(prep)?.map(PreRows::Gpu);
+                        }
+                    }
+                    let r = match got {
+                        Some(g) => g,
+                        None => PreRows::Host(
+                            self.encode_vision(prep)?
+                                .to_dtype(candle_core::DType::F32)?
+                                .flatten_all()?
+                                .to_vec1()?,
+                        ),
+                    };
+                    enc_fallback_s += t_fb.elapsed().as_secs_f64();
+                    r
+                }
+            };
+            if let PreRows::Host(r) = &rows {
+                rows_f32_total += r.len();
+            }
             let n_vis = prep.num_vision_tokens();
+            if let PreRows::Gpu(g) = &rows {
+                anyhow::ensure!(
+                    g.rows == n_vis,
+                    "resident crop encode produced {} tokens, expected {n_vis}",
+                    g.rows
+                );
+                self.gpu_handoff_crops
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let (tokens, vision_start) =
                 build_prompt_tokens(|s| self.encode_text(s), PROMPT_OCR, n_vis, self.style)?;
             let max_new = if heading_like(region.category.as_deref()) {
@@ -1050,40 +1822,95 @@ impl DotsOcrPipeline {
         let stride = cap + 1;
         let mut active: Vec<(usize, super::decoder_wgpu_graph::RegionRow)> = Vec::new();
         let mut next_job = 0usize;
-        let mut fill =
-            |graph: &mut super::decoder_wgpu_graph::DotsDecoderWgpuGraph,
-             active: &mut Vec<(usize, super::decoder_wgpu_graph::RegionRow)>,
-             next_job: &mut usize,
-             jobs: &[RegionJob]|
-             -> Result<()> {
-                let mut used: Vec<bool> = vec![false; slots];
-                for (_, r) in active.iter() {
-                    used[r.base as usize / stride] = true;
-                }
-                while active.len() < slots && *next_job < jobs.len() {
-                    let slot = (0..slots).find(|s| !used[*s]).expect("a free slot exists");
-                    used[slot] = true;
-                    let j = &jobs[*next_job];
-                    let len = graph.region_prefill(
-                        slot,
-                        &j.tokens,
-                        j.vision_start,
-                        Some(&j.rows),
-                    )?;
-                    active.push((
-                        *next_job,
-                        super::decoder_wgpu_graph::RegionRow {
-                            token: *j.tokens.last().expect("prompt is non-empty"),
-                            base: (slot * stride) as u32,
-                            len: len as u32,
-                        },
-                    ));
+        let fill = |graph: &mut super::decoder_wgpu_graph::DotsDecoderWgpuGraph,
+                    active: &mut Vec<(usize, super::decoder_wgpu_graph::RegionRow)>,
+                    next_job: &mut usize,
+                    jobs: &[RegionJob],
+                    pf_s: &mut f64,
+                    pf_drain_s: &mut f64|
+         -> Result<()> {
+            let mut used: Vec<bool> = vec![false; slots];
+            for (_, r) in active.iter() {
+                used[r.base as usize / stride] = true;
+            }
+            let before = active.len();
+            let free: Vec<usize> = (0..slots).filter(|s| !used[*s]).collect();
+            let jobs_left = jobs.len() - *next_job;
+            let defer = super::decoder_wgpu_graph::rpf_defer_rows();
+            if defer > 0 && before > 0 && jobs_left > free.len() && free.len() < defer {
+                return Ok(());
+            }
+            let picked: Vec<(usize, usize)> = free
+                .iter()
+                .take(jobs_left)
+                .map(|slot| {
+                    let ji = *next_job;
                     *next_job += 1;
-                }
-                Ok(())
-            };
-        fill(&mut graph, &mut active, &mut next_job, &jobs)?;
+                    (*slot, ji)
+                })
+                .collect();
+            if picked.is_empty() {
+                return Ok(());
+            }
+            let pack_jobs: Vec<super::decoder_wgpu_graph::RegionPackJob> = picked
+                .iter()
+                .map(|(slot, ji)| {
+                    let j = &jobs[*ji];
+                    super::decoder_wgpu_graph::RegionPackJob {
+                        slot: *slot,
+                        prompt_tokens: &j.tokens,
+                        vision_start: j.vision_start,
+                        src: match &j.rows {
+                            PreRows::Host(r) => {
+                                super::decoder_wgpu_graph::RegionRowsSrc::Host(r.as_slice())
+                            }
+                            PreRows::Gpu(g) => super::decoder_wgpu_graph::RegionRowsSrc::Gpu(g),
+                        },
+                    }
+                })
+                .collect();
+            let t_pf = std::time::Instant::now();
+            let lens = graph.region_prefill_pack(&pack_jobs)?;
+            *pf_s += t_pf.elapsed().as_secs_f64();
+            for ((slot, ji), len) in picked.iter().zip(lens) {
+                active.push((
+                    *ji,
+                    super::decoder_wgpu_graph::RegionRow {
+                        token: *jobs[*ji].tokens.last().expect("prompt is non-empty"),
+                        base: (slot * stride) as u32,
+                        len: len as u32,
+                    },
+                ));
+            }
+            if profile && active.len() > before {
+                eprintln!(
+                    "DOTS-RPF-BURST filled={} jobs_left={}",
+                    active.len() - before,
+                    jobs.len() - *next_job
+                );
+                let t_drain = std::time::Instant::now();
+                graph.drain();
+                *pf_drain_s += t_drain.elapsed().as_secs_f64();
+            }
+            Ok(())
+        };
+        let mut pf_s = 0.0f64;
+        let mut pf_drain_s = 0.0f64;
+        fill(
+            &mut graph,
+            &mut active,
+            &mut next_job,
+            &jobs,
+            &mut pf_s,
+            &mut pf_drain_s,
+        )?;
+        let handoff_max = t1_handoff_max_live_rows();
+        let t_bstep = std::time::Instant::now();
+        let mut bsteps = 0u64;
+        let mut live_curve: Vec<u32> = Vec::new();
         while !active.is_empty() {
+            bsteps += 1;
+            live_curve.push(active.len() as u32);
             let rows: Vec<super::decoder_wgpu_graph::RegionRow> =
                 active.iter().map(|(_, r)| *r).collect();
             let toks = graph.bstep_tokens(&rows)?;
@@ -1091,34 +1918,99 @@ impl DotsOcrPipeline {
             for (i, tok) in toks.iter().enumerate() {
                 let (ji, row) = &mut active[i];
                 let job = &mut jobs[*ji];
-                job.generated.push(*tok);
-                row.len += 1;
-                row.token = *tok;
                 if EOS_TOKEN_IDS.contains(tok) {
                     job.hit_eos = true;
                     job.done = true;
-                } else if job.generated.len() >= job.max_new
-                    || (row.len as usize + 1) >= cap
-                {
-                    job.done = true;
-                } else if let Some(n) = opts.ngram_size.filter(|n| *n > 0) {
-                    let banned = crate::deepseek_ocr::decoder::banned_tokens_windowed_ngram(
-                        &job.generated,
-                        n,
-                        opts.ngram_window,
-                        &opts.ngram_whitelist,
-                    );
-                    if !banned.is_empty() {
-                        job.banned_stop = true;
+                } else {
+                    job.generated.push(*tok);
+                    row.len += 1;
+                    row.token = *tok;
+                    if job.generated.len() >= job.max_new || (row.len as usize + 1) >= cap {
                         job.done = true;
+                    } else if let Some(n) = opts.ngram_size.filter(|n| *n > 0) {
+                        let banned = crate::deepseek_ocr::decoder::banned_tokens_windowed_ngram(
+                            &job.generated,
+                            n,
+                            opts.ngram_window,
+                            &opts.ngram_whitelist,
+                        );
+                        if !banned.is_empty() {
+                            job.banned_stop = true;
+                            job.done = true;
+                        }
                     }
                 }
                 retired |= job.done;
             }
             if retired {
                 active.retain(|(ji, _)| !jobs[*ji].done);
-                fill(&mut graph, &mut active, &mut next_job, &jobs)?;
+                fill(
+                    &mut graph,
+                    &mut active,
+                    &mut next_job,
+                    &jobs,
+                    &mut pf_s,
+                    &mut pf_drain_s,
+                )?;
+                if next_job >= jobs.len() && !active.is_empty() && active.len() <= handoff_max {
+                    let _ = A_THIN_BATCH_TAIL_KEEPS_BATCHING_BECAUSE_THE_GAZETTE_LADDER_MEASURED_EVERY_HANDOFF_THRESHOLD_LOSING;
+                    for (ji, _) in active.drain(..) {
+                        let job = &mut jobs[ji];
+                        job.done = true;
+                        let rem = job.max_new.saturating_sub(job.generated.len());
+                        if rem == 0 {
+                            continue;
+                        }
+                        let mut resume = job.tokens.clone();
+                        resume.extend_from_slice(&job.generated);
+                        let hopts = GenerateOptions {
+                            max_new_tokens: rem,
+                            ..opts.clone()
+                        };
+                        let outcome = match &job.rows {
+                            PreRows::Host(r) => {
+                                graph.generate(&resume, job.vision_start, Some(r), &hopts)?
+                            }
+                            PreRows::Gpu(g) => {
+                                graph.generate_gpu_rows(&resume, job.vision_start, g, &hopts)?
+                            }
+                        };
+                        job.generated.extend_from_slice(&outcome.tokens);
+                        job.hit_eos = outcome.hit_eos;
+                    }
+                }
             }
+        }
+        if profile {
+            let (bstep_cpu_s, bstep_read_s, bstep_n) = graph.take_bstep_split();
+            let sum_live: u64 = live_curve.iter().map(|l| *l as u64).sum();
+            let full = live_curve.iter().filter(|l| **l as usize == slots).count();
+            let le16 = live_curve.iter().filter(|l| **l <= 16).count();
+            let le8 = live_curve.iter().filter(|l| **l <= 8).count();
+            eprintln!(
+                "DOTS-BSTEP-OCC bsteps={bsteps} slots={slots} sum_live={sum_live} \
+                 occ_mean={:.3} steps_full={full} steps_le16={le16} steps_le8={le8} \
+                 bstep_cpu_s={bstep_cpu_s:.3} bstep_read_s={bstep_read_s:.3} bstep_n={bstep_n} \
+                 pf_drain_s={pf_drain_s:.3} live_curve={live_curve:?}",
+                sum_live as f64 / (bsteps.max(1) as f64 * slots as f64),
+            );
+            let rpf_repack_s = graph.take_region_repack_s();
+            let resident_crops = jobs
+                .iter()
+                .filter(|j| matches!(j.rows, PreRows::Gpu(_)))
+                .count();
+            eprintln!(
+                "DOTS-REGION-PROFILE regions={} batched_enc={batched_crops} fallback_enc={} \
+                 resident_crops={resident_crops} \
+                 enc_batch_s={enc_batch_s:.3} enc_fallback_s={enc_fallback_s:.3} \
+                 host_rows_mb={:.1} pf_s={pf_s:.3} (of which host repack {rpf_repack_s:.3}) \
+                 bstep_s={:.3} bsteps={bsteps} page_s={:.3}",
+                jobs.len(),
+                jobs.len() - batched_crops,
+                rows_f32_total as f64 * 4.0 / 1e6,
+                t_bstep.elapsed().as_secs_f64(),
+                t_page.elapsed().as_secs_f64(),
+            );
         }
         drop(graph);
         let mut out = RegionOcr {
@@ -1129,10 +2021,44 @@ impl DotsOcrPipeline {
             hit_eos: true,
         };
         for (region, job) in regions.iter().zip(jobs.iter_mut()) {
-            let mut toks = std::mem::take(&mut job.generated);
-            if job.hit_eos {
-                toks.pop();
+            if job.banned_stop {
+                let _ = A_BANNED_ROW_REDOES_SERIALLY_BECAUSE_THE_BATCH_KEEPS_NO_PER_ROW_LOGITS_TO_REARGUE;
+                let (x0, y0, x1, y1) = region.pixel_bounds(img.w, img.h);
+                let crop = img.crop(x0, y0, x1, y1);
+                let crop_px = (x1 - x0) * (y1 - y0);
+                let dpi_floor = if img_px > self.budget.max_pixels {
+                    crop_px * self.budget.max_pixels / img_px
+                } else {
+                    crop_px
+                };
+                let crop_budget = PixelBudget {
+                    min_pixels: DEFAULT_MIN_PIXELS,
+                    max_pixels: crop_max.max(dpi_floor),
+                };
+                let crop_opts = GenerateOptions {
+                    max_new_tokens: job.max_new,
+                    ..opts.clone()
+                };
+                let res =
+                    self.recognize_with_budget(&crop, DotsMode::PlainOcr, &crop_opts, crop_budget)?;
+                out.prompt_tokens += res.prompt_tokens;
+                out.generated_tokens += res.generated_tokens;
+                out.looped |= res.looped;
+                out.hit_eos &= res.hit_eos;
+                let body = res.text.trim();
+                let text = format!(
+                    "{}{}",
+                    category_prefix(region.category.as_deref(), body),
+                    body
+                );
+                out.elements.push(LayoutElement {
+                    bbox: Some(region.bbox),
+                    category: region.category.clone(),
+                    text: Some(text),
+                });
+                continue;
             }
+            let mut toks = std::mem::take(&mut job.generated);
             let detection = crate::deepseek_ocr::decoder::detect_loop(&toks);
             let looped = detection.is_some() || job.banned_stop;
             if let Some(d) = &detection {
@@ -1184,6 +2110,8 @@ impl DotsOcrPipeline {
             looped: false,
             hit_eos: true,
         };
+        let mut preps = Vec::with_capacity(regions.len());
+        let mut prep_secs = Vec::with_capacity(regions.len());
         for region in regions {
             let (x0, y0, x1, y1) = region.pixel_bounds(img.w, img.h);
             let crop = img.crop(x0, y0, x1, y1);
@@ -1199,6 +2127,23 @@ impl DotsOcrPipeline {
                 max_pixels: crop_max
                     .max(dpi_floor_matching_a_whole_page_pass_at_the_serving_budget),
             };
+            let t = std::time::Instant::now();
+            preps.push(prepare(&crop, crop_budget)?);
+            prep_secs.push(t.elapsed().as_secs_f64());
+        }
+        let _ = SERIAL_CROP_ENCODES_BATCH_BY_GRID_BECAUSE_TOWER_COST_IS_PER_CALL_NOT_PER_PATCH;
+        #[cfg(feature = "wgpu")]
+        let mut pre_rows = if std::env::var(T1_BATCH_ENV).ok().as_deref() == Some("0") {
+            (0..preps.len())
+                .map(|_| None)
+                .collect::<Vec<Option<PreRows>>>()
+        } else {
+            let resident = self.graph.is_some() && self.q3d.is_none() && region_handoff_enabled();
+            self.same_grid_batched_rows(&preps, resident)?
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let mut pre_rows: Vec<Option<PreRows>> = (0..preps.len()).map(|_| None).collect();
+        for (i, region) in regions.iter().enumerate() {
             let crop_opts = if heading_like(region.category.as_deref()) {
                 GenerateOptions {
                     max_new_tokens: opts.max_new_tokens.min(UNMERGED_HEADING_CROP_TOKEN_CAP),
@@ -1207,8 +2152,13 @@ impl DotsOcrPipeline {
             } else {
                 opts.clone()
             };
-            let res =
-                self.recognize_with_budget(&crop, DotsMode::PlainOcr, &crop_opts, crop_budget)?;
+            let res = self.recognize_prepared(
+                &preps[i],
+                DotsMode::PlainOcr,
+                &crop_opts,
+                pre_rows[i].take(),
+                prep_secs[i],
+            )?;
             out.prompt_tokens += res.prompt_tokens;
             out.generated_tokens += res.generated_tokens;
             out.looped |= res.looped;
@@ -1233,6 +2183,7 @@ impl DotsOcrPipeline {
         img: &RgbImage,
         opts: &GenerateOptions,
     ) -> Result<Option<DotsPageResult>> {
+        #[cfg(feature = "wgpu")]
         let t_t0 = std::time::Instant::now();
         let Some(scouted) = super::tiered::classical_scout(img) else {
             return Ok(None);
@@ -1241,7 +2192,9 @@ impl DotsOcrPipeline {
         if regions.is_empty() {
             return Ok(None);
         }
+        #[cfg(feature = "wgpu")]
         let t0_s = t_t0.elapsed().as_secs_f64();
+        #[cfg(feature = "wgpu")]
         let t_t1 = std::time::Instant::now();
         let t1 = self.ocr_regions(img, &regions, opts)?;
         #[cfg(feature = "wgpu")]
@@ -1277,11 +2230,13 @@ impl DotsOcrPipeline {
         img: &RgbImage,
         opts: &GenerateOptions,
     ) -> Result<DotsPageResult> {
-        let _ = INK_RECALL_RESCUES_SPARSE_SHEETS_THE_PAGE_AREA_FLOOR_WRONGLY_SENDS_BACK_TO_SINGLE_PASS;
+        let _ =
+            INK_RECALL_RESCUES_SPARSE_SHEETS_THE_PAGE_AREA_FLOOR_WRONGLY_SENDS_BACK_TO_SINGLE_PASS;
         let ink = sample_ink(img);
         let usable_by_ink = |planned: &[super::regions::Region]| {
-            ink_recall(&ink, planned)
-                .is_some_and(|r| r >= INK_RECALL_USABLE_MIN_085_A_DETECTOR_BOXING_85PCT_OF_THE_INK_SAW_THE_PAGE)
+            ink_recall(&ink, planned).is_some_and(|r| {
+                r >= INK_RECALL_USABLE_MIN_085_A_DETECTOR_BOXING_85PCT_OF_THE_INK_SAW_THE_PAGE
+            })
         };
         #[cfg(feature = "wgpu")]
         let profile = super::decoder_wgpu_graph::page_profile_enabled();
@@ -1588,6 +2543,39 @@ mod tests {
         assert!(heading_like(lone[0].category.as_deref()));
         assert!(!heading_like(Some("Text")));
         assert!(!heading_like(None));
+    }
+
+    #[test]
+    fn stacked_headings_chain_into_the_body_instead_of_stranding_a_category_less_pair() {
+        use super::super::regions::Region;
+        let title = Region {
+            bbox: [100.0, 60.0, 700.0, 130.0],
+            category: Some("Title".to_string()),
+        };
+        let section = Region {
+            bbox: [100.0, 170.0, 600.0, 220.0],
+            category: Some("Section-header".to_string()),
+        };
+        let body = Region {
+            bbox: [90.0, 280.0, 900.0, 700.0],
+            category: Some("Text".to_string()),
+        };
+        let merged =
+            merge_headings_into_following_regions(vec![title.clone(), section.clone(), body]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].bbox, [90.0, 60.0, 900.0, 700.0]);
+        assert_eq!(
+            merged[0].category, None,
+            "the body absorption ends the chain as plain text"
+        );
+
+        let pair_at_page_end = merge_headings_into_following_regions(vec![title, section]);
+        assert_eq!(pair_at_page_end.len(), 1);
+        assert!(
+            heading_like(pair_at_page_end[0].category.as_deref()),
+            "a heading pair with no body below stays heading-like so the token cap applies: {:?}",
+            pair_at_page_end[0].category
+        );
     }
 
     #[test]

@@ -1431,11 +1431,10 @@ mod tier1 {
             ResponseFunctionCallArgumentsDoneEvent, ResponseOutputAudioDeltaEvent,
             ResponseOutputAudioDoneEvent, ResponseOutputAudioTranscriptDeltaEvent,
             ResponseOutputAudioTranscriptDoneEvent, ResponseOutputItemAddedEvent,
-            ResponseOutputItemDoneEvent, ResponseOutputTextDeltaEvent,
-            ResponseOutputTextDoneEvent, ResponseToolProgressEvent, SessionCreatedEvent,
-            SessionDoneEvent, SessionUpdatedEvent, SpeechStartedEvent, SpeechStoppedEvent,
-            ToolProgressEntry, ToolStatus, TranscriptionCompletedEvent, TranscriptionDeltaEvent,
-            TranscriptionFailedEvent,
+            ResponseOutputItemDoneEvent, ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent,
+            ResponseToolProgressEvent, SessionCreatedEvent, SessionDoneEvent, SessionUpdatedEvent,
+            SpeechStartedEvent, SpeechStoppedEvent, ToolProgressEntry, ToolStatus,
+            TranscriptionCompletedEvent, TranscriptionDeltaEvent, TranscriptionFailedEvent,
         };
         use OutboundEvent::*;
         let item = || ItemId::new("item_x");

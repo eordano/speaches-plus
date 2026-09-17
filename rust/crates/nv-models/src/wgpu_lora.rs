@@ -384,7 +384,9 @@ pub(crate) fn emit_lora_site_pk(
     data.extend_from_slice(&routing.dest_words);
     let meta_buf = GpuTensor::<i32>::upload(ctx, "q3d-lora-pk-meta", &data);
     let n_slices = site.widths.len();
-    let n_tiles = site.k.div_ceil(LORA_PK_K_TILE_512_IS_THE_CUDA_LORA_M1_PROVEN_GEOMETRY);
+    let n_tiles = site
+        .k
+        .div_ceil(LORA_PK_K_TILE_512_IS_THE_CUDA_LORA_M1_PROVEN_GEOMETRY);
     let grid_loras = meta.grid_loras();
     let params = GpuUniform::new(
         ctx,
@@ -418,11 +420,7 @@ pub(crate) fn emit_lora_site_pk(
         grid_loras * m * n_slices * n_tiles * site.rank,
     );
     let max_n = *site.widths.iter().max().expect("lora site has slices");
-    let shrink_grid = (
-        n_tiles as u32,
-        n_slices as u32,
-        (grid_loras * m) as u32,
-    );
+    let shrink_grid = (n_tiles as u32, n_slices as u32, (grid_loras * m) as u32);
     let expand_grid = (
         (m * max_n.div_ceil(LORA_PK_N_CHUNK)) as u32,
         n_slices as u32,
@@ -684,7 +682,16 @@ pub fn lora_site_probe_pk(
     let mut passes: Vec<Pass> = Vec::new();
     let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
     let seg_refs: Vec<&wgpu::Buffer> = ys.iter().map(|t| t.raw()).collect();
-    emit_lora_site_pk(ctx, &mut passes, &mut keep, &pl, m, &site, x.raw(), &seg_refs);
+    emit_lora_site_pk(
+        ctx,
+        &mut passes,
+        &mut keep,
+        &pl,
+        m,
+        &site,
+        x.raw(),
+        &seg_refs,
+    );
     let refs: Vec<dispatch::PassRef<'_>> = passes
         .iter()
         .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
@@ -753,14 +760,6 @@ impl LoraSite {
         }
         Ok(())
     }
-
-    pub(crate) fn total_width(&self) -> usize {
-        self.widths.iter().sum()
-    }
-
-    pub(crate) fn pass_count(&self) -> usize {
-        1 + 2 * self.segs.len()
-    }
 }
 pub(crate) fn build_lora_site(
     adapter: &nv_weights::lora_adapter::LoraAdapter,
@@ -822,7 +821,11 @@ pub(crate) struct LoraSiteGpu {
     pub(crate) rank: usize,
 }
 
-pub(crate) fn upload_lora_site(ctx: &WgpuContext, label: &str, site: &LoraSite) -> Result<LoraSiteGpu> {
+pub(crate) fn upload_lora_site(
+    ctx: &WgpuContext,
+    label: &str,
+    site: &LoraSite,
+) -> Result<LoraSiteGpu> {
     site.validate(label)?;
     Ok(LoraSiteGpu {
         a: GpuTensor::upload(ctx, label, &pack_pairs(&site.a)),

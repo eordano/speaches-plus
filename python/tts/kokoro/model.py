@@ -50,6 +50,31 @@ SPEED_INPUT_KEY = "speed"
 VOICE_TENSOR_LAST_DIM = 256
 VOICE_FILE_SUFFIX = ".bin"
 VOICES_ARCHIVE_SUFFIXES = (".bin", ".npz")
+BUILTIN_VOICES_DIR = Path(__file__).resolve().parent / "voices"
+BUILTIN_VOICE_SUFFIX = ".npy"
+STORE_PACK_FILE = "pack.npy"
+STORE_META_FILE = "voice.json"
+
+def voice_store_root() -> Path | None:
+    """Runtime voice store (see rust/crates/nv-tts/src/voice_profile.rs): NV_VOICES_DATA_DIR/voices."""
+    root = env.read_str_or_none("NV_VOICES_DATA_DIR")
+    return Path(root) / "voices" if root else None
+
+def _store_voice_path(voice_name: str) -> Path | None:
+    root = voice_store_root()
+    if root is None or "/" in voice_name or voice_name.startswith("."):
+        return None
+    directory = root / voice_name
+    if (directory / "current").is_symlink():
+        directory = (directory / "current").resolve()
+    p = directory / STORE_PACK_FILE
+    return p if p.is_file() else None
+
+def store_voice_names() -> list[str]:
+    root = voice_store_root()
+    if root is None or not root.is_dir():
+        return []
+    return sorted(p.name for p in root.iterdir() if _store_voice_path(p.name) is not None)
 
 SENTENCE_PUNCTUATION = ".,!?;"
 _SENTENCE_SPLIT_RE = re.compile(r"([.,!?;])")
@@ -85,6 +110,19 @@ def _list_voices_from_hf_repo() -> list[str]:
 def _load_voice_tensor(path: str) -> np.ndarray:
     flat = np.fromfile(path, dtype=np.float32)
     return flat.reshape(-1, 1, VOICE_TENSOR_LAST_DIM)
+
+def _builtin_voice_path(voice_name: str) -> Path | None:
+    p = BUILTIN_VOICES_DIR / f"{voice_name}{BUILTIN_VOICE_SUFFIX}"
+    return p if p.is_file() else None
+
+def builtin_voice_names() -> list[str]:
+    if not BUILTIN_VOICES_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in BUILTIN_VOICES_DIR.glob(f"*{BUILTIN_VOICE_SUFFIX}"))
+
+def _load_builtin_voice(path: Path) -> np.ndarray:
+    arr = np.load(path).astype(np.float32, copy=False)
+    return arr.reshape(-1, 1, VOICE_TENSOR_LAST_DIM)
 
 def _voice_to_tensor(voice: Voice) -> np.ndarray:
     arr = np.asarray(voice.data, dtype=np.float32)
@@ -181,35 +219,46 @@ class KokoroTTS:
     def voices_list(self) -> list[str]:
         if self._known_voices is not None:
             return list(self._known_voices)
+        builtin = set(builtin_voice_names()) | set(store_voice_names())
         if self._voices_archive is not None:
-            self._known_voices = sorted(self._voices_archive.keys())
+            self._known_voices = sorted(set(self._voices_archive.keys()) | builtin)
             return list(self._known_voices)
         if self.voices_dir:
             local = Path(self.voices_dir)
             if local.is_dir():
                 self._known_voices = sorted(
-                    path.stem for path in local.glob(f"*{VOICE_FILE_SUFFIX}")
+                    {path.stem for path in local.glob(f"*{VOICE_FILE_SUFFIX}")} | builtin
                 )
                 return list(self._known_voices)
         try:
-            self._known_voices = _list_voices_from_hf_repo()
+            self._known_voices = sorted(set(_list_voices_from_hf_repo()) | builtin)
         except (OSError, ValueError) as exc:
             warnings.warn(
                 f"Kokoro voice list fetch failed ({exc}); falling back to preloaded cache",
                 stacklevel=2,
             )
-            self._known_voices = sorted(self._voice_cache.keys())
+            self._known_voices = sorted(set(self._voice_cache.keys()) | builtin)
         return list(self._known_voices)
 
     def _voice_tensor(self, name: str) -> np.ndarray:
+        stored = _store_voice_path(name)
+        if stored is not None:
+            return _load_builtin_voice(stored)
         cached = self._voice_cache.get(name)
         if cached is not None:
             return cached
+        builtin = _builtin_voice_path(name)
         if self._voices_archive is not None:
             voice = self._voices_archive.get(name)
-            if voice is None:
+            if voice is None and builtin is None:
                 raise FileNotFoundError(f"voice {name!r} not in archive")
-            tensor = _voice_to_tensor(voice)
+            tensor = _voice_to_tensor(voice) if voice is not None else _load_builtin_voice(builtin)
+            self._voice_cache[name] = tensor
+            return tensor
+        if builtin is not None and not (
+            self.voices_dir and (Path(self.voices_dir) / f"{name}{VOICE_FILE_SUFFIX}").exists()
+        ):
+            tensor = _load_builtin_voice(builtin)
             self._voice_cache[name] = tensor
             return tensor
         path = _ensure_voice_file(name, self.voices_dir)
@@ -240,7 +289,7 @@ class KokoroTTS:
                 f"phoneme token count {len(token_ids)} exceeds "
                 f"MAX_PHONEME_LENGTH ({MAX_PHONEME_LENGTH})"
             )
-        style_for_length = voice_style[len(token_ids)]
+        style_for_length = voice_style[min(len(token_ids), voice_style.shape[0] - 1)]
         token_tensor = np.array(
             [[PAD_TOKEN_ID, *token_ids, PAD_TOKEN_ID]], dtype=np.int64,
         )

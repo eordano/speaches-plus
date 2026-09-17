@@ -209,7 +209,9 @@ pub(super) async fn emit_response_done(
         status_details,
     };
     session
-        .emit(super::wire::OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent { response: payload }))
+        .emit(super::wire::OutboundEvent::ResponseDone(
+            super::wire::ResponseDoneEvent { response: payload },
+        ))
         .await;
 }
 
@@ -232,7 +234,9 @@ pub(super) async fn emit_error(
         param: param.map(|s| s.to_string()),
     };
     session
-        .emit(super::wire::OutboundEvent::Error(super::wire::ErrorEvent { error: payload }))
+        .emit(super::wire::OutboundEvent::Error(super::wire::ErrorEvent {
+            error: payload,
+        }))
         .await;
 }
 
@@ -259,7 +263,9 @@ pub(super) async fn emit_incomplete_brackets(
         }),
     };
     session
-        .emit(super::wire::OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent { response: payload }))
+        .emit(super::wire::OutboundEvent::ResponseDone(
+            super::wire::ResponseDoneEvent { response: payload },
+        ))
         .await;
 }
 
@@ -299,7 +305,9 @@ pub(super) async fn emit_cancelled_brackets(
         }),
     };
     session
-        .emit(super::wire::OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent { response: payload }))
+        .emit(super::wire::OutboundEvent::ResponseDone(
+            super::wire::ResponseDoneEvent { response: payload },
+        ))
         .await;
 }
 

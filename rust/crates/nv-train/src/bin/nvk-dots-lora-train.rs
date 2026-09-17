@@ -48,6 +48,7 @@ fn pick_device(cpu: bool) -> Device {
     if cpu {
         return Device::Cpu;
     }
+    nv_train::dots::metal_command_batching_default();
     #[cfg(feature = "metal")]
     if let Ok(d) = Device::new_metal(0) {
         return d;

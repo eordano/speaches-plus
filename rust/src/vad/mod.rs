@@ -74,7 +74,11 @@ fn detect_silero_io(session: &Session) -> (SileroIo, usize) {
     if has_h && has_c {
         return (
             SileroIo::LegacyHc,
-            if units > 0 { units } else { LEGACY_HC_STATE_UNITS },
+            if units > 0 {
+                units
+            } else {
+                LEGACY_HC_STATE_UNITS
+            },
         );
     }
     if !has_state {
@@ -686,8 +690,7 @@ impl<M: VadInfer> VadProcessor<M> {
                     "max speech duration reached; sealing and carrying the tail over"
                 );
                 self.seal_utterance(duration_ms);
-                self.carry_over_samples =
-                    SAMPLE_RATE * MAX_SPEECH_CARRY_OVER_MS as usize / 1000;
+                self.carry_over_samples = SAMPLE_RATE * MAX_SPEECH_CARRY_OVER_MS as usize / 1000;
             }
         }
 
@@ -861,7 +864,10 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 2, "zoo dir held {checked} models; expected several");
+        assert!(
+            checked >= 2,
+            "zoo dir held {checked} models; expected several"
+        );
         Ok(())
     }
 

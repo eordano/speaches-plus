@@ -61,6 +61,9 @@ pub struct FlashFwdParams {
     pub block_table: *mut i32,
     pub block_table_batch_stride: i64,
     pub page_block_size: i32,
+    pub mm_prefix_ranges: *mut i32,
+    pub mm_prefix_range_batch_stride: i64,
+    pub max_mm_prefix_ranges: i32,
     pub p_dropout: f32,
     pub p_dropout_in_uint8_t: u8,
     pub rp_dropout: f32,
@@ -87,7 +90,7 @@ extern "C" {
 }
 
 fn round_multiple(x: usize, m: usize) -> usize {
-    (x + m - 1) / m * m
+    x.div_ceil(m) * m
 }
 
 pub struct VarlenArgs {
@@ -109,8 +112,17 @@ pub struct VarlenArgs {
 }
 
 pub unsafe fn varlen_fwd_bf16(stream: CudaStreamRaw, a: &VarlenArgs) -> anyhow::Result<()> {
-    anyhow::ensure!(a.d % 8 == 0 && a.d <= 256, "fa2 shim: head dim {}", a.d);
-    anyhow::ensure!(a.h % a.h_k == 0, "fa2 shim: h {} % h_k {}", a.h, a.h_k);
+    anyhow::ensure!(
+        a.d.is_multiple_of(8) && a.d <= 256,
+        "fa2 shim: head dim {}",
+        a.d
+    );
+    anyhow::ensure!(
+        a.h.is_multiple_of(a.h_k),
+        "fa2 shim: h {} % h_k {}",
+        a.h,
+        a.h_k
+    );
 
     let mut window_size_left = a
         .window_size_left
@@ -206,12 +218,12 @@ pub unsafe fn batch_decode_fwd_bf16(
     a: &BatchDecodeArgs,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        a.d % 8 == 0 && a.d <= 256,
+        a.d.is_multiple_of(8) && a.d <= 256,
         "fa2 batch decode: head dim {}",
         a.d
     );
     anyhow::ensure!(
-        a.h % a.h_k == 0,
+        a.h.is_multiple_of(a.h_k),
         "fa2 batch decode: h {} % h_k {}",
         a.h,
         a.h_k

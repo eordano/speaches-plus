@@ -64,6 +64,9 @@ markers = ["native: requires native pybind11 extension"]
 [tool.setuptools]
 py-modules = ["server", "ids", "errors", "otel", "trace", "env"]
 
+[tool.setuptools.package-data]
+"tts.kokoro" = ["voices/*.npy"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
@@ -80,6 +83,7 @@ include = [
     "stt*",
     "tts*",
     "vad*",
+    "voices*",
 ]
 
 [tool.ruff]

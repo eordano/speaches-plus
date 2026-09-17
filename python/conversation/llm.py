@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections import deque
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -218,6 +219,8 @@ async def _stream_messages_into(
     except Exception as err:
         await queue.put(("error", err))
 
+_SENTENCE_TERMINATOR = re.compile(r"[.!?\n]")
+
 class SentenceChunker:
     def __init__(self) -> None:
         self.buf: str = ""
@@ -225,16 +228,11 @@ class SentenceChunker:
     def feed(self, delta: str) -> list[str]:
         self.buf += delta
         out: list[str] = []
-        terminators = (".", "!", "?", "\n")
         while True:
-            idx = -1
-            for i, ch in enumerate(self.buf):
-                if ch in terminators:
-                    idx = i
-                    break
-            if idx < 0:
+            hit = _SENTENCE_TERMINATOR.search(self.buf)
+            if hit is None:
                 break
-            end = idx + 1
+            end = hit.end()
             sentence = self.buf[:end].strip()
             self.buf = self.buf[end:]
             if sentence:

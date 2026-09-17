@@ -2,8 +2,8 @@
 
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
+use crate::wgpu_backend::pack::pack_u16_odd_tail_zeroed_min_one_word as pack_u16;
 use crate::wgpu_backend::{compose, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_odd_tail_zeroed_min_one_word as pack_u16};
 
 pub const GROUPED_WGSL: &str = include_str!("../../../wgsl/lora_grouped.wgsl");
 pub const FUSED_WGSL: &str = include_str!("../../../wgsl/lora_fused.wgsl");

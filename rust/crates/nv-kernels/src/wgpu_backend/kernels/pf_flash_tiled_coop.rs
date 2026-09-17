@@ -1,7 +1,7 @@
+use crate::wgpu_backend::compose_enabled;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::gemm_coop_f16;
 use crate::wgpu_backend::qualify::{CoopDecision, CoopRequest, CoopScalar};
-use crate::wgpu_backend::compose_enabled;
 
 pub const WGSL: &str = include_str!("../../../wgsl/q3d_pf_flash_tiled_coop.wgsl");
 

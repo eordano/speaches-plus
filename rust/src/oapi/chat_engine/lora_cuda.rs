@@ -63,24 +63,21 @@ pub struct CudaLoraAdapterEngine {
 }
 
 impl CudaLoraAdapterEngine {
-    pub fn try_load(
-        base_dir: &Path,
-        adapter_id: &str,
-        adapter_dir: &Path,
-    ) -> anyhow::Result<Self> {
+    pub fn try_load(base_dir: &Path, adapter_id: &str, adapter_dir: &Path) -> anyhow::Result<Self> {
         let eng = NvEngineChat::try_load_for_adapter_serving(base_dir)
             .with_context(|| format!("load cuda base engine from {}", base_dir.display()))?;
-        let adapter = nv_weights::lora_adapter::LoraAdapter::load(adapter_dir, &eng.inner.device)
-            .with_context(|| format!("load lora adapter from {}", adapter_dir.display()))?;
+        let adapter =
+            nv_weights::lora_adapter::LoraAdapter::load(adapter_dir, &eng.inner.device)
+                .with_context(|| format!("load lora adapter from {}", adapter_dir.display()))?;
         let install = match &eng.inner.model {
-            LoadedModel::Gemma4(m) => {
-                nv_specdecode::lora_spec::install_gemma4_serving_adapter(m, &adapter)
-                    .with_context(|| format!("install lora adapter {adapter_id:?} on cuda gemma4"))?
-            }
-            LoadedModel::Laguna(m) => {
-                nv_specdecode::lora_spec::install_laguna_serving_adapter(m, &adapter)
-                    .with_context(|| format!("install lora adapter {adapter_id:?} on cuda laguna"))?
-            }
+            LoadedModel::Gemma4(m) => nv_specdecode::lora_spec::install_gemma4_serving_adapter(
+                m, &adapter,
+            )
+            .with_context(|| format!("install lora adapter {adapter_id:?} on cuda gemma4"))?,
+            LoadedModel::Laguna(m) => nv_specdecode::lora_spec::install_laguna_serving_adapter(
+                m, &adapter,
+            )
+            .with_context(|| format!("install lora adapter {adapter_id:?} on cuda laguna"))?,
             _ => anyhow::bail!(
                 "try_load_for_adapter_serving admitted family {:?} for {}; its family gate \
                  must refuse everything outside the gemma4/laguna allowlist of hookable \

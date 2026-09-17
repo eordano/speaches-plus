@@ -58,7 +58,7 @@ Gated by `rust/tests/backend_wgpu_gate.rs`:
 aggregate *both* backends' reasons and return `NoBackend`, since the model
 is refused on cuda and wgpu alike). Not culled by the 2026-08-10 test cull.
 
-`docs/book/01.4-STATUS.md` records the refusal per backend and lists the
+the private status ledger records the refusal per backend and lists the
 decode loop as open; `docs/book/05-backends.md` (routing hazards) explains the
 named refusal and the ordering hazard.
 

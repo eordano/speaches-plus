@@ -7,9 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::gemma4_batch_graph::capture_stream::CaptureStream;
 use crate::gemma4_batch_graph::graph_teardown::GraphTeardown;
-use crate::gemma4_vision::{
-    full_grid_positions, vision_prof_enabled, Gemma4VisionTower,
-};
+use crate::gemma4_vision::{full_grid_positions, vision_prof_enabled, Gemma4VisionTower};
 
 pub const VISION_GRAPH_BUCKET_CAP_BOUNDS_GRAPH_MEMPOOL_ACROSS_RESOLUTIONS: usize = 8;
 
@@ -110,7 +108,13 @@ pub struct Gemma4VisionGraph {
     state: Mutex<GraphState>,
 }
 
-fn bucket_resident_bytes(n: usize, pp: usize, cells: usize, text_hidden: usize, aids: &CaptureAids) -> usize {
+fn bucket_resident_bytes(
+    n: usize,
+    pp: usize,
+    cells: usize,
+    text_hidden: usize,
+    aids: &CaptureAids,
+) -> usize {
     let f32b = std::mem::size_of::<f32>();
     let pinned_host = n * pp * f32b;
     let device_io = n * pp * f32b + cells * text_hidden * f32b;
@@ -164,8 +168,7 @@ fn clamp_by_value_in_f32_because_the_shift_by_the_bound_eats_bf16_mantissa(
     (lo, hi): (f64, f64),
 ) -> Result<Tensor> {
     let dtype = x.dtype();
-    Ok(x
-        .to_dtype(DType::F32)?
+    Ok(x.to_dtype(DType::F32)?
         .affine(1.0, -lo)?
         .relu()?
         .affine(-1.0, hi - lo)?
@@ -207,14 +210,10 @@ fn build_head_weights(tower: &Gemma4VisionTower) -> Result<Vec<LayerHeads>> {
             o_t: Vec::with_capacity(nh),
         };
         for h in 0..nh {
-            lh.q_t
-                .push(q_w.narrow(0, h * hd, hd)?.t()?.contiguous()?);
-            lh.k_t
-                .push(k_w.narrow(0, h * hd, hd)?.t()?.contiguous()?);
-            lh.v_t
-                .push(v_w.narrow(0, h * hd, hd)?.t()?.contiguous()?);
-            lh.o_t
-                .push(o_w.narrow(1, h * hd, hd)?.t()?.contiguous()?);
+            lh.q_t.push(q_w.narrow(0, h * hd, hd)?.t()?.contiguous()?);
+            lh.k_t.push(k_w.narrow(0, h * hd, hd)?.t()?.contiguous()?);
+            lh.v_t.push(v_w.narrow(0, h * hd, hd)?.t()?.contiguous()?);
+            lh.o_t.push(o_w.narrow(1, h * hd, hd)?.t()?.contiguous()?);
         }
         out.push(lh);
     }
@@ -291,8 +290,7 @@ fn build_capture_aids(
 }
 
 fn rope_by_value(t: &Tensor, aids: &CaptureAids) -> Result<Tensor> {
-    Ok(t
-        .mul(&aids.rope_cos)?
+    Ok(t.mul(&aids.rope_cos)?
         .add(&t.matmul(&aids.rope_rot)?.mul(&aids.rope_sin)?)?)
 }
 
@@ -425,10 +423,7 @@ impl Gemma4VisionGraph {
     }
 
     pub fn replays(&self) -> u64 {
-        self.state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .replays
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).replays
     }
 
     fn forward_eager(
@@ -488,12 +483,8 @@ impl Gemma4VisionGraph {
         }
         if !state.buckets.contains_key(&(grid_w, grid_h)) {
             let cells = (grid_h / pk) * (grid_w / pk);
-            let aids = build_capture_aids(
-                tower,
-                grid_w,
-                grid_h,
-                &Device::Cuda(self.device.clone()),
-            )?;
+            let aids =
+                build_capture_aids(tower, grid_w, grid_h, &Device::Cuda(self.device.clone()))?;
             let incoming = bucket_resident_bytes(n, pp, cells, text_hidden, &aids);
             let resident: Vec<((usize, usize), usize)> = state
                 .buckets
@@ -688,11 +679,41 @@ fn wrap_slice_f32<S: Into<candle_core::Shape>>(
     ))
 }
 
+fn copy_all_f32(
+    src: &Tensor,
+    expected: usize,
+    dst: &mut CudaSlice<f32>,
+    dev: &candle_core::CudaDevice,
+) -> Result<()> {
+    let contig = src.contiguous()?;
+    let (storage, _layout) = contig.storage_and_layout();
+    let cuda = match &*storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => anyhow::bail!("vision embedding must be on CUDA"),
+    };
+    let slice = cuda.as_cuda_slice::<f32>()?;
+    let len = slice.len();
+    anyhow::ensure!(
+        len >= expected,
+        "vision embedding len {len} < expected {expected}"
+    );
+    let src = slice.slice(len - expected..);
+    let stream = nv_layers::cuda_stream::current_stream(dev);
+    stream
+        .memcpy_dtod(&src, dst)
+        .map_err(|e| anyhow::anyhow!("dtod vision embedding: {e:?}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn evictions(resident: &[((usize, usize), usize)], incoming: usize, budget: usize) -> Vec<(usize, usize)> {
+    fn evictions(
+        resident: &[((usize, usize), usize)],
+        incoming: usize,
+        budget: usize,
+    ) -> Vec<(usize, usize)> {
         match plan_bucket_admission(resident, incoming, budget) {
             BucketAdmission::Admit {
                 evict_largest_first,
@@ -752,30 +773,4 @@ mod tests {
             "equal-sized buckets tie-break on the grid key so repeated runs evict the same set"
         );
     }
-}
-
-fn copy_all_f32(
-    src: &Tensor,
-    expected: usize,
-    dst: &mut CudaSlice<f32>,
-    dev: &candle_core::CudaDevice,
-) -> Result<()> {
-    let contig = src.contiguous()?;
-    let (storage, _layout) = contig.storage_and_layout();
-    let cuda = match &*storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("vision embedding must be on CUDA"),
-    };
-    let slice = cuda.as_cuda_slice::<f32>()?;
-    let len = slice.len();
-    anyhow::ensure!(
-        len >= expected,
-        "vision embedding len {len} < expected {expected}"
-    );
-    let src = slice.slice(len - expected..);
-    let stream = nv_layers::cuda_stream::current_stream(dev);
-    stream
-        .memcpy_dtod(&src, dst)
-        .map_err(|e| anyhow::anyhow!("dtod vision embedding: {e:?}"))?;
-    Ok(())
 }

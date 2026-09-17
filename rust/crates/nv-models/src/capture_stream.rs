@@ -16,7 +16,8 @@ pub const A_CANDLE_BODY_ESCAPES_A_FORKED_CAPTURE: &str = "a CUDA graph whose cap
      candle_core::Device::new_cuda_with_stream so cuda_stream() is a real non-NULL stream, which \
      is what CaptureStream::for_device then captures on";
 
-pub const A_FORKED_CAPTURE_IS_CORRECT_ONLY_FOR_A_RAW_BODY: &str = "CaptureStream::for_device forks \
+pub const A_FORKED_CAPTURE_IS_CORRECT_ONLY_FOR_A_RAW_BODY: &str =
+    "CaptureStream::for_device forks \
      when the device is on the legacy NULL stream, because cuStreamBeginCapture refuses the NULL \
      stream outright. A forked capture stream is unconditionally correct only for a body whose \
      every launch is a raw stream-parameterized nv-* kernel, with the candle handoff done as a \

@@ -88,7 +88,9 @@ impl DenseTrainModel {
 
         let mut layers = Vec::with_capacity(n_build);
         for i in 0..n_build {
-            layers.push(load_dense_layer(&config, i, weights, device, dtype, resident)?);
+            layers.push(load_dense_layer(
+                &config, i, weights, device, dtype, resident,
+            )?);
         }
 
         let final_norm = load_rmsnorm(
@@ -189,7 +191,7 @@ impl DenseTrainModel {
         x: &Tensor,
         positions: &Tensor,
         seq: usize,
-        kv_stash: &mut Vec<Option<(Tensor, Tensor)>>,
+        kv_stash: &mut [Option<(Tensor, Tensor)>],
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
 
@@ -243,7 +245,9 @@ impl DenseTrainModel {
         positions: &Tensor,
         seq: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let normed = self.layers[src].input_layernorm.forward_candle(boundary_in)?;
+        let normed = self.layers[src]
+            .input_layernorm
+            .forward_candle(boundary_in)?;
         self.layer_kv(src, &normed, positions, seq)
     }
 
@@ -253,7 +257,7 @@ impl DenseTrainModel {
         x: &Tensor,
         positions: &Tensor,
         seq: usize,
-        kv_stash: &mut Vec<Option<(Tensor, Tensor)>>,
+        kv_stash: &mut [Option<(Tensor, Tensor)>],
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
         let attn = &layer.self_attn;
@@ -476,10 +480,8 @@ fn load_dense_layer<S: TensorSource>(
     let build = |components: &[&str], w: Tensor| -> Result<Linear> {
         match resident {
             Some(ingest) => {
-                let names: Vec<String> = components
-                    .iter()
-                    .map(|c| format!("{prefix}.{c}"))
-                    .collect();
+                let names: Vec<String> =
+                    components.iter().map(|c| format!("{prefix}.{c}")).collect();
                 ingest(&names, w)
             }
             None => Linear::new_no_pretranspose(w, None),
@@ -663,12 +665,8 @@ impl DenseTrainModel {
             let src_recompute = match self.config.kv_source_layer(li) {
                 Some(src) => {
                     let src_in_var = Var::from_tensor(&boundaries[src])?;
-                    let live_kv = self.source_kv_from_boundary(
-                        src,
-                        src_in_var.as_tensor(),
-                        &positions,
-                        seq,
-                    )?;
+                    let live_kv =
+                        self.source_kv_from_boundary(src, src_in_var.as_tensor(), &positions, seq)?;
                     kv_stash[src] = Some(live_kv);
                     Some((src, src_in_var))
                 }
@@ -687,9 +685,7 @@ impl DenseTrainModel {
                         None => g,
                     });
                 }
-                kv_stash[*src] = kv_stash[*src]
-                    .take()
-                    .map(|(k, v)| (k.detach(), v.detach()));
+                kv_stash[*src] = kv_stash[*src].take().map(|(k, v)| (k.detach(), v.detach()));
             }
             for (i, v) in vars.iter().enumerate() {
                 if let Some(g) = gs.get(v.as_tensor()) {
@@ -791,9 +787,7 @@ impl DenseTrainModel {
             let probs = softmax_last_dim(&z)?;
             let neg_one = Tensor::from_vec(vec![-1f32; c], (c, 1usize), dev)?;
             let gz = probs.scatter_add(&idx, &neg_one, 1)?;
-            let mut gz = gz
-                .broadcast_mul(&mask_c)?
-                .affine(1.0 / denom as f64, 0.0)?;
+            let mut gz = gz.broadcast_mul(&mask_c)?.affine(1.0 / denom as f64, 0.0)?;
             if cap > 0.0 {
                 let zc = z.affine(1.0 / cap, 0.0)?;
                 let dcap = (Tensor::ones_like(&zc)? - zc.sqr()?)?;

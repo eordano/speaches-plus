@@ -49,9 +49,7 @@ pub fn script_mix(text: &str) -> ScriptMix {
         match u {
             0x0041..=0x024F => m.latin += 1,
             0x0400..=0x04FF => m.cyrillic += 1,
-            0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => {
-                m.arabic += 1
-            }
+            0x0600..=0x06FF | 0x0750..=0x077F | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => m.arabic += 1,
             0x3040..=0x30FF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF => m.cjk += 1,
             _ => {}
         }
@@ -87,7 +85,9 @@ pub fn ink_fraction(luma_hist: &[u32; 256]) -> f64 {
     let ink: u64 = luma_hist
         .iter()
         .enumerate()
-        .filter(|&(v, _)| (v as i32 - modal_paper).abs() > BLANK_INK_LUMA_DELTA_FROM_THE_MODAL_PAPER_TONE)
+        .filter(|&(v, _)| {
+            (v as i32 - modal_paper).abs() > BLANK_INK_LUMA_DELTA_FROM_THE_MODAL_PAPER_TONE
+        })
         .map(|(_, &n)| n as u64)
         .sum();
     ink as f64 / total as f64
@@ -161,7 +161,10 @@ mod tests {
     fn digit_table_flood_flags_without_any_prior() {
         let text = "<table>1234567891011121314151617181920212223242526272829303132333435363738\
                     39404142434445464748495051525354555657585960616263646566676869707172737475</table>";
-        assert_eq!(suspect_reason(text, ExpectedScript::Any), Some("digit-flood"));
+        assert_eq!(
+            suspect_reason(text, ExpectedScript::Any),
+            Some("digit-flood")
+        );
     }
 
     #[test]
@@ -171,9 +174,16 @@ mod tests {
         hist[248] = 60_000;
         hist[252] = 40_000;
         hist[20] = 400;
-        assert!(near_blank(&hist), "ink fraction {} must read as blank", ink_fraction(&hist));
+        assert!(
+            near_blank(&hist),
+            "ink fraction {} must read as blank",
+            ink_fraction(&hist)
+        );
         assert_eq!(
-            blank_page_suspect(true, "six styles of hair extensions are shown in the figure"),
+            blank_page_suspect(
+                true,
+                "six styles of hair extensions are shown in the figure"
+            ),
             Some("blank-page"),
             "the archive run confabulated exactly this on a white 144 Mpx page"
         );
@@ -183,7 +193,10 @@ mod tests {
             "a tiny artifact under the char floor is not worth a verdict"
         );
         assert_eq!(blank_page_suspect(true, ""), None);
-        assert_eq!(blank_page_suspect(false, "any amount of text on a page with ink"), None);
+        assert_eq!(
+            blank_page_suspect(false, "any amount of text on a page with ink"),
+            None
+        );
     }
 
     #[test]

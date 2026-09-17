@@ -244,11 +244,11 @@ func pcm16BytesToFloat32(b audio.PCM16Bytes) audio.MonoF32 {
 	if n == 0 {
 		return nil
 	}
-	int16s := make(audio.MonoS16, n)
-	for i := 0; i < n; i++ {
-		int16s[i] = int16(b[2*i]) | int16(b[2*i+1])<<8
+	out := make(audio.MonoF32, n)
+	for i := range out {
+		out[i] = float32(int16(b[2*i])|int16(b[2*i+1])<<8) / 32768.0
 	}
-	return audio.MonoS16ToF32(int16s)
+	return out
 }
 
 func decodeAppendAudio(raw []byte, format string) audio.MonoF32 {

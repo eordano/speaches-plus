@@ -122,7 +122,7 @@ def find_fixture() -> Path:
     ):
         if p.exists():
             return p
-    raise SystemExit("[FAIL] no fixture wav available. Run client/perf/gen-fixtures.py first.")
+    raise SystemExit("[FAIL] no fixture wav available. Provide one with a diarized fixture wav.")
 
 def main() -> int:
     target = os.environ.get("BENCH_TARGET", "http://127.0.0.1:18801")

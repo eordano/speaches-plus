@@ -3,8 +3,8 @@
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::gemv_w4a16;
 use crate::wgpu_backend::kernels::gemv_w4a16::ScaleGrain;
+use crate::wgpu_backend::pack::pack_u16_pairs as pack_u16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16};
 
 pub const MIN_M: u32 = 1;
 pub const MAX_M: u32 = 9;
@@ -159,7 +159,12 @@ struct Params {
 }
 
 fn check_device(ctx: &WgpuContext) -> Result<()> {
-    dispatch::require_workgroup_and_scratch(ctx, "gemm_w4a16_small_m", WORKGROUP_SIZE, SCRATCH_BYTES)
+    dispatch::require_workgroup_and_scratch(
+        ctx,
+        "gemm_w4a16_small_m",
+        WORKGROUP_SIZE,
+        SCRATCH_BYTES,
+    )
 }
 
 fn check_binding(ctx: &WgpuContext, what: &str, bytes: u64) -> Result<()> {

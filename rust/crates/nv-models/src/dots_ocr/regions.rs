@@ -124,7 +124,7 @@ fn largest_gap_split(regions: &[Region], lo_axis: usize) -> Option<(f32, usize, 
     let mut running_end = regions[idx[0]].bbox[hi_axis];
     for (pos, &i) in idx.iter().enumerate().skip(1) {
         let gap = regions[i].bbox[lo_axis] - running_end;
-        if gap > 0.0 && best.map_or(true, |(g, _)| gap > g) {
+        if gap > 0.0 && best.is_none_or(|(g, _)| gap > g) {
             best = Some((gap, pos));
         }
         running_end = running_end.max(regions[i].bbox[hi_axis]);

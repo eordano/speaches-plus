@@ -57,7 +57,7 @@ mod tests {
             1,
             "a new var<workgroup> must be summed into W4AFFM_WORKGROUP_BYTES_TOTAL_VS_METAL_LIMIT_32768 because Metal executes over-limit pipelines with aliased tiles"
         );
-        assert!(WGSL.contains("var<workgroup> w4affm_xf_tile: array<vec4<f32>, 256>"));
+        assert!(WGSL.contains("var<workgroup> w4affm_xf_tile: array<vec4<f32>, 512>"));
     }
 
     #[test]

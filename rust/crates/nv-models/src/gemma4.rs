@@ -826,7 +826,9 @@ impl Gemma4 {
     fn final_norm_then_lm_head_rows(&self, hidden_lr: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if decode_lmhead_i8_arm_enabled_env_nv_g4_lmhead_i8_shared_with_the_batch_graph_step_arm() {
-            if let Some(logits) = self.lm_head_i8_normed_rows_when_the_mk_kernel_serves_this_row_count(hidden_lr)? {
+            if let Some(logits) =
+                self.lm_head_i8_normed_rows_when_the_mk_kernel_serves_this_row_count(hidden_lr)?
+            {
                 return Ok(logits);
             }
         }
@@ -847,7 +849,8 @@ impl Gemma4 {
         );
         let rows = dims[1];
         let Some((wq, rs)) = self.lm_head_i8.as_ref() else {
-            if self.i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing
+            if self
+                .i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing
             {
                 return Ok(None);
             }
@@ -1039,18 +1042,7 @@ impl Gemma4 {
                     rowdiff_slot("k_full", layer_idx, i, &k_full);
                     rowdiff_slot("v_full", layer_idx, i, &v_full);
 
-                    if matches!(kind, LayerType::FullAttention) && !fa2_full_decode_requested() {
-                        causal_attention_chunked(
-                            &q_i,
-                            &k_full,
-                            &v_full,
-                            n_q,
-                            n_kv,
-                            head_dim,
-                            1,
-                            total - 1,
-                        )?
-                    } else {
+                    {
                         flash_attention(
                             &q_i,
                             &k_full,
@@ -1309,9 +1301,7 @@ impl Gemma4 {
                     det_hash_tensor("k_full", layer_idx, &k_full);
                     det_hash_tensor("v_full", layer_idx, &v_full);
                 }
-                if matches!(kind, LayerType::FullAttention)
-                    && (seq > 1 || !fa2_full_decode_requested())
-                {
+                if matches!(kind, LayerType::FullAttention) && seq > 1 {
                     causal_attention_chunked(
                         &q_rot,
                         &k_full,
@@ -1352,11 +1342,6 @@ pub trait Gemma4LayerHook {
 fn det_debug_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("NV_DEBUG_DETERMINISM").is_some())
-}
-
-fn fa2_full_decode_requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NV_GEMMA4_FA2_FULL_DECODE").is_some())
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -1582,6 +1567,17 @@ impl<T: Gemma4Cache + ?Sized> Gemma4Cache for Box<T> {
         scaling: f32,
     ) -> Result<Option<Tensor>> {
         (**self).try_decode_attention_fp8(layer, q_rot, n_q, sliding_window, scaling)
+    }
+    fn try_prefill_attention_fp8(
+        &mut self,
+        layer: usize,
+        q_rot: &Tensor,
+        n_q: usize,
+        seq: usize,
+        sliding_window: Option<usize>,
+        scaling: f32,
+    ) -> Result<Option<Tensor>> {
+        (**self).try_prefill_attention_fp8(layer, q_rot, n_q, seq, sliding_window, scaling)
     }
     fn try_decode_attention_ring(
         &mut self,
@@ -3094,7 +3090,10 @@ fn shadow_route_jit_warm_once_at_cache_creation(dev: &Device) {
 
 #[cfg(feature = "cuda")]
 fn spec_prefill_hd512_bf16_enabled() -> bool {
-    spec_prefill_hd512_bf16_from(spec_prefill_hd512_bf16_raw(), spec_prefill_hd512_eager_raw())
+    spec_prefill_hd512_bf16_from(
+        spec_prefill_hd512_bf16_raw(),
+        spec_prefill_hd512_eager_raw(),
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -3883,7 +3882,7 @@ impl Gemma4 {
 
         if let Some(out) = gemm_out {
             let attn_out = out.reshape((k, n_q * hd))?.contiguous()?;
-            return attn.o_forward(&attn_out).map_err(Into::into);
+            return attn.o_forward(&attn_out);
         }
 
         let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
@@ -3894,7 +3893,7 @@ impl Gemma4 {
             candle_core::op::BackpropOp::none(),
             false,
         );
-        attn.o_forward(&attn_out).map_err(Into::into)
+        attn.o_forward(&attn_out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3915,7 +3914,7 @@ impl Gemma4 {
         let hd = self.config.head_dim_for(kind);
         let n_q = self.config.num_attention_heads;
         let n_kv = self.config.num_kv_heads_for(kind);
-        if hd == 0 || hd % 2 != 0 || hd > 512 {
+        if hd == 0 || !hd.is_multiple_of(2) || hd > 512 {
             return Ok(None);
         }
         if attn.q_dim != n_q * hd || attn.kv_dim != n_kv * hd {
@@ -4316,7 +4315,7 @@ impl Gemma4 {
                 let attn_out = self.attention_tree_impl(
                     idx,
                     &normed_pre_attn.reshape((k, hidden_size))?,
-                    &pos_t,
+                    pos_t,
                     mask_dev,
                     k,
                     cache,
@@ -4422,6 +4421,7 @@ impl Gemma4 {
     }
 }
 
+#[cfg(feature = "cuda")]
 const DECODE_NORM_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_THREE_LAUNCH_NORM_CHAIN:
     bool = false;
 
@@ -4835,7 +4835,7 @@ fn gelu_tanh_mul_fused_cuda_bf16(fused: &Tensor) -> Result<Tensor> {
     let dims = fused.dims().to_vec();
     let last = dims.len() - 1;
     let two_inter = dims[last];
-    if two_inter % 2 != 0 {
+    if !two_inter.is_multiple_of(2) {
         anyhow::bail!(
             "gelu_tanh_mul_fused_cuda_bf16: last dim must be even, got {:?}",
             dims
@@ -5724,7 +5724,6 @@ pub fn xattn_prefill_bias(
         let qpos_max = q_offset + r1 - 1;
 
         let last_vis = qpos_max.saturating_sub(k_offset);
-        if last_vis >= stored + block {}
         let last_col = last_vis.min(stored.saturating_sub(1));
         let nkb_cand = last_col / block + 1;
 
@@ -6197,8 +6196,8 @@ fn attn_proj_scheme_from(raw: Option<&str>) -> AttnProjScheme {
     }
 }
 
-pub const ATTN_PROJ_NVFP4_ALONE_IS_A_MEASURED_QUALITY_REJECT_RESCUED_ONLY_BY_NV_NVFP4_M1_GEMV: &str =
-    "NV_ATTN_PROJ_QUANT=nvfp4 on its own scores 17.056 against a 16.308 zero-env basis on \
+pub const ATTN_PROJ_NVFP4_ALONE_IS_A_MEASURED_QUALITY_REJECT_RESCUED_ONLY_BY_NV_NVFP4_M1_GEMV:
+    &str = "NV_ATTN_PROJ_QUANT=nvfp4 on its own scores 17.056 against a 16.308 zero-env basis on \
      ppl_gemma4::gemma4_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode \
      (Gemma-4-31B-IT-NVFP4, 285 prompt tokens, 512 scored, wiki corpus): +0.748 ppl, a REJECT \
      on magnitude at 1.82x the family's own 0.41 reassociation-null spread (the +0.0973 figure \
@@ -6432,6 +6431,137 @@ fn load_mlp_proj(
     _device: &Device,
 ) -> Result<Linear> {
     anyhow::bail!("gemma4 NVFP4 path requires the `cuda` feature")
+}
+
+#[cfg(test)]
+mod boxed_prefill_dispatch_tests {
+    use super::Gemma4Cache;
+    use anyhow::Result;
+    use candle_core::{Device, Tensor};
+    use std::sync::{Arc, Mutex};
+
+    type Call = (usize, usize, usize, usize, Option<usize>, u32);
+
+    struct DefaultCache;
+
+    impl Gemma4Cache for DefaultCache {
+        fn current_len(&self) -> usize {
+            0
+        }
+        fn advance(&mut self, _: usize) {
+            panic!("unexpected advance")
+        }
+        fn prepare_for_decode(&mut self, _: usize, _: usize) -> Result<()> {
+            panic!("unexpected prepare")
+        }
+        fn write_at(&mut self, _: usize, _: &Tensor, _: &Tensor) -> Result<()> {
+            panic!("unexpected write")
+        }
+        fn view(&mut self, _: usize, _: usize) -> Result<(Tensor, Tensor)> {
+            panic!("prefill dispatch must not enter a fallback view")
+        }
+    }
+
+    struct HookCache(Arc<Mutex<Vec<Call>>>);
+
+    #[derive(Debug)]
+    struct PrefillFault;
+
+    impl std::fmt::Display for PrefillFault {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("prefill fixture fault")
+        }
+    }
+
+    impl std::error::Error for PrefillFault {}
+
+    impl Gemma4Cache for HookCache {
+        fn current_len(&self) -> usize {
+            0
+        }
+        fn advance(&mut self, _: usize) {
+            panic!("unexpected advance")
+        }
+        fn prepare_for_decode(&mut self, _: usize, _: usize) -> Result<()> {
+            panic!("unexpected prepare")
+        }
+        fn write_at(&mut self, _: usize, _: &Tensor, _: &Tensor) -> Result<()> {
+            panic!("unexpected write")
+        }
+        fn view(&mut self, _: usize, _: usize) -> Result<(Tensor, Tensor)> {
+            panic!("prefill dispatch must not enter a fallback view")
+        }
+        fn try_prefill_attention_fp8(
+            &mut self,
+            layer: usize,
+            q: &Tensor,
+            n_q: usize,
+            seq: usize,
+            window: Option<usize>,
+            scaling: f32,
+        ) -> Result<Option<Tensor>> {
+            self.0.lock().unwrap().push((
+                layer,
+                q as *const Tensor as usize,
+                n_q,
+                seq,
+                window,
+                scaling.to_bits(),
+            ));
+            if layer == 13 {
+                return Err(PrefillFault.into());
+            }
+            Ok(Some(q.clone()))
+        }
+    }
+
+    fn invoke<C: Gemma4Cache>(
+        cache: &mut C,
+        q: &Tensor,
+        layer: usize,
+        window: Option<usize>,
+    ) -> Result<Option<Tensor>> {
+        cache.try_prefill_attention_fp8(layer, q, 48, 3, window, 0.125)
+    }
+
+    #[test]
+    fn boxed_prefill_forwards_override_arguments_errors_and_default_none() {
+        let q = Tensor::from_vec(
+            vec![1.25f32, -2.5, 3.75, 4.0, 5.5, -6.25],
+            (3, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut erased: Box<dyn Gemma4Cache + Send> = Box::new(HookCache(calls.clone()));
+        let out = invoke(&mut erased, &q, 7, Some(513))
+            .unwrap()
+            .expect("boxed generic dispatch lost the concrete prefill override");
+        assert_eq!(out.dims(), q.dims());
+        assert_eq!(out.to_vec2::<f32>().unwrap(), q.to_vec2::<f32>().unwrap());
+        let error = invoke(&mut erased, &q, 13, None)
+            .expect_err("boxed prefill swallowed an error as None");
+        assert!(
+            error.downcast_ref::<PrefillFault>().is_some(),
+            "typed prefill error must survive delegation: {error:#}"
+        );
+        let mut concrete = Box::new(HookCache(calls.clone()));
+        assert!(invoke(&mut concrete, &q, 11, None).unwrap().is_some());
+        let ptr = &q as *const Tensor as usize;
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                (7, ptr, 48, 3, Some(513), 0.125f32.to_bits()),
+                (13, ptr, 48, 3, None, 0.125f32.to_bits()),
+                (11, ptr, 48, 3, None, 0.125f32.to_bits()),
+            ]
+        );
+        let mut default: Box<dyn Gemma4Cache + Send> = Box::new(DefaultCache);
+        assert!(
+            invoke(&mut default, &q, 7, None).unwrap().is_none(),
+            "a cache without the optional hook must retain default None"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7373,21 +7503,19 @@ mod prefill_shadow_tests {
                 let vs = mk(0.3, total, n_kv, hd, &dev)
                     .to_dtype(DType::BF16)
                     .unwrap();
-                let flash =
-                    super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None).unwrap();
+                let flash = super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None).unwrap();
                 let naive =
                     causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
-                let d = (flash.to_dtype(DType::F32).unwrap()
-                    - naive.to_dtype(DType::F32).unwrap())
-                .unwrap()
-                .abs()
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .max(0)
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
+                let d = (flash.to_dtype(DType::F32).unwrap() - naive.to_dtype(DType::F32).unwrap())
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .max(0)
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
                 eprintln!(
                     "hd512-probe hd={hd} committed={committed} len={len} \
                      flash_vs_chunked_max_abs={d:.6}"
@@ -7402,9 +7530,11 @@ mod prefill_shadow_tests {
         }
     }
 
+    #[cfg(feature = "cuda")]
     const HD512_BF16_PROBE_TOL_5E2_SEPARATES_BF16_GEMM_ROUNDING_FROM_THE_ORDER_ONE_HD512_FLASH_DEFECT:
         f32 = 5e-2;
 
+    #[cfg(feature = "cuda")]
     const HD512_BF16_PROBE_QK_AMPLITUDE_0_5_PUTS_HD512_LOGITS_IN_THE_TENS_REGIME_OF_TRAINED_ATTENTION_WHERE_BF16_SCORE_QUANTA_STAY_SUB_0_1_MATCHING_THE_E4B_MASK_TRANSFER_PRECEDENT_WHILE_AMPLITUDE_1_SYNTHETIC_LOGITS_NEAR_50_QUANTIZE_AT_0_25:
         f64 = 0.5;
 
@@ -7482,7 +7612,7 @@ mod prefill_shadow_tests {
             let vs = mk(0.3, total, n_kv, hd, &dev)
                 .to_dtype(DType::BF16)
                 .unwrap();
-            let mut time_it = |name: &str, f: &dyn Fn() -> super::Result<Tensor>| {
+            let time_it = |name: &str, f: &dyn Fn() -> super::Result<Tensor>| {
                 f().unwrap();
                 dev.synchronize().unwrap();
                 let t0 = std::time::Instant::now();

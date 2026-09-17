@@ -11,8 +11,6 @@ pub mod gemma4_e4b;
 #[cfg(feature = "wgpu")]
 pub mod gemma4_e4b_wgpu;
 pub mod gemma4_gguf;
-#[cfg(all(test, feature = "cuda"))]
-mod marlin_zero_drop_lifecycle;
 #[cfg(feature = "cuda")]
 pub mod gemma4_graph;
 pub mod gemma4_mm_splice;
@@ -34,7 +32,11 @@ pub mod gpt_oss_cuda;
 pub mod gpt_oss_wgpu;
 #[cfg(feature = "cuda")]
 pub mod graph_engine;
+pub mod hadamard_kv;
+pub mod host_serving_util;
 pub mod laguna;
+#[cfg(feature = "cuda")]
+pub mod laguna_batch_graph;
 pub mod laguna_dflash;
 #[cfg(feature = "cuda")]
 pub mod laguna_fa2;
@@ -43,32 +45,36 @@ pub mod laguna_fp8;
 #[cfg(feature = "cuda")]
 pub mod laguna_graph;
 #[cfg(feature = "cuda")]
+pub mod laguna_prefill_attn;
+#[cfg(feature = "cuda")]
 pub mod laguna_serve;
 #[cfg(feature = "cuda")]
 pub mod laguna_step_graph;
+pub mod laguna_train;
 #[cfg(feature = "laguna-wip")]
 pub mod laguna_wgpu;
-pub mod laguna_train;
-pub mod hadamard_kv;
-pub mod host_serving_util;
+#[cfg(all(test, feature = "cuda"))]
+mod marlin_zero_drop_lifecycle;
 pub use nv_config::{
     env_arm_opt_in_eq_some_1_cached_first_read_wins,
     env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins,
     env_arm_present_at_all_cached_first_read_wins,
 };
+pub mod laguna_prefix;
+pub mod laguna_prefix_diagnostics;
+#[cfg(feature = "wgpu")]
+pub mod nvfp4_host;
 pub mod paged_fp8;
 pub mod prefix_reuse;
 pub mod qwen3;
 #[cfg(feature = "wgpu")]
 pub mod qwen3_5_dense_wgpu;
 pub mod qwen3_5_moe;
-pub mod qwen3_mm_splice;
 #[cfg(feature = "wgpu")]
 pub mod qwen3_5_moe_wgpu;
 #[cfg(feature = "cuda")]
 pub mod qwen3_5_mtp;
-#[cfg(feature = "wgpu")]
-pub mod nvfp4_host;
+pub mod qwen3_mm_splice;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_ledger;
 #[cfg(feature = "wgpu")]

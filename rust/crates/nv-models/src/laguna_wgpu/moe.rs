@@ -2,9 +2,11 @@ use anyhow::Result;
 
 use super::config::{LagunaShapes, LayerShape, NVFP4_BLOCK};
 use super::gpu::{
-    alloc_lin_scratch, push_gemv_bf16, push_gemv_bf16_experts, push_gemv_i8_experts,
-    push_gemv_nvfp4, push_lin_gemv, push_quant_rows, push_silu_mul, upload_bf16, upload_experts,
-    upload_lin, Builder, ExpertsGpu, Sources, W8Scope,
+    alloc_lin_scratch, alloc_lin_scratch_rows, alloc_pair_scratch, alloc_pair_scratch_rows,
+    push_gemv_bf16, push_gemv_bf16_experts, push_gemv_bf16_rows, push_gemv_i8_experts,
+    push_gemv_nvfp4, push_lin_gemv, push_lin_gemv_pair, push_lin_gemv_pair_rows,
+    push_lin_gemv_rows, push_quant_rows, push_silu_mul, qshare_enabled, upload_bf16,
+    upload_experts, upload_lin, Bf16Gpu, Builder, ExpertsGpu, LinGpu, MRows, Sources, W8Scope,
 };
 use super::weights::{HostExperts, HostMoe};
 use super::{rbf, ref_gemv_bf16, ref_gemv_lin, sigmoid, silu};
@@ -34,6 +36,17 @@ pub struct CombineParams {
 }
 
 pub const ROUTER_MAX_EXPERTS: usize = 256;
+
+pub struct MoeGpu {
+    pub router: Bf16Gpu,
+    pub bias: wgpu::Buffer,
+    pub eg: ExpertsGpu,
+    pub eu: ExpertsGpu,
+    pub ed: ExpertsGpu,
+    pub sg: LinGpu,
+    pub su: LinGpu,
+    pub sd: LinGpu,
+}
 
 fn selection_bias(shapes: &LagunaShapes, w: &HostMoe) -> Result<Vec<f32>> {
     if w.selection_bias.is_empty() {
@@ -123,13 +136,15 @@ fn prepare_expert_input(
     k_elems: usize,
     slots: usize,
     x_per_slot: bool,
-) -> Result<Option<(wgpu::Buffer, wgpu::Buffer)>> {
+) -> Result<Option<(wgpu::Buffer, wgpu::Buffer, bool)>> {
     match stack {
         ExpertsGpu::Bf16(_) | ExpertsGpu::Int8(_) => Ok(None),
         ExpertsGpu::Nvfp4(st) => {
+            let x_shared = qshare_enabled() && st.globals_uniform && !x_per_slot;
+            let qslots = if x_shared { 1 } else { slots };
             let k_blocks = k_elems / NVFP4_BLOCK;
-            let xq = b.zeros(&format!("{label}-xq"), (slots * k_elems / 2) as u64);
-            let xs = b.zeros(&format!("{label}-xs"), (slots * k_blocks) as u64);
+            let xq = b.zeros(&format!("{label}-xq"), (qslots * k_elems / 2) as u64);
+            let xs = b.zeros(&format!("{label}-xs"), (qslots * k_blocks) as u64);
             push_quant_rows(
                 b,
                 s,
@@ -140,11 +155,12 @@ fn prepare_expert_input(
                 ids,
                 &st.globals,
                 k_elems,
-                slots,
+                qslots,
                 true,
                 x_per_slot,
+                1,
             )?;
-            Ok(Some((xq, xs)))
+            Ok(Some((xq, xs, x_shared)))
         }
     }
 }
@@ -156,7 +172,7 @@ fn push_expert_gemv(
     label: &str,
     stack: &ExpertsGpu,
     x_packed: &wgpu::Buffer,
-    quant: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
+    quant: Option<(&wgpu::Buffer, &wgpu::Buffer, bool)>,
     y: &wgpu::Buffer,
     ids: &wgpu::Buffer,
     slots: usize,
@@ -164,18 +180,18 @@ fn push_expert_gemv(
 ) -> Result<()> {
     match stack {
         ExpertsGpu::Bf16(st) => {
-            push_gemv_bf16_experts(b, s, label, st, x_packed, y, ids, slots, x_per_slot)
+            push_gemv_bf16_experts(b, s, label, st, x_packed, y, ids, slots, x_per_slot, 1)
         }
-        ExpertsGpu::Int8(st) => {
-            push_gemv_i8_experts(b, s, label, st, x_packed, y, ids, slots, true, x_per_slot)
-        }
+        ExpertsGpu::Int8(st) => push_gemv_i8_experts(
+            b, s, label, st, x_packed, y, ids, slots, true, x_per_slot, 1,
+        ),
         ExpertsGpu::Nvfp4(st) => {
-            let (xq, xs) = quant.ok_or_else(|| {
+            let (xq, xs, x_shared) = quant.ok_or_else(|| {
                 anyhow::anyhow!("{label}: nvfp4 expert stack needs a quantized x")
             })?;
             push_gemv_nvfp4(
                 b, s, label, &st.w, &st.scales, xq, xs, y, ids, &st.alphas, st.n, st.k, slots,
-                true, 1.0,
+                true, x_shared, 1.0, 1,
             )
         }
     }
@@ -190,7 +206,7 @@ pub fn build_moe_layer(
     w: &HostMoe,
     x_normed_packed: &wgpu::Buffer,
     out_packed: &wgpu::Buffer,
-) -> Result<()> {
+) -> Result<MoeGpu> {
     check_moe(shapes, layer, w)?;
 
     let hidden = shapes.hidden_size;
@@ -251,7 +267,7 @@ pub fn build_moe_layer(
         k_top,
         false,
     )?;
-    let xq_ref = xq.as_ref().map(|(q, sc)| (q, sc));
+    let xq_ref = xq.as_ref().map(|(q, sc, sh)| (q, sc, *sh));
 
     let y_gate = b.zeros(&format!("lgw-moe{li}-ygate"), (k_top * inter * 2) as u64);
     let y_up = b.zeros(&format!("lgw-moe{li}-yup"), (k_top * inter * 2) as u64);
@@ -309,7 +325,7 @@ pub fn build_moe_layer(
         &format!("lgw-moe{li}-down"),
         &ed,
         &act,
-        aq.as_ref().map(|(q, sc)| (q, sc)),
+        aq.as_ref().map(|(q, sc, sh)| (q, sc, *sh)),
         &y_down,
         &ids,
         k_top,
@@ -319,28 +335,27 @@ pub fn build_moe_layer(
     let sg = upload_lin(b, &format!("lgw-moe{li}-sg"), &w.shared_gate, W8Scope::Ffn);
     let su = upload_lin(b, &format!("lgw-moe{li}-su"), &w.shared_up, W8Scope::Ffn);
     let sd = upload_lin(b, &format!("lgw-moe{li}-sd"), &w.shared_down, W8Scope::Ffn);
-    let sg_scratch = alloc_lin_scratch(b, &format!("lgw-moe{li}-sg"), &sg);
-    let su_scratch = alloc_lin_scratch(b, &format!("lgw-moe{li}-su"), &su);
+    let sgu_scratch = alloc_pair_scratch(
+        b,
+        &format!("lgw-moe{li}-sg"),
+        &sg,
+        &format!("lgw-moe{li}-su"),
+        &su,
+    );
     let sd_scratch = alloc_lin_scratch(b, &format!("lgw-moe{li}-sd"), &sd);
 
     let sy_gate = b.zeros(&format!("lgw-moe{li}-syg"), (sinter * 2) as u64);
     let sy_up = b.zeros(&format!("lgw-moe{li}-syu"), (sinter * 2) as u64);
-    push_lin_gemv(
+    push_lin_gemv_pair(
         b,
         s,
         &format!("lgw-moe{li}-sgate"),
         &sg,
-        &sg_scratch,
-        x_normed_packed,
-        &sy_gate,
-    )?;
-    push_lin_gemv(
-        b,
-        s,
         &format!("lgw-moe{li}-sup"),
         &su,
-        &su_scratch,
+        &sgu_scratch,
         x_normed_packed,
+        &sy_gate,
         &sy_up,
     )?;
     let sact = b.zeros(&format!("lgw-moe{li}-sact"), (sinter * 2) as u64);
@@ -386,6 +401,299 @@ pub fn build_moe_layer(
             (24, &cp),
         ],
         grid,
+    )?;
+    Ok(MoeGpu {
+        router,
+        bias,
+        eg,
+        eu,
+        ed,
+        sg,
+        su,
+        sd,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_expert_input_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    stack: &ExpertsGpu,
+    x_packed: &wgpu::Buffer,
+    ids: &wgpu::Buffer,
+    k_elems: usize,
+    mp: &MRows,
+    top_k: usize,
+    x_per_slot: bool,
+) -> Result<Option<(wgpu::Buffer, wgpu::Buffer, usize)>> {
+    match stack {
+        ExpertsGpu::Bf16(_) | ExpertsGpu::Int8(_) => Ok(None),
+        ExpertsGpu::Nvfp4(st) => {
+            let x_shared = qshare_enabled() && st.globals_uniform && !x_per_slot;
+            let (qslots, sel, quant_div, gemv_div) = if x_shared {
+                (mp.m, &mp.sel0, 1usize, top_k)
+            } else if x_per_slot {
+                (mp.m * top_k, ids, 1usize, 1usize)
+            } else {
+                (mp.m * top_k, ids, top_k, 1usize)
+            };
+            let k_blocks = k_elems / NVFP4_BLOCK;
+            let xq = b.zeros(&format!("{label}-xq"), (qslots * k_elems / 2) as u64);
+            let xs = b.zeros(&format!("{label}-xs"), (qslots * k_blocks) as u64);
+            push_quant_rows(
+                b,
+                s,
+                &format!("{label}-quant"),
+                x_packed,
+                &xq,
+                &xs,
+                sel,
+                &st.globals,
+                k_elems,
+                qslots,
+                true,
+                true,
+                quant_div,
+            )?;
+            Ok(Some((xq, xs, gemv_div)))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_expert_gemv_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    stack: &ExpertsGpu,
+    x_packed: &wgpu::Buffer,
+    quant: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
+    y: &wgpu::Buffer,
+    ids: &wgpu::Buffer,
+    slots: usize,
+    raw_x_div: usize,
+) -> Result<()> {
+    match stack {
+        ExpertsGpu::Bf16(st) => {
+            push_gemv_bf16_experts(b, s, label, st, x_packed, y, ids, slots, true, raw_x_div)
+        }
+        ExpertsGpu::Int8(st) => push_gemv_i8_experts(
+            b, s, label, st, x_packed, y, ids, slots, true, true, raw_x_div,
+        ),
+        ExpertsGpu::Nvfp4(st) => {
+            let (xq, xs, x_div) = quant.ok_or_else(|| {
+                anyhow::anyhow!("{label}: nvfp4 expert stack needs a quantized x")
+            })?;
+            push_gemv_nvfp4(
+                b, s, label, &st.w, &st.scales, xq, xs, y, ids, &st.alphas, st.n, st.k, slots,
+                true, false, 1.0, x_div,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_moe_layer_rows(
+    b: &mut Builder,
+    s: &Sources,
+    shapes: &LagunaShapes,
+    layer: &LayerShape,
+    g: &MoeGpu,
+    x_rows_packed: &wgpu::Buffer,
+    out_rows_packed: &wgpu::Buffer,
+    mp: &MRows,
+) -> Result<()> {
+    let hidden = shapes.hidden_size;
+    let hidden_words = shapes.hidden_words();
+    let inter = layer.ffn_intermediate;
+    let sinter = shapes.shared_expert_intermediate_size;
+    let n_e = shapes.num_experts;
+    let k_top = shapes.top_k;
+    let li = layer.idx;
+    let m = mp.m;
+    let slots = m * k_top;
+
+    let rlogits = b.zeros(&format!("lgw-moe{li}-mrlogits"), (m * n_e * 4) as u64);
+    push_gemv_bf16_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-mrouter"),
+        &g.router,
+        x_rows_packed,
+        &rlogits,
+        mp,
+        true,
+    )?;
+
+    let ids = b.zeros(&format!("lgw-moe{li}-mids"), (slots * 4) as u64);
+    let wts = b.zeros(&format!("lgw-moe{li}-mwts"), (slots * 4) as u64);
+    let rp = b.uni(
+        &format!("lgw-moe{li}-mrouter-p"),
+        RouterParams {
+            n_experts: n_e as u32,
+            top_k: k_top as u32,
+            norm_topk: u32::from(shapes.norm_topk_prob),
+            softcap: shapes.router_softcap,
+            routed_scaling: shapes.routed_scaling,
+            ..Default::default()
+        },
+    );
+    b.push(
+        &format!("lgw-moe{li}-mtopk"),
+        &s.moe,
+        "lgw_moe_router_topk_rows",
+        &[(0, &rlogits), (1, &g.bias), (2, &ids), (3, &wts), (4, &rp)],
+        (m as u32, 1, 1),
+    )?;
+
+    let xq = prepare_expert_input_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-mx"),
+        &g.eg,
+        x_rows_packed,
+        &ids,
+        hidden,
+        mp,
+        k_top,
+        false,
+    )?;
+    let xq_ref = xq.as_ref().map(|(q, sc, d)| (q, sc, *d));
+
+    let y_gate = b.zeros(&format!("lgw-moe{li}-mygate"), (slots * inter * 2) as u64);
+    let y_up = b.zeros(&format!("lgw-moe{li}-myup"), (slots * inter * 2) as u64);
+    push_expert_gemv_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-mgate"),
+        &g.eg,
+        x_rows_packed,
+        xq_ref,
+        &y_gate,
+        &ids,
+        slots,
+        k_top,
+    )?;
+    push_expert_gemv_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-mup"),
+        &g.eu,
+        x_rows_packed,
+        xq_ref,
+        &y_up,
+        &ids,
+        slots,
+        k_top,
+    )?;
+
+    let act = b.zeros(&format!("lgw-moe{li}-mact"), (slots * inter * 2) as u64);
+    push_silu_mul(
+        b,
+        s,
+        &format!("lgw-moe{li}-msilu"),
+        &y_gate,
+        &y_up,
+        &act,
+        slots * inter,
+    )?;
+
+    let aq = prepare_expert_input_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-ma"),
+        &g.ed,
+        &act,
+        &ids,
+        inter,
+        mp,
+        k_top,
+        true,
+    )?;
+    let y_down = b.zeros(&format!("lgw-moe{li}-mydown"), (slots * hidden * 2) as u64);
+    push_expert_gemv_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-mdown"),
+        &g.ed,
+        &act,
+        aq.as_ref().map(|(q, sc, d)| (q, sc, *d)),
+        &y_down,
+        &ids,
+        slots,
+        1,
+    )?;
+
+    let sgu_scratch = alloc_pair_scratch_rows(
+        b,
+        &format!("lgw-moe{li}-msg"),
+        &g.sg,
+        &format!("lgw-moe{li}-msu"),
+        &g.su,
+        m,
+    );
+    let sd_scratch = alloc_lin_scratch_rows(b, &format!("lgw-moe{li}-msd"), &g.sd, m);
+
+    let sy_gate = b.zeros(&format!("lgw-moe{li}-msyg"), (m * sinter * 2) as u64);
+    let sy_up = b.zeros(&format!("lgw-moe{li}-msyu"), (m * sinter * 2) as u64);
+    push_lin_gemv_pair_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-msgate"),
+        &g.sg,
+        &format!("lgw-moe{li}-msup"),
+        &g.su,
+        &sgu_scratch,
+        x_rows_packed,
+        &sy_gate,
+        &sy_up,
+        mp,
+    )?;
+    let sact = b.zeros(&format!("lgw-moe{li}-msact"), (m * sinter * 2) as u64);
+    push_silu_mul(
+        b,
+        s,
+        &format!("lgw-moe{li}-mssilu"),
+        &sy_gate,
+        &sy_up,
+        &sact,
+        m * sinter,
+    )?;
+    let shared_out = b.zeros(&format!("lgw-moe{li}-msout"), (m * hidden * 2) as u64);
+    push_lin_gemv_rows(
+        b,
+        s,
+        &format!("lgw-moe{li}-msdown"),
+        &g.sd,
+        &sd_scratch,
+        &sact,
+        &shared_out,
+        mp,
+    )?;
+
+    let cp = b.uni(
+        &format!("lgw-moe{li}-mcomb-p"),
+        CombineParams {
+            hidden_words: hidden_words as u32,
+            top_k: k_top as u32,
+            slot_stride_words: hidden_words as u32,
+            routed_scaling: shapes.routed_scaling,
+        },
+    );
+    let grid = b.grid1(hidden_words as u64, 64);
+    b.push(
+        &format!("lgw-moe{li}-mcombine"),
+        &s.moe,
+        "lgw_moe_combine_rows",
+        &[
+            (20, &y_down),
+            (21, &wts),
+            (22, &shared_out),
+            (23, out_rows_packed),
+            (24, &cp),
+        ],
+        (grid.0, m as u32, 1),
     )
 }
 

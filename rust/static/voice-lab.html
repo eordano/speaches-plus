@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Lab</title>
+<style>
+  :root{
+    --bg:#161518; --canvas:#0D0C0E; --card:#1D1C21; --card-deep:#0D0C0F;
+    --line:rgba(255,255,255,0.08); --line-strong:rgba(255,255,255,0.14);
+    --text:#FCFCFC; --soft:#CFCDD4; --mid:#A29DAA; --muted:#736E7D;
+    --ruby:#FF2D55; --ruby-soft:#FF859C; --ruby-dim:rgba(255,45,85,0.14); --green:#30CD00; --amber:#E0A82E;
+    --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,system-ui,sans-serif;min-height:100vh}
+  header{display:flex;align-items:center;gap:18px;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--canvas);position:sticky;top:0;z-index:2}
+  header h1{font-size:15px;font-weight:600;letter-spacing:.01em}
+  nav{display:flex;gap:4px} nav button{background:none;border:1px solid transparent;color:var(--mid);padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit}
+  nav button[aria-selected="true"]{color:var(--text);border-color:var(--line-strong);background:var(--card)}
+  .cfg{margin-left:auto;display:flex;gap:8px;align-items:center;color:var(--muted);font-size:12px}
+  .cfg input{background:var(--card-deep);border:1px solid var(--line);color:var(--soft);padding:4px 8px;border-radius:5px;font:12px var(--mono);width:220px}
+  main{padding:20px;max-width:1200px;margin:0 auto}
+  section[hidden]{display:none}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .card b{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:500}
+  .card span{font:500 20px/1.4 var(--mono);font-variant-numeric:tabular-nums} .card i{font-style:normal;color:var(--muted);font-size:12px}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:500;padding:9px 12px;border-bottom:1px solid var(--line)}
+  td{padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:middle;color:var(--soft)} tr:last-child td{border-bottom:0}
+  td.mono,.mono{font:12px var(--mono);font-variant-numeric:tabular-nums}
+  .chip{display:inline-block;padding:1px 8px;border-radius:999px;font:11px var(--mono);border:1px solid var(--line-strong);color:var(--mid)}
+  .chip.ok{color:var(--green);border-color:rgba(48,205,0,.4)} .chip.todo{color:var(--amber);border-color:rgba(224,168,46,.4)} .chip.stale{color:var(--ruby-soft);border-color:var(--ruby-line)}
+  .wrap{overflow-x:auto}
+  input.name{background:var(--card-deep);border:1px solid var(--line);color:var(--text);padding:4px 8px;border-radius:5px;font:inherit;width:190px}
+  button.act{background:var(--ruby-dim);border:1px solid var(--ruby-line);color:var(--ruby-soft);padding:5px 12px;border-radius:6px;cursor:pointer;font:inherit}
+  button.act:disabled{opacity:.5;cursor:default} button.ghost{background:none;border:1px solid var(--line-strong);color:var(--mid);padding:4px 10px;border-radius:6px;cursor:pointer;font:12px var(--mono)}
+  audio{height:30px;width:200px;vertical-align:middle}
+  form.fit{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;align-items:end;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px;margin-bottom:16px}
+  form.fit label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)} form.fit input,form.fit select{background:var(--card-deep);border:1px solid var(--line);color:var(--text);padding:6px 8px;border-radius:5px;font:inherit}
+  canvas{width:100%;height:160px;background:var(--card-deep);border:1px solid var(--line);border-radius:8px;display:block}
+  pre.log{font:12px var(--mono);color:var(--mid);background:var(--card-deep);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:220px;overflow:auto;margin-top:10px;white-space:pre-wrap}
+  p.note{color:var(--muted);font-size:12px;margin:8px 0 14px;max-width:70ch} .err{color:var(--ruby-soft)}
+  h2{font-size:14px;font-weight:600;margin:0 0 10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Voice Lab</h1>
+  <nav role="tablist">
+    <button role="tab" data-view="recordings" aria-selected="true">Recordings</button>
+    <button role="tab" data-view="speakers">Speakers</button>
+    <button role="tab" data-view="fit">Fit</button>
+    <button role="tab" data-view="voices">Voices</button>
+  </nav>
+  <div class="cfg">
+    <label>engine <input id="wsApi" placeholder="this server"></label>
+  </div>
+</header>
+<main>
+<section id="view-recordings">
+  <div class="cards" id="statusCards"></div>
+  <p class="note">Every row is one recording, keyed by the audio's hash. A stage chip is <em>done</em> when its artifact exists with the current producer version, <em>stale</em> when the producer changed since. The nightly run does scan, transcribe, diarize, identify and clips for whatever is missing; the button runs the same chain now.</p>
+  <div style="margin-bottom:10px"><button class="act" id="runBtn">Run pipeline now</button> <span id="runMsg" class="mono"></span></div>
+  <pre class="log" id="runLog" hidden></pre>
+  <div class="wrap"><table id="recTable"><thead><tr><th>Podcast</th><th>Recording</th><th>Length</th><th>transcript</th><th>diar</th><th>clips</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="view-speakers" hidden>
+  <p class="note">Clusters linked across recordings from the diarization embeddings. Confirm a name to make it propagate to every recording the cluster touches; hosts are proposed from the dominant voice per podcast. Play the longest clean turns before you decide.</p>
+  <div style="margin-bottom:10px"><button class="act" id="identifyBtn">Re-run identify</button> <span id="identifyMsg" class="mono"></span></div>
+  <div class="wrap"><table id="spkTable"><thead><tr><th>id</th><th>name</th><th>proposed</th><th>speech</th><th>recordings</th><th>listen</th></tr></thead><tbody></tbody></table></div>
+</section>
+<section id="view-fit" hidden>
+  <form class="fit" id="fitForm">
+    <label>speaker <select id="fitSpeaker"></select></label>
+    <label>voice name <input id="fitName" placeholder="adapted_voice" pattern="[A-Za-z0-9_\-]+" required></label>
+    <label>tier <select id="fitTier"><option value="style">style vector (1 KB, any server)</option><option value="adapter">decoder adaptation (candle, GPU)</option></select></label>
+    <label>budget (steps or epochs) <input id="fitSteps" type="number" min="1" placeholder="default"></label>
+    <label>patience <input id="fitPatience" type="number" min="1" placeholder="default"></label>
+    <button class="act" type="submit" id="fitStart">Start fit</button>
+  </form>
+  <p class="note">Progress streams from the job: held-out WeSpeaker similarity per evaluation, best so far, and the stop reason. The run keeps the best checkpoint and stops early when the score flattens.</p>
+  <canvas id="fitCanvas" width="1100" height="160"></canvas>
+  <pre class="log" id="fitLog"></pre>
+</section>
+<section id="view-voices" hidden>
+  <p class="note">The runtime store. A voice fitted a minute ago is served without a restart; type a sentence to hear it through the TTS engine.</p>
+  <div style="display:flex;gap:8px;margin-bottom:10px"><input class="name" id="ttsText" style="width:60%" value="The biggest bottleneck right now is not the chips, it is power and the memory supply chain."></div>
+  <div class="wrap"><table id="voiceTable"><thead><tr><th>voice</th><th>kind</th><th>speaker</th><th>held-out WeSpeaker</th><th>sample</th><th>engine</th><th></th></tr></thead><tbody></tbody></table></div>
+</section>
+</main>
+<script>
+(() => {
+  const $ = (s, r = document) => r.querySelector(s);
+  // The page is served by the engine that owns the workspace and the voices, so every call is
+  // same-origin unless ?ws= (or a remembered override) points at another engine.
+  const store = { get: k => { try { return localStorage.getItem(k) || ''; } catch { return ''; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* denied: keep in memory */ } } };
+  const qs = new URLSearchParams(location.search);
+  const cfg = { ws: (qs.get('ws') || store.get('voicelab.ws')).replace(/\/$/, '') };
+  Object.defineProperty(cfg, 'tts', { get: () => cfg.ws });
+  $('#wsApi').value = cfg.ws;
+  $('#wsApi').onchange = e => { cfg.ws = e.target.value.replace(/\/$/, ''); store.set('voicelab.ws', cfg.ws); refresh(); };
+  const api = (p, o) => fetch(cfg.ws + p, o).then(r => { if (!r.ok) throw new Error(r.status + ' ' + p); return r.headers.get('content-type')?.includes('json') ? r.json() : r; });
+  const fmtH = ms => ms ? (ms / 3.6e6).toFixed(1) + ' h' : '–';
+  const fmtM = s => s >= 3600 ? (s / 3600).toFixed(1) + ' h' : Math.round(s / 60) + ' min';
+  const chip = (st, kind) => `<span class="chip ${st.stale ? 'stale' : st.done ? 'ok' : 'todo'}">${st.stale ? 'stale' : st.done ? 'done' : 'todo'}</span>`;
+
+  document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+    document.querySelectorAll('nav button').forEach(x => x.setAttribute('aria-selected', x === b));
+    document.querySelectorAll('main > section').forEach(s => s.hidden = s.id !== 'view-' + b.dataset.view);
+    refresh(b.dataset.view);
+  });
+
+  let manifest = null, speakers = null;
+  async function loadRecordings() {
+    const st = await api('/v1/voices/workspace/status'); manifest = await api('/v1/voices/workspace/manifest');
+    const cards = [['recordings', st.recordings, fmtH(st.hours * 3.6e6)], ['transcripts', st.transcript.done, st.transcript.todo + ' to do'],
+      ['diarized', st.diar.done, st.diar.todo + ' to do' + (st.diar.stale ? ', ' + st.diar.stale + ' stale' : '')], ['clips', st.clips.done, st.clips.todo + ' to do'],
+      ['speakers', st.speakers.total, st.speakers.named + ' named'], ['voices', st.voices.length, st.voices.slice(0, 3).join(', ')]];
+    $('#statusCards').innerHTML = cards.map(([b, v, i]) => `<div class="card"><b>${b}</b><span>${v}</span><br><i>${i}</i></div>`).join('');
+    const prod = manifest.producers || {};
+    $('#recTable tbody').innerHTML = manifest.recordings.map(r => {
+      const s = k => ({ done: !!r.artifacts[k], stale: r.artifacts[k] && prod[k] && r.artifacts[k].producer !== prod[k] });
+      return `<tr><td>${r.podcast || ''}</td><td title="${r.sha256}">${r.title || r.path}</td><td class="mono">${r.duration_ms ? Math.round(r.duration_ms / 60000) + ' min' : ''}</td><td>${chip(s('transcript'))}</td><td>${chip(s('diar'))}</td><td>${chip(s('clips'))}</td></tr>`;
+    }).join('');
+  }
+  async function loadSpeakers() {
+    speakers = await api('/v1/voices/workspace/speakers');
+    const rows = speakers.speakers.slice().sort((a, b) => b.seconds - a.seconds);
+    $('#spkTable tbody').innerHTML = rows.map(s => {
+      const recs = new Set(s.sources.map(x => x.recording)).size;
+      return `<tr data-id="${s.id}"><td class="mono">${s.id}</td><td><input class="name" value="${s.name || ''}" placeholder="unnamed"></td><td>${s.name_proposed || ''}</td><td class="mono">${fmtM(s.seconds)}</td><td class="mono">${recs}</td><td><button class="ghost" data-listen="${s.id}">turns</button> <span class="clips"></span></td></tr>`;
+    }).join('');
+    $('#fitSpeaker').innerHTML = rows.map(s => `<option value="${s.id}">${s.name || s.name_proposed || s.id} · ${fmtM(s.seconds)}</option>`).join('');
+    document.querySelectorAll('#spkTable input.name').forEach(inp => inp.onchange = async e => {
+      const id = e.target.closest('tr').dataset.id;
+      await api('/v1/voices/workspace/speakers/' + id, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: e.target.value }) });
+    });
+    document.querySelectorAll('button[data-listen]').forEach(b => b.onclick = () => listen(b.dataset.listen, b.parentElement.querySelector('.clips')));
+  }
+  async function listen(id, holder) {
+    const s = speakers.speakers.find(x => x.id === id); holder.textContent = 'loading…';
+    const labels = new Map(); s.sources.forEach(x => labels.set(x.recording + '|' + x.label, x));
+    const recs = [...new Set(s.sources.map(x => x.recording))].slice(0, 4); const found = [];
+    for (const sha of recs) {
+      try { const c = await api(`/v1/voices/workspace/artifacts/${sha}/clips`); c.clips.filter(k => k.clean && labels.has(sha + '|' + k.speaker)).forEach(k => found.push({ sha, ...k })); } catch (e) { /* no clips yet */ }
+    }
+    found.sort((a, b) => b.dur - a.dur);
+    holder.innerHTML = found.length ? found.slice(0, 3).map(k => `<audio controls preload="none" src="${cfg.ws}/v1/voices/workspace/clip/${k.sha}/${k.i}" title="${k.dur.toFixed(0)} s"></audio>`).join(' ') : '<span class="err">no clean clips yet (run clips)</span>';
+  }
+  const hist = []; let es = null;
+  function draw() {
+    const c = $('#fitCanvas'), g = c.getContext('2d'); g.clearRect(0, 0, c.width, c.height);
+    g.strokeStyle = 'rgba(255,255,255,0.08)'; g.beginPath(); g.moveTo(40, c.height - 20); g.lineTo(c.width - 10, c.height - 20); g.moveTo(40, 10); g.lineTo(40, c.height - 20); g.stroke();
+    g.fillStyle = '#736E7D'; g.font = '11px ui-monospace,monospace'; g.fillText('0.3', 8, c.height - 18); g.fillText('0.9', 8, 16);
+    if (hist.length < 1) return;
+    const x = i => 40 + i * (c.width - 60) / Math.max(1, hist.length - 1), y = v => c.height - 20 - (v - 0.3) / 0.6 * (c.height - 30);
+    g.strokeStyle = '#FF859C'; g.lineWidth = 1.5; g.beginPath(); hist.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v))); g.stroke();
+    const bi = hist.indexOf(Math.max(...hist)); g.fillStyle = '#FF2D55'; g.beginPath(); g.arc(x(bi), y(hist[bi]), 3.5, 0, 7); g.fill();
+    g.fillStyle = '#CFCDD4'; g.fillText('best ' + hist[bi].toFixed(3), Math.min(x(bi) + 6, c.width - 90), y(hist[bi]) - 6);
+  }
+  $('#fitForm').onsubmit = async e => {
+    e.preventDefault(); hist.length = 0; draw(); $('#fitLog').textContent = ''; $('#fitStart').disabled = true;
+    const body = { speaker: $('#fitSpeaker').value, name: $('#fitName').value, tier: $('#fitTier').value };
+    if ($('#fitSteps').value) body.steps = +$('#fitSteps').value; if ($('#fitPatience').value) body.patience = +$('#fitPatience').value;
+    try {
+      const job = await api('/v1/voices/fit', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      es?.close(); es = new EventSource(cfg.ws + job.events);
+      es.onmessage = ev => { const d = JSON.parse(ev.data); $('#fitLog').textContent += JSON.stringify(d) + '\n'; $('#fitLog').scrollTop = 1e9;
+        if (d.stage === 'train' && typeof d.wsim === 'number') { hist.push(d.wsim); draw(); }
+        if (d.stage === 'done' || d.stage === 'error') { es.close(); $('#fitStart').disabled = false; if (d.stage === 'done') loadVoices(); } };
+      es.onerror = () => { $('#fitStart').disabled = false; };
+    } catch (err) { $('#fitLog').textContent = 'start failed: ' + err.message; $('#fitStart').disabled = false; }
+  };
+  async function loadVoices() {
+    const v = await api('/v1/voices');
+    $('#voiceTable tbody').innerHTML = v.data.map(x => {
+      const ev = x.eval || {}; const sample = (x.files || []).find(f => /^sample_0\.wav$/.test(f));
+      return `<tr><td class="mono">${x.name}</td><td><span class="chip">${x.kind || ''}</span></td><td class="mono">${x.speaker_id || ''}</td><td class="mono">${ev.wespeaker_heldout ?? ''}${ev.best_stock ? ` <i style="color:var(--muted)">stock ${ev.best_stock.wespeaker}</i>` : ''}</td><td>${sample ? `<audio controls preload="none" src="${cfg.ws}/v1/voices/${x.name}/files/${sample}"></audio>` : ''}</td><td><button class="ghost" data-say="${x.name}">say it</button> <span class="say"></span></td><td></td></tr>`;
+    }).join('');
+    document.querySelectorAll('button[data-say]').forEach(b => b.onclick = async () => {
+      const holder = b.parentElement.querySelector('.say'); holder.textContent = '…';
+      try {
+        const r = await fetch(cfg.tts + '/v1/audio/speech', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'kokoro', voice: b.dataset.say, input: $('#ttsText').value, response_format: 'wav' }) });
+        if (!r.ok) throw new Error(r.status + ' ' + (await r.text()).slice(0, 120));
+        holder.innerHTML = `<audio controls autoplay src="${URL.createObjectURL(await r.blob())}"></audio>`;
+      } catch (err) { holder.innerHTML = `<span class="err">${err.message}</span>`; }
+    });
+  }
+  $('#runBtn').onclick = async () => {
+    $('#runBtn').disabled = true; $('#runMsg').textContent = 'running…'; const log = $('#runLog'); log.hidden = false; log.textContent = '';
+    try {
+      const job = await api('/v1/voices/workspace/run', { method: 'POST' });
+      const rs = new EventSource(cfg.ws + job.events);
+      rs.onmessage = ev => { const d = JSON.parse(ev.data); log.textContent += (d.message || JSON.stringify(d)) + '\n'; log.scrollTop = 1e9;
+        if (d.stage === 'done' || d.stage === 'error') { rs.close(); $('#runBtn').disabled = false; $('#runMsg').textContent = d.stage === 'done' ? 'finished' : 'failed'; loadRecordings(); } };
+      rs.onerror = () => { $('#runBtn').disabled = false; };
+    } catch (e) { $('#runMsg').textContent = e.message; $('#runBtn').disabled = false; }
+  };
+  $('#identifyBtn').onclick = async () => { $('#identifyMsg').textContent = 'running…'; try { const r = await api('/v1/voices/workspace/identify', { method: 'POST' }); $('#identifyMsg').textContent = `${r.speakers} speakers, ${r.hosts} hosts`; loadSpeakers(); } catch (e) { $('#identifyMsg').textContent = e.message; } };
+  async function refresh(view) {
+    view = view || document.querySelector('nav button[aria-selected="true"]').dataset.view;
+    try { if (view === 'recordings') await loadRecordings(); else if (view === 'speakers' || view === 'fit') await loadSpeakers(); else if (view === 'voices') await loadVoices(); }
+    catch (e) { $('#statusCards').innerHTML = `<div class="card"><b>error</b><span class="err" style="font-size:14px">${e.message}</span></div>`; }
+  }
+  draw(); refresh();
+})();
+</script>
+</body>
+</html>

@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Context;
+use anyhow::Result;
 use candle_core::{DType, Tensor};
 
 #[cfg(feature = "cuda")]
@@ -576,10 +578,10 @@ impl MoeBlock {
 
 #[cfg(feature = "cuda")]
 fn grouped_enabled() -> bool {
-    match std::env::var("SPEACHES_MOE_GROUPED").ok().as_deref() {
-        Some("1") | Some("true") | Some("on") => true,
-        _ => false,
-    }
+    matches!(
+        std::env::var("SPEACHES_MOE_GROUPED").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -837,7 +839,7 @@ pub fn nvfp4_linear_from_disk_fused_pair(
     device: &Device,
     sfx: Nvfp4Suffixes,
 ) -> Result<Linear> {
-    if out_features_each % 128 != 0 {
+    if !out_features_each.is_multiple_of(128) {
         anyhow::bail!(
             "fused NVFP4 pair: out_features_each ({}) must be a multiple of 128 \
              so the swizzled scale layout concatenates cleanly",
@@ -961,7 +963,7 @@ pub fn nvfp4_linear_from_disk_fused_pair(
 }
 
 #[cfg(feature = "cuda")]
-fn dequantize_nvfp4_to_bf16(
+pub fn dequantize_nvfp4_to_bf16(
     weights: &nv_weights::WeightLoader,
     module: &str,
     out_features: usize,

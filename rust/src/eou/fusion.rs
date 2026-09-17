@@ -210,9 +210,11 @@ pub fn combine_fusion(p_text: f32, p_audio: f32, rule: FusionRule, weight_text: 
             w * pt + (1.0 - w) * pa
         }
         FusionRule::Gated | FusionRule::Logit => (pt + pa) * 0.5,
-        FusionRule::Banded => {
-            band_blend(pt, pa, &DEFAULT_BANDED_FUSION_WEIGHTS_FIT_ON_CONTEXT_PROBE_BAND)
-        }
+        FusionRule::Banded => band_blend(
+            pt,
+            pa,
+            &DEFAULT_BANDED_FUSION_WEIGHTS_FIT_ON_CONTEXT_PROBE_BAND,
+        ),
     };
     combined.clamp(0.0, 1.0)
 }
@@ -468,7 +470,10 @@ mod tests {
     fn banded_parse_round_trip_and_aliases() {
         assert_eq!(FusionRule::parse("banded"), Some(FusionRule::Banded));
         assert_eq!(FusionRule::parse("band-gated"), Some(FusionRule::Banded));
-        assert_eq!(FusionRule::parse(FusionRule::Banded.as_str()), Some(FusionRule::Banded));
+        assert_eq!(
+            FusionRule::parse(FusionRule::Banded.as_str()),
+            Some(FusionRule::Banded)
+        );
     }
 
     #[test]
@@ -517,7 +522,10 @@ mod tests {
         let mut prev = 0.0f32;
         for pt in [0.05f32, 0.25, 0.5, 0.75, 0.95] {
             let f = combine_fusion_banded(pt, 0.5, w);
-            assert!(f >= prev, "more terminal text must never lower the fused score");
+            assert!(
+                f >= prev,
+                "more terminal text must never lower the fused score"
+            );
             prev = f;
         }
     }

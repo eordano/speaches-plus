@@ -1,5 +1,7 @@
 #![cfg(feature = "cuda")]
 
+pub mod prefix;
+
 use anyhow::{Context, Result};
 use candle_core::{CudaDevice, DType, Device, Tensor};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
@@ -10,7 +12,7 @@ use std::sync::Arc;
 use crate::gemma4::{Gemma4Cache, LayerType};
 use crate::laguna::{Laguna, LagunaFfn, LagunaKvCache};
 use crate::laguna_fa2::{varlen_fwd_bf16, VarlenArgs};
-use crate::laguna_fp8::LagunaKvCacheFp8;
+use crate::laguna_fp8::{LagunaFp8ScalePolicy, LagunaKvCacheFp8};
 use crate::laguna_graph::moe_block_body;
 use nv_kernels::graph::CudaGraphRunner;
 use nv_layers::moe_grouped::{GroupedDecodeContext, MoeGroupedWeights};
@@ -30,8 +32,23 @@ pub(crate) fn fine_prof_enabled() -> bool {
 pub(crate) fn m1_flash_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_LAGUNA_M1_FLASH")
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_LAGUNA_M1_FLASH",
+        )
     })
+}
+
+const M1_FUSED_TC_SPLITS_32_MUST_EQUAL_THE_VERIFY_GRAPHS_SO_ROW_J_REDUCES_LIKE_THE_M1_STEP: usize = 32;
+
+pub const USER_SIGNOFF_2026_09_14_FOLD_IT: &str =
+    "the verify graph folds the shared expert like the M=1 graph (its rows=1 pass is LagunaStepGraph bitwise through all 40 layers and the logits in the aux ledger at 2048 and 32768); default on, NV_LAGUNA_VERIFY_FOLDED_SHARED=0 restores the unfolded context";
+
+fn verify_dense_rows_run_as_t_single_row_forwards_so_each_row_is_the_m1_step_bitwise_opt_in_until_the_ledger_reads_bitwise() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_VERIFY_DENSE_ROWS_AS_M1")
+}
+
+fn m1_full_attention_through_the_fused_tc_verify_kernel_opt_in_until_petas_no_draft_bracket() -> bool {
+    nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_LAGUNA_M1_FUSED_TC")
 }
 
 struct M1FlashBufs {
@@ -55,7 +72,7 @@ fn m1_qkv_q8_enabled() -> bool {
     })
 }
 
-fn w8_bytes_ptr(p: &crate::laguna::LagunaProjW8, stream: &Arc<CudaStream>) -> u64 {
+pub(crate) fn w8_bytes_ptr(p: &crate::laguna::LagunaProjW8, stream: &Arc<CudaStream>) -> u64 {
     match p.bytes() {
         crate::laguna::LagunaProjBytes::I8(b) => {
             let (q, _g) = b.device_ptr(stream);
@@ -68,7 +85,7 @@ fn w8_bytes_ptr(p: &crate::laguna::LagunaProjW8, stream: &Arc<CudaStream>) -> u6
     }
 }
 
-fn w8_scale_ptr(p: &crate::laguna::LagunaProjW8, stream: &Arc<CudaStream>) -> u64 {
+pub(crate) fn w8_scale_ptr(p: &crate::laguna::LagunaProjW8, stream: &Arc<CudaStream>) -> u64 {
     let (q, _g) = p.row_scale().device_ptr(stream);
     q
 }
@@ -358,7 +375,11 @@ pub(crate) fn bf16_ptr(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Resu
     Ok(p)
 }
 
-fn wrap_bf16(slice: CudaSlice<bf16>, dims: (usize, usize, usize), dev: &CudaDevice) -> Tensor {
+pub(crate) fn wrap_bf16(
+    slice: CudaSlice<bf16>,
+    dims: (usize, usize, usize),
+    dev: &CudaDevice,
+) -> Tensor {
     let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
     Tensor::from_storage(
         candle_core::Storage::Cuda(storage),
@@ -368,9 +389,514 @@ fn wrap_bf16(slice: CudaSlice<bf16>, dims: (usize, usize, usize), dev: &CudaDevi
     )
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct NvLagunaXqaInfo {
+    pub abi_version: u32,
+    pub query_rows: u32,
+    pub capacity: u32,
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub page_size: u32,
+    pub splits: u32,
+    pub dynamic_shared_bytes: u32,
+    pub scratch_alignment: u32,
+    pub scratch_bytes: u64,
+    pub metadata_bytes: u64,
+    pub status_device: u64,
+}
+
+extern "C" {
+    fn dlopen(filename: *const std::os::raw::c_char, flag: std::os::raw::c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const std::os::raw::c_char) -> *mut c_void;
+}
+const RTLD_NOW_GLIBC: std::os::raw::c_int = 2;
+const RTLD_GLOBAL_GLIBC: std::os::raw::c_int = 0x100;
+
+type XqaCreateFn = unsafe extern "C" fn(
+    *const std::os::raw::c_char,
+    u32,
+    u32,
+    *mut *mut c_void,
+    *mut NvLagunaXqaInfo,
+) -> i32;
+type XqaLaunchFn =
+    unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u64, f32, *mut c_void) -> i32;
+type XqaDestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+
+struct XqaAdapter {
+    create: XqaCreateFn,
+    launch: XqaLaunchFn,
+    destroy: XqaDestroyFn,
+    dir: std::path::PathBuf,
+}
+
+unsafe impl Send for XqaAdapter {}
+unsafe impl Sync for XqaAdapter {}
+
+const XQA_ADAPTER_IS_ROOTS_PINNED_FLASHINFER_0_6_4_XQA_KERNEL_BEHIND_A_C_ABI_LOADED_AT_RUNTIME_ONLY_WHEN_NV_LAGUNA_XQA_IS_1: &str =
+    "NV_LAGUNA_XQA=1 needs NV_LAGUNA_XQA_DIR pointing at liblaguna_xqa_adapter.so and laguna-xqa-bf16-m{1,2,3,5}.cubin (temp/q38-coord/xqa-native-adapter-candidate/build.sh output)";
+
+fn xqa_adapter() -> Result<Option<&'static XqaAdapter>> {
+    static ADAPTER: std::sync::OnceLock<Option<XqaAdapter>> = std::sync::OnceLock::new();
+    if !std::env::var("NV_LAGUNA_XQA")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let loaded = ADAPTER.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var("NV_LAGUNA_XQA_DIR").unwrap_or_default());
+        let lib = std::ffi::CString::new(
+            dir.join("liblaguna_xqa_adapter.so")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .ok()?;
+        let handle = unsafe { dlopen(lib.as_ptr(), RTLD_NOW_GLIBC | RTLD_GLOBAL_GLIBC) };
+        if handle.is_null() {
+            eprintln!("[laguna_xqa] dlopen failed for {}", lib.to_string_lossy());
+            return None;
+        }
+        let sym = |name: &str| -> *mut c_void {
+            let c = std::ffi::CString::new(name).unwrap();
+            unsafe { dlsym(handle, c.as_ptr()) }
+        };
+        let (c, l, d) = (
+            sym("nv_laguna_xqa_create"),
+            sym("nv_laguna_xqa_launch"),
+            sym("nv_laguna_xqa_destroy"),
+        );
+        if c.is_null() || l.is_null() || d.is_null() {
+            eprintln!(
+                "[laguna_xqa] adapter symbols missing in {}",
+                lib.to_string_lossy()
+            );
+            return None;
+        }
+        Some(XqaAdapter {
+            create: unsafe { std::mem::transmute::<*mut c_void, XqaCreateFn>(c) },
+            launch: unsafe { std::mem::transmute::<*mut c_void, XqaLaunchFn>(l) },
+            destroy: unsafe { std::mem::transmute::<*mut c_void, XqaDestroyFn>(d) },
+            dir,
+        })
+    });
+    match loaded {
+        Some(a) => Ok(Some(a)),
+        None => anyhow::bail!("{XQA_ADAPTER_IS_ROOTS_PINNED_FLASHINFER_0_6_4_XQA_KERNEL_BEHIND_A_C_ABI_LOADED_AT_RUNTIME_ONLY_WHEN_NV_LAGUNA_XQA_IS_1}"),
+    }
+}
+
+pub struct XqaPlan {
+    adapter: &'static XqaAdapter,
+    plan: *mut c_void,
+    info: NvLagunaXqaInfo,
+    rows: usize,
+}
+
+unsafe impl Send for XqaPlan {}
+
+impl XqaPlan {
+    fn new_for(
+        rows: usize,
+        capacity: usize,
+        kv_heads: usize,
+        q_heads: usize,
+        hd: usize,
+        label: &str,
+    ) -> Result<Option<Self>> {
+        let Some(adapter) = xqa_adapter()? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(matches!(rows, 1 | 2 | 3 | 5) && kv_heads == 8 && q_heads == 48 && hd == 128 && capacity.is_multiple_of(128) && (128..=262144).contains(&capacity),
+            "NV_LAGUNA_XQA=1 supports rows 1, 2, 3 or 5 (m{rows}.cubin), 48/8 heads, hd 128, capacity a multiple of 128 up to 262144 (got rows={rows} capacity={capacity} q={q_heads} kv={kv_heads} hd={hd})");
+        let cubin = std::ffi::CString::new(
+            adapter
+                .dir
+                .join(format!("laguna-xqa-bf16-m{rows}.cubin"))
+                .to_string_lossy()
+                .as_bytes(),
+        )?;
+        let mut plan: *mut c_void = std::ptr::null_mut();
+        let mut info = NvLagunaXqaInfo::default();
+        let rc = unsafe {
+            (adapter.create)(
+                cubin.as_ptr(),
+                rows as u32,
+                capacity as u32,
+                &mut plan,
+                &mut info,
+            )
+        };
+        anyhow::ensure!(
+            rc == 0 && !plan.is_null(),
+            "nv_laguna_xqa_create rc={rc} rows={rows} capacity={capacity}"
+        );
+        eprintln!("[laguna_xqa] route=xqa-bf16 graph={label} rows={rows} capacity={capacity} splits={} dynamic_shared_bytes={} scratch_bytes={} status_device={:#x} (pinned FlashInfer XQA via root's C ABI; full-attention layers only; sliding layers stay native)",
+            info.splits, info.dynamic_shared_bytes, info.scratch_bytes, info.status_device);
+        Ok(Some(Self {
+            adapter,
+            plan,
+            info,
+            rows,
+        }))
+    }
+
+    fn launch(
+        &self,
+        s: &Arc<CudaStream>,
+        q: u64,
+        k: u64,
+        v: u64,
+        out: u64,
+        committed: u64,
+    ) -> Result<()> {
+        let rc = unsafe {
+            (self.adapter.launch)(
+                self.plan,
+                q,
+                k,
+                v,
+                out,
+                committed,
+                1.0,
+                s.cu_stream() as *mut c_void,
+            )
+        };
+        anyhow::ensure!(rc == 0, "nv_laguna_xqa_launch rc={rc} rows={}", self.rows);
+        Ok(())
+    }
+
+    fn status_after_sync(&self, s: &Arc<CudaStream>) -> Result<()> {
+        let mut status = [0u32; 1];
+        let view = unsafe { s.upgrade_device_ptr::<u32>(self.info.status_device, 1) };
+        let copied = s.memcpy_dtoh(&view, &mut status[..]);
+        std::mem::forget(view);
+        copied.map_err(|e| anyhow::anyhow!("xqa status dtoh: {e:?}"))?;
+        anyhow::ensure!(
+            status[0] == 0,
+            "xqa span status {} (committed + rows exceeded capacity; output poisoned)",
+            status[0]
+        );
+        Ok(())
+    }
+}
+
+impl Drop for XqaPlan {
+    fn drop(&mut self) {
+        unsafe { (self.adapter.destroy)(self.plan) };
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct NvLagunaXqaFp8Info {
+    pub abi_version: u32,
+    pub query_rows: u32,
+    pub capacity: u32,
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub page_size: u32,
+    pub splits: u32,
+    pub dynamic_shared_bytes: u32,
+    pub scratch_alignment: u32,
+    pub scratch_bytes: u64,
+    pub metadata_bytes: u64,
+    pub status_device: u64,
+    pub cache_elem_enum: u32,
+    pub scale_mode: u32,
+    pub k_scale: f32,
+    pub v_scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NvLagunaXqaFp8CacheView {
+    pub cache_elem_enum: u32,
+    pub scale_mode: u32,
+    pub k_scale: f32,
+    pub v_scale: f32,
+    pub k: u64,
+    pub v: u64,
+    pub k_row_scales: u64,
+    pub v_row_scales: u64,
+}
+
+const XQA_FP8_CACHE_ELEM_ENUM_2_IS_E4M3: u32 = 2;
+const XQA_FP8_SCALE_MODE_1_IS_FIXED_ONE: u32 = 1;
+
+type XqaFp8CreateFn = unsafe extern "C" fn(
+    *const std::os::raw::c_char,
+    u32,
+    u32,
+    *mut *mut c_void,
+    *mut NvLagunaXqaFp8Info,
+) -> i32;
+type XqaFp8LaunchFn = unsafe extern "C" fn(
+    *mut c_void,
+    u64,
+    *const NvLagunaXqaFp8CacheView,
+    u64,
+    u64,
+    f32,
+    *mut c_void,
+) -> i32;
+type XqaFp8DestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+
+struct XqaFp8Adapter {
+    create: XqaFp8CreateFn,
+    launch: XqaFp8LaunchFn,
+    destroy: XqaFp8DestroyFn,
+    dir: std::path::PathBuf,
+}
+
+unsafe impl Send for XqaFp8Adapter {}
+unsafe impl Sync for XqaFp8Adapter {}
+
+const XQA_FP8_ADAPTER_IS_ROOTS_FIXED_ONE_E4M3_KV_SPECIALIZATION_OF_THE_PINNED_FLASHINFER_XQA_KERNEL: &str =
+    "NV_LAGUNA_XQA_FP8=1 needs NV_LAGUNA_XQA_FP8_DIR pointing at liblaguna_xqa_fp8_adapter.so and laguna-xqa-fp8-m{1,2,3,5}.cubin (temp/q38-coord/xqa-fp8-fixed-scale-candidate/build.sh output)";
+
+fn xqa_fp8_adapter() -> Result<Option<&'static XqaFp8Adapter>> {
+    static ADAPTER: std::sync::OnceLock<Option<XqaFp8Adapter>> = std::sync::OnceLock::new();
+    if !std::env::var("NV_LAGUNA_XQA_FP8")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let loaded = ADAPTER.get_or_init(|| {
+        let dir =
+            std::path::PathBuf::from(std::env::var("NV_LAGUNA_XQA_FP8_DIR").unwrap_or_default());
+        let lib = std::ffi::CString::new(
+            dir.join("liblaguna_xqa_fp8_adapter.so")
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .ok()?;
+        let handle = unsafe { dlopen(lib.as_ptr(), RTLD_NOW_GLIBC | RTLD_GLOBAL_GLIBC) };
+        if handle.is_null() {
+            eprintln!(
+                "[laguna_xqa_fp8] dlopen failed for {}",
+                lib.to_string_lossy()
+            );
+            return None;
+        }
+        let sym = |name: &str| -> *mut c_void {
+            let c = std::ffi::CString::new(name).unwrap();
+            unsafe { dlsym(handle, c.as_ptr()) }
+        };
+        let (c, l, d) = (
+            sym("nv_laguna_xqa_fp8_create"),
+            sym("nv_laguna_xqa_fp8_launch"),
+            sym("nv_laguna_xqa_fp8_destroy"),
+        );
+        if c.is_null() || l.is_null() || d.is_null() {
+            eprintln!(
+                "[laguna_xqa_fp8] adapter symbols missing in {}",
+                lib.to_string_lossy()
+            );
+            return None;
+        }
+        Some(XqaFp8Adapter {
+            create: unsafe { std::mem::transmute::<*mut c_void, XqaFp8CreateFn>(c) },
+            launch: unsafe { std::mem::transmute::<*mut c_void, XqaFp8LaunchFn>(l) },
+            destroy: unsafe { std::mem::transmute::<*mut c_void, XqaFp8DestroyFn>(d) },
+            dir,
+        })
+    });
+    match loaded {
+        Some(a) => Ok(Some(a)),
+        None => anyhow::bail!("{XQA_FP8_ADAPTER_IS_ROOTS_FIXED_ONE_E4M3_KV_SPECIALIZATION_OF_THE_PINNED_FLASHINFER_XQA_KERNEL}"),
+    }
+}
+
+pub struct XqaFp8Plan {
+    adapter: &'static XqaFp8Adapter,
+    plan: *mut c_void,
+    info: NvLagunaXqaFp8Info,
+    rows: usize,
+}
+
+unsafe impl Send for XqaFp8Plan {}
+
+impl XqaFp8Plan {
+    pub(crate) fn new_for(
+        rows: usize,
+        capacity: usize,
+        kv_heads: usize,
+        q_heads: usize,
+        hd: usize,
+        policy: LagunaFp8ScalePolicy,
+        label: &str,
+    ) -> Result<Option<Self>> {
+        let Some(adapter) = xqa_fp8_adapter()? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(policy == LagunaFp8ScalePolicy::FixedOne,
+            "NV_LAGUNA_XQA_FP8=1 reads raw e4m3 KV with a fixed unit scale and needs NV_LAGUNA_FP8_UNIT_SCALE=1 at cache creation; the dynamic per-token/head-scaled fp8 cache is incompatible and is never relabeled (got {policy:?})");
+        anyhow::ensure!(matches!(rows, 1 | 2 | 3 | 5) && kv_heads == 8 && q_heads == 48 && hd == 128 && capacity.is_multiple_of(128) && (128..=262144).contains(&capacity),
+            "NV_LAGUNA_XQA_FP8=1 supports rows 1, 2, 3 or 5 (m{rows}.cubin), 48/8 heads, hd 128, capacity a multiple of 128 up to 262144 (got rows={rows} capacity={capacity} q={q_heads} kv={kv_heads} hd={hd})");
+        let cubin = std::ffi::CString::new(
+            adapter
+                .dir
+                .join(format!("laguna-xqa-fp8-m{rows}.cubin"))
+                .to_string_lossy()
+                .as_bytes(),
+        )?;
+        let mut plan: *mut c_void = std::ptr::null_mut();
+        let mut info = NvLagunaXqaFp8Info::default();
+        let rc = unsafe {
+            (adapter.create)(
+                cubin.as_ptr(),
+                rows as u32,
+                capacity as u32,
+                &mut plan,
+                &mut info,
+            )
+        };
+        anyhow::ensure!(
+            rc == 0 && !plan.is_null(),
+            "nv_laguna_xqa_fp8_create rc={rc} rows={rows} capacity={capacity}"
+        );
+        anyhow::ensure!(info.cache_elem_enum == XQA_FP8_CACHE_ELEM_ENUM_2_IS_E4M3 && info.scale_mode == XQA_FP8_SCALE_MODE_1_IS_FIXED_ONE && info.k_scale == 1.0 && info.v_scale == 1.0,
+            "fp8 XQA plan metadata is not the fixed-one e4m3 contract: elem={} scale_mode={} k_scale={} v_scale={}", info.cache_elem_enum, info.scale_mode, info.k_scale, info.v_scale);
+        eprintln!("[laguna_xqa_fp8] route=xqa-fp8-fixed-one graph={label} rows={rows} capacity={capacity} splits={} dynamic_shared_bytes={} scratch_bytes={} status_device={:#x} (root's fixed-unit-scale e4m3 specialization of the pinned FlashInfer XQA kernel; full-attention layers only; numerically unqualified)",
+            info.splits, info.dynamic_shared_bytes, info.scratch_bytes, info.status_device);
+        Ok(Some(Self {
+            adapter,
+            plan,
+            info,
+            rows,
+        }))
+    }
+
+    pub(crate) fn launch(
+        &self,
+        s: &Arc<CudaStream>,
+        q: u64,
+        k: u64,
+        v: u64,
+        out: u64,
+        committed: u64,
+    ) -> Result<()> {
+        let view = NvLagunaXqaFp8CacheView {
+            cache_elem_enum: XQA_FP8_CACHE_ELEM_ENUM_2_IS_E4M3,
+            scale_mode: XQA_FP8_SCALE_MODE_1_IS_FIXED_ONE,
+            k_scale: 1.0,
+            v_scale: 1.0,
+            k,
+            v,
+            k_row_scales: 0,
+            v_row_scales: 0,
+        };
+        let rc = unsafe {
+            (self.adapter.launch)(
+                self.plan,
+                q,
+                &view,
+                out,
+                committed,
+                1.0,
+                s.cu_stream() as *mut c_void,
+            )
+        };
+        anyhow::ensure!(
+            rc == 0,
+            "nv_laguna_xqa_fp8_launch rc={rc} rows={}",
+            self.rows
+        );
+        Ok(())
+    }
+
+    pub(crate) fn status_after_sync(&self, s: &Arc<CudaStream>) -> Result<()> {
+        let mut status = [0u32; 1];
+        let view = unsafe { s.upgrade_device_ptr::<u32>(self.info.status_device, 1) };
+        let copied = s.memcpy_dtoh(&view, &mut status[..]);
+        std::mem::forget(view);
+        copied.map_err(|e| anyhow::anyhow!("xqa fp8 status dtoh: {e:?}"))?;
+        anyhow::ensure!(
+            status[0] == 0,
+            "xqa fp8 span status {} (committed + rows exceeded capacity; output poisoned)",
+            status[0]
+        );
+        Ok(())
+    }
+}
+
+impl Drop for XqaFp8Plan {
+    fn drop(&mut self) {
+        unsafe { (self.adapter.destroy)(self.plan) };
+    }
+}
+
+pub enum StepCache {
+    Bf16(LagunaKvCache),
+    Fp8(LagunaKvCacheFp8),
+}
+
+impl StepCache {
+    pub fn current_len(&self) -> usize {
+        match self {
+            Self::Bf16(c) => c.current_len(),
+            Self::Fp8(c) => c.current_len(),
+        }
+    }
+    pub fn max_seq_len(&self) -> usize {
+        match self {
+            Self::Bf16(c) => c.max_seq_len(),
+            Self::Fp8(c) => c.max_seq_len(),
+        }
+    }
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8(_))
+    }
+    pub fn reset(&mut self) {
+        match self {
+            Self::Bf16(c) => c.reset(),
+            Self::Fp8(c) => c.reset(),
+        }
+    }
+    pub fn rollback(&mut self, n: usize) -> Result<()> {
+        match self {
+            Self::Bf16(c) => c.rollback(n),
+            Self::Fp8(c) => c.rollback(n),
+        }
+    }
+    fn advance(&mut self, n: usize) {
+        match self {
+            Self::Bf16(c) => c.advance(n),
+            Self::Fp8(c) => c.advance(n),
+        }
+    }
+    fn note_graph_write(&mut self) {
+        match self {
+            Self::Bf16(c) => c.note_graph_write(),
+            Self::Fp8(c) => c.note_graph_write(),
+        }
+    }
+    fn prepare_for_decode(&mut self, write_pos: usize, n_total: usize) -> Result<()> {
+        match self {
+            Self::Bf16(c) => c.prepare_for_decode(write_pos, n_total),
+            Self::Fp8(c) => c.prepare_for_decode_dev(write_pos, n_total),
+        }
+    }
+}
+
+const BF16_CACHE_ACCESSORS_STAY_FOR_THE_PREFILL_CACHE_TESTS_IN_LAGUNA_RS_AND_FP8_STEP_GRAPHS_USE_KV_MUT: &str =
+    "LagunaStepGraph::cache/cache_mut are the bf16 accessors; this graph owns an fp8 KV cache, use kv()/kv_mut()";
+
+pub const AUX_TAP_AFTER_ATTENTION_OFFSET_10000_ADDED_TO_THE_LAYER_INDEX_TAPS_THE_POST_ATTENTION_RESIDUAL: usize = 10_000;
+
 pub struct LagunaStepGraph {
     model: Arc<Laguna>,
-    cache: LagunaKvCache,
+    cache: StepCache,
+    verify_split: Option<VerifySplitBufs>,
+    fp8: Option<Fp8VerifyState>,
+    xqa: Option<XqaPlan>,
+    xqa_fp8: Option<XqaFp8Plan>,
+    sliding_rows: Option<SlidingVerifyBufs>,
     dev: CudaDevice,
     device: Device,
     forked: Arc<CudaStream>,
@@ -394,6 +920,8 @@ pub struct LagunaStepGraph {
     captured: bool,
     prof: Option<StepProfStamps>,
     m1_flash: Option<M1FlashBufs>,
+    aux_layers: Vec<usize>,
+    aux_ts: Vec<Tensor>,
 
     _err_drain: CtxErrDrain,
 }
@@ -410,6 +938,26 @@ unsafe impl Send for LagunaStepGraph {}
 
 impl LagunaStepGraph {
     pub fn new(model: Arc<Laguna>, cache: LagunaKvCache) -> Result<Self> {
+        Self::new_inner(model, StepCache::Bf16(cache), &[])
+    }
+
+    pub fn new_with_aux_taps_of_every_listed_layers_output_row(
+        model: Arc<Laguna>,
+        cache: LagunaKvCache,
+        aux_layers: &[usize],
+    ) -> Result<Self> {
+        Self::new_inner(model, StepCache::Bf16(cache), aux_layers)
+    }
+
+    pub fn new_fp8(model: Arc<Laguna>, cache: LagunaKvCacheFp8) -> Result<Self> {
+        Self::new_inner(model, StepCache::Fp8(cache), &[])
+    }
+
+    pub fn aux(&self) -> &[Tensor] {
+        &self.aux_ts
+    }
+
+    fn new_inner(model: Arc<Laguna>, cache: StepCache, aux_layers: &[usize]) -> Result<Self> {
         let device = model.device().clone();
         let dev = match &device {
             Device::Cuda(d) => d.clone(),
@@ -419,15 +967,19 @@ impl LagunaStepGraph {
             model.dtype() == DType::BF16,
             "LagunaStepGraph requires BF16"
         );
-        anyhow::ensure!(
-            cache.has_ring(),
-            "LagunaStepGraph requires the ring KV cache"
-        );
-        let meta_ptr = cache
-            .ring_meta_ptr()
-            .ok_or_else(|| anyhow::anyhow!("ring meta missing"))?;
-        let s_cap = cache.sliding_cap().unwrap_or(0);
+        let (meta_ptr, s_cap) = match &cache {
+            StepCache::Bf16(c) => {
+                anyhow::ensure!(c.has_ring(), "LagunaStepGraph requires the ring KV cache");
+                (
+                    c.ring_meta_ptr()
+                        .ok_or_else(|| anyhow::anyhow!("ring meta missing"))?,
+                    c.sliding_cap().unwrap_or(0),
+                )
+            }
+            StepCache::Fp8(c) => (c.ring_meta_ptr(), c.sliding_cap()),
+        };
         anyhow::ensure!(s_cap > 0, "LagunaStepGraph: no sliding capacity");
+        let max_seq_len = cache.max_seq_len();
 
         let raw_ctx: Arc<CudaContext> = dev.cuda_stream().context().clone();
         let mut ctor_guard = crate::gemma4_batch_graph::graph_teardown::CtorForkGuard::new();
@@ -471,8 +1023,22 @@ impl LagunaStepGraph {
 
         let mut layer_kv = Vec::with_capacity(model.layers().len());
         let mut grouped = Vec::with_capacity(model.layers().len());
+        let mut fp8_layers: Vec<Option<Fp8VerifyLayer>> = Vec::with_capacity(model.layers().len());
         for (li, layer) in model.layers().iter().enumerate() {
-            layer_kv.push(Some(cache.layer_kv_bufs(li)));
+            match &cache {
+                StepCache::Bf16(c) => {
+                    layer_kv.push(Some(c.layer_kv_bufs(li)));
+                    fp8_layers.push(None);
+                }
+                StepCache::Fp8(c) => {
+                    layer_kv.push(c.layer_bf16_bufs(li));
+                    fp8_layers.push(c.layer_fp8_ptrs(li).map(Fp8VerifyLayer::from_ptrs));
+                    anyhow::ensure!(
+                        layer_kv[li].is_some() != fp8_layers[li].is_some(),
+                        "fp8 cache layer {li}: expected exactly one of bf16/fp8 storage"
+                    );
+                }
+            }
             grouped.push(match &layer.ffn {
                 LagunaFfn::Moe(moe) => {
                     let w = model
@@ -483,6 +1049,62 @@ impl LagunaStepGraph {
                 LagunaFfn::Dense(_) => None,
             });
         }
+        let xqa = if cache.is_fp8() {
+            None
+        } else {
+            XqaPlan::new_for(
+                1,
+                max_seq_len,
+                cfg.num_key_value_heads,
+                cfg.num_attention_heads,
+                cfg.head_dim,
+                "m1-step",
+            )?
+        };
+        let xqa_fp8 = match &cache {
+            StepCache::Fp8(c) => XqaFp8Plan::new_for(
+                1,
+                max_seq_len,
+                cfg.num_key_value_heads,
+                cfg.num_attention_heads,
+                cfg.head_dim,
+                c.scale_policy(),
+                "m1-step",
+            )?,
+            StepCache::Bf16(_) => None,
+        };
+        let sliding_rows: Option<SlidingVerifyBufs> = None;
+        let (verify_split, fp8) = if let StepCache::Fp8(c) = &cache {
+            let fp8_count = fp8_layers.iter().filter(|l| l.is_some()).count();
+            let bufs = VerifySplitBufs::new(&model, 1, max_seq_len, &forked, fp8_count, 64)?;
+            eprintln!("[laguna_step_graph] route=m1-captured kv=fp8-full-layers-bf16-sliding fp8_layers={fp8_count} attention=split-gqa-forced-by-fp8-kv splits={}", bufs.splits);
+            (
+                Some(bufs),
+                Some(Fp8VerifyState {
+                    scale_policy: c.scale_policy(),
+                    layers: fp8_layers,
+                    n_committed_ptr: meta_ptr,
+                    attention: Fp8VerifyAttention::Split,
+                }),
+            )
+        } else if m1_full_attention_through_the_fused_tc_verify_kernel_opt_in_until_petas_no_draft_bracket() {
+            let bufs = VerifySplitBufs::new(
+                &model,
+                1,
+                max_seq_len,
+                &forked,
+                0,
+                M1_FUSED_TC_SPLITS_32_MUST_EQUAL_THE_VERIFY_GRAPHS_SO_ROW_J_REDUCES_LIKE_THE_M1_STEP,
+            )?;
+            anyhow::ensure!(
+                bufs.fused_tc_stages_each_kv_tile_once_for_all_rows_on_tensor_cores,
+                "NV_LAGUNA_M1_FUSED_TC=1 needs the fused-tc verify kernel (GQA group 6, NV_LAGUNA_VERIFY_SPLIT_TC unset)"
+            );
+            eprintln!("[laguna_step_graph] route=m1-captured attention=fused-tc-shared-with-verify splits={}", bufs.splits);
+            (Some(bufs), None)
+        } else {
+            (None, None)
+        };
         let weights_fold_shared = grouped
             .iter()
             .flatten()
@@ -524,18 +1146,21 @@ impl LagunaStepGraph {
         };
         let m1_flash = if m1_flash_enabled()
             && cfg.head_dim == 128
-            && cfg.num_attention_heads % cfg.num_key_value_heads == 0
+            && cfg
+                .num_attention_heads
+                .is_multiple_of(cfg.num_key_value_heads)
             && matches!(cfg.num_attention_heads / cfg.num_key_value_heads, 6 | 8)
         {
             let elems = nv_kernels::cuda::laguna_flash_decode_gqa_scratch_elems(
                 cfg.num_key_value_heads as i32,
             );
+            let rows_sharing_the_m1_kernel = 1usize;
             Some(M1FlashBufs {
                 scratch: forked
-                    .alloc_zeros::<f32>(elems)
+                    .alloc_zeros::<f32>(elems * rows_sharing_the_m1_kernel)
                     .map_err(|e| anyhow::anyhow!("m1 flash scratch: {e:?}"))?,
                 fan_in: forked
-                    .alloc_zeros::<u32>(cfg.num_key_value_heads)
+                    .alloc_zeros::<u32>(cfg.num_key_value_heads * rows_sharing_the_m1_kernel)
                     .map_err(|e| anyhow::anyhow!("m1 flash fan_in: {e:?}"))?,
             })
         } else {
@@ -543,9 +1168,18 @@ impl LagunaStepGraph {
         };
         let runner = CudaGraphRunner::new(forked.clone());
         ctor_guard.the_built_engine_owns_teardown_now();
+        let mut aux_ts = Vec::with_capacity(aux_layers.len());
+        for _ in aux_layers {
+            aux_ts.push(Tensor::zeros((1usize, 1usize, cfg.hidden_size), DType::BF16, &device)?);
+        }
         Ok(Self {
             model,
             cache,
+            verify_split,
+            fp8,
+            xqa,
+            xqa_fp8,
+            sliding_rows,
             dev,
             device,
             forked,
@@ -569,20 +1203,44 @@ impl LagunaStepGraph {
             captured: false,
             prof,
             m1_flash,
+            aux_layers: aux_layers.to_vec(),
+            aux_ts,
             _err_drain: CtxErrDrain(raw_ctx),
         })
     }
 
     pub fn cache(&self) -> &LagunaKvCache {
-        &self.cache
+        match &self.cache {
+            StepCache::Bf16(c) => c,
+            StepCache::Fp8(_) => panic!("{BF16_CACHE_ACCESSORS_STAY_FOR_THE_PREFILL_CACHE_TESTS_IN_LAGUNA_RS_AND_FP8_STEP_GRAPHS_USE_KV_MUT}"),
+        }
     }
 
     pub fn cache_mut(&mut self) -> &mut LagunaKvCache {
+        match &mut self.cache {
+            StepCache::Bf16(c) => c,
+            StepCache::Fp8(_) => panic!("{BF16_CACHE_ACCESSORS_STAY_FOR_THE_PREFILL_CACHE_TESTS_IN_LAGUNA_RS_AND_FP8_STEP_GRAPHS_USE_KV_MUT}"),
+        }
+    }
+
+    pub fn kv(&self) -> &StepCache {
+        &self.cache
+    }
+
+    pub fn kv_mut(&mut self) -> &mut StepCache {
         &mut self.cache
     }
 
     pub fn current_len(&self) -> usize {
         self.cache.current_len()
+    }
+
+    pub fn captured_node_count(&self) -> usize {
+        if self.captured {
+            self.runner.cached_node_count()
+        } else {
+            0
+        }
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -634,13 +1292,30 @@ impl LagunaStepGraph {
             cache,
             prof,
             m1_flash,
+            verify_split,
+            fp8,
+            xqa,
+            xqa_fp8,
+            sliding_rows,
+            aux_layers,
+            aux_ts,
             ..
         } = self;
         let meta_ptr = *meta_ptr;
         let s_cap = *s_cap;
         let max_seq_len = cache.max_seq_len();
+        let hidden = model.config().hidden_size;
+        let aux_dst = aux_ts
+            .iter()
+            .map(|a| bf16_ptr(a, &forked, hidden))
+            .collect::<Result<Vec<u64>>>()?;
         let prof = prof.as_ref();
         let m1_flash = m1_flash.as_ref();
+        let verify_split = verify_split.as_ref();
+        let fp8 = fp8.as_ref();
+        let xqa = xqa.as_ref();
+        let xqa_fp8 = xqa_fp8.as_ref();
+        let sliding_rows = sliding_rows.as_ref();
 
         let logits_ptr = {
             let (lp, _g) = logits_out.device_ptr(&forked);
@@ -667,11 +1342,15 @@ impl LagunaStepGraph {
                 s_cap,
                 max_seq_len,
                 1,
-                &[],
-                &[],
+                aux_layers,
+                &aux_dst,
                 prof,
                 m1_flash,
-                None,
+                verify_split,
+                fp8,
+                xqa,
+                xqa_fp8,
+                sliding_rows,
                 false,
             )
         };
@@ -713,6 +1392,12 @@ impl LagunaStepGraph {
 
     pub fn argmax_device(&self) -> Result<u32> {
         self.synchronize()?;
+        if let Some(x) = self.xqa.as_ref() {
+            x.status_after_sync(&self.forked)?;
+        }
+        if let Some(x) = self.xqa_fp8.as_ref() {
+            x.status_after_sync(&self.forked)?;
+        }
         let out = self
             .forked
             .clone_dtoh(&self.token_out)
@@ -757,11 +1442,322 @@ pub(crate) struct Fp8VerifyLayer {
     v_scales: u64,
 }
 
+impl Fp8VerifyLayer {
+    fn from_ptrs((k_fp8, v_fp8, k_scales, v_scales): (u64, u64, u64, u64)) -> Self {
+        Self {
+            k_fp8,
+            v_fp8,
+            k_scales,
+            v_scales,
+        }
+    }
+}
+
 pub(crate) struct Fp8VerifyState {
+    scale_policy: LagunaFp8ScalePolicy,
     layers: Vec<Option<Fp8VerifyLayer>>,
     n_committed_ptr: u64,
-    k_scratch: CudaSlice<bf16>,
-    v_scratch: CudaSlice<bf16>,
+    attention: Fp8VerifyAttention,
+}
+
+enum Fp8VerifyAttention {
+    Fa2 {
+        k_scratch: CudaSlice<bf16>,
+        v_scratch: CudaSlice<bf16>,
+    },
+    Split,
+}
+
+struct VerifySplitBufs {
+    scratch: CudaSlice<f32>,
+    fan_in: CudaSlice<u32>,
+    splits: usize,
+    fused_tc_stages_each_kv_tile_once_for_all_rows_on_tensor_cores: bool,
+}
+
+fn verify_split_fused_tc_default_on_user_signoff_20260912_unset_is_on_and_0_falls_back_to_the_split_kernel(
+) -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_LAGUNA_VERIFY_SPLIT_TC",
+    )
+}
+
+#[allow(non_upper_case_globals)]
+const FUSED_TC_ROWS_MAX_5_MUST_EQUAL_kMaxRows5_IN_LAGUNA_FLASH_FUSED_TC_CU: usize = 5;
+#[allow(non_upper_case_globals)]
+const FUSED_TC_GQA_GROUP_6_MUST_EQUAL_kGroup6_IN_LAGUNA_FLASH_FUSED_TC_CU: usize = 6;
+
+impl VerifySplitBufs {
+    fn new(
+        model: &Laguna,
+        t: usize,
+        max_seq_len: usize,
+        forked: &Arc<CudaStream>,
+        fp8_layers: usize,
+        splits: usize,
+    ) -> Result<Self> {
+        let cfg = model.config();
+        anyhow::ensure!(
+            cfg.head_dim == 128
+                && (1..=32).contains(&t)
+                && max_seq_len <= i32::MAX as usize
+                && t <= max_seq_len,
+            "Laguna split verify requires head_dim=128, 1<=M<=32 and an i32 context capacity"
+        );
+        let mut max_heads = 0usize;
+        for (li, layer) in model.layers().iter().enumerate() {
+            if !matches!(layer.self_attn.kind, LayerType::FullAttention) {
+                continue;
+            }
+            let heads = layer.self_attn.num_heads;
+            anyhow::ensure!(
+                cfg.num_key_value_heads > 0
+                    && heads % cfg.num_key_value_heads == 0
+                    && matches!(heads / cfg.num_key_value_heads, 6 | 8),
+                "Laguna split verify requires GQA group 6 or 8, layer {li} has {heads}/{}",
+                cfg.num_key_value_heads
+            );
+            max_heads = max_heads.max(heads);
+        }
+        anyhow::ensure!(
+            max_heads > 0,
+            "Laguna split verify requested but no layer has full attention"
+        );
+        let scratch_elems = t
+            .checked_mul(max_heads)
+            .and_then(|n| n.checked_mul(splits * (cfg.head_dim + 2)))
+            .ok_or_else(|| anyhow::anyhow!("split scratch size overflow"))?;
+        let scratch = forked
+            .alloc_zeros::<f32>(scratch_elems)
+            .map_err(|e| anyhow::anyhow!("split scratch: {e:?}"))?;
+        let fan_in = forked
+            .alloc_zeros::<u32>(t * cfg.num_key_value_heads)
+            .map_err(|e| anyhow::anyhow!("split fan-in: {e:?}"))?;
+        let fused_tc = verify_split_fused_tc_default_on_user_signoff_20260912_unset_is_on_and_0_falls_back_to_the_split_kernel()
+            && (fp8_layers == 0 || verify_fp8_fused_tc_dequantizes_each_tile_like_the_m1_flash_kernel_unset_is_on())
+            && t <= FUSED_TC_ROWS_MAX_5_MUST_EQUAL_kMaxRows5_IN_LAGUNA_FLASH_FUSED_TC_CU
+            && max_heads / cfg.num_key_value_heads == FUSED_TC_GQA_GROUP_6_MUST_EQUAL_kGroup6_IN_LAGUNA_FLASH_FUSED_TC_CU;
+        eprintln!("[laguna_verify_attention] route=split-gqa opt_in=1 splits={splits} rows={t} fused_tc={} max_seq_allocated={max_seq_len} fp8_layers={fp8_layers} kv_rounding=bf16 intermediate_kv_bytes=0 scratch_bytes={}", u8::from(fused_tc), scratch_elems * 4);
+        Ok(VerifySplitBufs {
+            scratch,
+            fan_in,
+            splits,
+            fused_tc_stages_each_kv_tile_once_for_all_rows_on_tensor_cores: fused_tc,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        stream: &Arc<CudaStream>,
+        q: u64,
+        kv: (u64, u64, u64, u64),
+        output: u64,
+        committed: u64,
+        heads: usize,
+        kv_heads: usize,
+        rows: usize,
+        capacity: usize,
+        kvq: i32,
+    ) -> Result<()> {
+        let (scratch, _gs) = self.scratch.device_ptr(stream);
+        let (fan_in, _gf) = self.fan_in.device_ptr(stream);
+        let fp8 = kvq != 0;
+        if self.fused_tc_stages_each_kv_tile_once_for_all_rows_on_tensor_cores
+            && fp8
+            && verify_fp8_fused_tc_dequantizes_each_tile_like_the_m1_flash_kernel_unset_is_on()
+        {
+            let rc = unsafe {
+                nv_kernels::cuda::laguna_flash_decode_verify_fused_tc_fp8(
+                    stream.cu_stream() as *mut c_void,
+                    q as *const u16,
+                    kv.0 as *const u8,
+                    kv.1 as *const u8,
+                    kv.2 as *const f32,
+                    kv.3 as *const f32,
+                    output as *mut u16,
+                    committed as *const i32,
+                    scratch as *mut f32,
+                    fan_in as *mut u32,
+                    heads as i32,
+                    kv_heads as i32,
+                    128,
+                    rows as i32,
+                    capacity as i32,
+                    self.splits as i32,
+                    128.0f32.powf(-0.5),
+                    kvq,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            anyhow::ensure!(rc == -1, "Laguna fused-tc fp8 verify attention rc={rc}");
+        }
+        if self.fused_tc_stages_each_kv_tile_once_for_all_rows_on_tensor_cores && !fp8 {
+            let rc = unsafe {
+                nv_kernels::cuda::laguna_flash_decode_verify_fused_tc(
+                    stream.cu_stream() as *mut c_void,
+                    q as *const u16,
+                    kv.0 as *const u16,
+                    kv.1 as *const u16,
+                    output as *mut u16,
+                    committed as *const i32,
+                    scratch as *mut f32,
+                    fan_in as *mut u32,
+                    heads as i32,
+                    kv_heads as i32,
+                    128,
+                    rows as i32,
+                    capacity as i32,
+                    self.splits as i32,
+                    128.0f32.powf(-0.5),
+                )
+            };
+            anyhow::ensure!(rc == 0, "Laguna fused-tc split verify attention rc={rc}");
+            return Ok(());
+        }
+        let rc = unsafe {
+            nv_kernels::cuda::laguna_flash_decode_verify(
+                stream.cu_stream() as *mut c_void,
+                q as *const u16,
+                kv.0 as *const u8,
+                kv.1 as *const u8,
+                kv.2 as *const f32,
+                kv.3 as *const f32,
+                output as *mut u16,
+                committed as *const i32,
+                scratch as *mut f32,
+                fan_in as *mut u32,
+                heads as i32,
+                kv_heads as i32,
+                128,
+                rows as i32,
+                capacity as i32,
+                self.splits as i32,
+                128.0f32.powf(-0.5),
+                kvq,
+            )
+        };
+        anyhow::ensure!(rc == 0, "Laguna split verify attention rc={rc} fp8={fp8}");
+        Ok(())
+    }
+}
+
+#[allow(non_upper_case_globals)]
+const SLIDING_VERIFY_SPLITS_8_MUST_EQUAL_kLagSlidingVerifySplits8_IN_LAGUNA_STEP_CU: usize = 8;
+const SLIDING_VERIFY_MAX_ROWS_8: usize = 8;
+
+struct SlidingVerifyBufs {
+    scratch: CudaSlice<f32>,
+    fan_in: CudaSlice<u32>,
+    rows_per_block: usize,
+}
+
+impl SlidingVerifyBufs {
+    fn new_opt_in(model: &Laguna, t: usize, forked: &Arc<CudaStream>) -> Result<Option<Self>> {
+        let rows_per_block = match std::env::var("NV_LAGUNA_VERIFY_SLIDING_ROWS") {
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Ok(v) if v == "0" => return Ok(None),
+            Ok(v) if v == "1" => 1usize,
+            Ok(v) if v == "2" => 2usize,
+            Ok(v) if v == "3" => 3usize,
+            other => anyhow::bail!("NV_LAGUNA_VERIFY_SLIDING_ROWS must be unset, 0, 1, 2 or 3 (rows per block; 1 measured fastest at 20 us vs 49 us for 2-3), got {other:?}"),
+        };
+        if !(2..=SLIDING_VERIFY_MAX_ROWS_8).contains(&t) {
+            return Ok(None);
+        }
+        let cfg = model.config();
+        let mut max_heads = 0usize;
+        for layer in model.layers() {
+            if matches!(layer.self_attn.kind, LayerType::FullAttention) {
+                continue;
+            }
+            let heads = layer.self_attn.num_heads;
+            anyhow::ensure!(cfg.num_key_value_heads > 0 && heads % cfg.num_key_value_heads == 0 && matches!(heads / cfg.num_key_value_heads, 6 | 8) && cfg.head_dim == 128,
+                "Laguna sliding rows verify requires GQA group 6 or 8 with head_dim 128 on the sliding layers");
+            max_heads = max_heads.max(heads);
+        }
+        anyhow::ensure!(
+            max_heads > 0 && cfg.sliding_window > 0,
+            "Laguna sliding rows verify requested but no sliding layer exists"
+        );
+        let scratch = forked
+            .alloc_zeros::<f32>(
+                t * max_heads
+                    * SLIDING_VERIFY_SPLITS_8_MUST_EQUAL_kLagSlidingVerifySplits8_IN_LAGUNA_STEP_CU
+                    * (cfg.head_dim + 2),
+            )
+            .map_err(|e| anyhow::anyhow!("sliding rows scratch: {e:?}"))?;
+        let fan_in = forked
+            .alloc_zeros::<u32>(t * cfg.num_key_value_heads)
+            .map_err(|e| anyhow::anyhow!("sliding rows fan-in: {e:?}"))?;
+        eprintln!("[laguna_verify_sliding_rows] route=share-kv-window-rows rows={t} rows_per_block={rows_per_block} splits={} window={} (sliding layers at t>=2 through the M-row share-kv flash body with a per-row window instead of FA2 varlen; fp32 online softmax, numerically a candidate)",
+            SLIDING_VERIFY_SPLITS_8_MUST_EQUAL_kLagSlidingVerifySplits8_IN_LAGUNA_STEP_CU, cfg.sliding_window);
+        Ok(Some(Self {
+            scratch,
+            fan_in,
+            rows_per_block,
+        }))
+    }
+}
+#[allow(non_upper_case_globals)]
+const VERIFY_ROWS_GEMV_MAX_ROWS_8_MUST_EQUAL_kLagRowsGemvMaxRows8_IN_LAGUNA_STEP_CU: usize = 8;
+
+fn verify_rows_gemv_opt_in() -> bool {
+    std::env::var("NV_LAGUNA_VERIFY_ROWS_GEMV")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+const Q8_ROWS_MAX_DYNAMIC_SMEM_98304: usize = 98304;
+
+fn sliding_rows_on_the_m1_flash_kernel_opt_in_1_since_the_2026_09_14_served_identity_ruling_because_its_kernel_vs_kernel_bitwise_gate_did_not_hold_on_the_served_stream_unset_is_fa2_rows(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_VERIFY_SLIDING_M1ROWS")
+}
+
+fn verify_fp8_fused_tc_dequantizes_each_tile_like_the_m1_flash_kernel_unset_is_on() -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_LAGUNA_VERIFY_FP8_TC",
+    )
+}
+
+fn qkvo_rows_default_on_user_signoff_20260913_unset_is_on_and_0_restores_the_cutlass_m_row_projections(
+) -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_LAGUNA_QKVO_ROWS")
+}
+
+fn qkvo_rows_opt_in() -> bool {
+    qkvo_rows_default_on_user_signoff_20260913_unset_is_on_and_0_restores_the_cutlass_m_row_projections()
+}
+
+const RSTD_FOLD_ROWS_MAX_1_THE_IN_KERNEL_REDUCTION_COSTS_30_VS_24_US_AT_5_ROWS: usize = 1;
+
+fn qkvo_rstd_fuse_opt_in() -> bool {
+    std::env::var("NV_LAGUNA_QKVO_RSTD_FUSE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn o_gate_fuse_default_on_user_signoff_20260913_unset_is_on_and_0_restores_the_separate_softplus_gate_launch(
+) -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_LAGUNA_O_GATE_FUSE",
+    )
+}
+
+fn o_gate_fuse_opt_in() -> bool {
+    o_gate_fuse_default_on_user_signoff_20260913_unset_is_on_and_0_restores_the_separate_softplus_gate_launch()
+}
+
+fn verify_split_default_on_user_signoff_20260912_unset_is_on_and_0_restores_fa2() -> Result<bool> {
+    match std::env::var("NV_LAGUNA_VERIFY_SPLIT") {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) if value == "1" => Ok(true),
+        value => anyhow::bail!("NV_LAGUNA_VERIFY_SPLIT must be 0 or 1, got {value:?}"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -793,7 +1789,11 @@ fn step_body(
     aux_dst: &[u64],
     prof: Option<&StepProfStamps>,
     m1_flash: Option<&M1FlashBufs>,
+    verify_split: Option<&VerifySplitBufs>,
     fp8: Option<&Fp8VerifyState>,
+    xqa: Option<&XqaPlan>,
+    xqa_fp8: Option<&XqaFp8Plan>,
+    sliding_rows: Option<&SlidingVerifyBufs>,
     spec_head: bool,
 ) -> Result<()> {
     let cfg = model.config();
@@ -837,7 +1837,7 @@ fn step_body(
             false,
         )
     };
-    let mut x = crate::gemma4::embed_lookup_bf16_op(model.embed_weight(), &tokens_t, device)?
+    let mut x = crate::laguna::LagunaEmbedding::lookup_captured(model, &tokens_t, device)?
         .reshape((1usize, t, hidden))?;
     if let Some(p) = prof {
         p.record(ProfPoint::Embed, s)?;
@@ -857,11 +1857,36 @@ fn step_body(
         } else {
             None
         };
-        let m1_fused = t == 1
+        let fp8_qkvg = match (
+            attn.q_proj
+                .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+            attn.k_proj
+                .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+            attn.v_proj
+                .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+            attn.fp8_gate_weight_and_scales(hidden, n_q),
+        ) {
+            (Some(q), Some(k), Some(v), Some(g))
+                if attn.q_proj.in_features() == hidden
+                    && attn.q_proj.out_features() == n_q * hd
+                    && attn.k_proj.in_features() == hidden
+                    && attn.k_proj.out_features() == n_kv * hd
+                    && attn.v_proj.in_features() == hidden
+                    && attn.v_proj.out_features() == n_kv * hd =>
+            {
+                Some((q, k, v, g))
+            }
+            _ => None,
+        };
+        let bf16_fused_norms = !layer.input_layernorm.fp8_e4m3_active()
+            && !attn.q_norm.fp8_e4m3_active()
+            && !attn.k_norm.fp8_e4m3_active();
+        let m1_fused = bf16_fused_norms
+            && t == 1
             && m1_qkv_enabled()
-            && hd % 32 == 0
+            && hd.is_multiple_of(32)
             && hd <= 512
-            && hidden % 8 == 0
+            && hidden.is_multiple_of(8)
             && hidden <= 4096
             && (!attn.m1_w8_active_qkv() || qkv_q8.is_some())
             && attn.q_proj.weight().is_some()
@@ -871,6 +1896,56 @@ fn step_body(
             && attn.q_proj.bias().is_none()
             && attn.k_proj.bias().is_none()
             && attn.v_proj.bias().is_none();
+        if t >= 2 && verify_rows_gemv_opt_in() {
+            static ROWS_GEMV_PRECONDITIONS_ONCE: std::sync::Once = std::sync::Once::new();
+            ROWS_GEMV_PRECONDITIONS_ONCE.call_once(|| eprintln!(
+                "[laguna_verify_projections] rows-gemv preconditions layer {li} t={t}: hd={hd} hidden={hidden} w8_qkv={} q_bf16={} k_bf16={} v_bf16={} g_present={} g_bf16={} g_bias_none={} qkv_bias_none={} o_bf16={} w8_o={}",
+                attn.m1_w8_active_qkv(), attn.q_proj.weight().is_some(), attn.k_proj.weight().is_some(), attn.v_proj.weight().is_some(),
+                g_lin.is_some(), g_lin.map(|g| g.weight().is_some()) == Some(true), g_lin.map(|g| g.bias().is_none()) == Some(true),
+                attn.q_proj.bias().is_none() && attn.k_proj.bias().is_none() && attn.v_proj.bias().is_none(),
+                attn.o_proj.weight().is_some(), attn.m1_w8_active_o()));
+        }
+        let rows_shape_ok = bf16_fused_norms
+            && (2..=VERIFY_ROWS_GEMV_MAX_ROWS_8_MUST_EQUAL_kLagRowsGemvMaxRows8_IN_LAGUNA_STEP_CU)
+                .contains(&t)
+            && hd.is_multiple_of(32)
+            && hd <= 512
+            && hidden.is_multiple_of(16)
+            && hidden <= 4096
+            && g_lin.map(|g| g.weight().is_some() && g.bias().is_none()) == Some(true)
+            && attn.q_proj.bias().is_none()
+            && attn.k_proj.bias().is_none()
+            && attn.v_proj.bias().is_none();
+        let rows_common = rows_shape_ok && verify_rows_gemv_opt_in();
+        let rows_w8 = rows_shape_ok
+            && (verify_rows_gemv_opt_in() || qkvo_rows_opt_in())
+            && attn
+                .m1_qkv_w8_fused(hidden, n_q, n_kv, hd)
+                .map(|(_, _, _, is_fp8)| is_fp8)
+                == Some(true);
+        let rows_gemv = rows_common
+            && !rows_w8
+            && !attn.m1_w8_active_qkv()
+            && attn.q_proj.weight().is_some()
+            && attn.k_proj.weight().is_some()
+            && attn.v_proj.weight().is_some();
+
+        let fp8_prepared_rows = qkvo_rows_opt_in()
+            && (1..=VERIFY_ROWS_GEMV_MAX_ROWS_8_MUST_EQUAL_kLagRowsGemvMaxRows8_IN_LAGUNA_STEP_CU)
+                .contains(&t)
+            && t * hidden * 2 <= Q8_ROWS_MAX_DYNAMIC_SMEM_98304
+            && hd.is_multiple_of(32)
+            && hd <= 256
+            && hidden.is_multiple_of(16)
+            && hidden <= 4096
+            && fp8_qkvg.is_some()
+            && attn.q_proj.bias().is_none()
+            && attn.k_proj.bias().is_none()
+            && attn.v_proj.bias().is_none()
+            && g_lin.is_some_and(|g| g.bias().is_none())
+            && layer.input_layernorm.fp8_e4m3_active()
+            && attn.q_norm.fp8_e4m3_active()
+            && attn.k_norm.fp8_e4m3_active();
 
         let (rope, rotary_dim, rot_scale) = model.rope_for_kind(attn.kind);
         let cos_c = rope.cos().contiguous()?;
@@ -909,12 +1984,198 @@ fn step_body(
         let mut g_pre: Option<CudaSlice<bf16>> = None;
         let mut v_tensor: Option<Tensor> = None;
         let mut normed_tensor: Option<Tensor> = None;
+        let mut gate_from_the_fused_qkv_twin: Option<Tensor> = None;
 
-        if m1_fused {
+        if fp8_prepared_rows {
+            static FP8_PREPARED_ROWS_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+            FP8_PREPARED_ROWS_FIRED_ONCE.call_once(|| eprintln!("[laguna_fp8_prepared_rows] rows={t} qkvg_fp8_norm_fused=true qk_normrope_rows=true matrix_weight_bits=8 norm_weight_bits=8"));
+            let x_ptr = bf16_ptr(&x, s, t * hidden)?;
+            let mut q_raw: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_q * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut k_raw: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_kv * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut v_dev: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_kv * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut g_dev: CudaSlice<bf16> =
+                unsafe { s.alloc::<bf16>(t * n_q).map_err(|e| anyhow::anyhow!(e))? };
+            {
+                let (q, k, v, g) = fp8_qkvg.expect("FP8 prepared rows predicate");
+                let (bq, _qg) = q.0.device_ptr(s);
+                let (sq, _qsg) = q.1.device_ptr(s);
+                let (bk, _kg) = k.0.device_ptr(s);
+                let (sk, _ksg) = k.1.device_ptr(s);
+                let (bv, _vg) = v.0.device_ptr(s);
+                let (sv, _vsg) = v.1.device_ptr(s);
+                let (bg, _gg) = g.0.device_ptr(s);
+                let (sg, _gsg) = g.1.device_ptr(s);
+                let (norm_weight, norm_scale, width) = layer
+                    .input_layernorm
+                    .fp8_e4m3_weight_and_scale()
+                    .expect("FP8 prepared input norm predicate");
+                anyhow::ensure!(
+                    width == hidden && norm_weight.len() == hidden && norm_scale.len() == 1,
+                    "FP8 prepared input norm storage does not match hidden={hidden}"
+                );
+                let (wn, _ng) = norm_weight.device_ptr(s);
+                let (sn, _nsg) = norm_scale.device_ptr(s);
+                let (yq, _yqg) = q_raw.device_ptr_mut(s);
+                let (yk, _ykg) = k_raw.device_ptr_mut(s);
+                let (yv, _yvg) = v_dev.device_ptr_mut(s);
+                let (yg, _ygg) = g_dev.device_ptr_mut(s);
+                let mut rstd: Option<CudaSlice<f32>> = if t > 1 {
+                    Some(unsafe { s.alloc::<f32>(t).map_err(|e| anyhow::anyhow!(e))? })
+                } else {
+                    None
+                };
+                let rc = if let Some(rstd) = rstd.as_mut() {
+                    let (rp, _rpg) = rstd.device_ptr_mut(s);
+                    let rc = unsafe {
+                        nv_kernels::cuda::laguna_rstd256_bf16_rows(
+                            s.cu_stream() as *mut c_void,
+                            x_ptr as *const u16,
+                            rp as *mut f32,
+                            hidden as i32,
+                            layer.input_layernorm.eps() as f32,
+                            t as i32,
+                        )
+                    };
+                    anyhow::ensure!(rc == 0, "FP8 prepared rstd rc={rc} layer {li} rows={t}");
+                    unsafe {
+                        nv_kernels::cuda::laguna_gemv_fp8_qkvg_rows_rstd(
+                            s.cu_stream() as *mut c_void,
+                            bq as *const u8,
+                            sq as *const f32,
+                            bk as *const u8,
+                            sk as *const f32,
+                            bv as *const u8,
+                            sv as *const f32,
+                            bg as *const u8,
+                            sg as *const f32,
+                            x_ptr as *const u16,
+                            wn as *const c_void,
+                            sn as *const f32,
+                            rp as *const f32,
+                            yq as *mut u16,
+                            yk as *mut u16,
+                            yv as *mut u16,
+                            yg as *mut u16,
+                            (n_q * hd) as i32,
+                            (n_kv * hd) as i32,
+                            (n_kv * hd) as i32,
+                            n_q as i32,
+                            hidden as i32,
+                            t as i32,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        nv_kernels::cuda::laguna_gemv_fp8_qkvg_fp8_norm_rows(
+                            s.cu_stream() as *mut c_void,
+                            bq as *const u8,
+                            sq as *const f32,
+                            bk as *const u8,
+                            sk as *const f32,
+                            bv as *const u8,
+                            sv as *const f32,
+                            bg as *const u8,
+                            sg as *const f32,
+                            x_ptr as *const u16,
+                            wn as *const u8,
+                            sn as *const f32,
+                            layer.input_layernorm.eps() as f32,
+                            yq as *mut u16,
+                            yk as *mut u16,
+                            yv as *mut u16,
+                            yg as *mut u16,
+                            (n_q * hd) as i32,
+                            (n_kv * hd) as i32,
+                            (n_kv * hd) as i32,
+                            n_q as i32,
+                            hidden as i32,
+                            t as i32,
+                        )
+                    }
+                };
+                anyhow::ensure!(rc == 0, "FP8 prepared qkvg rc={rc} layer {li} rows={t}");
+            }
+            if let Some(p) = prof {
+                p.record(ProfPoint::Qkv(li), s)?;
+            }
+            {
+                let (qw, qs, qh) = attn
+                    .q_norm
+                    .fp8_e4m3_weight_and_scale()
+                    .expect("FP8 prepared Q norm predicate");
+                let (kw, ks, kh) = attn
+                    .k_norm
+                    .fp8_e4m3_weight_and_scale()
+                    .expect("FP8 prepared K norm predicate");
+                anyhow::ensure!(
+                    qh == hd
+                        && kh == hd
+                        && qw.len() == hd
+                        && kw.len() == hd
+                        && qs.len() == 1
+                        && ks.len() == 1,
+                    "FP8 prepared Q/K norm storage does not match head_dim={hd}"
+                );
+                let (qi, _qig) = q_raw.device_ptr(s);
+                let (ki, _kig) = k_raw.device_ptr(s);
+                let (qo, _qog) = q_rot_dev.device_ptr_mut(s);
+                let (ko, _kog) = k_rot_dev.device_ptr_mut(s);
+                let (qw, _qwg) = qw.device_ptr(s);
+                let (qs, _qsg) = qs.device_ptr(s);
+                let (kw, _kwg) = kw.device_ptr(s);
+                let (ks, _ksg) = ks.device_ptr(s);
+                let normrope = if t == 1 {
+                    nv_kernels::cuda::laguna_qk_normrope_fp8_weight_rows
+                } else {
+                    nv_kernels::cuda::laguna_qk_normrope_fp8_weight_base_rows
+                };
+                let rc = unsafe {
+                    normrope(
+                        s.cu_stream() as *mut c_void,
+                        qi as *const u16,
+                        ki as *const u16,
+                        qo as *mut u16,
+                        ko as *mut u16,
+                        qw as *const u8,
+                        qs as *const f32,
+                        kw as *const u8,
+                        ks as *const f32,
+                        cos_ptr as *const f32,
+                        sin_ptr as *const f32,
+                        meta_ptr as *const i32,
+                        n_q as i32,
+                        n_kv as i32,
+                        hd as i32,
+                        rotary_dim as i32,
+                        rot_scale,
+                        attn.q_norm.eps() as f32,
+                        attn.k_norm.eps() as f32,
+                        t as i32,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "FP8 prepared normrope rc={rc} layer {li} rows={t}");
+            }
+            if let Some(p) = prof {
+                p.record(ProfPoint::Rope(li), s)?;
+            }
+            v_slice = Some(v_dev);
+            g_pre = Some(g_dev);
+        } else if m1_fused {
             let x_ptr = bf16_ptr(&x, s, t * hidden)?;
             let mut rstd_dev: CudaSlice<f32> =
                 unsafe { s.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
-            {
+            let rstd_in_gemv =
+                qkvo_rows_opt_in() && qkvo_rstd_fuse_opt_in() && qkv_q8.map(|q| q.3) == Some(true);
+            if !rstd_in_gemv {
                 let (rp, _g) = rstd_dev.device_ptr_mut(s);
                 let rc = unsafe {
                     nv_kernels::cuda::laguna_rstd256_bf16(
@@ -950,30 +2211,90 @@ fn step_body(
                     let (bq, sq) = (w8_bytes_ptr(pq, s), w8_scale_ptr(pq, s));
                     let (bk, sk) = (w8_bytes_ptr(pk, s), w8_scale_ptr(pk, s));
                     let (bv, sv) = (w8_bytes_ptr(pv, s), w8_scale_ptr(pv, s));
-                    unsafe {
-                        nv_kernels::cuda::gemv_q8_qkvg_normed(
-                            s.cu_stream() as *mut c_void,
-                            is_fp8 as i32,
-                            bq as *const c_void,
-                            sq as *const f32,
-                            bk as *const c_void,
-                            sk as *const f32,
-                            bv as *const c_void,
-                            sv as *const f32,
-                            wg as *const u16,
-                            x_ptr as *const u16,
-                            wn as *const u16,
-                            rp as *const f32,
-                            yq as *mut u16,
-                            yk as *mut u16,
-                            yv as *mut u16,
-                            yg as *mut u16,
-                            (n_q * hd) as i32,
-                            (n_kv * hd) as i32,
-                            (n_kv * hd) as i32,
-                            n_q as i32,
-                            hidden as i32,
-                        )
+                    if is_fp8 && qkvo_rows_opt_in() && rstd_in_gemv {
+                        static QKVO_RSTD_M1_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                        QKVO_RSTD_M1_FIRED_ONCE.call_once(|| eprintln!("[laguna_qkvo_rows] m1 rstd folded into laguna_gemv_q8_qkvg_normed_rows_rstd_fused (no rstd launch; bitwise to laguna_rstd256_bf16 + the fused rows GEMV, LAGUNA-Q8-ROWS gate)"));
+                        unsafe {
+                            nv_kernels::cuda::laguna_gemv_q8_qkvg_normed_rows_rstd_fused(
+                                s.cu_stream() as *mut c_void,
+                                1,
+                                bq as *const c_void,
+                                sq as *const f32,
+                                bk as *const c_void,
+                                sk as *const f32,
+                                bv as *const c_void,
+                                sv as *const f32,
+                                wg as *const u16,
+                                x_ptr as *const u16,
+                                wn as *const u16,
+                                layer.input_layernorm.eps() as f32,
+                                yq as *mut u16,
+                                yk as *mut u16,
+                                yv as *mut u16,
+                                yg as *mut u16,
+                                (n_q * hd) as i32,
+                                (n_kv * hd) as i32,
+                                (n_kv * hd) as i32,
+                                n_q as i32,
+                                hidden as i32,
+                                1,
+                            )
+                        }
+                    } else if is_fp8 && qkvo_rows_opt_in() {
+                        static QKVO_ROWS_M1_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                        QKVO_ROWS_M1_FIRED_ONCE.call_once(|| eprintln!("[laguna_qkvo_rows] m1 qkv+gate through laguna_gemv_q8_qkvg_normed_rows rows=1 (bitwise to the shared fused q8 kernel, LAGUNA-Q8-ROWS gate)"));
+                        unsafe {
+                            nv_kernels::cuda::laguna_gemv_q8_qkvg_normed_rows(
+                                s.cu_stream() as *mut c_void,
+                                1,
+                                bq as *const c_void,
+                                sq as *const f32,
+                                bk as *const c_void,
+                                sk as *const f32,
+                                bv as *const c_void,
+                                sv as *const f32,
+                                wg as *const u16,
+                                x_ptr as *const u16,
+                                wn as *const u16,
+                                rp as *const f32,
+                                yq as *mut u16,
+                                yk as *mut u16,
+                                yv as *mut u16,
+                                yg as *mut u16,
+                                (n_q * hd) as i32,
+                                (n_kv * hd) as i32,
+                                (n_kv * hd) as i32,
+                                n_q as i32,
+                                hidden as i32,
+                                1,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            nv_kernels::cuda::gemv_q8_qkvg_normed(
+                                s.cu_stream() as *mut c_void,
+                                is_fp8 as i32,
+                                bq as *const c_void,
+                                sq as *const f32,
+                                bk as *const c_void,
+                                sk as *const f32,
+                                bv as *const c_void,
+                                sv as *const f32,
+                                wg as *const u16,
+                                x_ptr as *const u16,
+                                wn as *const u16,
+                                rp as *const f32,
+                                yq as *mut u16,
+                                yk as *mut u16,
+                                yv as *mut u16,
+                                yg as *mut u16,
+                                (n_q * hd) as i32,
+                                (n_kv * hd) as i32,
+                                (n_kv * hd) as i32,
+                                n_q as i32,
+                                hidden as i32,
+                            )
+                        }
                     }
                 } else {
                     unsafe {
@@ -1038,16 +2359,392 @@ fn step_body(
             }
             v_slice = Some(v_dev);
             g_pre = Some(g_dev);
+        } else if rows_w8 {
+            static ROWS_W8_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+            ROWS_W8_FIRED_ONCE.call_once(|| eprintln!("[laguna_verify_projections] rows-w8 path fired: layer {li} t={t} (q/k/v through gemv_e4m3_mk_h with the M=1 rstd kernel and raw x, gate through the M-row bf16 GEMV; the M=1 fused q8 kernel's normalization and accumulation order)"));
+            let (pq, pk, pv, _) = attn
+                .m1_qkv_w8_fused(hidden, n_q, n_kv, hd)
+                .expect("rows_w8 checked the fused w8 projections");
+            let x_ptr = bf16_ptr(&x, s, t * hidden)?;
+            let mut rstd_dev: CudaSlice<f32> =
+                unsafe { s.alloc::<f32>(t).map_err(|e| anyhow::anyhow!(e))? };
+            let fused_single_launch = qkvo_rows_opt_in();
+            let rstd_in_gemv = fused_single_launch
+                && qkvo_rstd_fuse_opt_in()
+                && t <= RSTD_FOLD_ROWS_MAX_1_THE_IN_KERNEL_REDUCTION_COSTS_30_VS_24_US_AT_5_ROWS;
+            if rstd_in_gemv {
+                static QKVO_RSTD_VERIFY_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                QKVO_RSTD_VERIFY_FIRED_ONCE.call_once(|| eprintln!("[laguna_qkvo_rows] verify t={t} rstd folded into laguna_gemv_q8_qkvg_normed_rows_rstd_fused (no rstd launch)"));
+            } else if fused_single_launch {
+                static QKVO_ROWS_VERIFY_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                QKVO_ROWS_VERIFY_FIRED_ONCE.call_once(|| eprintln!("[laguna_qkvo_rows] verify t={t} qkv+gate through laguna_rstd256_bf16_rows + laguna_gemv_q8_qkvg_normed_rows (one launch each, bitwise to the rows-w8 five-launch form, LAGUNA-Q8-ROWS gate)"));
+                let (rp, _g) = rstd_dev.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_rstd256_bf16_rows(
+                        s.cu_stream() as *mut c_void,
+                        x_ptr as *const u16,
+                        rp as *mut f32,
+                        hidden as i32,
+                        layer.input_layernorm.eps() as f32,
+                        t as i32,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "rows-w8 rstd rows rc={rc} layer {li} t={t}");
+            } else {
+                for r in 0..t {
+                    let (rp, _g) = rstd_dev.device_ptr_mut(s);
+                    let rc = unsafe {
+                        nv_kernels::cuda::laguna_rstd256_bf16(
+                            s.cu_stream() as *mut c_void,
+                            (x_ptr + (r * hidden * 2) as u64) as *const u16,
+                            (rp + (r * 4) as u64) as *mut f32,
+                            hidden as i32,
+                            layer.input_layernorm.eps() as f32,
+                        )
+                    };
+                    anyhow::ensure!(rc == 0, "rows-w8 rstd rc={rc} layer {li} row {r}");
+                }
+            }
+            let mut q_raw: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_q * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut k_raw: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_kv * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut v_dev: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_kv * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut g_dev: CudaSlice<bf16> =
+                unsafe { s.alloc::<bf16>(t * n_q).map_err(|e| anyhow::anyhow!(e))? };
+            {
+                let wn = bf16_ptr(layer.input_layernorm.weight_bf16(), s, hidden)?;
+                let (rp, _g0) = rstd_dev.device_ptr(s);
+                let wg = bf16_ptr(g_lin.unwrap().weight().unwrap(), s, n_q * hidden)?;
+                if fused_single_launch {
+                    let (bq, sq) = (w8_bytes_ptr(pq, s), w8_scale_ptr(pq, s));
+                    let (bk, sk) = (w8_bytes_ptr(pk, s), w8_scale_ptr(pk, s));
+                    let (bv, sv) = (w8_bytes_ptr(pv, s), w8_scale_ptr(pv, s));
+                    let (yq, _g1) = q_raw.device_ptr_mut(s);
+                    let (yk, _g2) = k_raw.device_ptr_mut(s);
+                    let (yv, _g3) = v_dev.device_ptr_mut(s);
+                    let (yg, _g4) = g_dev.device_ptr_mut(s);
+                    let rc = if rstd_in_gemv {
+                        unsafe {
+                            nv_kernels::cuda::laguna_gemv_q8_qkvg_normed_rows_rstd_fused(
+                                s.cu_stream() as *mut c_void,
+                                1,
+                                bq as *const c_void,
+                                sq as *const f32,
+                                bk as *const c_void,
+                                sk as *const f32,
+                                bv as *const c_void,
+                                sv as *const f32,
+                                wg as *const u16,
+                                x_ptr as *const u16,
+                                wn as *const u16,
+                                layer.input_layernorm.eps() as f32,
+                                yq as *mut u16,
+                                yk as *mut u16,
+                                yv as *mut u16,
+                                yg as *mut u16,
+                                (n_q * hd) as i32,
+                                (n_kv * hd) as i32,
+                                (n_kv * hd) as i32,
+                                n_q as i32,
+                                hidden as i32,
+                                t as i32,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            nv_kernels::cuda::laguna_gemv_q8_qkvg_normed_rows(
+                                s.cu_stream() as *mut c_void,
+                                1,
+                                bq as *const c_void,
+                                sq as *const f32,
+                                bk as *const c_void,
+                                sk as *const f32,
+                                bv as *const c_void,
+                                sv as *const f32,
+                                wg as *const u16,
+                                x_ptr as *const u16,
+                                wn as *const u16,
+                                rp as *const f32,
+                                yq as *mut u16,
+                                yk as *mut u16,
+                                yv as *mut u16,
+                                yg as *mut u16,
+                                (n_q * hd) as i32,
+                                (n_kv * hd) as i32,
+                                (n_kv * hd) as i32,
+                                n_q as i32,
+                                hidden as i32,
+                                t as i32,
+                            )
+                        }
+                    };
+                    anyhow::ensure!(
+                        rc == 0,
+                        "rows-w8 fused q8 rows gemv rc={rc} layer {li} t={t}"
+                    );
+                } else {
+                    for (proj, n_out, out) in [
+                        (pq, n_q * hd, &mut q_raw),
+                        (pk, n_kv * hd, &mut k_raw),
+                        (pv, n_kv * hd, &mut v_dev),
+                    ] {
+                        let (wb, sc) = (w8_bytes_ptr(proj, s), w8_scale_ptr(proj, s));
+                        let (yp, _gy) = out.device_ptr_mut(s);
+                        let rc = unsafe {
+                            nv_kernels::cuda::gemv_e4m3_mk_h(
+                                s.cu_stream() as *mut c_void,
+                                wb as *const u8,
+                                sc as *const f32,
+                                x_ptr as *const u16,
+                                wn as *const u16,
+                                rp as *const f32,
+                                yp as *mut u16,
+                                n_out as i32,
+                                hidden as i32,
+                                t as i32,
+                            )
+                        };
+                        anyhow::ensure!(
+                            rc == 0,
+                            "rows-w8 e4m3 gemv rc={rc} layer {li} n_out={n_out}"
+                        );
+                    }
+                    let (yg, _g4) = g_dev.device_ptr_mut(s);
+                    let rc = unsafe {
+                        nv_kernels::cuda::laguna_gemv_bf16_qkvg_normed_rows(
+                            s.cu_stream() as *mut c_void,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            wg as *const u16,
+                            x_ptr as *const u16,
+                            wn as *const u16,
+                            rp as *const f32,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            yg as *mut u16,
+                            0,
+                            0,
+                            0,
+                            n_q as i32,
+                            hidden as i32,
+                            t as i32,
+                        )
+                    };
+                    anyhow::ensure!(rc == 0, "rows-w8 gate gemv rc={rc} layer {li}");
+                }
+            }
+            if let Some(p) = prof {
+                p.record(ProfPoint::Qkv(li), s)?;
+            }
+            if fused_single_launch {
+                let qw = bf16_ptr(attn.q_norm.weight_bf16(), s, hd)?;
+                let kw = bf16_ptr(attn.k_norm.weight_bf16(), s, hd)?;
+                let (qi, _g1) = q_raw.device_ptr(s);
+                let (ki, _g2) = k_raw.device_ptr(s);
+                let (qo, _g3) = q_rot_dev.device_ptr_mut(s);
+                let (ko, _g4) = k_rot_dev.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_qk_normrope_bf16_base_rows(
+                        s.cu_stream() as *mut c_void,
+                        qi as *const u16,
+                        ki as *const u16,
+                        qo as *mut u16,
+                        ko as *mut u16,
+                        qw as *const u16,
+                        kw as *const u16,
+                        cos_ptr as *const f32,
+                        sin_ptr as *const f32,
+                        meta_ptr as *const i32,
+                        n_q as i32,
+                        n_kv as i32,
+                        hd as i32,
+                        rotary_dim as i32,
+                        rot_scale,
+                        attn.q_norm.eps() as f32,
+                        attn.k_norm.eps() as f32,
+                        t as i32,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "rows-w8 normrope rows rc={rc} layer {li} t={t}");
+                if let Some(p) = prof {
+                    p.record(ProfPoint::Rope(li), s)?;
+                }
+                v_slice = Some(v_dev);
+                g_pre = Some(g_dev);
+            } else {
+                let q =
+                    wrap_bf16(q_raw, (1usize, t, n_q * hd), dev).reshape((1usize, t, n_q, hd))?;
+                let q = attn.q_norm.forward(&q)?.contiguous()?;
+                let k =
+                    wrap_bf16(k_raw, (1usize, t, n_kv * hd), dev).reshape((1usize, t, n_kv, hd))?;
+                let k = attn.k_norm.forward(&k)?.contiguous()?;
+                let v =
+                    wrap_bf16(v_dev, (1usize, t, n_kv * hd), dev).reshape((1usize, t, n_kv, hd))?;
+                {
+                    let q_ptr = bf16_ptr(&q, s, t * n_q * hd)?;
+                    let k_ptr = bf16_ptr(&k, s, t * n_kv * hd)?;
+                    let (qo, _g1) = q_rot_dev.device_ptr_mut(s);
+                    let (ko, _g2) = k_rot_dev.device_ptr_mut(s);
+                    let rc = unsafe {
+                        nv_kernels::cuda::laguna_rope_scale_bf16(
+                            s.cu_stream() as *mut c_void,
+                            q_ptr as *const u16,
+                            k_ptr as *const u16,
+                            qo as *mut u16,
+                            ko as *mut u16,
+                            cos_ptr as *const f32,
+                            sin_ptr as *const f32,
+                            meta_ptr as *const i32,
+                            t as i32,
+                            n_q as i32,
+                            n_kv as i32,
+                            hd as i32,
+                            rotary_dim as i32,
+                            rot_scale,
+                        )
+                    };
+                    anyhow::ensure!(rc == 0, "rows-w8 rope scale rc={rc} layer {li}");
+                }
+                if let Some(p) = prof {
+                    p.record(ProfPoint::Rope(li), s)?;
+                }
+                v_tensor = Some(v);
+                g_pre = Some(g_dev);
+            }
+        } else if rows_gemv {
+            static ROWS_GEMV_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+            ROWS_GEMV_FIRED_ONCE.call_once(|| eprintln!("[laguna_verify_projections] rows-gemv path fired: layer {li} t={t} (qkv+gate and o_proj through the M-row fused GEMVs)"));
+            let x_ptr = bf16_ptr(&x, s, t * hidden)?;
+            let mut rstd_dev: CudaSlice<f32> =
+                unsafe { s.alloc::<f32>(t).map_err(|e| anyhow::anyhow!(e))? };
+            for r in 0..t {
+                let (rp, _g) = rstd_dev.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_rstd256_bf16(
+                        s.cu_stream() as *mut c_void,
+                        (x_ptr + (r * hidden * 2) as u64) as *const u16,
+                        (rp + (r * 4) as u64) as *mut f32,
+                        hidden as i32,
+                        layer.input_layernorm.eps() as f32,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "rows rstd rc={rc} layer {li} row {r}");
+            }
+            let mut q_raw: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_q * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut k_raw: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_kv * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut v_dev: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * n_kv * hd)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            };
+            let mut g_dev: CudaSlice<bf16> =
+                unsafe { s.alloc::<bf16>(t * n_q).map_err(|e| anyhow::anyhow!(e))? };
+            {
+                let wq = bf16_ptr(attn.q_proj.weight().unwrap(), s, n_q * hd * hidden)?;
+                let wk = bf16_ptr(attn.k_proj.weight().unwrap(), s, n_kv * hd * hidden)?;
+                let wv = bf16_ptr(attn.v_proj.weight().unwrap(), s, n_kv * hd * hidden)?;
+                let wg = bf16_ptr(g_lin.unwrap().weight().unwrap(), s, n_q * hidden)?;
+                let wn = bf16_ptr(layer.input_layernorm.weight_bf16(), s, hidden)?;
+                let (rp, _g0) = rstd_dev.device_ptr(s);
+                let (yq, _g1) = q_raw.device_ptr_mut(s);
+                let (yk, _g2) = k_raw.device_ptr_mut(s);
+                let (yv, _g3) = v_dev.device_ptr_mut(s);
+                let (yg, _g4) = g_dev.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_gemv_bf16_qkvg_normed_rows(
+                        s.cu_stream() as *mut c_void,
+                        wq as *const u16,
+                        wk as *const u16,
+                        wv as *const u16,
+                        wg as *const u16,
+                        x_ptr as *const u16,
+                        wn as *const u16,
+                        rp as *const f32,
+                        yq as *mut u16,
+                        yk as *mut u16,
+                        yv as *mut u16,
+                        yg as *mut u16,
+                        (n_q * hd) as i32,
+                        (n_kv * hd) as i32,
+                        (n_kv * hd) as i32,
+                        n_q as i32,
+                        hidden as i32,
+                        t as i32,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "rows qkvg gemv rc={rc} layer {li}");
+            }
+            if let Some(p) = prof {
+                p.record(ProfPoint::Qkv(li), s)?;
+            }
+            let q = wrap_bf16(q_raw, (1usize, t, n_q * hd), dev).reshape((1usize, t, n_q, hd))?;
+            let q = attn.q_norm.forward(&q)?.contiguous()?;
+            let k = wrap_bf16(k_raw, (1usize, t, n_kv * hd), dev).reshape((1usize, t, n_kv, hd))?;
+            let k = attn.k_norm.forward(&k)?.contiguous()?;
+            let v = wrap_bf16(v_dev, (1usize, t, n_kv * hd), dev).reshape((1usize, t, n_kv, hd))?;
+            {
+                let q_ptr = bf16_ptr(&q, s, t * n_q * hd)?;
+                let k_ptr = bf16_ptr(&k, s, t * n_kv * hd)?;
+                let (qo, _g1) = q_rot_dev.device_ptr_mut(s);
+                let (ko, _g2) = k_rot_dev.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_rope_scale_bf16(
+                        s.cu_stream() as *mut c_void,
+                        q_ptr as *const u16,
+                        k_ptr as *const u16,
+                        qo as *mut u16,
+                        ko as *mut u16,
+                        cos_ptr as *const f32,
+                        sin_ptr as *const f32,
+                        meta_ptr as *const i32,
+                        t as i32,
+                        n_q as i32,
+                        n_kv as i32,
+                        hd as i32,
+                        rotary_dim as i32,
+                        rot_scale,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "rows rope scale rc={rc} layer {li}");
+            }
+            if let Some(p) = prof {
+                p.record(ProfPoint::Rope(li), s)?;
+            }
+            v_tensor = Some(v);
+            g_pre = Some(g_dev);
         } else {
             let normed = layer.input_layernorm.forward(&x)?;
-            let q = attn.proj_q(&normed, t)?.reshape((1usize, t, n_q, hd))?;
+            let (q_raw, k_raw, v_raw) = match attn.proj_qkv_fused_rows(&normed, t)? {
+                Some((q, k, v, g)) => {
+                    gate_from_the_fused_qkv_twin = g;
+                    (q, k, v)
+                }
+                None => (
+                    attn.proj_q(&normed, t)?,
+                    attn.proj_k(&normed, t)?,
+                    attn.proj_v(&normed, t)?,
+                ),
+            };
+            let q = q_raw.reshape((1usize, t, n_q, hd))?;
             let q = attn.q_norm.forward(&q)?.contiguous()?;
-            let k = attn.proj_k(&normed, t)?.reshape((1usize, t, n_kv, hd))?;
+            let k = k_raw.reshape((1usize, t, n_kv, hd))?;
             let k = attn.k_norm.forward(&k)?.contiguous()?;
-            let v = attn
-                .proj_v(&normed, t)?
-                .reshape((1usize, t, n_kv, hd))?
-                .contiguous()?;
+            let v = v_raw.reshape((1usize, t, n_kv, hd))?.contiguous()?;
             if let Some(p) = prof {
                 p.record(ProfPoint::Qkv(li), s)?;
             }
@@ -1103,8 +2800,13 @@ fn step_body(
             );
             {
                 let (k_src, _g) = k_rot_dev.device_ptr(s);
+                let append = match st.scale_policy {
+                    LagunaFp8ScalePolicy::PerTokenHead => nv_kernels::cuda::kv_append_fp8,
+                    LagunaFp8ScalePolicy::FixedOne => nv_kernels::cuda::kv_append_fp8_unit_scale,
+                    LagunaFp8ScalePolicy::PerTokenHeadInt8 => nv_kernels::cuda::kv_append_int8,
+                };
                 let rc = unsafe {
-                    nv_kernels::cuda::kv_append_fp8(
+                    append(
                         s.cu_stream() as *mut c_void,
                         k_src as *const u16,
                         v_src_ptr as *const u16,
@@ -1124,56 +2826,96 @@ fn step_body(
             if let Some(p) = prof {
                 p.record(ProfPoint::Append(li), s)?;
             }
-            let (k_scr, _gks) = st.k_scratch.device_ptr(s);
-            let (v_scr, _gvs) = st.v_scratch.device_ptr(s);
-            for (src, scales, dst) in [
-                (fpl.k_fp8, fpl.k_scales, k_scr),
-                (fpl.v_fp8, fpl.v_scales, v_scr),
-            ] {
-                let rc = unsafe {
-                    nv_kernels::cuda::dequantize_kv_fp8(
-                        s.cu_stream() as *mut c_void,
-                        src as *const u8,
-                        scales as *const f32,
-                        dst as *mut u16,
-                        0,
-                        max_seq_len as i32,
-                        n_kv as i32,
-                        hd as i32,
-                        0,
-                    )
-                };
-                anyhow::ensure!(rc == 0, "fp8 verify dequant rc={rc} layer {li}");
+            let xqa_fp8_hit =
+                xqa_fp8.filter(|x| x.rows == t && n_q == 48 && n_kv == 8 && hd == 128);
+            if let Some(xp) = xqa_fp8_hit {
+                let (qp, _gq) = q_rot_dev.device_ptr(s);
+                let (op, _go) = o_dev.device_ptr_mut(s);
+                xp.launch(s, qp, fpl.k_fp8, fpl.v_fp8, op, st.n_committed_ptr)?;
             }
-            {
-                let lse_dev: CudaSlice<f32> = s
-                    .alloc_zeros::<f32>(n_q * t)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                let (qp, _g1) = q_rot_dev.device_ptr(s);
-                let (op, _g2) = o_dev.device_ptr_mut(s);
-                let (lp, _g3) = lse_dev.device_ptr(s);
-                let scale = (hd as f32).powf(-0.5);
-                unsafe {
-                    varlen_fwd_bf16(
-                        s.cu_stream() as *mut c_void,
-                        &VarlenArgs {
-                            q_ptr: qp,
-                            k_ptr: k_scr,
-                            v_ptr: v_scr,
-                            o_ptr: op,
-                            lse_ptr: lp,
-                            cu_seqlens_q: cu_q_ptr,
-                            cu_seqlens_k: cu_full_ptr,
-                            max_seqlen_q: t,
-                            max_seqlen_k: max_seq_len,
-                            h: n_q,
-                            h_k: n_kv,
-                            d: hd,
-                            softmax_scale: scale,
-                            window_size_left: None,
-                            window_size_right: Some(0),
-                        },
+            match &st.attention {
+                _ if xqa_fp8_hit.is_some() => {}
+                Fp8VerifyAttention::Split => {
+                    let buffers = verify_split
+                        .ok_or_else(|| anyhow::anyhow!("missing FP8 verify split buffers"))?;
+                    let (qp, _gq) = q_rot_dev.device_ptr(s);
+                    let (op, _go) = o_dev.device_ptr_mut(s);
+                    buffers.forward(
+                        s,
+                        qp,
+                        (fpl.k_fp8, fpl.v_fp8, fpl.k_scales, fpl.v_scales),
+                        op,
+                        st.n_committed_ptr,
+                        n_q,
+                        n_kv,
+                        t,
+                        max_seq_len,
+                        st.scale_policy
+                            .kv_elem_code_matching_the_kernels_0_bf16_1_e4m3_2_int8(),
                     )?;
+                }
+                Fp8VerifyAttention::Fa2 {
+                    k_scratch,
+                    v_scratch,
+                } => {
+                    let dequantize = match st.scale_policy {
+                        LagunaFp8ScalePolicy::PerTokenHeadInt8 => {
+                            nv_kernels::cuda::dequantize_kv_int8
+                        }
+                        _ => nv_kernels::cuda::dequantize_kv_fp8,
+                    };
+                    let (k_scr, _gks) = k_scratch.device_ptr(s);
+                    let (v_scr, _gvs) = v_scratch.device_ptr(s);
+                    for (src, scales, dst) in [
+                        (fpl.k_fp8, fpl.k_scales, k_scr),
+                        (fpl.v_fp8, fpl.v_scales, v_scr),
+                    ] {
+                        let rc = unsafe {
+                            dequantize(
+                                s.cu_stream() as *mut c_void,
+                                src as *const u8,
+                                scales as *const f32,
+                                dst as *mut u16,
+                                0,
+                                max_seq_len as i32,
+                                n_kv as i32,
+                                hd as i32,
+                                0,
+                            )
+                        };
+                        anyhow::ensure!(rc == 0, "fp8 verify dequant rc={rc} layer {li}");
+                    }
+                    {
+                        let lse_dev: CudaSlice<f32> = s
+                            .alloc_zeros::<f32>(n_q * t)
+                            .map_err(|e| anyhow::anyhow!(e))?;
+                        let (qp, _g1) = q_rot_dev.device_ptr(s);
+                        let (op, _g2) = o_dev.device_ptr_mut(s);
+                        let (lp, _g3) = lse_dev.device_ptr(s);
+                        let scale = (hd as f32).powf(-0.5);
+                        unsafe {
+                            varlen_fwd_bf16(
+                                s.cu_stream() as *mut c_void,
+                                &VarlenArgs {
+                                    q_ptr: qp,
+                                    k_ptr: k_scr,
+                                    v_ptr: v_scr,
+                                    o_ptr: op,
+                                    lse_ptr: lp,
+                                    cu_seqlens_q: cu_q_ptr,
+                                    cu_seqlens_k: cu_full_ptr,
+                                    max_seqlen_q: t,
+                                    max_seqlen_k: max_seq_len,
+                                    h: n_q,
+                                    h_k: n_kv,
+                                    d: hd,
+                                    softmax_scale: scale,
+                                    window_size_left: None,
+                                    window_size_right: Some(0),
+                                },
+                            )?;
+                        }
+                    }
                 }
             }
         } else {
@@ -1212,7 +2954,106 @@ fn step_body(
 
             let m1_gqa = m1_flash
                 .filter(|_| t == 1 && hd == 128 && n_q % n_kv == 0 && matches!(n_q / n_kv, 6 | 8));
-            if let Some(bufs) = m1_gqa {
+            if let Some(xp) = xqa.filter(|x| {
+                x.rows == t
+                    && n_q == 48
+                    && n_kv == 8
+                    && hd == 128
+                    && matches!(attn.kind, LayerType::FullAttention)
+            }) {
+                let (qp, _gq) = q_rot_dev.device_ptr(s);
+                let (op, _go) = o_dev.device_ptr_mut(s);
+                xp.launch(s, qp, k_dst_ptr, v_dst_ptr, op, meta_ptr)?;
+            } else if let Some(buffers) =
+                verify_split.filter(|_| matches!(attn.kind, LayerType::FullAttention))
+            {
+                let (qp, _gq) = q_rot_dev.device_ptr(s);
+                let (op, _go) = o_dev.device_ptr_mut(s);
+                buffers.forward(
+                    s,
+                    qp,
+                    (k_dst_ptr, v_dst_ptr, 0, 0),
+                    op,
+                    meta_ptr,
+                    n_q,
+                    n_kv,
+                    t,
+                    max_seq_len,
+                    0,
+                )?;
+            } else if let Some(bufs) = m1_flash.filter(|_| {
+                (2..=SLIDING_VERIFY_MAX_ROWS_8).contains(&t)
+                    && window.is_some()
+                    && hd == 128
+                    && n_q == 8 * n_kv
+                    && sliding_rows_on_the_m1_flash_kernel_opt_in_1_since_the_2026_09_14_served_identity_ruling_because_its_kernel_vs_kernel_bitwise_gate_did_not_hold_on_the_served_stream_unset_is_fa2_rows()
+            }) {
+                static SLIDING_M1ROWS_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                SLIDING_M1ROWS_FIRED_ONCE.call_once(|| eprintln!("[laguna_verify_sliding_m1rows] fired: layer {li} t={t} window={} (grid.z rows of the m=1 flash-decode kernel, bitwise per row)", window.unwrap()));
+                let (qp, _g1) = q_rot_dev.device_ptr(s);
+                let (op, _g2) = o_dev.device_ptr_mut(s);
+                let (scp, _g3) = bufs.scratch.device_ptr(s);
+                let (fip, _g4) = bufs.fan_in.device_ptr(s);
+                let scale = (hd as f32).powf(-0.5);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_flash_decode_gqa_rows(
+                        s.cu_stream() as *mut c_void,
+                        qp as *const u16,
+                        k_dst_ptr as *const u16,
+                        v_dst_ptr as *const u16,
+                        op as *mut u16,
+                        (cu_k_ptr + 4) as *const i32,
+                        1 - t as i32,
+                        scp as *mut f32,
+                        fip as *mut u32,
+                        n_q as i32,
+                        n_kv as i32,
+                        hd as i32,
+                        t as i32,
+                        window.unwrap() as i32,
+                        scale,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "sliding m1-rows verify attention rc={rc} layer {li} t={t}");
+            } else if let Some(sb) = sliding_rows.filter(|_| {
+                (2..=SLIDING_VERIFY_MAX_ROWS_8).contains(&t)
+                    && hd == 128
+                    && window.is_some()
+                    && n_q % n_kv == 0
+                    && matches!(n_q / n_kv, 6 | 8)
+            }) {
+                static SLIDING_ROWS_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                SLIDING_ROWS_FIRED_ONCE.call_once(|| eprintln!("[laguna_verify_sliding_rows] fired: layer {li} t={t} window={} rows_per_block={}", window.unwrap(), sb.rows_per_block));
+                let (qp, _g1) = q_rot_dev.device_ptr(s);
+                let (op, _g2) = o_dev.device_ptr_mut(s);
+                let (scp, _g3) = sb.scratch.device_ptr(s);
+                let (fip, _g4) = sb.fan_in.device_ptr(s);
+                let scale = (hd as f32).powf(-0.5);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_flash_decode_verify_window(
+                        s.cu_stream() as *mut c_void,
+                        qp as *const u16,
+                        k_dst_ptr as *const u16,
+                        v_dst_ptr as *const u16,
+                        op as *mut u16,
+                        (cu_k_ptr + 4) as *const i32,
+                        scp as *mut f32,
+                        fip as *mut u32,
+                        n_q as i32,
+                        n_kv as i32,
+                        hd as i32,
+                        t as i32,
+                        cap as i32,
+                        window.unwrap() as i32,
+                        sb.rows_per_block as i32,
+                        scale,
+                    )
+                };
+                anyhow::ensure!(
+                    rc == 0,
+                    "sliding rows verify attention rc={rc} layer {li} t={t}"
+                );
+            } else if let Some(bufs) = m1_gqa {
                 let (qp, _g1) = q_rot_dev.device_ptr(s);
                 let (op, _g2) = o_dev.device_ptr_mut(s);
                 let (scp, _g3) = bufs.scratch.device_ptr(s);
@@ -1276,6 +3117,8 @@ fn step_body(
 
         let g = if g_pre.is_some() {
             None
+        } else if let Some(gf) = gate_from_the_fused_qkv_twin.take() {
+            Some(gf)
         } else {
             let g_proj = g_lin
                 .ok_or_else(|| anyhow::anyhow!("step graph: expected g_proj on layer {li}"))?;
@@ -1285,47 +3128,159 @@ fn step_body(
                     .contiguous()?,
             )
         };
-        let gated = {
-            let mut out_dev: CudaSlice<bf16> = unsafe {
-                s.alloc::<bf16>(t * n_q * hd)
+        let a_ptr = bf16_ptr(&o_t, s, t * n_q * hd)?;
+        let g_ptr = if let Some(gd) = &g_pre {
+            let (p, _g) = gd.device_ptr(s);
+            p
+        } else {
+            bf16_ptr(g.as_ref().unwrap(), s, t * n_q)?
+        };
+        let qkvo_o_ok = qkvo_rows_opt_in()
+            && t <= VERIFY_ROWS_GEMV_MAX_ROWS_8_MUST_EQUAL_kLagRowsGemvMaxRows8_IN_LAGUNA_STEP_CU
+            && t * n_q * hd * 9 / 4 <= Q8_ROWS_MAX_DYNAMIC_SMEM_98304
+            && attn.m1_w8_active_o()
+            && attn.o_proj.bias().is_none()
+            && attn.w8.as_ref().is_some_and(|w| w.is_fp8() && matches!(w.o.bytes(), crate::laguna::LagunaProjBytes::E4m3(b) if b.len() == hidden * n_q * hd));
+        let attn_out_fused: Option<Tensor> = if qkvo_o_ok
+            && o_gate_fuse_opt_in()
+            && n_q <= 64
+            && hd.is_multiple_of(8)
+        {
+            static O_GATE_FUSED_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+            O_GATE_FUSED_FIRED_ONCE.call_once(|| eprintln!("[laguna_qkvo_rows] o_proj gated t={t} through laguna_gemv_q8_rows_gated (softplus gate folded into the x staging, bitwise to softplus_gate_exact_bf16 + laguna_gemv_q8_rows, LAGUNA-Q8-ROWS gate)"));
+            let o8 = &attn.w8.as_ref().unwrap().o;
+            let (wo, so) = (w8_bytes_ptr(o8, s), w8_scale_ptr(o8, s));
+            let mut o_out: CudaSlice<bf16> = unsafe {
+                s.alloc::<bf16>(t * hidden)
                     .map_err(|e| anyhow::anyhow!(e))?
             };
-            let a_ptr = bf16_ptr(&o_t, s, t * n_q * hd)?;
-            let g_ptr = if let Some(gd) = &g_pre {
-                let (p, _g) = gd.device_ptr(s);
-                p
-            } else {
-                bf16_ptr(g.as_ref().unwrap(), s, t * n_q)?
-            };
             {
-                let (op, _g) = out_dev.device_ptr_mut(s);
+                let (yo, _g) = o_out.device_ptr_mut(s);
                 let rc = unsafe {
-                    nv_kernels::cuda::softplus_gate_exact_bf16(
+                    nv_kernels::cuda::laguna_gemv_q8_rows_gated(
                         s.cu_stream() as *mut c_void,
+                        1,
+                        wo as *const c_void,
+                        so as *const f32,
                         a_ptr as *const u16,
                         g_ptr as *const u16,
-                        op as *mut u16,
-                        (t * n_q) as i32,
+                        n_q as i32,
                         hd as i32,
+                        yo as *mut u16,
+                        hidden as i32,
+                        (n_q * hd) as i32,
+                        t as i32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "softplus gate rc={rc} layer {li}");
+                anyhow::ensure!(
+                    rc == 0,
+                    "qkvo rows gated o_proj gemv rc={rc} layer {li} t={t}"
+                );
             }
-            wrap_bf16(out_dev, (1usize, t, n_q * hd), dev)
+            Some(wrap_bf16(o_out, (1usize, t, hidden), dev))
+        } else {
+            None
+        };
+        let gated = if attn_out_fused.is_some() {
+            None
+        } else {
+            Some({
+                let mut out_dev: CudaSlice<bf16> = unsafe {
+                    s.alloc::<bf16>(t * n_q * hd)
+                        .map_err(|e| anyhow::anyhow!(e))?
+                };
+                {
+                    let (op, _g) = out_dev.device_ptr_mut(s);
+                    let rc = unsafe {
+                        nv_kernels::cuda::softplus_gate_exact_bf16(
+                            s.cu_stream() as *mut c_void,
+                            a_ptr as *const u16,
+                            g_ptr as *const u16,
+                            op as *mut u16,
+                            (t * n_q) as i32,
+                            hd as i32,
+                        )
+                    };
+                    anyhow::ensure!(rc == 0, "softplus gate rc={rc} layer {li}");
+                }
+                wrap_bf16(out_dev, (1usize, t, n_q * hd), dev)
+            })
         };
         if let Some(p) = prof {
             p.record(ProfPoint::Gate(li), s)?;
         }
-        let attn_out = attn.proj_o(&gated, t)?;
+        let attn_out = if let Some(o) = attn_out_fused {
+            o
+        } else {
+            let gated = gated.expect("gate tensor when the fused gated o_proj is off");
+            if rows_gemv && !attn.m1_w8_active_o() && attn.o_proj.weight().is_some() && attn.o_proj.bias().is_none() {
+            let wo = bf16_ptr(attn.o_proj.weight().unwrap(), s, hidden * n_q * hd)?;
+            let xg = bf16_ptr(&gated, s, t * n_q * hd)?;
+            let mut o_out: CudaSlice<bf16> =
+                unsafe { s.alloc::<bf16>(t * hidden).map_err(|e| anyhow::anyhow!(e))? };
+            {
+                let (yo, _g) = o_out.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_gemv_bf16_rows(s.cu_stream() as *mut c_void, wo as *const u16, xg as *const u16, yo as *mut u16, hidden as i32, (n_q * hd) as i32, t as i32)
+                };
+                anyhow::ensure!(rc == 0, "rows o_proj gemv rc={rc} layer {li}");
+            }
+            wrap_bf16(o_out, (1usize, t, hidden), dev)
+        } else if qkvo_rows_opt_in()
+            && t <= VERIFY_ROWS_GEMV_MAX_ROWS_8_MUST_EQUAL_kLagRowsGemvMaxRows8_IN_LAGUNA_STEP_CU
+            && t * n_q * hd * 9 / 4 <= Q8_ROWS_MAX_DYNAMIC_SMEM_98304
+            && attn.m1_w8_active_o()
+            && attn.o_proj.bias().is_none()
+            && attn.w8.as_ref().is_some_and(|w| w.is_fp8() && matches!(w.o.bytes(), crate::laguna::LagunaProjBytes::E4m3(b) if b.len() == hidden * n_q * hd))
+        {
+            static QKVO_ROWS_O_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+            QKVO_ROWS_O_FIRED_ONCE.call_once(|| eprintln!("[laguna_qkvo_rows] o_proj t={t} through laguna_gemv_q8_rows (bitwise to gemv_e4m3_mk_h with unit norm, LAGUNA-Q8-ROWS gate)"));
+            let o8 = &attn.w8.as_ref().unwrap().o;
+            let (wo, so) = (w8_bytes_ptr(o8, s), w8_scale_ptr(o8, s));
+            let xg = bf16_ptr(&gated, s, t * n_q * hd)?;
+            let mut o_out: CudaSlice<bf16> =
+                unsafe { s.alloc::<bf16>(t * hidden).map_err(|e| anyhow::anyhow!(e))? };
+            {
+                let (yo, _g) = o_out.device_ptr_mut(s);
+                let rc = unsafe {
+                    nv_kernels::cuda::laguna_gemv_q8_rows(s.cu_stream() as *mut c_void, 1, wo as *const c_void, so as *const f32, xg as *const u16, yo as *mut u16, hidden as i32, (n_q * hd) as i32, t as i32)
+                };
+                anyhow::ensure!(rc == 0, "qkvo rows o_proj gemv rc={rc} layer {li} t={t}");
+            }
+            wrap_bf16(o_out, (1usize, t, hidden), dev)
+        } else {
+            attn.proj_o(&gated, t)?
+        }
+        };
         let after_attn = crate::gemma4::residual_add_scale_bf16_op(&x, &attn_out, 1.0, device)?;
+        if let Some(slot) = aux_layers
+            .iter()
+            .position(|&l| l == li + AUX_TAP_AFTER_ATTENTION_OFFSET_10000_ADDED_TO_THE_LAYER_INDEX_TAPS_THE_POST_ATTENTION_RESIDUAL)
+        {
+            let src_ptr = bf16_ptr(&after_attn, s, t * hidden)?;
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(aux_dst[slot], src_ptr, t * hidden * 2, s.cu_stream())
+                    .map_err(|e| anyhow::anyhow!("aux attention stage dtod: {e:?}"))?;
+            }
+        }
         if let Some(p) = prof {
             p.record(ProfPoint::Attn(li), s)?;
         }
 
         x = match &layer.ffn {
             LagunaFfn::Dense(mlp) => {
-                let normed_mlp = layer.post_attention_layernorm.forward(&after_attn)?;
-                let ffn = mlp.forward_fused_cuda(&normed_mlp)?;
+                let ffn = if t >= 2 && verify_dense_rows_run_as_t_single_row_forwards_so_each_row_is_the_m1_step_bitwise_opt_in_until_the_ledger_reads_bitwise() {
+                    let mut rows_out = Vec::with_capacity(t);
+                    for r in 0..t {
+                        let row = after_attn.narrow(1, r, 1)?.contiguous()?;
+                        let normed_row = layer.post_attention_layernorm.forward(&row)?;
+                        rows_out.push(mlp.forward_fused_cuda(&normed_row)?);
+                    }
+                    Tensor::cat(&rows_out, 1)?.contiguous()?
+                } else {
+                    let normed_mlp = layer.post_attention_layernorm.forward(&after_attn)?;
+                    mlp.forward_fused_cuda(&normed_mlp)?
+                };
                 crate::gemma4::residual_add_scale_bf16_op(&after_attn, &ffn, 1.0, device)?
             }
             LagunaFfn::Moe(moe) => {
@@ -1454,6 +3409,11 @@ pub struct LagunaVerifyGraph<'m> {
     captured: bool,
     prof: Option<StepProfStamps>,
     fp8: Option<Fp8VerifyState>,
+    verify_split: Option<VerifySplitBufs>,
+    m1_flash: Option<M1FlashBufs>,
+    xqa: Option<XqaPlan>,
+    xqa_fp8: Option<XqaFp8Plan>,
+    sliding_rows: Option<SlidingVerifyBufs>,
     _err_drain: CtxErrDrain,
 }
 
@@ -1582,32 +3542,136 @@ impl<'m> LagunaVerifyGraph<'m> {
                 LagunaFfn::Dense(_) => None,
             });
         }
+        eprintln!("[laguna_verify_projections] rows_gemv={} rows={t} (opt-in: q/k/v/gate through M-row GEMVs with the M=1 kernels' normalization and accumulation order; the fired marker names the path taken)", if (2..=VERIFY_ROWS_GEMV_MAX_ROWS_8_MUST_EQUAL_kLagRowsGemvMaxRows8_IN_LAGUNA_STEP_CU).contains(&t) && verify_rows_gemv_opt_in() { "on" } else { "off" });
+        let verify_split =
+            if verify_split_default_on_user_signoff_20260912_unset_is_on_and_0_restores_fa2()? {
+                let fp8_count = fp8_layers.iter().filter(|layer| layer.is_some()).count();
+                Some(VerifySplitBufs::new(
+                    model,
+                    t,
+                    max_seq_len,
+                    &forked,
+                    fp8_count,
+                    M1_FUSED_TC_SPLITS_32_MUST_EQUAL_THE_VERIFY_GRAPHS_SO_ROW_J_REDUCES_LIKE_THE_M1_STEP,
+                )?)
+            } else {
+                None
+            };
+        let xqa = match &cache {
+            VerifyCacheRef::Bf16(_) if matches!(t, 1 | 2 | 3 | 5) => XqaPlan::new_for(
+                t,
+                max_seq_len,
+                cfg.num_key_value_heads,
+                model
+                    .layers()
+                    .iter()
+                    .filter(|l| matches!(l.self_attn.kind, LayerType::FullAttention))
+                    .map(|l| l.self_attn.num_heads)
+                    .max()
+                    .unwrap_or(0),
+                cfg.head_dim,
+                &format!("verify-t{t}"),
+            )?,
+            _ => None,
+        };
+        let xqa_fp8 = match &cache {
+            VerifyCacheRef::Fp8(c) if matches!(t, 1 | 2 | 3 | 5) => XqaFp8Plan::new_for(
+                t,
+                max_seq_len,
+                cfg.num_key_value_heads,
+                model
+                    .layers()
+                    .iter()
+                    .filter(|l| matches!(l.self_attn.kind, LayerType::FullAttention))
+                    .map(|l| l.self_attn.num_heads)
+                    .max()
+                    .unwrap_or(0),
+                cfg.head_dim,
+                c.scale_policy(),
+                &format!("verify-t{t}"),
+            )?,
+            _ => None,
+        };
+        let sliding_rows = SlidingVerifyBufs::new_opt_in(model, t, &forked)?;
+        let m1_flash = if (1..=SLIDING_VERIFY_MAX_ROWS_8).contains(&t)
+            && m1_flash_enabled()
+            && cfg.head_dim == 128
+            && cfg
+                .num_attention_heads
+                .is_multiple_of(cfg.num_key_value_heads)
+            && matches!(cfg.num_attention_heads / cfg.num_key_value_heads, 6 | 8)
+        {
+            let elems = nv_kernels::cuda::laguna_flash_decode_gqa_scratch_elems(
+                cfg.num_key_value_heads as i32,
+            );
+            let rows_sharing_the_m1_kernel = t.clamp(1, SLIDING_VERIFY_MAX_ROWS_8);
+            Some(M1FlashBufs {
+                scratch: forked
+                    .alloc_zeros::<f32>(elems * rows_sharing_the_m1_kernel)
+                    .map_err(|e| anyhow::anyhow!("verify m1 flash scratch: {e:?}"))?,
+                fan_in: forked
+                    .alloc_zeros::<u32>(cfg.num_key_value_heads * rows_sharing_the_m1_kernel)
+                    .map_err(|e| anyhow::anyhow!("verify m1 flash fan_in: {e:?}"))?,
+            })
+        } else {
+            None
+        };
         let fp8 = match &cache {
             VerifyCacheRef::Bf16(_) => None,
-            VerifyCacheRef::Fp8(_) => {
-                let scratch_elems = max_seq_len * cfg.num_key_value_heads * cfg.head_dim;
-                let k_scratch = forked
-                    .alloc_zeros::<bf16>(scratch_elems)
-                    .map_err(|e| anyhow::anyhow!("fp8 verify k scratch: {e:?}"))?;
-                let v_scratch = forked
-                    .alloc_zeros::<bf16>(scratch_elems)
-                    .map_err(|e| anyhow::anyhow!("fp8 verify v scratch: {e:?}"))?;
+            VerifyCacheRef::Fp8(c) => {
+                let attention = if verify_split.is_some() {
+                    Fp8VerifyAttention::Split
+                } else {
+                    let scratch_elems = max_seq_len * cfg.num_key_value_heads * cfg.head_dim;
+                    let k_scratch = forked
+                        .alloc_zeros::<bf16>(scratch_elems)
+                        .map_err(|e| anyhow::anyhow!("fp8 verify k scratch: {e:?}"))?;
+                    let v_scratch = forked
+                        .alloc_zeros::<bf16>(scratch_elems)
+                        .map_err(|e| anyhow::anyhow!("fp8 verify v scratch: {e:?}"))?;
+                    eprintln!("[laguna_verify_attention] route=fp8-dequant-fa2 opt_in=0 splits=1 rows={t} max_seq_allocated={max_seq_len} intermediate_kv_bytes={}", scratch_elems * 4);
+                    Fp8VerifyAttention::Fa2 {
+                        k_scratch,
+                        v_scratch,
+                    }
+                };
                 Some(Fp8VerifyState {
+                    scale_policy: c.scale_policy(),
                     layers: fp8_layers,
                     n_committed_ptr: meta_ptr,
-                    k_scratch,
-                    v_scratch,
+                    attention,
                 })
             }
         };
-        let moe_ctx = GroupedDecodeContext::new_multi(
-            cfg.hidden_size,
-            cfg.moe_intermediate_size,
-            cfg.num_experts_per_tok,
-            cfg.num_experts,
-            t,
-            &forked,
-        )?;
+        let verify_folds_shared_like_the_m1_graph = grouped
+            .iter()
+            .flatten()
+            .any(|w: &Arc<MoeGroupedWeights>| w.folded_shared)
+            && {
+                let _ = USER_SIGNOFF_2026_09_14_FOLD_IT;
+                nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+                    "NV_LAGUNA_VERIFY_FOLDED_SHARED",
+                )
+            };
+        let moe_ctx = if verify_folds_shared_like_the_m1_graph {
+            GroupedDecodeContext::new_folded_shared(
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                cfg.num_experts_per_tok,
+                cfg.num_experts,
+                t,
+                &forked,
+            )?
+        } else {
+            GroupedDecodeContext::new_multi(
+                cfg.hidden_size,
+                cfg.moe_intermediate_size,
+                cfg.num_experts_per_tok,
+                cfg.num_experts,
+                t,
+                &forked,
+            )?
+        };
         forked.synchronize().map_err(|e| anyhow::anyhow!(e))?;
 
         let prof = if verify_prof_enabled() {
@@ -1653,8 +3717,20 @@ impl<'m> LagunaVerifyGraph<'m> {
             captured: false,
             prof,
             fp8,
+            m1_flash,
+            verify_split,
+            xqa,
+            xqa_fp8,
+            sliding_rows,
             _err_drain: CtxErrDrain(raw_ctx),
         })
+    }
+
+    pub(crate) fn accept_status_device(&self) -> Option<u64> {
+        self.xqa
+            .as_ref()
+            .map(|x| x.info.status_device)
+            .or_else(|| self.xqa_fp8.as_ref().map(|x| x.info.status_device))
     }
 
     pub(crate) fn drafts_device_ptr(&self, stream: &Arc<CudaStream>) -> (u64, usize) {
@@ -1689,6 +3765,14 @@ impl<'m> LagunaVerifyGraph<'m> {
             .prepare_for_decode(write_pos, write_pos + self.t)
             .context("verify graph prepare_for_decode")?;
         let out = self.run_captured(tokens)?;
+        if let Some(x) = self.xqa.as_ref() {
+            nv_layers::cuda_stream::sync_legacy_then_forked(&self.dev, &self.forked)?;
+            x.status_after_sync(&self.forked)?;
+        }
+        if let Some(x) = self.xqa_fp8.as_ref() {
+            nv_layers::cuda_stream::sync_legacy_then_forked(&self.dev, &self.forked)?;
+            x.status_after_sync(&self.forked)?;
+        }
         cache.advance(self.t);
         cache.note_graph_write();
         Ok(out)
@@ -1872,6 +3956,11 @@ impl<'m> LagunaVerifyGraph<'m> {
             aux_layers,
             prof,
             fp8,
+            m1_flash,
+            verify_split,
+            xqa,
+            xqa_fp8,
+            sliding_rows,
             ..
         } = self;
         let meta_ptr = *meta_ptr;
@@ -1880,6 +3969,10 @@ impl<'m> LagunaVerifyGraph<'m> {
         let t = *t;
         let prof = prof.as_ref();
         let fp8 = fp8.as_ref();
+        let xqa = xqa.as_ref();
+        let xqa_fp8 = xqa_fp8.as_ref();
+        let sliding_rows = sliding_rows.as_ref();
+        let verify_split = verify_split.as_ref();
 
         let mut body = |s: &Arc<CudaStream>, moe_ctx: &mut GroupedDecodeContext| -> Result<()> {
             step_body(
@@ -1905,8 +3998,12 @@ impl<'m> LagunaVerifyGraph<'m> {
                 aux_layers,
                 &aux_dst,
                 prof,
-                None,
+                m1_flash.as_ref(),
+                verify_split,
                 fp8,
+                xqa,
+                xqa_fp8,
+                sliding_rows,
                 true,
             )
         };
@@ -1932,6 +4029,14 @@ impl<'m> LagunaVerifyGraph<'m> {
                 .synchronize()
                 .map_err(|e| anyhow::anyhow!("post-capture sync: {e:?}"))?;
             self.captured = true;
+            if let Some(buffers) = self.verify_split.as_ref() {
+                let fp8_layers = self
+                    .fp8
+                    .as_ref()
+                    .map(|state| state.layers.iter().filter(|layer| layer.is_some()).count())
+                    .unwrap_or(0);
+                eprintln!("[laguna_verify_attention_capture] route=split-gqa captured=1 splits={} rows={} max_seq_allocated={} fp8_layers={fp8_layers}", buffers.splits, self.t, self.max_seq_len);
+            }
         }
         if let Some(p) = self.prof.as_ref() {
             self.dev

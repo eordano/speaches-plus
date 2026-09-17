@@ -20,6 +20,14 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
     return v;
 }
 
+constexpr float kInt8Max = 127.0f;
+
+__device__ __forceinline__ uint8_t encode_int8_round_nearest_clamped(float v) {
+    const float c = fminf(fmaxf(v, -kInt8Max), kInt8Max);
+    return static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(c)));
+}
+
+template <bool INT8>
 __global__ void quantize_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ x_bf16,
     uint8_t* __restrict__ x_fp8_base,
@@ -65,21 +73,63 @@ __global__ void quantize_kv_fp8_kernel(
     __syncthreads();
     float amax = warp_max[0];
 
-    float scale = (amax > 0.0f) ? (amax / kFp8E4m3Max) : 1.0f;
-    float inv_scale = (amax > 0.0f) ? (kFp8E4m3Max / amax) : 1.0f;
+    const float qmax = INT8 ? kInt8Max : kFp8E4m3Max;
+    float scale = (amax > 0.0f) ? (amax / qmax) : 1.0f;
+    float inv_scale = (amax > 0.0f) ? (qmax / amax) : 1.0f;
     if (tid == 0) {
         scales_base[slot * n_kv + kv_head] = scale;
     }
 
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float v = __bfloat162float(x_bf16[base_src + d]);
-        __nv_fp8_e4m3 enc = static_cast<__nv_fp8_e4m3>(v * inv_scale);
+        if (INT8) {
+            x_fp8_base[base_dst + d] = encode_int8_round_nearest_clamped(v * inv_scale);
+        } else {
+            __nv_fp8_e4m3 enc = static_cast<__nv_fp8_e4m3>(v * inv_scale);
+            x_fp8_base[base_dst + d] = enc.__x;
+        }
+    }
+
+    NVK_PDL_EPILOG();
+}
+
+__global__ void quantize_kv_fp8_unit_scale_kernel(
+    const __nv_bfloat16* __restrict__ x_bf16,
+    uint8_t* __restrict__ x_fp8_base,
+    float* __restrict__ scales_base,
+    const int* __restrict__ start_dev,
+    int n_tokens,
+    int n_kv,
+    int head_dim,
+    int ring
+) {
+    NVK_PDL_PROLOG();
+
+    int token = blockIdx.x;
+    int kv_head = blockIdx.y;
+    if (token >= n_tokens || kv_head >= n_kv) return;
+
+    int start = *start_dev;
+    int slot = start + token;
+    if (ring > 0) slot = slot % ring;
+    int base_src = (token * n_kv + kv_head) * head_dim;
+    int base_dst = (slot * n_kv + kv_head) * head_dim;
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        scales_base[slot * n_kv + kv_head] = 1.0f;
+    }
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float v = __bfloat162float(x_bf16[base_src + d]);
+        __nv_fp8_e4m3 enc = static_cast<__nv_fp8_e4m3>(v);
         x_fp8_base[base_dst + d] = enc.__x;
     }
 
     NVK_PDL_EPILOG();
 }
 
+template <bool INT8>
 __global__ void dequantize_kv_fp8_kernel(
     const uint8_t* __restrict__ x_fp8,
     const float* __restrict__ scales,
@@ -101,16 +151,22 @@ __global__ void dequantize_kv_fp8_kernel(
     float scale = scales[slot * n_kv + kv_head];
     int tid = threadIdx.x;
     for (int d = tid; d < head_dim; d += blockDim.x) {
-        __nv_fp8_e4m3 packed;
-        packed.__x = x_fp8[base + d];
-        float v = static_cast<float>(packed) * scale;
+        float v;
+        if (INT8) {
+            v = static_cast<float>(static_cast<int8_t>(x_fp8[base + d])) * scale;
+        } else {
+            __nv_fp8_e4m3 packed;
+            packed.__x = x_fp8[base + d];
+            v = static_cast<float>(packed) * scale;
+        }
         x_bf16[obase + d] = __float2bfloat16(v);
     }
 }
 
 }
 
-extern "C" int nv_kernels_quantize_kv_fp8(
+template <bool INT8>
+static int quantize_kv_launch(
     void* stream,
     const uint16_t* x_bf16,
     uint8_t* x_fp8_base,
@@ -132,13 +188,13 @@ extern "C" int nv_kernels_quantize_kv_fp8(
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(cfg, grid, dim3(static_cast<unsigned>(block)), 0, s);
         cudaLaunchKernelEx(
-            &cfg, quantize_kv_fp8_kernel,
+            &cfg, quantize_kv_fp8_kernel<INT8>,
             reinterpret_cast<const __nv_bfloat16*>(x_bf16),
             x_fp8_base, scales_base, start_dev,
             n_tokens, n_kv, head_dim, ring
         );
     } else {
-        quantize_kv_fp8_kernel<<<grid, block, 0, s>>>(
+        quantize_kv_fp8_kernel<INT8><<<grid, block, 0, s>>>(
             reinterpret_cast<const __nv_bfloat16*>(x_bf16),
             x_fp8_base, scales_base, start_dev,
             n_tokens, n_kv, head_dim, ring
@@ -148,7 +204,54 @@ extern "C" int nv_kernels_quantize_kv_fp8(
     return (e == cudaSuccess) ? 0 : static_cast<int>(e);
 }
 
-extern "C" int nv_kernels_dequantize_kv_fp8(
+extern "C" int nv_kernels_quantize_kv_fp8(void* stream, const uint16_t* x_bf16, uint8_t* x_fp8_base, float* scales_base, const int* start_dev, int n_tokens, int n_kv, int head_dim, int ring) {
+    return quantize_kv_launch<false>(stream, x_bf16, x_fp8_base, scales_base, start_dev, n_tokens, n_kv, head_dim, ring);
+}
+
+extern "C" int nv_kernels_quantize_kv_int8(void* stream, const uint16_t* x_bf16, uint8_t* x_int8_base, float* scales_base, const int* start_dev, int n_tokens, int n_kv, int head_dim, int ring) {
+    return quantize_kv_launch<true>(stream, x_bf16, x_int8_base, scales_base, start_dev, n_tokens, n_kv, head_dim, ring);
+}
+
+extern "C" int nv_kernels_quantize_kv_fp8_unit_scale(
+    void* stream,
+    const uint16_t* x_bf16,
+    uint8_t* x_fp8_base,
+    float* scales_base,
+    const int* start_dev,
+    int n_tokens,
+    int n_kv,
+    int head_dim,
+    int ring
+) {
+    if (n_tokens <= 0 || n_kv <= 0 || head_dim <= 0) return 0;
+    if (ring < 0) return -3;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+
+    int block = head_dim;
+    if (block > 512) block = 512;
+    if (block < 32) block = 32;
+    dim3 grid(static_cast<unsigned>(n_tokens), static_cast<unsigned>(n_kv));
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, grid, dim3(static_cast<unsigned>(block)), 0, s);
+        cudaLaunchKernelEx(
+            &cfg, quantize_kv_fp8_unit_scale_kernel,
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            x_fp8_base, scales_base, start_dev,
+            n_tokens, n_kv, head_dim, ring
+        );
+    } else {
+        quantize_kv_fp8_unit_scale_kernel<<<grid, block, 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+            x_fp8_base, scales_base, start_dev,
+            n_tokens, n_kv, head_dim, ring
+        );
+    }
+    cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : static_cast<int>(e);
+}
+
+template <bool INT8>
+static int dequantize_kv_launch(
     void* stream,
     const uint8_t* x_fp8,
     const float* scales,
@@ -166,11 +269,19 @@ extern "C" int nv_kernels_dequantize_kv_fp8(
     if (block > 512) block = 512;
     if (block < 32) block = 32;
     dim3 grid(static_cast<unsigned>(n_tokens), static_cast<unsigned>(n_kv));
-    dequantize_kv_fp8_kernel<<<grid, block, 0, s>>>(
+    dequantize_kv_fp8_kernel<INT8><<<grid, block, 0, s>>>(
         x_fp8, scales,
         reinterpret_cast<__nv_bfloat16*>(x_bf16),
         start, n_tokens, n_kv, head_dim, ring
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : static_cast<int>(e);
+}
+
+extern "C" int nv_kernels_dequantize_kv_fp8(void* stream, const uint8_t* x_fp8, const float* scales, uint16_t* x_bf16, int start, int n_tokens, int n_kv, int head_dim, int ring) {
+    return dequantize_kv_launch<false>(stream, x_fp8, scales, x_bf16, start, n_tokens, n_kv, head_dim, ring);
+}
+
+extern "C" int nv_kernels_dequantize_kv_int8(void* stream, const uint8_t* x_int8, const float* scales, uint16_t* x_bf16, int start, int n_tokens, int n_kv, int head_dim, int ring) {
+    return dequantize_kv_launch<true>(stream, x_int8, scales, x_bf16, start, n_tokens, n_kv, head_dim, ring);
 }

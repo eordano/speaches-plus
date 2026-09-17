@@ -16,8 +16,7 @@ use crate::dots_ocr::DotsPrecision;
 pub const GOT_PRECISION_ENV: &str = "NV_GOT_DEC_PRECISION";
 
 pub fn got_precision(raw: Option<&str>, default: DotsPrecision) -> Result<DotsPrecision> {
-    DotsPrecision::parse(raw, default)
-        .map_err(|e| anyhow!("{GOT_PRECISION_ENV}: {e:#}"))
+    DotsPrecision::parse(raw, default).map_err(|e| anyhow!("{GOT_PRECISION_ENV}: {e:#}"))
 }
 
 pub fn got_default_precision(device: &Device) -> DotsPrecision {
@@ -357,8 +356,7 @@ impl GotOcrPipeline {
             d.rope_span()
         );
         let budget = (prompt_len + opts.max_new_tokens + 1).min(d.rope_span());
-        let mut cache =
-            DotsKvCache::new_with_mode(cfg, budget, d.device(), d.dtype(), true)?;
+        let mut cache = DotsKvCache::new_with_mode(cfg, budget, d.device(), d.dtype(), true)?;
         let n = vision_features.dim(0)?;
         anyhow::ensure!(
             vision_start + n <= prompt_len,
@@ -441,14 +439,14 @@ mod tests {
         let err = got_precision(Some("int4"), DotsPrecision::Bf16)
             .unwrap_err()
             .to_string();
-        assert!(err.contains(GOT_PRECISION_ENV), "error names the env var: {err}");
+        assert!(
+            err.contains(GOT_PRECISION_ENV),
+            "error names the env var: {err}"
+        );
     }
 
     #[test]
     fn cpu_default_precision_is_bf16_nvfp4_kernels_are_cuda_only() {
-        assert_eq!(
-            got_default_precision(&Device::Cpu),
-            DotsPrecision::Bf16
-        );
+        assert_eq!(got_default_precision(&Device::Cpu), DotsPrecision::Bf16);
     }
 }

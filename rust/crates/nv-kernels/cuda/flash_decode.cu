@@ -2177,334 +2177,6 @@ __device__ __forceinline__ void rowshared_mrows_split_store_static_g_unroll_keep
     }
 }
 
-template <int GROUP, int HD>
-__device__ __forceinline__ void rowshared_position_softmax_update_bf16_qsh(
-    const unsigned short* __restrict__ qsh_rows,
-    const uchar4 (&kcur)[HD >> 7],
-    const uint2 (&vcur)[HD / kWarp / 8],
-    float ks,
-    float vs,
-    float scaling,
-    int lane,
-    bool live,
-    float (&m)[GROUP],
-    float (&l)[GROUP],
-    float (&acc)[GROUP][HD / kWarp]
-) {
-    constexpr int vc = HD / kWarp;
-    constexpr int nck = HD >> 7;
-    constexpr int nv2 = vc / 8;
-
-    float kf[nck * 4];
-    #pragma unroll
-    for (int c = 0; c < nck; ++c) {
-        uchar4 raw = kcur[c];
-        float2 f01 = nv_fp8x2_to_float2(
-            (unsigned short)(raw.x | ((unsigned short)raw.y << 8)));
-        float2 f23 = nv_fp8x2_to_float2(
-            (unsigned short)(raw.z | ((unsigned short)raw.w << 8)));
-        kf[c * 4 + 0] = f01.x;
-        kf[c * 4 + 1] = f01.y;
-        kf[c * 4 + 2] = f23.x;
-        kf[c * 4 + 3] = f23.y;
-    }
-    float vf[vc];
-    #pragma unroll
-    for (int t = 0; t < nv2; ++t) {
-        uint2 raw = vcur[t];
-        float2 f0 = nv_fp8x2_to_float2((unsigned short)(raw.x & 0xffffu));
-        float2 f1 = nv_fp8x2_to_float2((unsigned short)(raw.x >> 16));
-        float2 f2 = nv_fp8x2_to_float2((unsigned short)(raw.y & 0xffffu));
-        float2 f3 = nv_fp8x2_to_float2((unsigned short)(raw.y >> 16));
-        vf[t * 8 + 0] = f0.x;
-        vf[t * 8 + 1] = f0.y;
-        vf[t * 8 + 2] = f1.x;
-        vf[t * 8 + 3] = f1.y;
-        vf[t * 8 + 4] = f2.x;
-        vf[t * 8 + 5] = f2.y;
-        vf[t * 8 + 6] = f3.x;
-        vf[t * 8 + 7] = f3.y;
-    }
-
-    float partial[GROUP];
-    #pragma unroll
-    for (int g = 0; g < GROUP; ++g) {
-        const __nv_bfloat162* qrow = reinterpret_cast<const __nv_bfloat162*>(
-            qsh_rows + (size_t)g * HD);
-        float acc_p = 0.0f;
-        #pragma unroll
-        for (int c = 0; c < nck; ++c) {
-            const int idx4 = lane + c * kWarp;
-            float2 q01 = __bfloat1622float2(qrow[2 * idx4]);
-            float2 q23 = __bfloat1622float2(qrow[2 * idx4 + 1]);
-            acc_p += q01.x * kf[c * 4 + 0]
-                   + q01.y * kf[c * 4 + 1]
-                   + q23.x * kf[c * 4 + 2]
-                   + q23.y * kf[c * 4 + 3];
-        }
-        partial[g] = acc_p;
-    }
-    #pragma unroll
-    for (int o = kWarp / 2; o > 0; o >>= 1) {
-        #pragma unroll
-        for (int g = 0; g < GROUP; ++g)
-            partial[g] += __shfl_xor_sync(0xffffffffu, partial[g], o);
-    }
-    if (live) {
-        float corr[GROUP];
-        float w_v[GROUP];
-        #pragma unroll
-        for (int g = 0; g < GROUP; ++g) {
-            float score = partial[g] * ks * scaling;
-            float m_new = fmaxf(m[g], score);
-            corr[g] = __expf(m[g] - m_new);
-            float w = __expf(score - m_new);
-            l[g] = l[g] * corr[g] + w;
-            w_v[g] = w * vs;
-            m[g] = m_new;
-        }
-        #pragma unroll
-        for (int g = 0; g < GROUP; ++g) {
-            #pragma unroll
-            for (int i = 0; i < vc; ++i)
-                acc[g][i] = __fmaf_rn(w_v[g], vf[i], __fmul_rn(acc[g][i], corr[g]));
-        }
-    }
-}
-
-template <int GROUP, int HD>
-__global__ void __launch_bounds__(kFlashThreads, 2) flash_splitk_fused_fp8_rowshared_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const uint8_t* __restrict__ k_fp8,
-    const uint8_t* __restrict__ v_fp8,
-    const float* __restrict__ k_scales,
-    const float* __restrict__ v_scales,
-    float* __restrict__ scratch,
-    unsigned int* __restrict__ fan_in,
-    __nv_bfloat16* __restrict__ outp,
-    const int* __restrict__ n_total_dev,
-    int NKV,
-    int SPLITS,
-    int WINDOW,
-    int RING,
-    float scaling,
-    const int* __restrict__ block_table,
-    int block_size,
-    int delta,
-    int M,
-    int hole_from_row,
-    int hole_lo_delta,
-    int hole_hi_delta
-) {
-    static_assert((HD & 127) == 0 && HD <= kMaxHD, "uchar4 K chunks assume 128-dim multiples");
-    constexpr int vc = HD / kWarp;
-    constexpr int nck = HD >> 7;
-    constexpr int nv2 = vc / 8;
-    const int kvh = blockIdx.x;
-    const int split = blockIdx.y;
-    if (kvh >= NKV || split >= SPLITS) return;
-
-    NVK_PDL_PROLOG();
-
-    const int total = n_total_dev[0] - delta;
-    const int hole_lo = n_total_dev[0] - hole_lo_delta;
-    const int hole_hi = n_total_dev[0] - hole_hi_delta;
-    const int NH = NKV * GROUP;
-    const int lane = threadIdx.x & (kWarp - 1);
-    const int warp = threadIdx.x >> 5;
-    const int mi = warp % M;
-    const int rsub = warp / M;
-    const int warps_on_mi = (kFlashWarps - 1 - mi) / M + 1;
-    const int total_mi = total - (M - 1) + mi;
-    const int start_mi = (WINDOW > 0 && total_mi > WINDOW) ? (total_mi - WINDOW) : 0;
-    const bool holes_mi = mi >= hole_from_row;
-    const int total_q0 = total - (M - 1);
-    const int start = (WINDOW > 0 && total_q0 > WINDOW) ? (total_q0 - WINDOW) : 0;
-
-    __shared__ __align__(16) unsigned short
-        qsh[kRowsharedMaxRows8MatchesTheMkVerifyTemplateCap * GROUP][HD];
-    for (int t = threadIdx.x; t < M * GROUP * HD; t += kFlashThreads) {
-        const int r = t / HD;
-        const int d = t - r * HD;
-        const int rq = r / GROUP;
-        const int g = r - rq * GROUP;
-        qsh[r][d] = reinterpret_cast<const unsigned short*>(
-            q)[((size_t)rq * NH + (size_t)kvh * GROUP + g) * HD + d];
-    }
-
-    float acc[GROUP][vc];
-    float m[GROUP];
-    float l[GROUP];
-    #pragma unroll
-    for (int g = 0; g < GROUP; ++g) {
-        m[g] = -INFINITY;
-        l[g] = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < vc; ++i) acc[g][i] = 0.0f;
-    }
-
-    __shared__ __align__(16) uint8_t ktile[kFlashWarps][HD];
-    __shared__ __align__(16) uint8_t vtile[kFlashWarps][HD];
-    __shared__ float kstile[kFlashWarps];
-    __shared__ float vstile[kFlashWarps];
-
-    const bool bs_pow2 = (block_size & (block_size - 1)) == 0;
-    const int bs_shift = __ffs((unsigned)block_size) - 1;
-    const int tile_stride = SPLITS * kFlashWarps;
-    constexpr int row_u2 = HD / 8;
-    constexpr int u2_per_lane = row_u2 / kWarp;
-
-    uint2 kpre[u2_per_lane];
-    uint2 vpre[u2_per_lane];
-    float kspre = 0.0f;
-    float vspre = 0.0f;
-    auto prefetch = [&](int base) {
-        const int p = base + warp;
-        if (base < total && p < total) {
-            const int sp = kv_phys_slot_pow2hint(
-                block_table, block_size, RING, p, bs_pow2, bs_shift);
-            const size_t row = (size_t)sp * NKV + kvh;
-            const uint2* krow = reinterpret_cast<const uint2*>(k_fp8 + row * HD);
-            const uint2* vrow = reinterpret_cast<const uint2*>(v_fp8 + row * HD);
-            #pragma unroll
-            for (int c = 0; c < u2_per_lane; ++c) {
-                kpre[c] = __ldg(&krow[lane + c * kWarp]);
-                vpre[c] = __ldg(&vrow[lane + c * kWarp]);
-            }
-            kspre = k_scales[row];
-            vspre = v_scales[row];
-        } else {
-            kspre = 0.0f;
-            vspre = 0.0f;
-        }
-    };
-
-    const int tile0 = start + split * kFlashWarps;
-    prefetch(tile0);
-    for (int base = tile0; base < total; base += tile_stride) {
-        {
-            uint2* kdst = reinterpret_cast<uint2*>(ktile[warp]);
-            uint2* vdst = reinterpret_cast<uint2*>(vtile[warp]);
-            #pragma unroll
-            for (int c = 0; c < u2_per_lane; ++c) {
-                kdst[lane + c * kWarp] = kpre[c];
-                vdst[lane + c * kWarp] = vpre[c];
-            }
-            if (lane == 0) {
-                kstile[warp] = kspre;
-                vstile[warp] = vspre;
-            }
-        }
-        __syncthreads();
-        prefetch(base + tile_stride);
-        for (int j = rsub; j < kFlashWarps; j += warps_on_mi) {
-            const int p = base + j;
-            const bool live = p < total_mi && p >= start_mi
-                && !(holes_mi && p >= hole_lo && p < hole_hi);
-            uchar4 kcur[nck];
-            const uchar4* ksrc = reinterpret_cast<const uchar4*>(ktile[j]);
-            #pragma unroll
-            for (int c = 0; c < nck; ++c) kcur[c] = ksrc[lane + c * kWarp];
-            uint2 vcur[nv2];
-            const uint2* vsrc = reinterpret_cast<const uint2*>(vtile[j]);
-            #pragma unroll
-            for (int t = 0; t < nv2; ++t) vcur[t] = vsrc[lane * nv2 + t];
-            rowshared_position_softmax_update_bf16_qsh<GROUP, HD>(
-                &qsh[mi * GROUP][0], kcur, vcur, kstile[j], vstile[j],
-                scaling, lane, live, m, l, acc);
-        }
-        __syncthreads();
-    }
-
-    __shared__ float smw[kFlashWarps];
-    __shared__ float slw[kFlashWarps];
-    __shared__ float saccr[kFlashWarps][HD];
-    for (int r = 0; r < M * GROUP; ++r) {
-        const int rq = r / GROUP;
-        const int g = r - rq * GROUP;
-        const bool own = mi == rq;
-        __syncthreads();
-        if (lane == 0) {
-            smw[warp] = own ? m[g] : -INFINITY;
-            slw[warp] = own ? l[g] : 0.0f;
-        }
-        if (own) {
-            #pragma unroll
-            for (int i = 0; i < vc; ++i) saccr[warp][lane * vc + i] = acc[g][i];
-        }
-        __syncthreads();
-
-        float* out = scratch
-            + (((size_t)(kvh * M + rq) * GROUP + g) * SPLITS + split) * (HD + 2);
-        if (warp == 0) {
-            float m_blk = -INFINITY;
-            #pragma unroll
-            for (int w = 0; w < kFlashWarps; ++w) m_blk = fmaxf(m_blk, smw[w]);
-            float l_blk = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < kFlashWarps; ++w)
-                l_blk += (smw[w] > -INFINITY) ? slw[w] * __expf(smw[w] - m_blk) : 0.0f;
-            if (lane == 0) {
-                out[0] = m_blk;
-                out[1] = l_blk;
-            }
-        }
-        float m_blk = -INFINITY;
-        #pragma unroll
-        for (int w = 0; w < kFlashWarps; ++w) m_blk = fmaxf(m_blk, smw[w]);
-        for (int d = threadIdx.x; d < HD; d += kFlashThreads) {
-            float a = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < kFlashWarps; ++w)
-                a += (smw[w] > -INFINITY) ? saccr[w][d] * __expf(smw[w] - m_blk) : 0.0f;
-            out[2 + d] = a;
-        }
-    }
-
-    __syncthreads();
-    __threadfence();
-    __shared__ unsigned int ticket;
-    if (threadIdx.x == 0) ticket = atomicAdd(&fan_in[kvh], 1u);
-    __syncthreads();
-    if (ticket == SPLITS - 1) {
-        __threadfence();
-        __shared__ float ssc[kKvShareMaxSplits];
-        __shared__ float sinv_l;
-        for (int r = 0; r < M * GROUP; ++r) {
-            const int rq = r / GROUP;
-            const int g = r - rq * GROUP;
-            const float* base =
-                scratch + ((size_t)(kvh * M + rq) * GROUP + g) * SPLITS * (HD + 2);
-            if (threadIdx.x == 0) {
-                float m_glob = -INFINITY;
-                for (int s = 0; s < SPLITS; ++s)
-                    m_glob = fmaxf(m_glob, base[(size_t)s * (HD + 2)]);
-                float l_glob = 0.0f;
-                for (int s = 0; s < SPLITS; ++s) {
-                    const float* part = base + (size_t)s * (HD + 2);
-                    float sc = (part[0] > -INFINITY) ? __expf(part[0] - m_glob) : 0.0f;
-                    ssc[s] = sc;
-                    l_glob += part[1] * sc;
-                }
-                sinv_l = (l_glob > 0.0f) ? (1.0f / l_glob) : 0.0f;
-            }
-            __syncthreads();
-            const float inv_l = sinv_l;
-            for (int d = threadIdx.x; d < HD; d += kFlashThreads) {
-                float a = 0.0f;
-                for (int s = 0; s < SPLITS; ++s)
-                    a += base[(size_t)s * (HD + 2) + 2 + d] * ssc[s];
-                outp[((size_t)rq * NH + (size_t)kvh * GROUP + g) * HD + d] =
-                    __float2bfloat16(a * inv_l);
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) fan_in[kvh] = 0u;
-    }
-
-    NVK_PDL_EPILOG();
-}
-
 constexpr int kTctileChunkPositions8MatchTheM16N8K16NTile = kTcTilePositions;
 constexpr int kTctileChunksPerTile4Stage32PositionsSoEveryWarpOwnsAChunkFromM2 = 4;
 constexpr int kTctileQRows50CoverSmemRowMi7TimesGroup6PlusGid7 = 50;
@@ -3399,66 +3071,11 @@ extern "C" int nv_kernels_flash_decode_kvshare_fp8kv_paged(
         group, -1, 0, 0, 0, delta, hole_lo_delta, hole_hi_delta);
 }
 
-namespace {
-
-template <int GROUP>
-int rowshared_launch_for_group(
-    dim3 grid,
-    cudaStream_t cs,
-    const __nv_bfloat16* qb,
-    const uint8_t* k_fp8,
-    const uint8_t* v_fp8,
-    const float* k_scales,
-    const float* v_scales,
-    float* scratch,
-    unsigned int* fan_in,
-    __nv_bfloat16* ob,
-    const int* n_total_dev,
-    int NKV,
-    int sp,
-    int WINDOW,
-    int RING,
-    float scaling,
-    const int* block_table,
-    int block_size,
-    int delta,
-    int M,
-    int hole_from_row,
-    int hole_lo_delta,
-    int hole_hi_delta
-) {
-    auto kern = splitk::flash_splitk_fused_fp8_rowshared_kernel<
-        GROUP, splitk::kKvShareHD>;
-    if (splitk::kvshare_debug_env()) {
-        cudaFuncAttributes fa{};
-        cudaFuncGetAttributes(&fa, kern);
-        int occ = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ, kern, splitk::kFlashThreads, 0);
-        fprintf(stderr,
-                "[rowshared-debug] group=%d m=%d splits=%d regs=%d smem=%zu "
-                "local=%zu occ_blocks_per_sm=%d sms=%d\n",
-                GROUP, M, sp, fa.numRegs, fa.sharedSizeBytes,
-                fa.localSizeBytes, occ, splitk::flash_sm_count());
-    }
-    if (nvk_pdl_enabled()) {
-        NVK_PDL_ATTR(cfg, grid, dim3(splitk::kFlashThreads), 0, cs);
-        cudaLaunchKernelEx(
-            &cfg, kern, qb, k_fp8, v_fp8, k_scales, v_scales, scratch, fan_in,
-            ob, n_total_dev, NKV, sp, WINDOW, RING, scaling, block_table,
-            block_size, delta, M, hole_from_row, hole_lo_delta, hole_hi_delta);
-    } else {
-        kern<<<grid, splitk::kFlashThreads, 0, cs>>>(
-            qb, k_fp8, v_fp8, k_scales, v_scales, scratch, fan_in, ob,
-            n_total_dev, NKV, sp, WINDOW, RING, scaling, block_table,
-            block_size, delta, M, hole_from_row, hole_lo_delta, hole_hi_delta);
-    }
-    return (int)cudaGetLastError();
+extern "C" int nv_kernels_flash_decode_kvshare_splits_pick(int NKV) {
+    return splitk::kvshare_splits_pick(NKV);
 }
 
-}
-
-extern "C" int nv_kernels_flash_decode_rowshared_fp8kv_mk_paged(
+extern "C" int nv_kernels_flash_decode_kvshare_fp8kv_paged_qk_tc(
     void* stream,
     const uint16_t* q,
     const uint8_t* k_fp8,
@@ -3475,13 +3092,10 @@ extern "C" int nv_kernels_flash_decode_rowshared_fp8kv_mk_paged(
     int WINDOW,
     int RING,
     int splits,
-    int splits_cap_scratch_rows_over_m,
     float scaling,
     const int* block_table,
     int block_size,
     int delta,
-    int M,
-    int hole_from_row,
     int hole_lo_delta,
     int hole_hi_delta
 ) {
@@ -3492,28 +3106,18 @@ extern "C" int nv_kernels_flash_decode_rowshared_fp8kv_mk_paged(
         || (group != splitk::kKvShareGroup
             && group != splitk::kKvShareGroupQ36Is8For16q2kv))
         return -22;
-    if (M < 1 || M > splitk::kRowsharedMaxRows8MatchesTheMkVerifyTemplateCap)
-        return -26;
     if (RING < 0 || (RING > 0 && WINDOW <= 0)) return -3;
     if (hole_lo_delta < hole_hi_delta || hole_hi_delta < 0) return -25;
     int sp = (splits > 0) ? splits : splitk::kvshare_splits_pick(NKV);
-    if (splits_cap_scratch_rows_over_m > 0 && sp > splits_cap_scratch_rows_over_m)
-        sp = splits_cap_scratch_rows_over_m;
     if (sp < 1 || sp > splitk::kKvShareMaxSplits) return -23;
     dim3 grid((unsigned)NKV, (unsigned)sp);
     const __nv_bfloat16* qb = reinterpret_cast<const __nv_bfloat16*>(q);
     __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out);
     cudaStream_t cs = (cudaStream_t)stream;
-    if (group == splitk::kKvShareGroupQ36Is8For16q2kv) {
-        return rowshared_launch_for_group<splitk::kKvShareGroupQ36Is8For16q2kv>(
-            grid, cs, qb, k_fp8, v_fp8, k_scales, v_scales, scratch, fan_in,
-            ob, n_total_dev, NKV, sp, WINDOW, RING, scaling, block_table,
-            block_size, delta, M, hole_from_row, hole_lo_delta, hole_hi_delta);
-    }
-    return rowshared_launch_for_group<splitk::kKvShareGroup>(
+    return kvshare_launch(
         grid, cs, qb, k_fp8, v_fp8, k_scales, v_scales, scratch, fan_in, ob,
         n_total_dev, NKV, sp, WINDOW, RING, scaling, block_table, block_size,
-        delta, M, hole_from_row, hole_lo_delta, hole_hi_delta);
+        group, 1, 0, 0, 0, delta, hole_lo_delta, hole_hi_delta);
 }
 
 extern "C" int nv_kernels_flash_decode_rowshared_tctile_fp8kv_mk_paged(
@@ -3893,7 +3497,15 @@ constexpr int kFlashWarps = 8;
 constexpr int kFlashThreads = kWarp * kFlashWarps;
 constexpr int kMaxHDmk = 256;
 constexpr int kMaxAccMk = kMaxHDmk / kWarp;
-constexpr int kMaxM = 8;
+constexpr int kMaxMContiguous = 8;
+constexpr int kNoMkRowCaseRcMinus31LoudErrorNotASilentNoLaunch = -31;
+constexpr int
+    kMaxMRows24RowsPastContiguousChunkThroughThe8RowTemplatesBoundedByTheCallersScratchPoolOf768RowSplitSlotsAtThe32SplitPick =
+        24;
+constexpr bool mk_rows_case_instantiated(int m) {
+    return m >= 1
+        && m <= kMaxMRows24RowsPastContiguousChunkThroughThe8RowTemplatesBoundedByTheCallersScratchPoolOf768RowSplitSlotsAtThe32SplitPick;
+}
 constexpr int kMaxHDmkFp8 = 512;
 static_assert(
     kMaxHDmkFp8 > kMaxHDmk,
@@ -4458,7 +4070,7 @@ extern "C" int nv_kernels_flash_decode_fused_bf16kv_mk(
     int WINDOW
 ) {
     if (NH <= 0 || NKV <= 0) return 0;
-    if (M < 1 || M > splitk_mk::kMaxM) return -1;
+    if (!splitk_mk::mk_rows_case_instantiated(M)) return -1;
     if (HD > splitk_mk::kMaxHDmk || (NH % NKV) != 0) return -1;
     int sp = splitk::flash_splits_pick(NH);
     dim3 grid((unsigned)NH, (unsigned)sp);
@@ -4470,10 +4082,16 @@ extern "C" int nv_kernels_flash_decode_fused_bf16kv_mk(
     case MM: \
         splitk_mk::flash_splitk_fused_mk_kernel<SP, MM> \
             <<<grid, splitk_mk::kFlashThreads, 0, cs>>>( \
-                q, kb, vb, scratch, fan_in, ob, pos, delta, NH, NKV, HD, WINDOW); \
+                qc, kb, vb, scratch, fan_in, oc, pos, dc, NH, NKV, HD, WINDOW); \
         break;
+    for (int q0 = 0; q0 < M; q0 += splitk_mk::kMaxMContiguous) {
+        const int cm =
+            (M - q0 < splitk_mk::kMaxMContiguous) ? (M - q0) : splitk_mk::kMaxMContiguous;
+        const float* qc = q + (size_t)q0 * NH * HD;
+        __nv_bfloat16* oc = ob + (size_t)q0 * NH * HD;
+        const int dc = delta + (M - q0 - cm);
 #define NV_MK_BF16_SWITCH(SP) \
-    switch (M) { \
+    switch (cm) { \
         NV_MK_BF16_CASE(SP, 1) \
         NV_MK_BF16_CASE(SP, 2) \
         NV_MK_BF16_CASE(SP, 3) \
@@ -4482,14 +4100,16 @@ extern "C" int nv_kernels_flash_decode_fused_bf16kv_mk(
         NV_MK_BF16_CASE(SP, 6) \
         NV_MK_BF16_CASE(SP, 7) \
         NV_MK_BF16_CASE(SP, 8) \
+        default: return splitk_mk::kNoMkRowCaseRcMinus31LoudErrorNotASilentNoLaunch; \
     } \
     break;
-    switch (sp) {
-        case 8: NV_MK_BF16_SWITCH(8)
-        case 32: NV_MK_BF16_SWITCH(32)
-        default: NV_MK_BF16_SWITCH(16)
-    }
+        switch (sp) {
+            case 8: NV_MK_BF16_SWITCH(8)
+            case 32: NV_MK_BF16_SWITCH(32)
+            default: NV_MK_BF16_SWITCH(16)
+        }
 #undef NV_MK_BF16_SWITCH
+    }
 #undef NV_MK_BF16_CASE
     return (int)cudaGetLastError();
 }
@@ -4520,7 +4140,7 @@ static int fused_fp8kv_mk_paged_launch_whose_hole_masks_tree_sibling_rows(
     int hole_hi_delta
 ) {
     if (NH <= 0 || NKV <= 0) return 0;
-    if (M < 1 || M > splitk_mk::kMaxM) return -1;
+    if (!splitk_mk::mk_rows_case_instantiated(M)) return -1;
     if (hole_lo_delta < hole_hi_delta || hole_hi_delta < 0) return -25;
     if (HD > splitk_mk::kMaxHDmkFp8 || (NH % NKV) != 0) return -1;
     if (RING < 0 || (RING > 0 && WINDOW <= 0)) return -3;
@@ -4559,6 +4179,7 @@ static int fused_fp8kv_mk_paged_launch_whose_hole_masks_tree_sibling_rows(
         NV_MK_FP8_CASE(SP, 6, 512) \
         NV_MK_FP8_CASE(SP, 7, 512) \
         NV_MK_FP8_CASE(SP, 8, 512) \
+        default: return splitk_mk::kNoMkRowCaseRcMinus31LoudErrorNotASilentNoLaunch; \
     } \
     break;
             switch (sp) {
@@ -4570,13 +4191,15 @@ static int fused_fp8kv_mk_paged_launch_whose_hole_masks_tree_sibling_rows(
         }
         return (int)cudaGetLastError();
     }
-    {
-        const __nv_bfloat16* qc = qb;
-        __nv_bfloat16* oc = ob;
-        const int dc = delta;
-        const int hc = hole_from_row;
+    for (int q0 = 0; q0 < M; q0 += splitk_mk::kMaxMContiguous) {
+        const int cm =
+            (M - q0 < splitk_mk::kMaxMContiguous) ? (M - q0) : splitk_mk::kMaxMContiguous;
+        const __nv_bfloat16* qc = qb + (size_t)q0 * NH * HD;
+        __nv_bfloat16* oc = ob + (size_t)q0 * NH * HD;
+        const int dc = delta + (M - q0 - cm);
+        const int hc = (hole_from_row >= M) ? cm : (hole_from_row - q0);
 #define NV_MK_FP8_SWITCH(SP) \
-    switch (M) { \
+    switch (cm) { \
         NV_MK_FP8_CASE(SP, 1, 256) \
         NV_MK_FP8_CASE(SP, 2, 256) \
         NV_MK_FP8_CASE(SP, 3, 256) \
@@ -4585,6 +4208,7 @@ static int fused_fp8kv_mk_paged_launch_whose_hole_masks_tree_sibling_rows(
         NV_MK_FP8_CASE(SP, 6, 256) \
         NV_MK_FP8_CASE(SP, 7, 256) \
         NV_MK_FP8_CASE(SP, 8, 256) \
+        default: return splitk_mk::kNoMkRowCaseRcMinus31LoudErrorNotASilentNoLaunch; \
     } \
     break;
         switch (sp) {

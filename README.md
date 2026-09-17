@@ -28,10 +28,6 @@ Canonical references, in order of authority:
   changes that measured worse, the kernel rules, the per-token cost model
   and its consequences for spec decode and batching, and where we stand
   versus the field.
-- [`docs/book/01.4-STATUS.md`](docs/book/01.4-STATUS.md) -- what is actually implemented,
-  phase by phase, including what is *not* verified.
-- [`docs/book/08.4-PERFORMANCE.md`](docs/book/08.4-PERFORMANCE.md) -- every measured number,
-  both backends, with the conditions that make it meaningful.
 - [`docs/book/08.1-quality-harness.md`](docs/book/08.1-quality-harness.md) -- how output
   quality is measured, and the chat-template rules that decide whether a
   measurement means anything.
@@ -115,13 +111,11 @@ Apple-silicon measured matrix.
 
 ## Performance
 
-Numbers go stale within hours here, so this README quotes none.
-[`docs/book/08.4-PERFORMANCE.md`](docs/book/08.4-PERFORMANCE.md) is the rule for
-quoting one (a number without its basis tuple is not a number), and the
-per-platform measured records live in the book's chapter-5 and chapter-8
-subchapters. Per [`docs/book/01.4-STATUS.md`](docs/book/01.4-STATUS.md), 0 of 9
-PRD §11.5 performance gates have been measured -- what exists are real bs=1
-decode figures with per-run provenance. Treat any number found outside those
+Numbers go stale within hours here, so this README quotes none, and the
+measured records are kept outside this repository. A number without its basis
+tuple (checkpoint, backend, device, batch, tokens, load) is not a number; the
+book's chapter-5 and chapter-8 subchapters state the relationships the
+measurements evidenced without the figures. Treat any number found outside those
 documents as unverified.
 
 ## Building and testing
@@ -229,7 +223,6 @@ speaches-plus/
       nv-config, nv-runner
   go/                    Go realtime server (self-contained: pion, whisper.cpp, Kokoro)
   python/                Qwen3-Omni multimodal HTTP server (PyTorch; Apache-2.0, derived from upstream speaches)
-  rocq/                  Rocq (Coq) proofs + generators: launch geometry, roofline, KV budgets
   conformance/           shared fixture corpus + canonical assertions + runner
   client/                Python e2e drivers + fuzzer (aiortc)
   studio/                nur studio: React/Vite web UI (proxies /v1 to the server; NUR_API overrides)

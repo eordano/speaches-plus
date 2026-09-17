@@ -10,6 +10,8 @@ use nv_weights::WeightLoader;
 use crate::spk_mel::{log_mel_24k, SPK_MEL_N_MELS, SPK_MEL_SAMPLE_RATE};
 
 pub const CHECKPOINT_SPEAKER_PREFIX: &str = "speaker_encoder.";
+pub const ENV_SPEAKER_ENCODER_DIR: &str = "NV_TTS_SPEAKER_ENCODER_DIR";
+pub const ENV_KOKORO_QWEN_ENCODER_DIR: &str = "NV_QWEN_VOICE_ENCODER_DIR";
 
 pub fn qwen3_tts_base_dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("NV_TTS_BASE_TALKER_DIR") {
@@ -65,31 +67,42 @@ impl SpeakerEncoderConfig {
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&raw)?;
         let mut cfg = Self::default();
-        let Some(sec) = v.get("speaker_encoder_config") else {
-            return Ok(cfg);
-        };
-        if let Some(x) = sec.get("mel_dim").and_then(|x| x.as_u64()) {
-            cfg.mel_dim = x as usize;
+        if let Some(sec) = v.get("speaker_encoder_config") {
+            cfg.apply_json(sec);
         }
-        if let Some(x) = sec.get("enc_dim").and_then(|x| x.as_u64()) {
-            cfg.enc_dim = x as usize;
-        }
-        if let Some(x) = sec.get("enc_attention_channels").and_then(|x| x.as_u64()) {
-            cfg.enc_attention_channels = x as usize;
-        }
-        if let Some(x) = sec.get("enc_res2net_scale").and_then(|x| x.as_u64()) {
-            cfg.enc_res2net_scale = x as usize;
-        }
-        if let Some(x) = sec.get("enc_se_channels").and_then(|x| x.as_u64()) {
-            cfg.enc_se_channels = x as usize;
-        }
-        if let Some(x) = sec.get("sample_rate").and_then(|x| x.as_u64()) {
-            cfg.sample_rate = x as usize;
+        Ok(cfg)
+    }
+
+    pub fn from_standalone_config_file(path: &Path) -> Result<Self> {
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        Self::from_standalone_config_str(&raw)
+    }
+
+    pub fn from_standalone_config_str(raw: &str) -> Result<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw)?;
+        let mut cfg = Self::default();
+        cfg.apply_json(&v);
+        Ok(cfg)
+    }
+
+    fn apply_json(&mut self, sec: &serde_json::Value) {
+        for (key, slot) in [
+            ("mel_dim", &mut self.mel_dim),
+            ("enc_dim", &mut self.enc_dim),
+            ("enc_attention_channels", &mut self.enc_attention_channels),
+            ("enc_res2net_scale", &mut self.enc_res2net_scale),
+            ("enc_se_channels", &mut self.enc_se_channels),
+            ("sample_rate", &mut self.sample_rate),
+        ] {
+            if let Some(x) = sec.get(key).and_then(|x| x.as_u64()) {
+                *slot = x as usize;
+            }
         }
         for (key, slot) in [
-            ("enc_channels", &mut cfg.enc_channels),
-            ("enc_kernel_sizes", &mut cfg.enc_kernel_sizes),
-            ("enc_dilations", &mut cfg.enc_dilations),
+            ("enc_channels", &mut self.enc_channels),
+            ("enc_kernel_sizes", &mut self.enc_kernel_sizes),
+            ("enc_dilations", &mut self.enc_dilations),
         ] {
             if let Some(arr) = sec.get(key).and_then(|x| x.as_array()) {
                 let parsed: Option<Vec<usize>> =
@@ -99,7 +112,6 @@ impl SpeakerEncoderConfig {
                 }
             }
         }
-        Ok(cfg)
     }
 
     fn validate(&self) -> Result<()> {
@@ -500,6 +512,30 @@ impl SpeakerEncoder {
         Self::from_weights(cfg, &weights, CHECKPOINT_SPEAKER_PREFIX, device)
     }
 
+    pub fn from_standalone_bytes(
+        config_json: &str,
+        safetensors: &[u8],
+        device: &Device,
+    ) -> Result<Self> {
+        let cfg = SpeakerEncoderConfig::from_standalone_config_str(config_json)?;
+        let map = candle_core::safetensors::load_buffer(safetensors, device)?;
+        let get = |name: &str| -> Result<Tensor> {
+            let t = map
+                .get(name)
+                .ok_or_else(|| anyhow!("speaker encoder: missing tensor {name}"))?;
+            Ok(t.to_dtype(DType::F32)?)
+        };
+        Self::from_getter(cfg, &get, device)
+    }
+
+    pub fn from_standalone_dir(dir: &Path, device: &Device) -> Result<Self> {
+        let cfg = SpeakerEncoderConfig::from_standalone_config_file(&dir.join("config.json"))?;
+        let shard = dir.join("model.safetensors");
+        let weights = WeightLoader::open_file(&shard, device)
+            .with_context(|| format!("open {}", shard.display()))?;
+        Self::from_weights(cfg, &weights, "", device)
+    }
+
     pub fn config(&self) -> &SpeakerEncoderConfig {
         &self.cfg
     }
@@ -562,6 +598,100 @@ impl SpeakerEncoder {
         let (mel_flat, frames) = log_mel_24k(samples_24k)?;
         let mel = Tensor::from_vec(mel_flat, (1usize, SPK_MEL_N_MELS, frames), &self.device)?;
         self.encode(&mel)
+    }
+}
+
+fn talker_tts_model_type(talker_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(talker_dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("tts_model_type")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpeakerEncoderSource {
+    Checkpoint(PathBuf),
+    External(PathBuf),
+    Unavailable(String),
+}
+
+impl SpeakerEncoderSource {
+    pub fn choose(talker_dir: Option<&Path>, external_dir: Option<&Path>) -> Self {
+        let Some(talker) = talker_dir else {
+            return Self::Unavailable(
+                "no TTS talker directory (NV_TTS_TALKER_DIR unset); nothing to enroll against"
+                    .to_string(),
+            );
+        };
+        if SpeakerEncoder::checkpoint_has_speaker_encoder(talker) {
+            return Self::Checkpoint(talker.to_path_buf());
+        }
+        let Some(external) = external_dir else {
+            return Self::Unavailable(format!(
+                "{} has no speaker_encoder.* tensors (CustomVoice/VoiceDesign) and no external \
+                 speaker encoder directory is set ({ENV_SPEAKER_ENCODER_DIR} or \
+                 {ENV_KOKORO_QWEN_ENCODER_DIR}); voice-profile enrollment disabled -- use a \
+                 Qwen3-TTS Base checkpoint to enroll",
+                talker.display()
+            ));
+        };
+        match Self::external_compatible(talker, external) {
+            Ok(()) => Self::External(external.to_path_buf()),
+            Err(reason) => Self::Unavailable(format!(
+                "{} has no speaker_encoder.* tensors and the external speaker encoder {} cannot \
+                 stand in: {reason}; voice-profile enrollment disabled -- use a Qwen3-TTS Base \
+                 checkpoint to enroll",
+                talker.display(),
+                external.display()
+            )),
+        }
+    }
+
+    fn external_compatible(talker: &Path, external: &Path) -> std::result::Result<(), String> {
+        for f in ["config.json", "model.safetensors"] {
+            if !external.join(f).is_file() {
+                return Err(format!("missing {}", external.join(f).display()));
+            }
+        }
+        let model_type = talker_tts_model_type(talker).unwrap_or_default();
+        if model_type != "base" {
+            return Err(format!(
+                "talker tts_model_type {model_type:?} is not \"base\", so its codec prefix was \
+                 never trained with an x-vector in the speaker slot"
+            ));
+        }
+        let hidden =
+            crate::talker::Qwen3TtsTalkerConfig::from_hf_config_file(&talker.join("config.json"))
+                .map_err(|e| format!("talker config unreadable: {e:#}"))?
+                .hidden_size;
+        let enc_dim =
+            SpeakerEncoderConfig::from_standalone_config_file(&external.join("config.json"))
+                .map_err(|e| format!("encoder config unreadable: {e:#}"))?
+                .enc_dim;
+        if enc_dim != hidden {
+            return Err(format!(
+                "encoder enc_dim {enc_dim} != talker hidden_size {hidden} (the x-vector is \
+                 inserted verbatim as one hidden-state row)"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn load(&self, device: &Device) -> Result<SpeakerEncoder> {
+        match self {
+            Self::Checkpoint(dir) => SpeakerEncoder::from_qwen3_checkpoint(dir, device),
+            Self::External(dir) => SpeakerEncoder::from_standalone_dir(dir, device),
+            Self::Unavailable(reason) => Err(anyhow!("{reason}")),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Checkpoint(_) => "checkpoint",
+            Self::External(_) => "external",
+            Self::Unavailable(_) => "unavailable",
+        }
     }
 }
 
@@ -802,5 +932,282 @@ mod tests {
             enc.encode_pcm_24k(&pcm).is_err(),
             "tiny config has mel_dim 8, pcm path must refuse"
         );
+    }
+
+    struct FakeDir(PathBuf);
+
+    impl FakeDir {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!(
+                "nv-tts-spk-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&d).unwrap();
+            Self(d)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn config(&self, json: &str) -> &Self {
+            std::fs::write(self.0.join("config.json"), json).unwrap();
+            self
+        }
+
+        fn weights(&self, prefix: &str, cfg: &SpeakerEncoderConfig) -> &Self {
+            let map: HashMap<String, Tensor> = tiny_weight_map(cfg, &cpu())
+                .into_iter()
+                .map(|(k, v)| (format!("{prefix}{k}"), v))
+                .collect();
+            candle_core::safetensors::save(&map, self.0.join("model.safetensors")).unwrap();
+            self
+        }
+    }
+
+    impl Drop for FakeDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn talker_config(model_type: &str, hidden: usize) -> String {
+        format!(r#"{{"tts_model_type":"{model_type}","talker_config":{{"hidden_size":{hidden}}}}}"#)
+    }
+
+    fn standalone_config(cfg: &SpeakerEncoderConfig) -> String {
+        serde_json::json!({
+            "mel_dim": cfg.mel_dim,
+            "enc_dim": cfg.enc_dim,
+            "enc_channels": cfg.enc_channels,
+            "enc_kernel_sizes": cfg.enc_kernel_sizes,
+            "enc_dilations": cfg.enc_dilations,
+            "enc_attention_channels": cfg.enc_attention_channels,
+            "enc_res2net_scale": cfg.enc_res2net_scale,
+            "enc_se_channels": cfg.enc_se_channels,
+            "sample_rate": cfg.sample_rate,
+        })
+        .to_string()
+    }
+
+    fn unavailable_reason(src: SpeakerEncoderSource) -> String {
+        match src {
+            SpeakerEncoderSource::Unavailable(r) => r,
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_prefers_checkpoint_tensors_over_external_dir() {
+        let cfg = tiny_cfg();
+        let talker = FakeDir::new("ckpt");
+        talker
+            .config(&talker_config("base", cfg.enc_dim))
+            .weights(CHECKPOINT_SPEAKER_PREFIX, &cfg);
+        let external = FakeDir::new("ext");
+        external.config(&standalone_config(&cfg)).weights("", &cfg);
+        let src = SpeakerEncoderSource::choose(Some(talker.path()), Some(external.path()));
+        assert_eq!(
+            src,
+            SpeakerEncoderSource::Checkpoint(talker.path().to_path_buf())
+        );
+        assert_eq!(src.label(), "checkpoint");
+    }
+
+    #[test]
+    fn source_uses_external_dir_for_base_talker_with_matching_width() {
+        let cfg = tiny_cfg();
+        let talker = FakeDir::new("base-noenc");
+        talker
+            .config(&talker_config("base", cfg.enc_dim))
+            .weights("talker.", &cfg);
+        let external = FakeDir::new("ext-ok");
+        external.config(&standalone_config(&cfg)).weights("", &cfg);
+        let src = SpeakerEncoderSource::choose(Some(talker.path()), Some(external.path()));
+        assert_eq!(
+            src,
+            SpeakerEncoderSource::External(external.path().to_path_buf())
+        );
+        let enc = src.load(&cpu()).expect("external encoder loads");
+        assert_eq!(enc.config().enc_dim, cfg.enc_dim);
+        let mel = det_mel(enc.config(), 40, 0.2);
+        assert_eq!(enc.encode(&mel).unwrap().len(), cfg.enc_dim);
+    }
+
+    #[test]
+    fn source_rejects_external_dir_when_width_mismatches_talker() {
+        let cfg = tiny_cfg();
+        let talker = FakeDir::new("base-wide");
+        talker
+            .config(&talker_config("base", cfg.enc_dim * 2))
+            .weights("talker.", &cfg);
+        let external = FakeDir::new("ext-narrow");
+        external.config(&standalone_config(&cfg)).weights("", &cfg);
+        let reason = unavailable_reason(SpeakerEncoderSource::choose(
+            Some(talker.path()),
+            Some(external.path()),
+        ));
+        assert!(
+            reason.contains(&format!(
+                "enc_dim {} != talker hidden_size {}",
+                cfg.enc_dim,
+                cfg.enc_dim * 2
+            )),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn source_rejects_external_dir_for_custom_voice_talker() {
+        let cfg = tiny_cfg();
+        let talker = FakeDir::new("cv");
+        talker
+            .config(&talker_config("custom_voice", cfg.enc_dim))
+            .weights("talker.", &cfg);
+        let external = FakeDir::new("ext-cv");
+        external.config(&standalone_config(&cfg)).weights("", &cfg);
+        let reason = unavailable_reason(SpeakerEncoderSource::choose(
+            Some(talker.path()),
+            Some(external.path()),
+        ));
+        assert!(
+            reason.contains("\"custom_voice\" is not \"base\""),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn source_without_checkpoint_tensors_or_external_dir_is_unavailable() {
+        let cfg = tiny_cfg();
+        let talker = FakeDir::new("cv-alone");
+        talker
+            .config(&talker_config("custom_voice", cfg.enc_dim))
+            .weights("talker.", &cfg);
+        let reason = unavailable_reason(SpeakerEncoderSource::choose(Some(talker.path()), None));
+        assert!(reason.contains(ENV_SPEAKER_ENCODER_DIR), "{reason}");
+        assert!(
+            reason.contains("use a Qwen3-TTS Base checkpoint"),
+            "{reason}"
+        );
+        let none = unavailable_reason(SpeakerEncoderSource::choose(None, Some(talker.path())));
+        assert!(none.contains("NV_TTS_TALKER_DIR"), "{none}");
+        assert!(SpeakerEncoderSource::Unavailable(none)
+            .load(&cpu())
+            .is_err());
+    }
+
+    fn fixture_wav_24k() -> Vec<f32> {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/parakeet_fox_16k.wav");
+        let bytes = std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        let mut pos = 12;
+        let data = loop {
+            let id = &bytes[pos..pos + 4];
+            let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            if id == b"data" {
+                break &bytes[pos + 8..pos + 8 + len];
+            }
+            pos += 8 + len + (len & 1);
+        };
+        let pcm: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+            .collect();
+        let n_out = pcm.len() * SPK_MEL_SAMPLE_RATE / rate;
+        (0..n_out)
+            .map(|i| {
+                let pos = i as f64 * rate as f64 / SPK_MEL_SAMPLE_RATE as f64;
+                let lo = pos.floor() as usize;
+                let hi = (lo + 1).min(pcm.len() - 1);
+                let t = (pos - lo as f64) as f32;
+                pcm[lo] * (1.0 - t) + pcm[hi] * t
+            })
+            .collect()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    fn assert_real_xvector(enc: &SpeakerEncoder, expect_dim: usize) {
+        let pcm = fixture_wav_24k();
+        let (first, second) = pcm.split_at(pcm.len() / 2);
+        let a = enc.encode_pcm_24k(first).expect("encode first half");
+        let b = enc.encode_pcm_24k(second).expect("encode second half");
+        assert_eq!(a.len(), expect_dim);
+        assert!(a.iter().all(|x| x.is_finite()), "non-finite x-vector");
+        assert_eq!(
+            a,
+            enc.encode_pcm_24k(first).unwrap(),
+            "must be deterministic"
+        );
+        let noise: Vec<f32> = (0..first.len())
+            .map(|i| (((i as u64 * 2654435761) % 10_007) as f32 / 10_007.0 - 0.5) * 0.2)
+            .collect();
+        let n = enc.encode_pcm_24k(&noise).unwrap();
+        let same = cosine(&a, &b);
+        let other = cosine(&a, &n);
+        eprintln!("same-speaker cos={same:.3} vs noise cos={other:.3}");
+        assert!(same > 0.5, "two halves of one speaker: cos {same}");
+        assert!(
+            same > other,
+            "noise must not outscore the same speaker ({same} vs {other})"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn real_qwen_spk_dir_enrolls_xvector_from_wav_on_cpu() {
+        let dir = std::env::var_os(ENV_KOKORO_QWEN_ENCODER_DIR)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("models/qwen-spk"));
+        let cfg = SpeakerEncoderConfig::from_standalone_config_file(&dir.join("config.json"))
+            .expect("qwen-spk config");
+        let enc = SpeakerEncoder::from_standalone_dir(&dir, &cpu()).expect("qwen-spk loads");
+        assert_real_xvector(&enc, cfg.enc_dim);
+        let talker = FakeDir::new("talker-0_6b");
+        talker
+            .config(&talker_config("custom_voice", 1024))
+            .weights("talker.", &tiny_cfg());
+        let reason = unavailable_reason(SpeakerEncoderSource::choose(
+            Some(talker.path()),
+            Some(&dir),
+        ));
+        assert!(reason.contains("custom_voice"), "{reason}");
+        talker.config(&talker_config("base", 1024));
+        let reason = unavailable_reason(SpeakerEncoderSource::choose(
+            Some(talker.path()),
+            Some(&dir),
+        ));
+        assert!(
+            reason.contains(&format!(
+                "enc_dim {} != talker hidden_size 1024",
+                cfg.enc_dim
+            )),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn real_base_checkpoint_is_chosen_over_external_and_enrolls_on_cpu() {
+        let dir = qwen3_tts_base_dir().expect("NV_TTS_BASE_TALKER_DIR or the HF cache");
+        let external = FakeDir::new("ext-ignored");
+        let src = SpeakerEncoderSource::choose(Some(&dir), Some(external.path()));
+        assert_eq!(src, SpeakerEncoderSource::Checkpoint(dir.clone()));
+        let enc = src.load(&cpu()).expect("Base checkpoint speaker encoder");
+        let hidden =
+            crate::talker::Qwen3TtsTalkerConfig::from_hf_config_file(&dir.join("config.json"))
+                .unwrap()
+                .hidden_size;
+        assert_eq!(enc.config().enc_dim, hidden);
+        assert_real_xvector(&enc, hidden);
     }
 }

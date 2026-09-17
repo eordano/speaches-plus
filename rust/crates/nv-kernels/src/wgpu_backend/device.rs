@@ -1,5 +1,8 @@
 use std::sync::OnceLock;
 
+pub const WGPU_POLL_TIMEOUT_SO_A_HUNG_DISPATCH_IS_AN_ERROR_NOT_A_WEDGED_THREAD:
+    std::time::Duration = std::time::Duration::from_secs(300);
+
 use super::qualify::{self, Capabilities, QualStatus};
 use super::{Result, WgpuError};
 
@@ -126,6 +129,28 @@ fn coop_matrix_opt_out() -> bool {
     )
 }
 
+pub const SUBGROUPS_UNGRANTED_ENV_OPT_IN_RUNS_THE_STRIPPED_FALLBACK_TWIN_ON_A_GRANTING_DEVICE:
+    &str = "NV_WGPU_SUBGROUPS_UNGRANTED";
+
+pub const SG_WIDTH_UNPRIMED_ENV_OPT_IN_MIRRORS_THE_BROWSERS_UNPROBED_RUNTIME_WIDTH: &str =
+    "NV_WGPU_SG_WIDTH_UNPRIMED";
+
+fn subgroups_ungranted_forced() -> bool {
+    std::env::var(
+        SUBGROUPS_UNGRANTED_ENV_OPT_IN_RUNS_THE_STRIPPED_FALLBACK_TWIN_ON_A_GRANTING_DEVICE,
+    )
+    .ok()
+    .as_deref()
+        == Some("1")
+}
+
+fn sg_width_unprimed_forced() -> bool {
+    std::env::var(SG_WIDTH_UNPRIMED_ENV_OPT_IN_MIRRORS_THE_BROWSERS_UNPROBED_RUNTIME_WIDTH)
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
 fn requested_backends() -> wgpu::Backends {
     match std::env::var("NV_KERNELS_WGPU_BACKEND")
         .ok()
@@ -170,6 +195,9 @@ impl WgpuContext {
         let coop_configs = qualify::coop_configs(&adapter.cooperative_matrix_properties());
         let mut caps = Capabilities::probe(&info, available, &limits, &downlevel);
         caps.coop_configs = coop_configs;
+        if subgroups_ungranted_forced() {
+            caps.subgroup = false;
+        }
 
         if info.backend == wgpu::Backend::Vulkan
             && caps.subgroup
@@ -250,6 +278,9 @@ impl WgpuContext {
             caps,
             ts_inside_passes,
         };
+        if sg_width_unprimed_forced() {
+            let _ = SG_WIDTH.set(None);
+        }
         ctx.caps.subgroup_runtime_width = ctx.subgroup_width();
         Ok(ctx)
     }
@@ -275,12 +306,107 @@ impl WgpuContext {
 
     pub fn poll_blocking(&self) -> Result<()> {
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(WGPU_POLL_TIMEOUT_SO_A_HUNG_DISPATCH_IS_AN_ERROR_NOT_A_WEDGED_THREAD),
+            })
             .map(|_| ())
-            .map_err(|e| WgpuError::Readback(format!("device poll: {e}")))
+            .map_err(|e| {
+                WgpuError::Readback(format!(
+                    "device poll: {e} (a submission that has not signalled after {:?} is a hung \
+                     dispatch, not a slow one)",
+                    WGPU_POLL_TIMEOUT_SO_A_HUNG_DISPATCH_IS_AN_ERROR_NOT_A_WEDGED_THREAD
+                ))
+            })
     }
 }
 
 pub fn shared_or_reason() -> std::result::Result<&'static WgpuContext, String> {
     WgpuContext::shared().map_err(|e| e.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub const BROWSER_CONTEXT_IS_AWAITED_AND_INSTALLED_BECAUSE_WEBGPU_HAS_NO_ENUMERATION_AND_POLLSTER_WOULD_PARK_THE_EVENT_LOOP:
+    &str =
+    "a browser exposes exactly one adapter through the async navigator.gpu request pair, \
+     enumerate_adapters returns nothing on the webgpu backend, and blocking in pollster parks \
+     the same event loop the request's callbacks need -- so the wasm entry point awaits \
+     new_browser and installs the result into the shared slot before any kernel path calls \
+     shared(). Requested limits are the adapter's own offer, never more, and the only features \
+     requested are shader-f16 (the vision tower hard-requires it) and subgroups, each only \
+     when offered. The blocking subgroup-width probe is unrunnable for the same event-loop \
+     reason, so the runtime width is primed unprobed (None) and width-gated subgroup arms \
+     must treat a browser as width-unknown until an async probe exists.";
+
+#[cfg(target_arch = "wasm32")]
+static BROWSER_SUBGROUPS_UNGRANTED_FLAG_EXISTS_BECAUSE_STD_ENV_SET_VAR_PANICS_ON_WASM32:
+    std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_arch = "wasm32")]
+pub fn browser_force_subgroups_ungranted() {
+    BROWSER_SUBGROUPS_UNGRANTED_FLAG_EXISTS_BECAUSE_STD_ENV_SET_VAR_PANICS_ON_WASM32
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WgpuContext {
+    pub async fn new_browser() -> Result<Self> {
+        let _ = BROWSER_CONTEXT_IS_AWAITED_AND_INSTALLED_BECAUSE_WEBGPU_HAS_NO_ENUMERATION_AND_POLLSTER_WOULD_PARK_THE_EVENT_LOOP;
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::BROWSER_WEBGPU;
+        let instance = wgpu::Instance::new(desc);
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| WgpuError::NoAdapter(format!("browser webgpu request_adapter: {e}")))?;
+        let info = adapter.get_info();
+        let available = adapter.features();
+        let limits = adapter.limits();
+        let downlevel = adapter.get_downlevel_capabilities();
+        let mut caps = Capabilities::probe(&info, available, &limits, &downlevel);
+        if subgroups_ungranted_forced()
+            || BROWSER_SUBGROUPS_UNGRANTED_FLAG_EXISTS_BECAUSE_STD_ENV_SET_VAR_PANICS_ON_WASM32
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            caps.subgroup = false;
+        }
+        let mut base = wgpu::Features::empty();
+        if caps.shader_f16 {
+            base |= wgpu::Features::SHADER_F16;
+        }
+        if caps.subgroup {
+            base |= wgpu::Features::SUBGROUP;
+        }
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("nv-kernels-wgpu"),
+                required_features: base,
+                required_limits: limits,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| WgpuError::DeviceRequest(format!("{} : {e}", info.name)))?;
+        caps.timestamp_query = false;
+        caps.cooperative_matrix = false;
+        caps.coop_configs.clear();
+        caps.subgroup_runtime_width = None;
+        let _ = SG_WIDTH.set(None);
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+            info,
+            caps,
+            ts_inside_passes: false,
+        })
+    }
+
+    pub fn install_shared(ctx: Self) -> Result<&'static WgpuContext> {
+        let _ = SHARED.set(Ok(ctx));
+        Self::shared()
+    }
 }

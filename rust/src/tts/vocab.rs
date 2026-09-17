@@ -40,17 +40,18 @@ pub fn tokenize(phonemes: &str) -> Vec<i64> {
     out
 }
 
-pub fn clean_phonemes(phonemes: &str) -> String {
+pub fn clean_phonemes(phonemes: &str, lang: &str) -> String {
     let phonemes = phonemes
         .replace("kəkˈoːɹoʊ", "kˈoʊkəɹoʊ")
         .replace("kəkˈɔːɹəʊ", "kˈəʊkəɹəʊ");
+    let english_r_and_x_remap = lang.starts_with("en");
 
     let mapped: String = phonemes
         .chars()
         .map(|c| match c {
             'ʲ' => 'j',
-            'r' => 'ɹ',
-            'x' => 'k',
+            'r' if english_r_and_x_remap => 'ɹ',
+            'x' if english_r_and_x_remap => 'k',
             'ɬ' => 'l',
             other => other,
         })
@@ -77,14 +78,25 @@ mod tests {
 
     #[test]
     fn cleans_r_to_alveolar_approximant() {
-        let cleaned = clean_phonemes("brown");
+        let cleaned = clean_phonemes("brown", "en-us");
         assert!(cleaned.contains('ɹ'));
         assert!(!cleaned.contains('r'));
     }
 
     #[test]
+    fn spanish_keeps_trill_tap_and_velar_fricative() {
+        let cleaned = clean_phonemes("rˈosa peɾo xamˈon", "es");
+        assert_eq!(cleaned, "rˈosa peɾo xamˈon");
+    }
+
+    #[test]
+    fn punctuation_survives_cleaning() {
+        assert_eq!(clean_phonemes("ˈola, mˈundo. ¿kˈomo?", "es"), "ˈola, mˈundo. ¿kˈomo?");
+    }
+
+    #[test]
     fn drops_unknown_runes() {
-        let cleaned = clean_phonemes("hello@world");
+        let cleaned = clean_phonemes("hello@world", "en-us");
         assert!(!cleaned.contains('@'));
     }
 }

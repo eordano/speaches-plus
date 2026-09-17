@@ -1,3 +1,4 @@
+#[cfg(feature = "cuda")]
 use anyhow::Result;
 
 #[cfg(feature = "cuda")]
@@ -228,7 +229,9 @@ impl PhaseLadderReplayAccumulatorHostCore {
         }
         self.replayed_steps += 1;
         self.dump_every_replayed_steps > 0
-            && self.replayed_steps % self.dump_every_replayed_steps == 0
+            && self
+                .replayed_steps
+                .is_multiple_of(self.dump_every_replayed_steps)
     }
 
     pub fn render_sol_lane_lines(&self, n_events: usize) -> Vec<String> {
@@ -307,7 +310,10 @@ impl InGraphPhaseEventLadder {
                 deltas.push((self.labels[i], ms as f64));
             }
         }
-        if self.core.accumulate_replayed_step_returning_dump_due(&deltas) {
+        if self
+            .core
+            .accumulate_replayed_step_returning_dump_due(&deltas)
+        {
             for line in self.core.render_sol_lane_lines(self.events.len()) {
                 eprintln!("{line}");
             }
@@ -330,8 +336,7 @@ mod tests {
     #[test]
     fn phase_ladder_core_renders_the_exact_g4_sol_lane_format() {
         let mut core = PhaseLadderReplayAccumulatorHostCore::new("g4-phase", 2);
-        assert!(!core
-            .accumulate_replayed_step_returning_dump_due(&[("attn", 1.0), ("moe", 3.0)]));
+        assert!(!core.accumulate_replayed_step_returning_dump_due(&[("attn", 1.0), ("moe", 3.0)]));
         assert!(core.accumulate_replayed_step_returning_dump_due(&[("attn", 1.0), ("moe", 3.0)]));
         let lines = core.render_sol_lane_lines(3);
         assert_eq!(

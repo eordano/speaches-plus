@@ -243,7 +243,7 @@ GPU, and are the reason a documentation claim in 05-backends.md can be trusted
 between measurements.
 
 **Numerical parity.** There is no golden-fixture tier ladder; see
-01.4-STATUS.md's Numerics row for what its absence ungates. The repo-wide rule
+the private status ledger's Numerics row for what its absence ungates. The repo-wide rule
 it modeled still stands: without the parent `nano-qwen3-omni` repo present, scaffolds get
 architectural verification — real weights load with the right shapes, forward
 produces the right output shape — and nothing may be called numerical parity.
@@ -275,7 +275,8 @@ fn real_26b_a4b_weights_load_and_forward() {
 }
 ```
 
-There are many such variables — `NV_LAGUNA_TEST`, `NV_WGPU_SERVE_TEST`,
+There are many such variables — `NV_LAGUNA_TEST` (also gates
+`laguna_prefix_reuse`, the sequenced CUDA checkpoint/HTTP gate), `NV_WGPU_SERVE_TEST`,
 `NV_GEMMA4_WGPU_TEST`, `NV_E4B_WGPU_TEST`, `NV_QWEN36_TEST`, `NV_DFLASH_TEST`,
 `NV_PARITY_T5_TEST`, `NV_TOOLS_REAL_TEST`, and more. Each names the assets it
 needs. None of them belong in a CI run without a GPU.
@@ -284,6 +285,95 @@ A gate that `panic!`s when its variable is unset is stronger than one that
 prints `skip` and returns, because the second shape is indistinguishable from a
 pass in the harness output. `rust/tests/gemma4_mm_e2e.rs` is the panic-shaped
 example.
+
+**Laguna prefix checkpoints.** Validation is specific to the recorded serving
+composition, KV/draft arm and chunk size.
+[`05.9-prefix-cache-scope.md`](05.9-prefix-cache-scope.md#running-the-gates)
+provides the exact commands and coverage boundaries. The planner's
+`laguna_prefix::tests` covers shared-allocation accounting, byte/count admission,
+LRU selection and backtracking without GPU execution. The three ignored
+`prefix_cuda_gate` fixtures need `NV_LAGUNA_PREFIX_CUDA_TEST=1` and actual CUDA;
+they cover BF16/FixedOne target snapshots and ring draft context, not full-model
+numerics. The separate
+`buffered_and_sse_usage_preserve_prestarted_cached_tokens` fixture checks HTTP
+usage serialization without model loading.
+
+The separate shared-prefill lifecycle suite
+(`laguna_serve::shared_prefill_handoff_cuda_tests`) requires
+`NV_LAGUNA_B2_HANDOFF_TEST=1`, the pinned target directory and content manifest,
+and the matching prepared `m2` or packed-K2 `m2-spec` settings. Run its ignored
+tests individually through `nvk.sh` on an available CUDA device. It checks source
+ownership, cancellation, draft-context isolation, decode progress between
+prefill chunks, buffer retention, physical graph masks and teardown. Its
+full-capacity allocations contain shorter test prompts; real near-cap HTTP
+execution, throughput and model quality require separate validation. The
+`retirement_producer_tests` and HTTP `laguna_loop::overload_tests` cover returned
+errors, client-close observation, reservations and capability-based context-tail
+routing without claiming recovery from a CUDA call that never returns.
+
+The ignored real-model
+`checkpoint_http_reuse_backtracks_restores_and_refuses_unbudgeted_copies` requires
+`NV_LAGUNA_TEST=1`, `NV_LAGUNA_PREFIX_TEST_KV=bf16|fp8-fixed-one`,
+`NV_LAGUNA_PREFIX_TEST_DRAFT=0|1`, the explicit pinned `NV_LAGUNA_DIR` and, when
+enabled, `NV_LAGUNA_DFLASH_DIR`, plus a new `NV_LAGUNA_PREFIX_ARTIFACT_DIR`.
+Missing paths, renderer preconditions, producer diagnostics or real cache hits
+fail the gate. It compares cold and reused emitted IDs and HTTP results, checks
+thinking-strip backtracking, off-device restore, pre-header cancellation/recovery
+and refusal before copying under a one-byte snapshot budget. It pins exact
+extension off, uses in-process HTTP, and produces diagnostic artifacts rather
+than performance rows; it does not qualify exact extension, cross-theta reuse or
+sticky-driver recovery. Use `nvk.sh probe` for the ignored CUDA tests and retain
+the raw artifacts, nonzero test count and successful terminal markers.
+
+The larger-chunk test
+`checkpoint_http_large_chunk_layout_guard_cold_misses_and_reuses` requires draft
+`0` and tests both 1024/2048 boundaries. The deep test
+`checkpoint_http_168k_chunk1024_fixed_one_packed_draft_resident_reuse` requires
+FixedOne KV and packed draft `1`; it checks actual 168000-token resident reuse
+with a 2 GiB budget and at most 48 outputs. These packed gates use strict-window
+eager CUDA proposals; `NV_LAGUNA_DFLASH_GRAPH=1` alone does not establish graph
+execution.
+
+The two separate relaxed-window filters are
+`checkpoint_http_relaxed_graph_reuse_backtracks_and_restores` and
+`checkpoint_http_168k_chunk1024_fixed_one_packed_graph_resident_reuse`.
+Both require FixedOne KV and packed draft `1`, and assert positive graph-proposal
+rounds with zero eager rounds through `laguna_prefix_diagnostics::draft_round`.
+The deep graph filter emits 256 tokens; it is distinct from the 48-output
+strict-window filter. Select each test with `--exact` and a new artifact
+directory, since their modes and output budgets differ.
+
+The sealed HostB graph scope contains 17 planner passes, two real-model passes,
+18 HTTP responses and 12 exact emitted-ID comparisons. Its deep cold/reuse pair
+has 110 graph rounds each, resident position 167936 and 74072064 charged bytes,
+with no additional snapshot copy. The evidence applies to that HostB parent and
+in-process HTTP composition, not the compiled combined central package or
+canonical numerical/throughput qualification. Current central diagnostic/test
+sources still require composed-build and producer-hook validation. The central
+archive/restore workflow remains a separate qualification from the HostB gate's
+admitted 4096-position archive restore.
+
+Unset `NV_LAGUNA_PREFILL_BF16_HANDOFF` for the ordinary prefix gates. The
+default-off handoff requires explicit `NV_LAGUNA_PREFIX_REUSE=0`:
+ordinary checkpoint operations address the step cache, while handoff prefill
+writes a separate BF16 source. Source-unaware reuse
+must refuse at startup. Its combined central build and handoff-plus-prefix
+composition remain unqualified; the ordinary prefix tests do not cover them.
+
+**Laguna optional decode kernels.** `NV_LAGUNA_VERIFY_ROUTER_GEMV=1` selects
+the fused router and activation staging for eligible verifier rows 2–8.
+Its arithmetic differs from the replaced GEMM. The suite covering router
+staging (`moe_mchain_mrow_parity`) compares against per-row GEMV, not that GEMM.
+`NV_LAGUNA_QKVO_ROWS` (unset is on) routes verifier rows 1-8 through the
+fused FP8 q|k|v|gate, norm+rope and gated o_proj row kernels;
+`NV_LAGUNA_QKVO_RSTD_FUSE=1` additionally folds the rstd reduction into the
+projection at M1. The suite covering row projections (`laguna_r3_rows_gemv`,
+`NV_LAGUNA_ROWS_GEMV_TEST=1`) checks every row 1..8 bit for bit against the
+m=1 decode kernels and compares fused and separate normalization for FP8
+and int8 weights. `NV_LAGUNA_VERIFY_ROUTER_GEMV` and the rstd fold default
+off; all three are read at graph construction. Preserve actual route markers and validate
+the composed binary through `nvk.sh`; an older host result does not qualify a
+selective source port or the overall model trajectory.
 
 **Multimodal chat serving.** 06-serving-surface.md owns the engine behaviour
 (`Gemma4MmTowers::from_model_dir`, `NvEngineChat::supports_mm_input`,

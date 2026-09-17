@@ -152,11 +152,19 @@ impl Gemma4VisionConfig {
 
 pub(crate) enum VisLinear {
     Dense(Linear),
-    Int8Row { w: Tensor, scale: Tensor },
-    Nvfp4KPadded { lin: Linear, in_logical: usize },
+    Int8Row {
+        w: Tensor,
+        scale: Tensor,
+    },
+    #[cfg(feature = "cuda")]
+    Nvfp4KPadded {
+        lin: Linear,
+        in_logical: usize,
+    },
 }
 
 impl VisLinear {
+    #[cfg(feature = "cuda")]
     pub(crate) fn dense_weight(&self) -> Option<&Tensor> {
         match self {
             VisLinear::Dense(l) => l.weight(),
@@ -179,6 +187,7 @@ impl VisLinear {
     pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             VisLinear::Dense(l) => l.forward(x),
+            #[cfg(feature = "cuda")]
             VisLinear::Nvfp4KPadded { lin, in_logical } => {
                 let dims = x.dims();
                 let last = dims.len() - 1;
@@ -227,6 +236,7 @@ pub struct ClippedLinear {
 }
 
 impl ClippedLinear {
+    #[cfg(feature = "cuda")]
     pub(crate) fn dense_weight(&self) -> Option<&Tensor> {
         self.linear.dense_weight()
     }
@@ -532,6 +542,7 @@ impl PatchEmbedder {
         Ok(emb.broadcast_mul(&mask)?)
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn position_sum_for(
         &self,
         positions: &[(i64, i64)],

@@ -33,6 +33,12 @@ fn normgate_fuse_applies_only_with_the_shared_expert_folded_and_m_1_because_the_
     normgate_fuse_enabled() && ctx.folds_shared() && ctx.n_tokens() == 1
 }
 
+fn verify_router_gemv_opt_in() -> bool {
+    std::env::var("NV_LAGUNA_VERIFY_ROUTER_GEMV")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 fn normgate_fused_rstd_normx_gemv(
     s: &Arc<CudaStream>,
     moe: &LagunaMoe,
@@ -329,7 +335,7 @@ pub(crate) fn moe_block_body(
     let hidden = w.hidden_size;
     let e = w.num_experts;
     let n = ctx.n_tokens();
-    let x_t: Option<Tensor> = if normgate_fuse_applies_only_with_the_shared_expert_folded_and_m_1_because_the_unfolded_branch_consumes_the_normed_tensor_and_the_router_path_is_a_gemv(ctx) {
+    let x_t: Option<Tensor> = if !norm.fp8_e4m3_active() && normgate_fuse_applies_only_with_the_shared_expert_folded_and_m_1_because_the_unfolded_branch_consumes_the_normed_tensor_and_the_router_path_is_a_gemv(ctx) {
         normgate_fused_rstd_normx_gemv(s, moe, norm, ctx, hidden, e)?;
         None
     } else {
@@ -355,6 +361,18 @@ pub(crate) fn moe_block_body(
         x_t.dims(),
         x_t.dtype()
     );
+    let router_gemv_rows = verify_router_gemv_opt_in()
+        && (2..=nv_layers::moe_grouped::ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS).contains(&n)
+        && !ctx.folds_shared()
+        && moe.gate.weight().is_some()
+        && moe.gate.bias().is_none();
+    if router_gemv_rows {
+        static ROUTER_GEMV_ROWS_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+        ROUTER_GEMV_ROWS_FIRED_ONCE.call_once(|| eprintln!("[laguna_verify_moe] router rows={n} through fused_router_gemv_sg_and_x_stage_replacing_gate_gemm_cast_and_dtod (the M=1 router GEMV numerics for the verify rows; replaces the cuBLAS gate GEMM, its cast and the normed-x staging copy)"));
+        let xp = crate::laguna_step_graph::bf16_ptr(&x_t, s, n * hidden)?;
+        let gw = crate::laguna_step_graph::bf16_ptr(moe.gate.weight().unwrap(), s, e * hidden)?;
+        ctx.fused_router_gemv_sg_and_x_stage_replacing_gate_gemm_cast_and_dtod(s, xp, gw, None)?;
+    } else {
     {
         let (ns, nl) = x_t.storage_and_layout();
         anyhow::ensure!(nl.is_contiguous(), "graph moe: norm output not contiguous");
@@ -400,6 +418,7 @@ pub(crate) fn moe_block_body(
         };
         anyhow::ensure!(rc == 0, "logits cast rc={rc}");
     }
+    }
     Some(x_t)
     };
     if let Some((p, li)) = prof {
@@ -438,36 +457,36 @@ pub(crate) fn moe_block_body(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("unfolded shared expert needs the normed tensor"))?;
         nv_layers::cuda_stream::with_stream(aux_shared.clone(), || -> Result<()> {
-        let shared_t = moe.shared_expert.forward_fused_cuda(x_t)?;
-        anyhow::ensure!(
-            shared_t.dtype() == DType::BF16 && shared_t.elem_count() == n * hidden,
-            "graph moe: unexpected shared expert output {:?} {:?}",
-            shared_t.dims(),
-            shared_t.dtype()
-        );
-        let (ss, sl) = shared_t.storage_and_layout();
-        anyhow::ensure!(
-            sl.is_contiguous(),
-            "graph moe: shared output not contiguous"
-        );
-        let s_cuda = match &*ss {
-            candle_core::Storage::Cuda(st) => st,
-            _ => anyhow::bail!("graph moe: shared output must be CUDA"),
-        };
-        let s_slice = s_cuda.as_cuda_slice::<bf16>()?;
-        let s_view = s_slice.slice(sl.start_offset()..sl.start_offset() + n * hidden);
-        let (sp, _g1) = s_view.device_ptr(aux_shared);
-        let (dp, _g2) = ctx.shared_f32.device_ptr_mut(aux_shared);
-        let rc = unsafe {
-            nv_kernels::cuda::cast_bf16_f32(
-                aux_shared.cu_stream() as *mut c_void,
-                sp as *const u16,
-                dp as *mut f32,
-                (n * hidden) as i32,
-            )
-        };
-        anyhow::ensure!(rc == 0, "shared cast rc={rc}");
-        Ok(())
+            let shared_t = moe.shared_expert.forward_fused_cuda(x_t)?;
+            anyhow::ensure!(
+                shared_t.dtype() == DType::BF16 && shared_t.elem_count() == n * hidden,
+                "graph moe: unexpected shared expert output {:?} {:?}",
+                shared_t.dims(),
+                shared_t.dtype()
+            );
+            let (ss, sl) = shared_t.storage_and_layout();
+            anyhow::ensure!(
+                sl.is_contiguous(),
+                "graph moe: shared output not contiguous"
+            );
+            let s_cuda = match &*ss {
+                candle_core::Storage::Cuda(st) => st,
+                _ => anyhow::bail!("graph moe: shared output must be CUDA"),
+            };
+            let s_slice = s_cuda.as_cuda_slice::<bf16>()?;
+            let s_view = s_slice.slice(sl.start_offset()..sl.start_offset() + n * hidden);
+            let (sp, _g1) = s_view.device_ptr(aux_shared);
+            let (dp, _g2) = ctx.shared_f32.device_ptr_mut(aux_shared);
+            let rc = unsafe {
+                nv_kernels::cuda::cast_bf16_f32(
+                    aux_shared.cu_stream() as *mut c_void,
+                    sp as *const u16,
+                    dp as *mut f32,
+                    (n * hidden) as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "shared cast rc={rc}");
+            Ok(())
         })?;
         if let Some((p, li)) = prof {
             p.record(ProfPoint::SharedEnd(li), aux_shared)?;

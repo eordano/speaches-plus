@@ -12,11 +12,12 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::oapi::chat::{
-    engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed, now_unix_secs, parse_model_tool_calls, rand_seed, render_chat_checked_kwargs,
-    resolve_guided_think_close, resolve_tool_policy, split_thinking, template_required_for,
-    ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn, ClientDeadline,
-    FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess, Tool,
-    ToolCall, ToolChoice, THINK_OPEN,
+    engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed, now_unix_secs,
+    parse_model_tool_calls, rand_seed, render_chat_checked_kwargs, resolve_guided_think_close,
+    resolve_tool_policy, retryable_message, retryable_response, split_thinking,
+    template_required_for, ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn,
+    ClientDeadline, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess,
+    Tool, ToolCall, ToolChoice, ENGINE_INTERRUPTED, THINK_OPEN,
 };
 
 pub const RESPONSE_STORE_DIR_ENV: &str = "NV_KV_CACHE_DIR";
@@ -116,25 +117,22 @@ async fn first_event(
         Some(client) => match tokio::time::timeout(client.budget, rx.recv()).await {
             Ok(ev) => ev,
             Err(_) => {
-                return Err(error_response(
+                return Err(retryable_response(error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "overloaded_error",
-                    format!(
+                    retryable_message(format!(
                         "generation did not start within the {} ms client budget ({})",
                         client.budget_ms(),
                         client.source
-                    ),
-                ))
+                    )),
+                )))
             }
         },
         None => rx.recv().await,
     };
     match ev {
-        Some(ChatEvent::Error(msg))
-            if is_busy_shed(&msg) || crate::oapi::chat::is_prompt_overflow(&msg) =>
-        {
-            Err(engine_event_error(msg))
-        }
+        Some(ChatEvent::Error(msg)) => Err(engine_event_error(msg)),
+        None => Err(engine_event_error(ENGINE_INTERRUPTED.into())),
         other => Ok(other),
     }
 }
@@ -839,6 +837,7 @@ async fn run_non_streaming(
         tool_calls: Vec::new(),
         finish: String::from("stop"),
     };
+    let mut saw_done = false;
     #[allow(clippy::while_let_loop)]
     loop {
         let Some(ev) = (match pre.take() {
@@ -860,9 +859,14 @@ async fn run_non_streaming(
             } => {
                 out.finish = finish_reason;
                 out.output_tokens = completion_tokens;
+                saw_done = true;
+                break;
             }
             ChatEvent::Error(msg) => return engine_event_error(msg),
         }
+    }
+    if !saw_done {
+        return engine_event_error(ENGINE_INTERRUPTED.into());
     }
     out.text = visible_text(&out.text, &ctx.think);
     if ctx.tools_active {
@@ -886,6 +890,21 @@ async fn send_event(
     data["sequence_number"] = json!(*seq);
     *seq += 1;
     crate::oapi::send_sse_event(tx, event, &data).await
+}
+
+fn failed_event(id: &str, message: String) -> Value {
+    let (code, message) = if is_busy_shed(&message) {
+        ("overloaded_error", retryable_message(message))
+    } else {
+        ("server_error", message)
+    };
+    json!({
+        "type": "response.failed",
+        "response": {
+            "id": id, "object": "response", "status": "failed",
+            "error": {"code": code, "message": message},
+        },
+    })
 }
 
 async fn emit_message_events(
@@ -1109,11 +1128,16 @@ async fn run_streaming(
         };
         let mut raw = String::new();
         let mut emitted = 0usize;
+        let mut saw_done = false;
         #[allow(clippy::while_let_loop)]
         loop {
             let Some(ev) = (match pre.take() {
                 Some(ev) => Some(ev),
-                None => rx_ev.recv().await,
+                None => tokio::select! {
+                    biased;
+                    _ = tx_bytes.closed() => return,
+                    event = rx_ev.recv() => event,
+                },
             }) else {
                 break;
             };
@@ -1155,19 +1179,20 @@ async fn run_streaming(
                 } => {
                     out.finish = finish_reason;
                     out.output_tokens = completion_tokens;
+                    saw_done = true;
+                    break;
                 }
                 ChatEvent::Error(msg) => {
-                    let failed = json!({
-                        "type": "response.failed",
-                        "response": {
-                            "id": ctx.id, "object": "response", "status": "failed",
-                            "error": {"code": "server_error", "message": msg},
-                        },
-                    });
+                    let failed = failed_event(&ctx.id, msg);
                     let _ = send_event(&tx_bytes, &mut seq, "response.failed", failed).await;
                     return;
                 }
             }
+        }
+        if !saw_done {
+            let failed = failed_event(&ctx.id, ENGINE_INTERRUPTED.into());
+            let _ = send_event(&tx_bytes, &mut seq, "response.failed", failed).await;
+            return;
         }
         out.text = visible_stream(&raw, &ctx.think);
         if ctx.tools_active {

@@ -57,6 +57,111 @@ pub fn sdpa_windowed(
     sdpa_masked(q, k, v, cfg, None, sliding_window)
 }
 
+pub const GQA_GROUPED_BATCHES_THE_KV_GROUPS_INSTEAD_OF_EXPANDING_KV_TO_EVERY_HEAD: &str =
+    "the shipped GQA path materializes k and v expanded to all H heads (two rank-5 expand \
+     copies forward, and backward pays a rank-5 strided sum-reduce folding dK/dV back to H_kv \
+     -- the candle strided-reduce class), then runs B*H batched GEMMs at m=sq. \
+     NV_ATTN_GQA_GROUPED=1 instead views q as (B*H_kv, factor*sq, d) -- head h = g*factor + f \
+     is exactly the layout the expand construction distributes, so the group rows are already \
+     contiguous -- and runs B*H_kv batched GEMMs at m=factor*sq against the unexpanded \
+     (B*H_kv, d, sk) k and (B*H_kv, sk, d) v: no expand copies, no expand-backward reduce, dK \
+     and dV fall straight out of matmul backward. The causal mask tiles to (factor*sq, sk) with \
+     row r masking query position r % sq. Every score and probability is the same dot product \
+     over the same operands, but the GEMM tiling moves at m=factor*sq, so the arm is \
+     NON-BITWISE BY CONSTRUCTION: it gates on the eval-CE census (28-row base CE deltas, \
+     step-19 trajectory band, adapter delta-amax), never on bit-identity, and must not be \
+     composed silently with bitwise-claimed arms";
+
+fn attn_gqa_grouped_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NV_ATTN_GQA_GROUPED").as_deref() == Ok("1"))
+}
+
+fn sdpa_masked_grouped(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cfg: &AttnConfig,
+    sliding_window: usize,
+) -> Result<Tensor> {
+    let _ = GQA_GROUPED_BATCHES_THE_KV_GROUPS_INSTEAD_OF_EXPANDING_KV_TO_EVERY_HEAD;
+    let qd = q.dims();
+    let kd = k.dims();
+    let (b, sq, h, d) = (qd[0], qd[1], qd[2], qd[3]);
+    let sk = kd[1];
+    let h_kv = kd[2];
+    let factor = h / h_kv;
+    let orig_dtype = q.dtype();
+
+    let q = q.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!(e))?;
+    let k = k.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!(e))?;
+    let v = v.to_dtype(DType::F32).map_err(|e| anyhow::anyhow!(e))?;
+
+    let q_g = q
+        .permute((0, 2, 1, 3))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .contiguous()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .reshape((b * h_kv, factor * sq, d))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let k_t = k
+        .permute((0, 2, 1, 3))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .contiguous()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .reshape((b * h_kv, sk, d))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let v_flat = v
+        .permute((0, 2, 1, 3))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .contiguous()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .reshape((b * h_kv, sk, d))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let k_perm = k_t
+        .permute((0, 2, 1))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .contiguous()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let scale = if attn_resident_enabled() {
+        softmax_scale_resident(cfg.softmax_scale, q_g.device())?
+    } else {
+        Tensor::new(cfg.softmax_scale, q_g.device()).map_err(|e| anyhow::anyhow!(e))?
+    };
+    let mut scores = q_g
+        .matmul(&k_perm)
+        .map_err(|e| anyhow::anyhow!(e))?
+        .broadcast_mul(&scale)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    if cfg.causal {
+        let mask = if attn_resident_enabled() {
+            causal_mask_grouped_resident(sq, sk, sliding_window, factor, q_g.device())?
+        } else {
+            build_causal_mask_grouped(sq, sk, sliding_window, factor, q_g.device())?
+        };
+        scores = scores
+            .broadcast_add(&mask)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    let probs = softmax_last_dim_that_keeps_q_and_k_on_the_graph(&scores)?;
+    let out = probs
+        .contiguous()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .matmul(&v_flat)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let out = out
+        .reshape((b, h_kv, factor, sq, d))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .permute((0, 3, 1, 2, 4))
+        .map_err(|e| anyhow::anyhow!(e))?
+        .contiguous()
+        .map_err(|e| anyhow::anyhow!(e))?
+        .reshape((b, sq, h, d))
+        .map_err(|e| anyhow::anyhow!(e))?;
+    out.to_dtype(orig_dtype).map_err(|e| anyhow::anyhow!(e))
+}
+
 fn sdpa_masked(
     q: &Tensor,
     k: &Tensor,
@@ -79,6 +184,12 @@ fn sdpa_masked(
     let h_kv = kd[2];
     if h % h_kv != 0 {
         anyhow::bail!("sdpa: H ({h}) not divisible by H_kv ({h_kv})");
+    }
+    if sliding_window > 0 && !cfg.causal {
+        anyhow::bail!("sdpa: a sliding window is only defined on the causal path");
+    }
+    if attn_gqa_grouped_enabled() && h_kv != h && sinks.is_none() {
+        return sdpa_masked_grouped(q, k, v, cfg, sliding_window);
     }
     let orig_dtype = q.dtype();
 
@@ -138,18 +249,24 @@ fn sdpa_masked(
         .map_err(|e| anyhow::anyhow!(e))?
         .contiguous()
         .map_err(|e| anyhow::anyhow!(e))?;
-    let scale = Tensor::new(cfg.softmax_scale, q_flat.device()).map_err(|e| anyhow::anyhow!(e))?;
+    let scale = if attn_resident_enabled() {
+        let _ = ATTN_RESIDENT_CACHES_THE_MASK_AND_SCALE_UPLOADS_THAT_SDPA_REBUILT_EVERY_CALL;
+        softmax_scale_resident(cfg.softmax_scale, q_flat.device())?
+    } else {
+        Tensor::new(cfg.softmax_scale, q_flat.device()).map_err(|e| anyhow::anyhow!(e))?
+    };
     let mut scores = q_flat
         .matmul(&k_perm)
         .map_err(|e| anyhow::anyhow!(e))?
         .broadcast_mul(&scale)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    if sliding_window > 0 && !cfg.causal {
-        anyhow::bail!("sdpa: a sliding window is only defined on the causal path");
-    }
     if cfg.causal {
-        let mask = build_causal_mask_windowed(sq, sk, sliding_window, q_flat.device())?;
+        let mask = if attn_resident_enabled() {
+            causal_mask_resident(sq, sk, sliding_window, q_flat.device())?
+        } else {
+            build_causal_mask_windowed(sq, sk, sliding_window, q_flat.device())?
+        };
         scores = scores
             .broadcast_add(&mask)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -223,6 +340,106 @@ pub fn softmax_last_dim_that_keeps_q_and_k_on_the_graph(scores: &Tensor) -> Resu
     candle_nn::ops::softmax_last_dim(scores).map_err(|e| anyhow::anyhow!(e))
 }
 
+pub const ATTN_RESIDENT_CACHES_THE_MASK_AND_SCALE_UPLOADS_THAT_SDPA_REBUILT_EVERY_CALL: &str =
+    "sdpa_masked rebuilt the causal mask on the host (an sq*sk f32 fill plus upload) and \
+     re-uploaded the softmax scale scalar on every call; both are pure functions of \
+     (sq, sk, window, device) and (scale bits, device), so NV_ATTN_RESIDENT=1 serves them from \
+     a process cache -- identical bytes reach identical ops, bitwise by construction. The qlora \
+     window forward pays the rebuild once per layer per bucket (48 per step at up to 450x450)";
+
+fn attn_resident_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NV_ATTN_RESIDENT").as_deref() == Ok("1"))
+}
+
+type MaskKey = (usize, usize, usize, candle_core::DeviceLocation);
+
+fn causal_mask_resident(
+    sq: usize,
+    sk: usize,
+    sliding_window: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    static CACHE: std::sync::Mutex<Vec<(MaskKey, Tensor)>> = std::sync::Mutex::new(Vec::new());
+    let key = (sq, sk, sliding_window, device.location());
+    let mut cache = CACHE
+        .lock()
+        .map_err(|e| anyhow::anyhow!("mask cache poisoned: {e}"))?;
+    if let Some((_, t)) = cache.iter().find(|(k, _)| *k == key) {
+        return Ok(t.clone());
+    }
+    let t = build_causal_mask_windowed(sq, sk, sliding_window, device)?;
+    cache.push((key, t.clone()));
+    Ok(t)
+}
+
+fn softmax_scale_resident(scale: f32, device: &candle_core::Device) -> Result<Tensor> {
+    static CACHE: std::sync::Mutex<Vec<((u32, candle_core::DeviceLocation), Tensor)>> =
+        std::sync::Mutex::new(Vec::new());
+    let key = (scale.to_bits(), device.location());
+    let mut cache = CACHE
+        .lock()
+        .map_err(|e| anyhow::anyhow!("scale cache poisoned: {e}"))?;
+    if let Some((_, t)) = cache.iter().find(|(k, _)| *k == key) {
+        return Ok(t.clone());
+    }
+    let t = Tensor::new(scale, device).map_err(|e| anyhow::anyhow!(e))?;
+    cache.push((key, t.clone()));
+    Ok(t)
+}
+
+fn causal_mask_grouped_resident(
+    sq: usize,
+    sk: usize,
+    sliding_window: usize,
+    factor: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    static CACHE: std::sync::Mutex<
+        Vec<(
+            (usize, usize, usize, usize, candle_core::DeviceLocation),
+            Tensor,
+        )>,
+    > = std::sync::Mutex::new(Vec::new());
+    let key = (sq, sk, sliding_window, factor, device.location());
+    let mut cache = CACHE
+        .lock()
+        .map_err(|e| anyhow::anyhow!("grouped mask cache poisoned: {e}"))?;
+    if let Some((_, t)) = cache.iter().find(|(k, _)| *k == key) {
+        return Ok(t.clone());
+    }
+    let t = build_causal_mask_grouped(sq, sk, sliding_window, factor, device)?;
+    cache.push((key, t.clone()));
+    Ok(t)
+}
+
+fn build_causal_mask_grouped(
+    sq: usize,
+    sk: usize,
+    sliding_window: usize,
+    factor: usize,
+    device: &candle_core::Device,
+) -> Result<Tensor> {
+    let off = sk.saturating_sub(sq);
+    let mut mask = vec![0f32; factor * sq * sk];
+    for r in 0..factor * sq {
+        let i = r % sq;
+        let last = i + off;
+        let first = if sliding_window > 0 {
+            (last + 1).saturating_sub(sliding_window)
+        } else {
+            0
+        };
+        for (j, cell) in mask[r * sk..(r + 1) * sk].iter_mut().enumerate() {
+            if j > last || j < first {
+                *cell = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let t = Tensor::from_vec(mask, (1, factor * sq, sk), device).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(t)
+}
+
 fn build_causal_mask_windowed(
     sq: usize,
     sk: usize,
@@ -249,8 +466,8 @@ fn build_causal_mask_windowed(
 }
 
 #[cfg(feature = "cuda")]
-pub const CANDLE_FLASH_ATTN_LAUNCHES_ON_THE_LEGACY_NULL_STREAM_SO_EVERY_CALL_IS_EVENT_FENCED:
-    &str = "candle-flash-attn's flash_api.cu hardcodes cudaStream_t stream = 0, so its kernel \
+pub const CANDLE_FLASH_ATTN_LAUNCHES_ON_THE_LEGACY_NULL_STREAM_SO_EVERY_CALL_IS_EVENT_FENCED: &str =
+    "candle-flash-attn's flash_api.cu hardcodes cudaStream_t stream = 0, so its kernel \
      runs on the legacy NULL stream while a Device::new_cuda_with_stream device runs every \
      candle op, every nv-* kernel, every cuMemAllocAsync and every CudaSlice drop's \
      cuMemFreeAsync on a CU_STREAM_NON_BLOCKING stream the NULL stream never synchronizes with. \
@@ -500,6 +717,42 @@ mod paper_validation {
         }
     }
 
+    #[test]
+    fn sdpa_grouped_matches_the_expand_path_at_gqa_shapes() {
+        let device = Device::Cpu;
+        for &(sq, sk, h, h_kv, d, window) in &[
+            (5usize, 5usize, 12usize, 2usize, 16usize, 0usize),
+            (3, 7, 4, 2, 8, 0),
+            (6, 6, 6, 3, 4, 4),
+        ] {
+            let mk = |seed: f32, dims: (usize, usize, usize, usize)| -> Tensor {
+                let n = dims.0 * dims.1 * dims.2 * dims.3;
+                let v: Vec<f32> = (0..n).map(|i| ((i as f32 + seed) * 0.173).sin()).collect();
+                Tensor::from_vec(v, dims, &device).unwrap()
+            };
+            let q = mk(1.0, (1, sq, h, d));
+            let k = mk(2.0, (1, sk, h_kv, d));
+            let v = mk(3.0, (1, sk, h_kv, d));
+            let cfg = AttnConfig {
+                num_heads: h,
+                num_kv_heads: h_kv,
+                head_dim: d,
+                softmax_scale: 0.31,
+                causal: true,
+            };
+            let shipped = sdpa_masked(&q, &k, &v, &cfg, None, window).unwrap();
+            let grouped = sdpa_masked_grouped(&q, &k, &v, &cfg, window).unwrap();
+            let a = shipped.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = grouped.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() < 1e-5,
+                    "grouped diverges at sq{sq} sk{sk} h{h}/{h_kv} w{window} idx {i}: {x} vs {y}"
+                );
+            }
+        }
+    }
+
     const WARPS: usize = 8;
 
     #[derive(Clone)]
@@ -671,4 +924,360 @@ mod paper_validation {
             "empty range must produce zeros, not NaN"
         );
     }
+}
+
+#[cfg(feature = "cuda")]
+struct E4bFullAttnScratch {
+    s: Option<cudarc::driver::CudaSlice<f32>>,
+    p: Option<cudarc::driver::CudaSlice<u16>>,
+    m: Option<cudarc::driver::CudaSlice<f32>>,
+    l: Option<cudarc::driver::CudaSlice<f32>>,
+    o: Option<cudarc::driver::CudaSlice<f32>>,
+    q8: Option<cudarc::driver::CudaSlice<u8>>,
+    k8: Option<cudarc::driver::CudaSlice<u8>>,
+    scales_and_amax: Option<cudarc::driver::CudaSlice<f32>>,
+}
+
+pub const E4B_FULL_ATTN_FP8_SCORES_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_BF16_SCORE_GEMM_Q_AND_THE_VISIBLE_K_GO_TO_E4M3_PER_TENSOR_AND_THE_SCORE_GEMM_RUNS_IN_FP8_WITH_F32_SCORES_OUT_CORPUS_WITHIN_0_6_PERCENT_NEEDLE_EXACT_GREEDY_CHAINS_IDENTICAL: &str =
+    "NV_E4B_FULL_ATTN_FP8_SCORES";
+
+pub const FP8_SCORE_TILES_NEED_16_ALIGNED_ROWS_AND_KEYS_SO_A_RAGGED_TAIL_TILE_RUNS_THE_BF16_GEMM:
+    usize = 16;
+
+pub fn e4b_full_attn_fp8_scores_enabled() -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        E4B_FULL_ATTN_FP8_SCORES_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_BF16_SCORE_GEMM_Q_AND_THE_VISIBLE_K_GO_TO_E4M3_PER_TENSOR_AND_THE_SCORE_GEMM_RUNS_IN_FP8_WITH_F32_SCORES_OUT_CORPUS_WITHIN_0_6_PERCENT_NEEDLE_EXACT_GREEDY_CHAINS_IDENTICAL,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn grow_u8<'a>(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    slot: &'a mut Option<cudarc::driver::CudaSlice<u8>>,
+    n: usize,
+) -> Result<&'a mut cudarc::driver::CudaSlice<u8>> {
+    if slot.as_ref().is_none_or(|s| s.len() < n) {
+        *slot = Some(unsafe { stream.alloc::<u8>(n) }.map_err(|e| anyhow::anyhow!(e))?);
+    }
+    Ok(slot.as_mut().expect("just filled"))
+}
+
+#[cfg(feature = "cuda")]
+static E4B_FULL_ATTN_SCRATCH_GROWS_ONCE_PER_STREAM_BECAUSE_A_CUDAMALLOC_PER_CHUNK_LAYER_COST_4_PERCENT_AT_2K:
+    std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, E4bFullAttnScratch>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "cuda")]
+fn grow_f32<'a>(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    slot: &'a mut Option<cudarc::driver::CudaSlice<f32>>,
+    len: usize,
+) -> Result<&'a mut cudarc::driver::CudaSlice<f32>> {
+    if slot.as_ref().map(|b| b.len() < len).unwrap_or(true) {
+        *slot = Some(unsafe { stream.alloc::<f32>(len) }.map_err(|e| anyhow::anyhow!(e))?);
+    }
+    Ok(slot.as_mut().expect("just filled"))
+}
+
+#[cfg(feature = "cuda")]
+fn grow_u16<'a>(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    slot: &'a mut Option<cudarc::driver::CudaSlice<u16>>,
+    len: usize,
+) -> Result<&'a mut cudarc::driver::CudaSlice<u16>> {
+    if slot.as_ref().map(|b| b.len() < len).unwrap_or(true) {
+        *slot = Some(unsafe { stream.alloc::<u16>(len) }.map_err(|e| anyhow::anyhow!(e))?);
+    }
+    Ok(slot.as_mut().expect("just filled"))
+}
+
+pub const E4B_FULL_ATTN_KEY_TILE_4096_KEEPS_THE_F32_SCORE_TILE_INSIDE_L2_AND_MATCHES_THE_SOFTMAX_KERNELS_REGISTER_BUDGET: usize = 4096;
+
+pub const E4B_FULL_ATTN_KEY_TILE_ENV_4096_OR_8192_THE_8192_ARM_IS_THE_SHAPE_ONLY_PROBE_OF_THE_TILE_TERM: &str =
+    "NV_E4B_FULL_ATTN_KEY_TILE";
+
+pub fn e4b_full_attn_key_tile() -> usize {
+    match std::env::var(E4B_FULL_ATTN_KEY_TILE_ENV_4096_OR_8192_THE_8192_ARM_IS_THE_SHAPE_ONLY_PROBE_OF_THE_TILE_TERM)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(8192) => 8192,
+        _ => E4B_FULL_ATTN_KEY_TILE_4096_KEEPS_THE_F32_SCORE_TILE_INSIDE_L2_AND_MATCHES_THE_SOFTMAX_KERNELS_REGISTER_BUDGET,
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub fn e4b_full_attn_gqa_folded_f32_scores_tiled_online_softmax(
+    q_groups_rows_hd_bf16: &Tensor,
+    k_groups_len_hd_bf16: &Tensor,
+    v_groups_len_hd_bf16: &Tensor,
+    n: usize,
+    group: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    use candle_core::Device;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let dev = match q_groups_rows_hd_bf16.device() {
+        Device::Cuda(d) => d.clone(),
+        _ => anyhow::bail!("e4b full attention gemm arm requires cuda"),
+    };
+    let (nkv, rows, hd) = q_groups_rows_hd_bf16.dims3()?;
+    let (nkv_k, len, hd_k) = k_groups_len_hd_bf16.dims3()?;
+    anyhow::ensure!(
+        nkv == nkv_k && hd == hd_k && rows == group * n && len >= n,
+        "e4b full attention gemm arm: q {:?} k {:?} n {n} group {group}",
+        q_groups_rows_hd_bf16.dims(),
+        k_groups_len_hd_bf16.dims()
+    );
+    anyhow::ensure!(
+        v_groups_len_hd_bf16.dims() == k_groups_len_hd_bf16.dims(),
+        "e4b full attention gemm arm: v {:?} k {:?}",
+        v_groups_len_hd_bf16.dims(),
+        k_groups_len_hd_bf16.dims()
+    );
+    let q = q_groups_rows_hd_bf16.contiguous()?;
+    let kv_head_stride_elems_lets_a_capacity_sized_twin_serve_its_prefix_without_a_copy =
+        |t: &Tensor| -> Result<Option<usize>> {
+            let (dims, strides) = (t.dims(), t.stride());
+            if strides[2] == 1 && strides[1] == dims[2] && strides[0] % dims[2] == 0 {
+                Ok(Some(strides[0]))
+            } else {
+                Ok(None)
+            }
+        };
+    let (k, k_stride) =
+        match kv_head_stride_elems_lets_a_capacity_sized_twin_serve_its_prefix_without_a_copy(
+            k_groups_len_hd_bf16,
+        )? {
+            Some(st) => (k_groups_len_hd_bf16.clone(), st),
+            None => {
+                let c = k_groups_len_hd_bf16.contiguous()?;
+                let st = len * hd;
+                (c, st)
+            }
+        };
+    let (v, v_stride) =
+        match kv_head_stride_elems_lets_a_capacity_sized_twin_serve_its_prefix_without_a_copy(
+            v_groups_len_hd_bf16,
+        )? {
+            Some(st) => (v_groups_len_hd_bf16.clone(), st),
+            None => {
+                let c = v_groups_len_hd_bf16.contiguous()?;
+                let st = len * hd;
+                (c, st)
+            }
+        };
+    let tile = e4b_full_attn_key_tile();
+    let stream = crate::cuda_stream::current_stream(&dev);
+    let all_rows = nkv * rows;
+    let scratch = E4B_FULL_ATTN_SCRATCH_GROWS_ONCE_PER_STREAM_BECAUSE_A_CUDAMALLOC_PER_CHUNK_LAYER_COST_4_PERCENT_AT_2K
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut scratch = scratch
+        .lock()
+        .map_err(|e| anyhow::anyhow!("e4b full attention scratch poisoned: {e}"))?;
+    let key = nv_quant::stream_cache_key(&stream);
+    let sc = scratch.entry(key).or_insert_with(|| E4bFullAttnScratch {
+        s: None,
+        p: None,
+        m: None,
+        l: None,
+        o: None,
+        q8: None,
+        k8: None,
+        scales_and_amax: None,
+    });
+    let fp8_scores = e4b_full_attn_fp8_scores_enabled();
+    let (q8_dev, k8_dev, scales_dev) = if fp8_scores {
+        anyhow::ensure!(
+            nkv == 2,
+            "e4b fp8 scores: the two-segment per-tensor quantizer covers exactly two kv heads, got {nkv}"
+        );
+        (
+            Some(grow_u8(&stream, &mut sc.q8, nkv * rows * hd)?),
+            None::<&mut cudarc::driver::CudaSlice<u8>>,
+            None::<&mut cudarc::driver::CudaSlice<f32>>,
+        )
+    } else {
+        (None, None, None)
+    };
+    let _ = (k8_dev, scales_dev);
+    let (k8_dev, scales_dev) = if fp8_scores {
+        (
+            Some(grow_u8(&stream, &mut sc.k8, nkv * len * hd)?),
+            Some(grow_f32(&stream, &mut sc.scales_and_amax, 4)?),
+        )
+    } else {
+        (None, None)
+    };
+    let s_dev = grow_f32(&stream, &mut sc.s, all_rows * tile)?;
+    let p_dev = grow_u16(&stream, &mut sc.p, all_rows * tile)?;
+    let m_dev = grow_f32(&stream, &mut sc.m, all_rows)?;
+    let l_dev = grow_f32(&stream, &mut sc.l, all_rows)?;
+    let o_dev = grow_f32(&stream, &mut sc.o, all_rows * hd)?;
+    let mut out_dev: cudarc::driver::CudaSlice<half::bf16> =
+        unsafe { stream.alloc::<half::bf16>(n * nkv * group * hd) }
+            .map_err(|e| anyhow::anyhow!(e))?;
+    {
+        let (qs, _) = q.storage_and_layout();
+        let (ks, _) = k.storage_and_layout();
+        let (vs, _) = v.storage_and_layout();
+        let cuda_of = |st: &candle_core::Storage| -> Result<u64> {
+            match st {
+                candle_core::Storage::Cuda(c) => {
+                    let sl = c.as_cuda_slice::<half::bf16>()?;
+                    let (p, _g) = sl.device_ptr(&stream);
+                    Ok(p as u64)
+                }
+                _ => anyhow::bail!("e4b full attention gemm arm: tensor not on cuda"),
+            }
+        };
+        let qp = cuda_of(&qs)?;
+        let kp = cuda_of(&ks)?;
+        let vp = cuda_of(&vs)?;
+        let (sp, _gs) = s_dev.device_ptr_mut(&stream);
+        let (pp, _gp) = p_dev.device_ptr_mut(&stream);
+        let (mp, _gm) = m_dev.device_ptr_mut(&stream);
+        let (lp, _gl) = l_dev.device_ptr_mut(&stream);
+        let (op, _go) = o_dev.device_ptr_mut(&stream);
+        let (outp, _gout) = out_dev.device_ptr_mut(&stream);
+        let q_pos0 = len - n;
+        let fp8 = match (q8_dev, k8_dev, scales_dev) {
+            (Some(q8), Some(k8), Some(scales)) => {
+                let (q8p, _g8) = q8.device_ptr_mut(&stream);
+                let (k8p, _gk8) = k8.device_ptr_mut(&stream);
+                let (scp, _gsc) = scales.device_ptr_mut(&stream);
+                let q_scale = scp as *mut f32;
+                let k_scale = (scp + 4) as *mut f32;
+                let amax = (scp + 8) as *mut u32;
+                let rc = unsafe {
+                    nv_kernels::cuda::e4m3_pertensor_quant_two_segments(
+                        stream.cu_stream() as *mut _,
+                        qp as *const u16,
+                        (qp + (rows * hd * 2) as u64) as *const u16,
+                        (rows * hd) as i64,
+                        q8p as *mut u8,
+                        (q8p + (rows * hd) as u64) as *mut u8,
+                        q_scale,
+                        amax,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "e4b fp8 scores: q quantize rc={rc}");
+                let rc = unsafe {
+                    nv_kernels::cuda::e4m3_pertensor_quant_two_segments(
+                        stream.cu_stream() as *mut _,
+                        kp as *const u16,
+                        (kp + (k_stride * 2) as u64) as *const u16,
+                        (len * hd) as i64,
+                        k8p as *mut u8,
+                        (k8p + (len * hd) as u64) as *mut u8,
+                        k_scale,
+                        amax,
+                    )
+                };
+                anyhow::ensure!(rc == 0, "e4b fp8 scores: k quantize rc={rc}");
+                Some((q8p, k8p, q_scale as *const f32, k_scale as *const f32))
+            }
+            _ => None,
+        };
+        let mut key_off = 0usize;
+        let mut first = true;
+        while key_off < len {
+            let tile_len = tile.min(len - key_off);
+            unsafe {
+                let _ = FP8_SCORE_TILES_NEED_16_ALIGNED_ROWS_AND_KEYS_SO_A_RAGGED_TAIL_TILE_RUNS_THE_BF16_GEMM;
+                match fp8.filter(|_| rows % 16 == 0 && tile_len % 16 == 0) {
+                    Some((q8p, k8p, qs, ks)) => {
+                        nv_quant::matmul::e4m3_gemm_f32_out_strided_batched_raw(
+                            &stream,
+                            q8p as *const std::ffi::c_void,
+                            (k8p + (key_off * hd) as u64) as *const std::ffi::c_void,
+                            sp as *mut std::ffi::c_void,
+                            rows as u64,
+                            tile_len as u64,
+                            hd as u64,
+                            nkv as i32,
+                            (rows * hd) as i64,
+                            (len * hd) as i64,
+                            (rows * tile_len) as i64,
+                            qs,
+                            ks,
+                            0.0,
+                        )?;
+                    }
+                    None => {
+                        nv_quant::matmul::bf16_gemm_f32_out_strided_batched_raw(
+                            &stream,
+                            qp as *const std::ffi::c_void,
+                            (kp + (key_off * hd * 2) as u64) as *const std::ffi::c_void,
+                            sp as *mut std::ffi::c_void,
+                            rows as u64,
+                            tile_len as u64,
+                            hd as u64,
+                            nkv as i32,
+                            (rows * hd) as i64,
+                            k_stride as i64,
+                            (rows * tile_len) as i64,
+                            true,
+                            0.0,
+                        )?;
+                    }
+                }
+                let rc = nv_kernels::cuda::e4b_online_softmax_tile(
+                    stream.cu_stream() as *mut _,
+                    sp as *const f32,
+                    pp as *mut u16,
+                    mp as *mut f32,
+                    lp as *mut f32,
+                    op as *mut f32,
+                    rows as i32,
+                    nkv as i32,
+                    n as i32,
+                    tile_len as i32,
+                    key_off as i32,
+                    q_pos0 as i32,
+                    hd as i32,
+                    scale,
+                    first as i32,
+                );
+                anyhow::ensure!(rc == 0, "e4b_online_softmax_tile returned {rc}");
+                nv_quant::matmul::bf16_gemm_f32_out_strided_batched_raw(
+                    &stream,
+                    pp as *const std::ffi::c_void,
+                    (vp + (key_off * hd * 2) as u64) as *const std::ffi::c_void,
+                    op as *mut std::ffi::c_void,
+                    rows as u64,
+                    hd as u64,
+                    tile_len as u64,
+                    nkv as i32,
+                    (rows * tile_len) as i64,
+                    v_stride as i64,
+                    (rows * hd) as i64,
+                    false,
+                    if first { 0.0 } else { 1.0 },
+                )?;
+            }
+            first = false;
+            key_off += tile_len;
+        }
+        let rc = unsafe {
+            nv_kernels::cuda::e4b_attn_finalize(
+                stream.cu_stream() as *mut _,
+                op as *const f32,
+                lp as *const f32,
+                outp as *mut u16,
+                n as i32,
+                (nkv * group) as i32,
+                hd as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "e4b_attn_finalize returned {rc}");
+    }
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev);
+    let storage = candle_core::Storage::Cuda(storage);
+    Ok(Tensor::from_storage(
+        storage,
+        (n, nkv * group * hd),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
 }

@@ -58,3 +58,19 @@ rocq/.nia.cache
 # lane-local shader temp files: a sweep must never publish these
 *.wgsl.tmp.*
 *.tmp.[0-9]*
+
+# fitted Kokoro voices shipped with the code (1 KB each; the flake only sees tracked files)
+!rust/voices/*.npy
+!python/tts/kokoro/voices/*.npy
+sae-runs/
+
+# model weights, databases and secrets must never be tracked
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+outputs/

@@ -22,7 +22,7 @@ mod cuda {
     use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use half::bf16;
-    use std::collections::HashMap;
+    use std::collections::{hash_map::Entry, HashMap};
     use std::ffi::c_void;
     use std::mem;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -35,8 +35,8 @@ mod cuda {
         let mut guard = cache
             .lock()
             .map_err(|e| anyhow::anyhow!("gemm handle cache poisoned: {e}"))?;
-        if !guard.contains_key(&key) {
-            guard.insert(key, CudaBlasLT::new(stream.clone())?);
+        if let Entry::Vacant(entry) = guard.entry(key) {
+            entry.insert(CudaBlasLT::new(stream.clone())?);
         }
         Ok(())
     }
@@ -50,8 +50,8 @@ mod cuda {
         let mut guard = cache
             .lock()
             .map_err(|e| anyhow::anyhow!("gemm handle cache poisoned: {e}"))?;
-        if !guard.contains_key(&key) {
-            guard.insert(key, CudaBlasLT::new(stream.clone())?);
+        if let Entry::Vacant(entry) = guard.entry(key) {
+            entry.insert(CudaBlasLT::new(stream.clone())?);
         }
         f(guard.get(&key).unwrap())
     }
@@ -295,7 +295,9 @@ mod cuda {
     }
 
     pub fn nondeterministic_reduction_was_explicitly_allowed() -> bool {
-        nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_BF16_ALLOW_NONDET_REDUCTION")
+        nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!(
+            "NV_BF16_ALLOW_NONDET_REDUCTION"
+        )
     }
 
     pub fn splitk_enabled() -> bool {
@@ -356,20 +358,17 @@ mod cuda {
         let mut guard = cache
             .lock()
             .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
-        if !guard.contains_key(&key) {
+        if let Entry::Vacant(entry) = guard.entry(key) {
             let handle = lt_result::create_handle()
                 .map_err(|e| anyhow::anyhow!("cublasLt create: {e:?}"))?;
 
             let workspace_bytes = 32 * 1024 * 1024;
             let workspace = stream.alloc_zeros::<u8>(workspace_bytes)?;
-            guard.insert(
-                key,
-                DetLt {
-                    handle,
-                    workspace,
-                    workspace_bytes,
-                },
-            );
+            entry.insert(DetLt {
+                handle,
+                workspace,
+                workspace_bytes,
+            });
         }
         Ok(())
     }
@@ -522,6 +521,339 @@ mod cuda {
             d_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
         }
         Ok(())
+    }
+
+    struct F32OutBatchedPlan {
+        desc: lt_sys::cublasLtMatmulDesc_t,
+        a_layout: lt_sys::cublasLtMatrixLayout_t,
+        b_layout: lt_sys::cublasLtMatrixLayout_t,
+        d_layout: lt_sys::cublasLtMatrixLayout_t,
+        algo: lt_sys::cublasLtMatmulAlgo_t,
+    }
+
+    unsafe impl Send for F32OutBatchedPlan {}
+
+    static F32_OUT_BATCHED_PLAN_PER_SHAPE_BECAUSE_DESCRIPTOR_CHURN_PLUS_THE_HEURISTIC_QUERY_COST_MORE_CPU_THAN_A_2K_TILE_GEMM_TAKES_ON_THE_GPU: OnceLock<
+        Mutex<HashMap<(u64, u64, u64, i32, i64, i64, i64, bool), F32OutBatchedPlan>>,
+    > = OnceLock::new();
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn f32_out_batched_plan(
+        handle: lt_sys::cublasLtHandle_t,
+        ws_bytes: usize,
+        m: u64,
+        n: u64,
+        k: u64,
+        batch: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        b_is_n_by_k_row_major: bool,
+    ) -> Result<F32OutBatchedPlan> {
+        let bf = lt_sys::cudaDataType_t::CUDA_R_16BF;
+        let f32t = lt_sys::cudaDataType_t::CUDA_R_32F;
+        let (a_layout, transa) = if b_is_n_by_k_row_major {
+            (
+                lt_result::create_matrix_layout(bf, k, n, k as i64)
+                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?,
+                cublasOperation_t::CUBLAS_OP_T,
+            )
+        } else {
+            (
+                lt_result::create_matrix_layout(bf, n, k, n as i64)
+                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?,
+                cublasOperation_t::CUBLAS_OP_N,
+            )
+        };
+        let b_layout = lt_result::create_matrix_layout(bf, k, m, k as i64)
+            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+        let d_layout = lt_result::create_matrix_layout(f32t, n, m, n as i64)
+            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+        for (layout, stride) in [
+            (a_layout, stride_b),
+            (b_layout, stride_a),
+            (d_layout, stride_c),
+        ] {
+            lt_result::set_matrix_layout_attribute(
+                layout,
+                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                &batch as *const _ as *const c_void,
+                mem::size_of::<i32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("batch count: {e:?}"))?;
+            lt_result::set_matrix_layout_attribute(
+                layout,
+                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &stride as *const _ as *const c_void,
+                mem::size_of::<i64>(),
+            )
+            .map_err(|e| anyhow::anyhow!("batch stride: {e:?}"))?;
+        }
+        let desc = lt_result::create_matmul_desc(
+            lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt_sys::cudaDataType_t::CUDA_R_32F,
+        )
+        .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
+        let nn = cublasOperation_t::CUBLAS_OP_N;
+        lt_result::set_matmul_desc_attribute(
+            desc,
+            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const c_void,
+            mem::size_of::<cublasOperation_t>(),
+        )
+        .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
+        lt_result::set_matmul_desc_attribute(
+            desc,
+            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &nn as *const _ as *const c_void,
+            mem::size_of::<cublasOperation_t>(),
+        )
+        .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
+        let algo = legacy_det_algo(handle, ws_bytes, desc, a_layout, b_layout, d_layout)?;
+        Ok(F32OutBatchedPlan {
+            desc,
+            a_layout,
+            b_layout,
+            d_layout,
+            algo,
+        })
+    }
+
+    static E4M3_F32_OUT_BATCHED_PLAN_PER_SHAPE_LIKE_THE_BF16_PLAN_CACHE: OnceLock<
+        Mutex<HashMap<(u64, u64, u64, i32, i64, i64, i64), F32OutBatchedPlan>>,
+    > = OnceLock::new();
+
+    unsafe fn e4m3_f32_out_batched_plan(
+        handle: lt_sys::cublasLtHandle_t,
+        ws_bytes: usize,
+        m: u64,
+        n: u64,
+        k: u64,
+        batch: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+    ) -> Result<F32OutBatchedPlan> {
+        let e4m3 = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
+        let f32t = lt_sys::cudaDataType_t::CUDA_R_32F;
+        let a_layout = lt_result::create_matrix_layout(e4m3, k, n, k as i64)
+            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+        let b_layout = lt_result::create_matrix_layout(e4m3, k, m, k as i64)
+            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+        let d_layout = lt_result::create_matrix_layout(f32t, n, m, n as i64)
+            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+        for (layout, stride) in [
+            (a_layout, stride_b),
+            (b_layout, stride_a),
+            (d_layout, stride_c),
+        ] {
+            lt_result::set_matrix_layout_attribute(
+                layout,
+                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                &batch as *const _ as *const c_void,
+                mem::size_of::<i32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("batch count: {e:?}"))?;
+            lt_result::set_matrix_layout_attribute(
+                layout,
+                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                &stride as *const _ as *const c_void,
+                mem::size_of::<i64>(),
+            )
+            .map_err(|e| anyhow::anyhow!("batch stride: {e:?}"))?;
+        }
+        let desc = lt_result::create_matmul_desc(
+            lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt_sys::cudaDataType_t::CUDA_R_32F,
+        )
+        .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
+        let transa = cublasOperation_t::CUBLAS_OP_T;
+        let nn = cublasOperation_t::CUBLAS_OP_N;
+        lt_result::set_matmul_desc_attribute(
+            desc,
+            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const c_void,
+            mem::size_of::<cublasOperation_t>(),
+        )
+        .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
+        lt_result::set_matmul_desc_attribute(
+            desc,
+            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &nn as *const _ as *const c_void,
+            mem::size_of::<cublasOperation_t>(),
+        )
+        .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
+        let algo = legacy_det_algo(handle, ws_bytes, desc, a_layout, b_layout, d_layout)?;
+        Ok(F32OutBatchedPlan {
+            desc,
+            a_layout,
+            b_layout,
+            d_layout,
+            algo,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn e4m3_gemm_f32_out_strided_batched_raw(
+        stream: &Arc<CudaStream>,
+        ap: *const c_void,
+        bp: *const c_void,
+        cp: *mut c_void,
+        m: u64,
+        n: u64,
+        k: u64,
+        batch: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        a_scale_dev: *const f32,
+        b_scale_dev: *const f32,
+        beta: f32,
+    ) -> Result<()> {
+        ensure_det_handle(stream)?;
+        let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = crate::stream_cache_key(stream);
+        let mut guard = cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
+        let det = guard.get_mut(&key).expect("ensured above");
+        let plans = E4M3_F32_OUT_BATCHED_PLAN_PER_SHAPE_LIKE_THE_BF16_PLAN_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        let mut plans = plans
+            .lock()
+            .map_err(|e| anyhow::anyhow!("e4m3 f32-out plan cache poisoned: {e}"))?;
+        let plan = match plans.entry((m, n, k, batch, stride_a, stride_b, stride_c)) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => v.insert(e4m3_f32_out_batched_plan(
+                det.handle,
+                det.workspace_bytes,
+                m,
+                n,
+                k,
+                batch,
+                stride_a,
+                stride_b,
+                stride_c,
+            )?),
+        };
+        for (attr, ptr) in [
+            (
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                b_scale_dev,
+            ),
+            (
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                a_scale_dev,
+            ),
+        ] {
+            lt_result::set_matmul_desc_attribute(
+                plan.desc,
+                attr,
+                &ptr as *const _ as *const c_void,
+                mem::size_of::<*const f32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("e4m3 scale pointer: {e:?}"))?;
+        }
+        let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
+        let alpha: f32 = 1.0;
+        lt_result::matmul(
+            det.handle,
+            plan.desc,
+            &alpha as *const _ as *const c_void,
+            &beta as *const _ as *const c_void,
+            bp,
+            plan.a_layout,
+            ap,
+            plan.b_layout,
+            cp as *const c_void,
+            plan.d_layout,
+            cp,
+            plan.d_layout,
+            &plan.algo as *const _,
+            wsp as *mut c_void,
+            det.workspace_bytes,
+            stream.cu_stream() as lt_sys::cudaStream_t,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("cublasLtMatmul e4m3 f32-out batched {m}x{n}x{k}x{batch}: {e:?}")
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn bf16_gemm_f32_out_strided_batched_raw(
+        stream: &Arc<CudaStream>,
+        ap: *const c_void,
+        bp: *const c_void,
+        cp: *mut c_void,
+        m: u64,
+        n: u64,
+        k: u64,
+        batch: i32,
+        stride_a: i64,
+        stride_b: i64,
+        stride_c: i64,
+        b_is_n_by_k_row_major: bool,
+        beta: f32,
+    ) -> Result<()> {
+        ensure_det_handle(stream)?;
+        let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = crate::stream_cache_key(stream);
+        let mut guard = cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
+        let det = guard.get_mut(&key).expect("ensured above");
+        let plans = F32_OUT_BATCHED_PLAN_PER_SHAPE_BECAUSE_DESCRIPTOR_CHURN_PLUS_THE_HEURISTIC_QUERY_COST_MORE_CPU_THAN_A_2K_TILE_GEMM_TAKES_ON_THE_GPU
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        let mut plans = plans
+            .lock()
+            .map_err(|e| anyhow::anyhow!("f32-out plan cache poisoned: {e}"))?;
+        let plan = match plans.entry((
+            m,
+            n,
+            k,
+            batch,
+            stride_a,
+            stride_b,
+            stride_c,
+            b_is_n_by_k_row_major,
+        )) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => v.insert(f32_out_batched_plan(
+                det.handle,
+                det.workspace_bytes,
+                m,
+                n,
+                k,
+                batch,
+                stride_a,
+                stride_b,
+                stride_c,
+                b_is_n_by_k_row_major,
+            )?),
+        };
+        let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
+        let alpha: f32 = 1.0;
+        lt_result::matmul(
+            det.handle,
+            plan.desc,
+            &alpha as *const _ as *const c_void,
+            &beta as *const _ as *const c_void,
+            bp,
+            plan.a_layout,
+            ap,
+            plan.b_layout,
+            cp as *const c_void,
+            plan.d_layout,
+            cp,
+            plan.d_layout,
+            &plan.algo as *const _,
+            wsp as *mut c_void,
+            det.workspace_bytes,
+            stream.cu_stream() as lt_sys::cudaStream_t,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("cublasLtMatmul bf16 f32-out batched {m}x{n}x{k}x{batch}: {e:?}")
+        })
     }
 
     unsafe fn legacy_det_algo(

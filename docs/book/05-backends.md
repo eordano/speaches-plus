@@ -279,7 +279,7 @@ checkpoint, so ordering and discriminator choice carry real weight:
   and **the capability report must describe exactly what `try_load` will do under
   the same environment**, or an operator gets a green backends-report for a model
   that then fails to load. Standalone w4a16 decode measured faster on cuda than on
-  wgpu (numbers: `perf/runs.jsonl`).
+  wgpu (numbers: the private run ledger).
 - **Gemma-4 E4B cuda step logits are softcapped by default.**
   `Gemma4E4b::forward_step_inner` -- the body behind `forward_step`,
   `forward_step_embeds`, `forward_step_spec`, `forward_step_fixed` and
@@ -297,7 +297,7 @@ checkpoint, so ordering and discriminator choice carry real weight:
   gate is `nv-models/tests/e4b_ppl_cuda_wgpu_position_diff.rs`). Cost of the cap:
   one fused elementwise kernel over `[n, vocab]` per step and f32 rows out of the
   step APIs where bf16 came out before. Numbers measured on the raw path, all
-  superseded by the `"e4b ppl-fix"` rows: `perf/runs.jsonl` lines 1042, 1043,
+  superseded by the `"e4b ppl-fix"` rows: the private run ledger
   1056, 1057 (families `e4b-chat-cuda-prefill512`/`-w4a8fp8`, values
   709.676/719.434/705.078/707.070).
 
@@ -331,7 +331,7 @@ wgpu is E4B-only** (`spec_route_eligible` requires
 `kind == WgpuModelKind::Gemma4E4b`), and **chunked prefill is delegated by all
 seven kinds** through `Decoder::prefill_chunk_len` -- though the `Qwen3_5Dense`
 path does not engage on an NVFP4 checkpoint
-(`docs/measurements/2026-08-11-wgpu-prefill-basis-line.md`), so **a wgpu serving
+(a private measurement record), so **a wgpu serving
 figure is not a decode figure**.
 
 ## The Vulkan loader, or your wgpu tests run nothing

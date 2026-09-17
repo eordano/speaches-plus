@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod algo_pin;
 pub mod fp8;
+pub mod marlin_fp8;
+pub mod marlin_nvfp4;
 pub mod matmul;
 pub mod mlx_affine;
 pub mod mxfp4;

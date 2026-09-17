@@ -2,13 +2,21 @@ use anyhow::Result;
 
 use super::config::{LagunaShapes, LayerShape};
 use super::gpu::{
-    alloc_lin_scratch, push_lin_gemv, push_silu_mul, upload_lin, Builder, Sources, W8Scope,
+    alloc_lin_scratch, alloc_lin_scratch_rows, alloc_pair_scratch, alloc_pair_scratch_rows,
+    push_lin_gemv, push_lin_gemv_pair, push_lin_gemv_pair_rows, push_lin_gemv_rows, push_silu_mul,
+    upload_lin, Builder, LinGpu, MRows, Sources, W8Scope,
 };
 use super::lora::LoraSiteCtx;
 use super::weights::HostDenseMlp;
 use super::{rbf, ref_gemv_lin, silu};
 
 pub const DENSE_WGSL: &str = "";
+
+pub struct DenseGpu {
+    pub gate: LinGpu,
+    pub up: LinGpu,
+    pub down: LinGpu,
+}
 
 fn check_shapes(shapes: &LagunaShapes, layer: &LayerShape, w: &HostDenseMlp) -> Result<usize> {
     let hidden = shapes.hidden_size;
@@ -52,7 +60,7 @@ pub fn build_dense_mlp(
     x_normed_packed: &wgpu::Buffer,
     out_packed: &wgpu::Buffer,
     lora: Option<&LoraSiteCtx>,
-) -> Result<()> {
+) -> Result<DenseGpu> {
     let inter = check_shapes(shapes, layer, w)?;
     let label = format!("lgw-dense{}", layer.idx);
 
@@ -60,30 +68,29 @@ pub fn build_dense_mlp(
     let up = upload_lin(b, &format!("{label}-up"), &w.up, W8Scope::Ffn);
     let down = upload_lin(b, &format!("{label}-down"), &w.down, W8Scope::Ffn);
 
-    let gate_sc = alloc_lin_scratch(b, &format!("{label}-gate"), &gate);
-    let up_sc = alloc_lin_scratch(b, &format!("{label}-up"), &up);
+    let gu_scratch = alloc_pair_scratch(
+        b,
+        &format!("{label}-gate"),
+        &gate,
+        &format!("{label}-up"),
+        &up,
+    );
     let down_sc = alloc_lin_scratch(b, &format!("{label}-down"), &down);
 
     let y_gate = b.zeros(&format!("{label}-yg"), (inter * 2) as u64);
     let y_up = b.zeros(&format!("{label}-yu"), (inter * 2) as u64);
     let act = b.zeros(&format!("{label}-act"), (inter * 2) as u64);
 
-    push_lin_gemv(
+    push_lin_gemv_pair(
         b,
         s,
         &format!("{label}-gate"),
         &gate,
-        &gate_sc,
-        x_normed_packed,
-        &y_gate,
-    )?;
-    push_lin_gemv(
-        b,
-        s,
         &format!("{label}-up"),
         &up,
-        &up_sc,
+        &gu_scratch,
         x_normed_packed,
+        &y_gate,
         &y_up,
     )?;
     if let Some(lc) = lora {
@@ -106,7 +113,68 @@ pub fn build_dense_mlp(
             lc.push_site(b, site, &act, &[out_packed]);
         }
     }
-    Ok(())
+    Ok(DenseGpu { gate, up, down })
+}
+
+pub fn build_dense_mlp_rows(
+    b: &mut Builder,
+    s: &Sources,
+    layer: &LayerShape,
+    g: &DenseGpu,
+    x_rows_packed: &wgpu::Buffer,
+    out_rows_packed: &wgpu::Buffer,
+    mp: &MRows,
+) -> Result<()> {
+    let inter = layer.ffn_intermediate;
+    let m = mp.m;
+    let label = format!("lgw-mdense{}", layer.idx);
+
+    let gu_scratch = alloc_pair_scratch_rows(
+        b,
+        &format!("{label}-gate"),
+        &g.gate,
+        &format!("{label}-up"),
+        &g.up,
+        m,
+    );
+    let down_sc = alloc_lin_scratch_rows(b, &format!("{label}-down"), &g.down, m);
+
+    let y_gate = b.zeros(&format!("{label}-yg"), (m * inter * 2) as u64);
+    let y_up = b.zeros(&format!("{label}-yu"), (m * inter * 2) as u64);
+    let act = b.zeros(&format!("{label}-act"), (m * inter * 2) as u64);
+
+    push_lin_gemv_pair_rows(
+        b,
+        s,
+        &format!("{label}-gate"),
+        &g.gate,
+        &format!("{label}-up"),
+        &g.up,
+        &gu_scratch,
+        x_rows_packed,
+        &y_gate,
+        &y_up,
+        mp,
+    )?;
+    push_silu_mul(
+        b,
+        s,
+        &format!("{label}-silu"),
+        &y_gate,
+        &y_up,
+        &act,
+        m * inter,
+    )?;
+    push_lin_gemv_rows(
+        b,
+        s,
+        &format!("{label}-down"),
+        &g.down,
+        &down_sc,
+        &act,
+        out_rows_packed,
+        mp,
+    )
 }
 
 pub fn ref_dense_mlp(

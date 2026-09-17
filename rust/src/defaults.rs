@@ -228,6 +228,9 @@ pub mod env {
 
     pub const STT_BACKEND: &str = "STT_BACKEND";
 
+    pub const WHISPER_MODEL: &str = "WHISPER_MODEL";
+    pub const CT2_MODEL: &str = "CT2_MODEL";
+
     pub const NV_SERVE_BACKEND: &str = "NV_SERVE_BACKEND";
 
     pub const KOKORO_INTRA_THREADS: &str = "KOKORO_INTRA_THREADS";

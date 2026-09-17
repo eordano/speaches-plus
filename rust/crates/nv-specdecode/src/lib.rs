@@ -35,7 +35,9 @@ pub use qwen38_mtp::{
     NV_Q38_MTP_VERIFY_REPLAY_ENV, QWEN38_27B_MTP_GEOMETRY,
 };
 #[cfg(feature = "cuda")]
-pub use qwen38_mtp::{MtpKvCache, Qwen38DenseMtpHead, Qwen38MtpDecodeSession, Qwen38MtpSelfSpecEngine};
+pub use qwen38_mtp::{
+    MtpKvCache, Qwen38DenseMtpHead, Qwen38MtpDecodeSession, Qwen38MtpSelfSpecEngine,
+};
 #[cfg(feature = "wgpu")]
 pub use wgpu_spec::{
     rope_tables, ChainDrafter, LockstepChainSpec, ModelDrafter, PromptLookupDrafter, RealSpecStats,

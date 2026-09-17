@@ -223,6 +223,49 @@ __device__ __forceinline__ float bf16_bits_to_f32(unsigned bits16) {
 
 constexpr int kGemvActWarps = 8;
 
+constexpr int
+    kGemvActMRowsContiguousTo8ThenSparse12And16And24MatchingTheMkVerifyRungsSoADeepVerifyBlockKeepsOneLaunch =
+        24;
+constexpr bool gemv_act_mrows_case_instantiated(int m) {
+    return (m >= 1 && m <= 8) || m == 12 || m == 16 || m == 24;
+}
+
+__device__ __forceinline__ float nvfp4_block_dot_e2m1_against_bf16_row(
+    unsigned w0,
+    unsigned w1,
+    uint4 x0,
+    uint4 x1
+) {
+    float bd = 0.f;
+    unsigned xw;
+    xw = x0.x;
+    bd = fmaf(e2m1_lo_times_2e14(w0), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w0), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x0.y;
+    bd = fmaf(e2m1_lo_times_2e14(w0 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w0 >> 8), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x0.z;
+    bd = fmaf(e2m1_lo_times_2e14(w0 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w0 >> 16), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x0.w;
+    bd = fmaf(e2m1_lo_times_2e14(w0 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w0 >> 24), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x1.x;
+    bd = fmaf(e2m1_lo_times_2e14(w1), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w1), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x1.y;
+    bd = fmaf(e2m1_lo_times_2e14(w1 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w1 >> 8), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x1.z;
+    bd = fmaf(e2m1_lo_times_2e14(w1 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w1 >> 16), bf16_bits_to_f32(xw >> 16), bd);
+    xw = x1.w;
+    bd = fmaf(e2m1_lo_times_2e14(w1 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
+    bd = fmaf(e2m1_hi_times_2e14(w1 >> 24), bf16_bits_to_f32(xw >> 16), bd);
+    return bd;
+}
+
+template <int MROWS>
 __global__ void nvfp4_gemv_bf16act_kernel(
     const uint8_t* __restrict__ W_packed,
     const uint8_t* __restrict__ W_scales,
@@ -240,51 +283,34 @@ __global__ void nvfp4_gemv_bf16act_kernel(
     const uint8_t* w_row = W_packed + (size_t)n * (K / 2);
     const uint16_t* xb = reinterpret_cast<const uint16_t*>(x);
 
-    float acc = 0.f;
+    float acc[MROWS];
+    #pragma unroll
+    for (int r = 0; r < MROWS; ++r) acc[r] = 0.f;
+
     for (int kb = lane; kb < n_blocks; kb += 32) {
         float scale =
             decode_ue4m3_branchless_dev(W_scales[swizzled_scale_dst(n, kb, n_blocks)]) * 16384.f;
         uint2 wq = *reinterpret_cast<const uint2*>(w_row + (size_t)kb * 8);
-        uint4 x0 = *reinterpret_cast<const uint4*>(xb + (size_t)kb * 16);
-        uint4 x1 = *reinterpret_cast<const uint4*>(xb + (size_t)kb * 16 + 8);
-
-        float bd = 0.f;
         unsigned w0 = wq.x;
         unsigned w1 = wq.y;
-        unsigned xw;
-        xw = x0.x;
-        bd = fmaf(e2m1_lo_times_2e14(w0), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w0), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x0.y;
-        bd = fmaf(e2m1_lo_times_2e14(w0 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w0 >> 8), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x0.z;
-        bd = fmaf(e2m1_lo_times_2e14(w0 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w0 >> 16), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x0.w;
-        bd = fmaf(e2m1_lo_times_2e14(w0 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w0 >> 24), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x1.x;
-        bd = fmaf(e2m1_lo_times_2e14(w1), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w1), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x1.y;
-        bd = fmaf(e2m1_lo_times_2e14(w1 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w1 >> 8), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x1.z;
-        bd = fmaf(e2m1_lo_times_2e14(w1 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w1 >> 16), bf16_bits_to_f32(xw >> 16), bd);
-        xw = x1.w;
-        bd = fmaf(e2m1_lo_times_2e14(w1 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
-        bd = fmaf(e2m1_hi_times_2e14(w1 >> 24), bf16_bits_to_f32(xw >> 16), bd);
-
-        acc = fmaf(scale, bd, acc);
+        #pragma unroll
+        for (int r = 0; r < MROWS; ++r) {
+            const uint16_t* xr = xb + (size_t)r * K;
+            uint4 x0 = *reinterpret_cast<const uint4*>(xr + (size_t)kb * 16);
+            uint4 x1 = *reinterpret_cast<const uint4*>(xr + (size_t)kb * 16 + 8);
+            acc[r] = fmaf(scale, nvfp4_block_dot_e2m1_against_bf16_row(w0, w1, x0, x1), acc[r]);
+        }
     }
 
     #pragma unroll
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    for (int r = 0; r < MROWS; ++r) {
+        float a = acc[r];
+        #pragma unroll
+        for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            a += __shfl_xor_sync(0xffffffff, a, offset);
+        }
+        if (lane == 0) y[(size_t)r * N + n] = __float2bfloat16(a * alpha);
     }
-    if (lane == 0) y[n] = __float2bfloat16(acc * alpha);
 }
 
 constexpr int kGemvPrenormBlockIs256TheSameShapeAsRmsnormCuSoTheFoldedRowIsBitwise =
@@ -367,36 +393,10 @@ __global__ void nvfp4_gemv_bf16act_prenorm_kernel(
             uint2 wq = *reinterpret_cast<const uint2*>(
                 W_packed + (size_t)n * (K / 2) + (size_t)kb * 8);
 
-            float bd = 0.f;
-            unsigned w0 = wq.x;
-            unsigned w1 = wq.y;
-            unsigned xw;
-            xw = x0.x;
-            bd = fmaf(e2m1_lo_times_2e14(w0), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w0), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x0.y;
-            bd = fmaf(e2m1_lo_times_2e14(w0 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w0 >> 8), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x0.z;
-            bd = fmaf(e2m1_lo_times_2e14(w0 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w0 >> 16), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x0.w;
-            bd = fmaf(e2m1_lo_times_2e14(w0 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w0 >> 24), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x1.x;
-            bd = fmaf(e2m1_lo_times_2e14(w1), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w1), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x1.y;
-            bd = fmaf(e2m1_lo_times_2e14(w1 >> 8), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w1 >> 8), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x1.z;
-            bd = fmaf(e2m1_lo_times_2e14(w1 >> 16), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w1 >> 16), bf16_bits_to_f32(xw >> 16), bd);
-            xw = x1.w;
-            bd = fmaf(e2m1_lo_times_2e14(w1 >> 24), bf16_bits_to_f32(xw & 0xffffu), bd);
-            bd = fmaf(e2m1_hi_times_2e14(w1 >> 24), bf16_bits_to_f32(xw >> 16), bd);
-
-            acc[r] = fmaf(scale, bd, acc[r]);
+            acc[r] = fmaf(
+                scale,
+                nvfp4_block_dot_e2m1_against_bf16_row(wq.x, wq.y, x0, x1),
+                acc[r]);
         }
     }
 
@@ -413,6 +413,45 @@ __global__ void nvfp4_gemv_bf16act_prenorm_kernel(
     }
 }
 
+extern "C" int nv_kernels_nvfp4_gemv_bf16act_mrows(
+    void* stream,
+    const uint8_t* W_packed,
+    const uint8_t* W_scales,
+    const uint16_t* x_bf16,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K,
+    int M
+) {
+    if (N <= 0 || K <= 0 || M <= 0) return 0;
+    if ((K & 15) != 0) return -1;
+    if (!gemv_act_mrows_case_instantiated(M)) return -2;
+    cudaStream_t s = (cudaStream_t)stream;
+    dim3 grid((unsigned)((N + kGemvActWarps - 1) / kGemvActWarps));
+    dim3 block(kGemvActWarps * kWarpSize);
+    const __nv_bfloat16* xx = reinterpret_cast<const __nv_bfloat16*>(x_bf16);
+    __nv_bfloat16* yy = reinterpret_cast<__nv_bfloat16*>(y);
+#define NVK_GEMV_ACT_MROWS(R)                                                                   \
+    nvfp4_gemv_bf16act_kernel<R><<<grid, block, 0, s>>>(W_packed, W_scales, xx, yy, alpha, N, K)
+    switch (M) {
+        case 1: NVK_GEMV_ACT_MROWS(1); break;
+        case 2: NVK_GEMV_ACT_MROWS(2); break;
+        case 3: NVK_GEMV_ACT_MROWS(3); break;
+        case 4: NVK_GEMV_ACT_MROWS(4); break;
+        case 5: NVK_GEMV_ACT_MROWS(5); break;
+        case 6: NVK_GEMV_ACT_MROWS(6); break;
+        case 7: NVK_GEMV_ACT_MROWS(7); break;
+        case 8: NVK_GEMV_ACT_MROWS(8); break;
+        case 12: NVK_GEMV_ACT_MROWS(12); break;
+        case 16: NVK_GEMV_ACT_MROWS(16); break;
+        case 24: NVK_GEMV_ACT_MROWS(24); break;
+        default: return -2;
+    }
+#undef NVK_GEMV_ACT_MROWS
+    return (int)cudaGetLastError();
+}
+
 extern "C" int nv_kernels_nvfp4_gemv_bf16act(
     void* stream,
     const uint8_t* W_packed,
@@ -423,20 +462,8 @@ extern "C" int nv_kernels_nvfp4_gemv_bf16act(
     int N,
     int K
 ) {
-    if (N <= 0 || K <= 0) return 0;
-    if ((K & 15) != 0) return -1;
-    cudaStream_t s = (cudaStream_t)stream;
-    dim3 grid((unsigned)((N + kGemvActWarps - 1) / kGemvActWarps));
-    dim3 block(kGemvActWarps * kWarpSize);
-    nvfp4_gemv_bf16act_kernel<<<grid, block, 0, s>>>(
-        W_packed,
-        W_scales,
-        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
-        reinterpret_cast<__nv_bfloat16*>(y),
-        alpha,
-        N, K
-    );
-    return (int)cudaGetLastError();
+    return nv_kernels_nvfp4_gemv_bf16act_mrows(
+        stream, W_packed, W_scales, x_bf16, y, alpha, N, K, 1);
 }
 
 static const int

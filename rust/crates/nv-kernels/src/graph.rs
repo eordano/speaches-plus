@@ -173,6 +173,18 @@ impl CudaGraphRunner {
         total
     }
 
+    pub fn cached_mem_alloc_consumer_census_key_is_bytes_and_kernel_name(
+        &self,
+    ) -> std::collections::BTreeMap<(u64, String), usize> {
+        let mut total = std::collections::BTreeMap::new();
+        for g in self.cached.values() {
+            for (k, n) in raw_graph_mem_alloc_consumer_census(g.cu_graph) {
+                *total.entry(k).or_insert(0) += n;
+            }
+        }
+        total
+    }
+
     pub fn cached_memcpy_consumer_census_key_is_bytes_and_kernel_name(
         &self,
     ) -> std::collections::BTreeMap<(u64, String), usize> {
@@ -204,8 +216,7 @@ impl CudaGraphRunner {
             }
             for node in &nodes[..m] {
                 let mut ty = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
-                if unsafe { sys::cuGraphNodeGetType(*node, &mut ty) }
-                    != sys::CUresult::CUDA_SUCCESS
+                if unsafe { sys::cuGraphNodeGetType(*node, &mut ty) } != sys::CUresult::CUDA_SUCCESS
                     || ty != sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL
                 {
                     continue;
@@ -218,8 +229,7 @@ impl CudaGraphRunner {
                     continue;
                 }
                 let mut cname: *const std::ffi::c_char = std::ptr::null();
-                if unsafe { sys::cuFuncGetName(&mut cname, kp.func) }
-                    != sys::CUresult::CUDA_SUCCESS
+                if unsafe { sys::cuFuncGetName(&mut cname, kp.func) } != sys::CUresult::CUDA_SUCCESS
                     || cname.is_null()
                 {
                     continue;
@@ -265,8 +275,7 @@ impl CudaGraphRunner {
             }
             for node in &nodes[..m] {
                 let mut ty = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
-                if unsafe { sys::cuGraphNodeGetType(*node, &mut ty) }
-                    != sys::CUresult::CUDA_SUCCESS
+                if unsafe { sys::cuGraphNodeGetType(*node, &mut ty) } != sys::CUresult::CUDA_SUCCESS
                     || ty != sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_KERNEL
                 {
                     continue;
@@ -279,8 +288,7 @@ impl CudaGraphRunner {
                     continue;
                 }
                 let mut cname: *const std::ffi::c_char = std::ptr::null();
-                if unsafe { sys::cuFuncGetName(&mut cname, kp.func) }
-                    == sys::CUresult::CUDA_SUCCESS
+                if unsafe { sys::cuFuncGetName(&mut cname, kp.func) } == sys::CUresult::CUDA_SUCCESS
                     && !cname.is_null()
                 {
                     let name = unsafe { std::ffi::CStr::from_ptr(cname) }
@@ -570,6 +578,41 @@ fn raw_graph_memcpy_consumer_census(
     out
 }
 
+fn raw_graph_mem_alloc_consumer_census(
+    cu_graph: sys::CUgraph,
+) -> std::collections::BTreeMap<(u64, String), usize> {
+    let mut out = std::collections::BTreeMap::new();
+    let n = raw_graph_node_count(cu_graph);
+    if n == 0 {
+        return out;
+    }
+    let mut nodes: Vec<sys::CUgraphNode> = vec![std::ptr::null_mut(); n];
+    let mut m = n;
+    if unsafe { sys::cuGraphGetNodes(cu_graph, nodes.as_mut_ptr(), &mut m) }
+        != sys::CUresult::CUDA_SUCCESS
+    {
+        return out;
+    }
+    for node in &nodes[..m] {
+        let mut ty: sys::CUgraphNodeType = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+        if unsafe { sys::cuGraphNodeGetType(*node, &mut ty) } != sys::CUresult::CUDA_SUCCESS
+            || ty != sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEM_ALLOC
+        {
+            continue;
+        }
+        let mut p = std::mem::MaybeUninit::<sys::CUDA_MEM_ALLOC_NODE_PARAMS>::uninit();
+        if unsafe { sys::cuGraphMemAllocNodeGetParams(*node, p.as_mut_ptr()) }
+            != sys::CUresult::CUDA_SUCCESS
+        {
+            continue;
+        }
+        let p = unsafe { p.assume_init() };
+        *out.entry((p.bytesize as u64, first_dependent_kernel_name(*node)))
+            .or_insert(0) += 1;
+    }
+    out
+}
+
 fn first_kernel_name_in(nodes: &[sys::CUgraphNode]) -> String {
     for d in nodes {
         let mut dty = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
@@ -579,8 +622,7 @@ fn first_kernel_name_in(nodes: &[sys::CUgraphNode]) -> String {
             continue;
         }
         let mut kp: sys::CUDA_KERNEL_NODE_PARAMS = unsafe { std::mem::zeroed() };
-        if unsafe { sys::cuGraphKernelNodeGetParams_v2(*d, &mut kp) }
-            != sys::CUresult::CUDA_SUCCESS
+        if unsafe { sys::cuGraphKernelNodeGetParams_v2(*d, &mut kp) } != sys::CUresult::CUDA_SUCCESS
             || kp.func.is_null()
         {
             continue;
@@ -618,8 +660,7 @@ fn first_dependent_kernel_name(node: sys::CUgraphNode) -> String {
             continue;
         }
         let mut kp: sys::CUDA_KERNEL_NODE_PARAMS = unsafe { std::mem::zeroed() };
-        if unsafe { sys::cuGraphKernelNodeGetParams_v2(*d, &mut kp) }
-            != sys::CUresult::CUDA_SUCCESS
+        if unsafe { sys::cuGraphKernelNodeGetParams_v2(*d, &mut kp) } != sys::CUresult::CUDA_SUCCESS
             || kp.func.is_null()
         {
             continue;

@@ -153,7 +153,8 @@ pub fn decode_data_url_bytes(url: &str) -> Result<Vec<u8>> {
     if !meta.ends_with(";base64") {
         bail!("data: URL must be base64-encoded (got {meta:?})");
     }
-    B64.decode(payload.trim()).context("decode base64 image data")
+    B64.decode(payload.trim())
+        .context("decode base64 image data")
 }
 
 pub fn decode_b64(data: &str) -> Result<Vec<u8>> {

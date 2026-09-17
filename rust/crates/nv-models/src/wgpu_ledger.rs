@@ -17,12 +17,9 @@ macro_rules! wgpu_step_readback_api {
             let t: Vec<u32> =
                 ::nv_kernels::wgpu_backend::dispatch::read_back(self.ctx, &self.token_out, 1)
                     .map_err(|e| ::anyhow::anyhow!("{e}"))?;
-            let l: Vec<f32> = ::nv_kernels::wgpu_backend::dispatch::read_back(
-                self.ctx,
-                &self.logits,
-                self.vocab,
-            )
-            .map_err(|e| ::anyhow::anyhow!("{e}"))?;
+            let l: Vec<f32> =
+                ::nv_kernels::wgpu_backend::dispatch::read_back(self.ctx, &self.logits, self.vocab)
+                    .map_err(|e| ::anyhow::anyhow!("{e}"))?;
             Ok((t[0], l))
         }
 

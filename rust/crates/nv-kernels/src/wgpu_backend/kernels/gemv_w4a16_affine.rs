@@ -15,8 +15,7 @@ pub const MROW8_ROWS_PER_GROUP: u32 = 64;
 pub const MROW4H_PROBE_ENTRY: &str = "gemv_w4a16_affine_mrow4h";
 pub const MROW4H_ROWS_PER_GROUP: u32 = 16;
 pub const MROW4H_PK_ENTRY_REQUIRES_GS_MULTIPLE_OF_32: &str = "gemv_w4a16_affine_mrow4h_pk";
-pub const GU_PK_ENTRY_SEGMENTS_MUST_BE_MULTIPLES_OF_4_ROWS: &str =
-    "gemv_w4a16_affine_mrow4h_gu_pk";
+pub const GU_PK_ENTRY_SEGMENTS_MUST_BE_MULTIPLES_OF_4_ROWS: &str = "gemv_w4a16_affine_mrow4h_gu_pk";
 pub const GU_W_B_SLOT: u32 = 20;
 pub const GU_SCALE_B_SLOT: u32 = 21;
 pub const GU_BIAS_B_SLOT: u32 = 22;

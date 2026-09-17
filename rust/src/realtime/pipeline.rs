@@ -419,14 +419,20 @@ pub(super) async fn process_utterance(
         let mut state = session.state.lock().await;
         state.store_sealed_buffer(sealed);
     }
+    let speaker_audio = super::speaker_id::SpeakerIdentifier::global(&session.models)
+        .map(|identifier| (identifier, audio.clone()));
     let transcript = if let Some(cached) = cached_transcript {
         debug!(%item_id, len = cached.len(), "using speculative STT result");
         cached
     } else {
         let stt_result = match match session.models.whisper() {
             Ok(w) => {
-                run_stt_full(w, crate::types::MonoF32At16k::new(audio), session.stt_language())
-                    .await
+                run_stt_full(
+                    w,
+                    crate::types::MonoF32At16k::new(audio),
+                    session.stt_language(),
+                )
+                .await
             }
             Err(e) => Err(e),
         } {
@@ -500,12 +506,29 @@ pub(super) async fn process_utterance(
         .complete_user_item_transcript(&item_id, transcript.clone())
         .await;
 
+    let speaker = match speaker_audio {
+        Some((identifier, audio)) => {
+            tokio::task::spawn_blocking(move || identifier.identify(&audio))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+                .unwrap_or_else(|err| {
+                    warn!(error = %err, %item_id, "speaker identification failed");
+                    None
+                })
+        }
+        None => None,
+    };
+    if let Some(m) = &speaker {
+        info!(%item_id, speaker = %m.id, name = ?m.name, score = m.score, "speaker identified");
+    }
     session
         .send_to_client(&json!({
             "type": "conversation.item.input_audio_transcription.completed",
             "item_id": item_id,
             "content_index": 0,
             "transcript": transcript,
+            "speaker": speaker,
         }))
         .await;
     {
@@ -720,7 +743,7 @@ pub(super) async fn run_response(
     }
 
     let (sentence_tx, mut sentence_rx) = mpsc::channel::<String>(64);
-    let voice = session.query.voice.clone();
+    let (voice, language) = session.tts_settings();
     let tts_speed = session.tts_speed();
     let kokoro_clone = kokoro.clone();
     let audio_store = session.audio_store.clone();
@@ -744,6 +767,7 @@ pub(super) async fn run_response(
                 &kokoro_clone,
                 &sentence,
                 voice.clone(),
+                language,
                 tts_speed,
                 pacer.as_mut(),
                 utterance_started,
@@ -1189,6 +1213,7 @@ async fn synthesize_and_play(
     kokoro: &crate::tts::KokoroHandle,
     sentence: &str,
     voice: Option<String>,
+    language: &'static str,
     speed: f32,
     pacer: Option<&mut AudioPacer>,
     utterance_started: std::time::Instant,
@@ -1199,7 +1224,7 @@ async fn synthesize_and_play(
     let synth_text = sentence.to_string();
     let synth_started = std::time::Instant::now();
     let result = tokio::task::spawn_blocking(move || {
-        kokoro.synthesize(&synth_text, voice.as_deref(), Some("en-us"), speed)
+        kokoro.synthesize(&synth_text, voice.as_deref(), Some(language), speed)
     })
     .await;
     let audio_24k = match result {

@@ -12,7 +12,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 nv-config = { workspace = true }
 nv-tokenizer = { workspace = true }
-tokenizers = { workspace = true }
 nv-layers = { workspace = true }
 nv-lookup = { workspace = true }
 nv-weights = { workspace = true }
@@ -28,9 +27,15 @@ wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl
 pollster = { version = "0.4", optional = true }
 bytemuck = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"] }
+
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "nv-layers/cuda", "nv-weights/cuda", "nv-quant/cuda", "nv-kernels/cuda", "dep:cudarc"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "nv-layers/cuda", "nv-weights/cuda", "nv-quant/cuda", "nv-kernels/cuda", "nv-train/cuda", "dep:cudarc"]
 metal = ["candle-core/metal", "candle-nn/metal", "nv-layers/metal", "nv-weights/metal"]
 wgpu = ["nv-kernels/wgpu", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
 laguna-wip = ["wgpu"]

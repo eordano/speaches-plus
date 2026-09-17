@@ -9,6 +9,12 @@ namespace {
 constexpr int kNvfp4Block = 16;
 constexpr int kWarp = 32;
 constexpr int kWarpsPerBlockSharesOneStagedX = 16;
+constexpr int kMkSlabSmemBudget48KbStaysUnderTheStaticOptinLine = 48 * 1024;
+
+__host__ __device__ inline int mk_slab_kb_for(int TM, int kb_total) {
+    int cap = ((kMkSlabSmemBudget48KbStaysUnderTheStaticOptinLine / TM) / kNvfp4Block) & ~31;
+    return kb_total < cap ? kb_total : cap;
+}
 #define NV_UE4M3_SUBNORMAL_STEP 0.001953125f
 constexpr float kHalfUndoesTheDoubledE2m1IntTables = 0.5f;
 constexpr int kSiluQuantBlockThreads = 1024;
@@ -460,19 +466,12 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
     int K
 ) {
     extern __shared__ int xs_q8_words[];
-    {
-        const int4* xg = reinterpret_cast<const int4*>(x_q8);
-        int4* xs4 = reinterpret_cast<int4*>(xs_q8_words);
-        for (int i = threadIdx.x; i < TM * (K >> 4); i += blockDim.x) {
-            xs4[i] = __ldg(&xg[i]);
-        }
-    }
-    __syncthreads();
+    const int kSlab = mk_slab_kb_for(TM, K / kNvfp4Block);
 
     int lane = threadIdx.x & (kWarp - 1);
     int warp = threadIdx.x / kWarp;
     int row = blockIdx.x * kWarpsPerBlockSharesOneStagedX + warp;
-    if (row >= N + N_b) return;
+    const bool active = row < N + N_b;
     bool second = row >= N;
     int r = second ? row - N : row;
     const uint8_t* wq = second ? wq_b : wq_a;
@@ -489,8 +488,23 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
     #pragma unroll
     for (int j = 0; j < TM; ++j) acc[j] = 0.0f;
     int kb = lane;
-    uint2 raw = (kb < kb_total) ? __ldcs(&w8[kb]) : make_uint2(0, 0);
-    while (kb < kb_total) {
+    uint2 raw = (active && kb < kb_total) ? __ldcs(&w8[kb]) : make_uint2(0, 0);
+    for (int slab0 = 0; slab0 < kb_total; slab0 += kSlab) {
+    const int slab_kb = (kb_total - slab0 < kSlab) ? (kb_total - slab0) : kSlab;
+    __syncthreads();
+    {
+        const int4* xg = reinterpret_cast<const int4*>(x_q8);
+        int4* xs4 = reinterpret_cast<int4*>(xs_q8_words);
+        const int per_row = slab_kb;
+        for (int i = threadIdx.x; i < TM * per_row; i += blockDim.x) {
+            const int j = i / per_row;
+            const int c = i - j * per_row;
+            xs4[j * kSlab + c] = __ldg(&xg[(size_t)j * (K >> 4) + slab0 + c]);
+        }
+    }
+    __syncthreads();
+    const int slab_end = slab0 + slab_kb;
+    while (active && kb < slab_end) {
         int kb_next = kb + kWarp;
         uint2 nxt = (kb_next < kb_total) ? __ldcs(&w8[kb_next]) : make_uint2(0, 0);
         uint8_t sc = __ldg(&scales_sw[sc_row_base + (kb >> 2) * 512 + (kb & 3)]);
@@ -500,16 +514,18 @@ __global__ void gemv_nvfp4_w4a8_dual_mk_kernel(
         nibbles8_to_doubled_e2m1_int8_lanes_because_dp4a_needs_integers(raw.y, v2, v3);
         #pragma unroll
         for (int j = 0; j < TM; ++j) {
-            const int* xw = xs_q8_words + j * (K >> 2) + kb * 4;
-            int idot = __dp4a((int)v0, xw[0], 0);
-            idot = __dp4a((int)v1, xw[1], idot);
-            idot = __dp4a((int)v2, xw[2], idot);
-            idot = __dp4a((int)v3, xw[3], idot);
+            const int4 xw = *reinterpret_cast<const int4*>(xs_q8_words + j * (kSlab * 4) + (kb - slab0) * 4);
+            int idot = __dp4a((int)v0, xw.x, 0);
+            idot = __dp4a((int)v1, xw.y, idot);
+            idot = __dp4a((int)v2, xw.z, idot);
+            idot = __dp4a((int)v3, xw.w, idot);
             acc[j] += sf * (float)idot;
         }
         kb = kb_next;
         raw = nxt;
     }
+    }
+    if (!active) return;
     float alpha = second ? alpha_b : alpha_a;
     __nv_bfloat16* y = second ? y_b : y_a;
     int y_stride = second ? N_b : N;
@@ -538,19 +554,12 @@ __global__ void gemv_nvfp4_w4a8_down_residual_mk_kernel(
     int K
 ) {
     extern __shared__ int xs_q8_words[];
-    {
-        const int4* xg = reinterpret_cast<const int4*>(x_q8);
-        int4* xs4 = reinterpret_cast<int4*>(xs_q8_words);
-        for (int i = threadIdx.x; i < TM * (K >> 4); i += blockDim.x) {
-            xs4[i] = __ldg(&xg[i]);
-        }
-    }
-    __syncthreads();
+    const int kSlab = mk_slab_kb_for(TM, K / kNvfp4Block);
 
     int lane = threadIdx.x & (kWarp - 1);
     int warp = threadIdx.x / kWarp;
     int r = blockIdx.x * kWarpsPerBlockSharesOneStagedX + warp;
-    if (r >= N) return;
+    const bool active = r < N;
 
     int kb_total = K / kNvfp4Block;
     int k_tiles = (kb_total + 3) >> 2;
@@ -563,8 +572,23 @@ __global__ void gemv_nvfp4_w4a8_down_residual_mk_kernel(
     #pragma unroll
     for (int j = 0; j < TM; ++j) acc[j] = 0.0f;
     int kb = lane;
-    uint2 raw = (kb < kb_total) ? __ldcs(&w8[kb]) : make_uint2(0, 0);
-    while (kb < kb_total) {
+    uint2 raw = (active && kb < kb_total) ? __ldcs(&w8[kb]) : make_uint2(0, 0);
+    for (int slab0 = 0; slab0 < kb_total; slab0 += kSlab) {
+    const int slab_kb = (kb_total - slab0 < kSlab) ? (kb_total - slab0) : kSlab;
+    __syncthreads();
+    {
+        const int4* xg = reinterpret_cast<const int4*>(x_q8);
+        int4* xs4 = reinterpret_cast<int4*>(xs_q8_words);
+        const int per_row = slab_kb;
+        for (int i = threadIdx.x; i < TM * per_row; i += blockDim.x) {
+            const int j = i / per_row;
+            const int c = i - j * per_row;
+            xs4[j * kSlab + c] = __ldg(&xg[(size_t)j * (K >> 4) + slab0 + c]);
+        }
+    }
+    __syncthreads();
+    const int slab_end = slab0 + slab_kb;
+    while (active && kb < slab_end) {
         int kb_next = kb + kWarp;
         uint2 nxt = (kb_next < kb_total) ? __ldcs(&w8[kb_next]) : make_uint2(0, 0);
         uint8_t sc_b = __ldg(&sc[sc_row_base + (kb >> 2) * 512 + (kb & 3)]);
@@ -574,16 +598,18 @@ __global__ void gemv_nvfp4_w4a8_down_residual_mk_kernel(
         nibbles8_to_doubled_e2m1_int8_lanes_because_dp4a_needs_integers(raw.y, v2, v3);
         #pragma unroll
         for (int j = 0; j < TM; ++j) {
-            const int* xw = xs_q8_words + j * (K >> 2) + kb * 4;
-            int idot = __dp4a((int)v0, xw[0], 0);
-            idot = __dp4a((int)v1, xw[1], idot);
-            idot = __dp4a((int)v2, xw[2], idot);
-            idot = __dp4a((int)v3, xw[3], idot);
+            const int4 xw = *reinterpret_cast<const int4*>(xs_q8_words + j * (kSlab * 4) + (kb - slab0) * 4);
+            int idot = __dp4a((int)v0, xw.x, 0);
+            idot = __dp4a((int)v1, xw.y, idot);
+            idot = __dp4a((int)v2, xw.z, idot);
+            idot = __dp4a((int)v3, xw.w, idot);
             acc[j] += sf * (float)idot;
         }
         kb = kb_next;
         raw = nxt;
     }
+    }
+    if (!active) return;
     #pragma unroll
     for (int j = 0; j < TM; ++j) {
         float a = acc[j];
@@ -616,11 +642,7 @@ static int launch_dual_mk(
     int N_b,
     int K
 ) {
-    size_t smem = (size_t)TM * K;
-    static SmemOptinHighWater optin;
-    int orc = raise_dynamic_smem_optin_above_48k(
-        optin, (const void*)gemv_nvfp4_w4a8_dual_mk_kernel<TM>, smem);
-    if (orc != 0) return orc;
+    size_t smem = (size_t)TM * mk_slab_kb_for(TM, K / kNvfp4Block) * kNvfp4Block;
     unsigned grid = (unsigned)((N + N_b + kWarpsPerBlockSharesOneStagedX - 1)
         / kWarpsPerBlockSharesOneStagedX);
     gemv_nvfp4_w4a8_dual_mk_kernel<TM><<<grid, dim3(kWarpsPerBlockSharesOneStagedX * kWarp),
@@ -642,11 +664,7 @@ static int launch_down_mk(
     int N,
     int K
 ) {
-    size_t smem = (size_t)TM * K;
-    static SmemOptinHighWater optin;
-    int orc = raise_dynamic_smem_optin_above_48k(
-        optin, (const void*)gemv_nvfp4_w4a8_down_residual_mk_kernel<TM>, smem);
-    if (orc != 0) return orc;
+    size_t smem = (size_t)TM * mk_slab_kb_for(TM, K / kNvfp4Block) * kNvfp4Block;
     unsigned grid = (unsigned)((N + kWarpsPerBlockSharesOneStagedX - 1)
         / kWarpsPerBlockSharesOneStagedX);
     gemv_nvfp4_w4a8_down_residual_mk_kernel<TM><<<grid,
@@ -659,8 +677,8 @@ static int launch_down_mk(
 constexpr int kW4a8MkMaxTokensPerLaunch = 8;
 
 int w4a8_mk_chunk_tokens_bounded_by_96k_smem(int K) {
-    int by_smem = (int)((96 * 1024) / (size_t)K);
-    return by_smem < kW4a8MkMaxTokensPerLaunch ? by_smem : kW4a8MkMaxTokensPerLaunch;
+    (void)K;
+    return kW4a8MkMaxTokensPerLaunch;
 }
 
 }

@@ -555,10 +555,25 @@ mod tests {
             assert!(src.contains("fn gemv_e2m1_decode("));
             assert!(src.contains("fn gemv_ue4m3_decode("));
             assert!(src.contains("fn gemv_i8map("));
+            let helper = src
+                .split_once(
+                    "fn gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together(",
+                )
+                .expect("dot8 helper")
+                .1
+                .split_once("\n}")
+                .expect("dot8 helper end")
+                .0;
+            assert!(
+                helper.contains("dot4I8Packed"),
+                "dot8's helper lost the packed integer dot"
+            );
             let body = src.split_once("fn gemv_dot8(").expect("dot8").1;
             let dot8 = body.split_once("\n}").expect("dot8 end").0;
             assert!(
-                dot8.contains("dot4I8Packed"),
+                dot8.contains(
+                    "gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together"
+                ),
                 "dot8 lost the packed integer dot"
             );
             assert!(dot8.contains("gemv_i8map"), "dot8 lost the swar nibble map");

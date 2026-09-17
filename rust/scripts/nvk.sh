@@ -44,10 +44,11 @@ Sources a CACHED nix dev environment instead of re-entering `nix develop`.
 Re-entering it yields a slightly different env each time, which trips
 build.rs's rerun-if-env-changed and recompiles every .cu on EVERY run
 (~6 min). The cache is keyed on flake.nix + flake.lock and refreshes
-automatically when either changes. It ALSO refreshes when a ${self}
-source path baked into the cached env has vanished or drifted from the
-working tree -- that key cannot see a repo-layout change, which once
-left every build failing on a missing cmake-install-shim.sh.
+automatically when either changes. It ALSO refreshes when any store path
+baked into the cached env has vanished (GC) or a baked ${./script} has
+drifted from the working tree -- the key cannot see a repo-layout change
+or a GC, and each once left every build failing on a missing
+cmake-install-shim.sh.
 
 env:
   NVK_LANE      target-dir suffix under $HOME/.cache/cargo-tmp (default: base)
@@ -217,12 +218,19 @@ STAMP=$({
 
 STALE_SELF=0
 if [ -s "$ENVFILE" ]; then
-  for p in $(grep -oE "/nix/store/[a-z0-9]{32}-source/[^\"' :)]*" "$ENVFILE" | sort -u | head -40); do
+  # Every store path the env names must still exist: a GC'd one (package or a
+  # bare ${./file} like cmake-install-shim.sh, which is NOT a -source/ subpath)
+  # fails the build with a confusing "cannot stat" instead of a refresh.
+  for p in $(grep -oE "/nix/store/[a-z0-9]{32}-[A-Za-z0-9._+/@~-]*" "$ENVFILE" | grep -v '\.drv$' | sort -u); do
     if [ ! -e "$p" ]; then
-      echo "nvk: cached dev env points at a vanished source path ($p); regenerating" >&2
+      echo "nvk: cached dev env points at a vanished store path ($p); regenerating" >&2
       STALE_SELF=1
       break
     fi
+    case "$p" in
+      */*-source/*|/nix/store/*-*.sh|/nix/store/*-*.py) ;;
+      *) continue ;;
+    esac
     base=$(basename "$p")
     for local in "$REPO/rust/scripts/$base" "$REPO/scripts/$base"; do
       if [ -e "$local" ] && ! cmp -s "$p" "$local"; then
@@ -350,8 +358,19 @@ case "$SUB" in
       LOCKWRAP="python3 $REPO/rust/scripts/gpu-flock.py $GPU_LOCK"
     fi
     echo "nvk: probe mode -- release profile, exclusive GPU lock $GPU_LOCK (waits if another probe holds it)" >&2
+    PROBE_PREBUILD=1
     ;;
 esac
+if [ -n "${PROBE_PREBUILD:-}" ]; then
+  PRE_ARGS="${ARGS%% -- *}"
+  PRE_ARGS="${PRE_ARGS% --}"
+  echo "nvk: probe prebuild -- compiling outside the GPU lock" >&2
+  if [ -n "$FEATURES" ]; then
+    eval "cargo $SUB -j $JOBS -p $PKG --features $FEATURES $PRE_ARGS --no-run" || exit $?
+  else
+    eval "cargo $SUB -j $JOBS -p $PKG $PRE_ARGS --no-run" || exit $?
+  fi
+fi
 if [ -n "$FEATURES" ]; then
   eval "exec $LOCKWRAP cargo $SUB -j $JOBS -p $PKG --features $FEATURES $ARGS"
 else

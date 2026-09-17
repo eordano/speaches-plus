@@ -139,9 +139,7 @@ fn host_lin(
                 k,
             })
         }
-        WgpuDecQuant::I8
-            if k.is_multiple_of(16) && k <= wk::gemv_bf16::MAX_SHARED_K =>
-        {
+        WgpuDecQuant::I8 if k.is_multiple_of(16) && k <= wk::gemv_bf16::MAX_SHARED_K => {
             let mut w_i8 = vec![0i8; n * k];
             let mut row_scales = vec![0f32; n];
             for r in 0..n {
@@ -211,9 +209,11 @@ impl DeepseekOcrDecoderWgpu {
         max_seq: usize,
     ) -> Result<Self> {
         let quant = wgpu_quant_from_env_value(
-            std::env::var(DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED)
-                .ok()
-                .as_deref(),
+            std::env::var(
+                DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED,
+            )
+            .ok()
+            .as_deref(),
         )?;
         Self::from_loader_mode(cfg, weights, max_seq, quant)
     }
@@ -306,15 +306,45 @@ impl DeepseekOcrDecoderWgpu {
             layers.push(WgpuLayer {
                 input_ln: host_norm(weights, &format!("{p}.input_layernorm.weight"), h)?,
                 post_ln: host_norm(weights, &format!("{p}.post_attention_layernorm.weight"), h)?,
-                q: host_lin(weights, &format!("{p}.self_attn.q_proj.weight"), qd, h, nvfp4)?,
-                k: host_lin(weights, &format!("{p}.self_attn.k_proj.weight"), kvd, h, nvfp4)?,
-                v: host_lin(weights, &format!("{p}.self_attn.v_proj.weight"), kvd, h, nvfp4)?,
-                o: host_lin(weights, &format!("{p}.self_attn.o_proj.weight"), h, qd, nvfp4)?,
+                q: host_lin(
+                    weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    qd,
+                    h,
+                    nvfp4,
+                )?,
+                k: host_lin(
+                    weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    kvd,
+                    h,
+                    nvfp4,
+                )?,
+                v: host_lin(
+                    weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    kvd,
+                    h,
+                    nvfp4,
+                )?,
+                o: host_lin(
+                    weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    h,
+                    qd,
+                    nvfp4,
+                )?,
                 ff,
             });
         }
         let final_norm = host_norm(weights, "model.norm.weight", h)?;
-        let lm_head = host_lin(weights, "lm_head.weight", cfg.vocab_size, h, WgpuDecQuant::Bf16)?;
+        let lm_head = host_lin(
+            weights,
+            "lm_head.weight",
+            cfg.vocab_size,
+            h,
+            WgpuDecQuant::Bf16,
+        )?;
         let max_seq = max_seq.min(cfg.max_position_embeddings);
         let half = cfg.head_dim() / 2;
         let mut cos = vec![0f32; max_seq * half];

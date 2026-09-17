@@ -348,6 +348,7 @@ __global__ void tree_verify_attn_fp8_kernel(
     }
 }
 
+template <bool INT8>
 __global__ void kv_append_fp8_kernel(
     const __nv_bfloat16* __restrict__ k_new,
     const __nv_bfloat16* __restrict__ v_new,
@@ -391,15 +392,57 @@ __global__ void kv_append_fp8_kernel(
     }
     __syncthreads();
     float amaxK = wmK[0], amaxV = wmV[0];
-    float invK = (amaxK > 0.0f) ? (kFp8Max / amaxK) : 1.0f;
-    float invV = (amaxV > 0.0f) ? (kFp8Max / amaxV) : 1.0f;
+    const float qmax = INT8 ? 127.0f : kFp8Max;
+    float invK = (amaxK > 0.0f) ? (qmax / amaxK) : 1.0f;
+    float invV = (amaxV > 0.0f) ? (qmax / amaxV) : 1.0f;
     if (tid == 0) {
-        k_scale[(size_t)slot * NKV + kvh] = (amaxK > 0.0f) ? (amaxK / kFp8Max) : 1.0f;
-        v_scale[(size_t)slot * NKV + kvh] = (amaxV > 0.0f) ? (amaxV / kFp8Max) : 1.0f;
+        k_scale[(size_t)slot * NKV + kvh] = (amaxK > 0.0f) ? (amaxK / qmax) : 1.0f;
+        v_scale[(size_t)slot * NKV + kvh] = (amaxV > 0.0f) ? (amaxV / qmax) : 1.0f;
     }
     for (int d = tid; d < HD; d += blockDim.x) {
-        __nv_fp8_e4m3 ek = static_cast<__nv_fp8_e4m3>(__bfloat162float(k_new[base_src + d]) * invK);
-        __nv_fp8_e4m3 ev = static_cast<__nv_fp8_e4m3>(__bfloat162float(v_new[base_src + d]) * invV);
+        const float fk = __bfloat162float(k_new[base_src + d]) * invK;
+        const float fv = __bfloat162float(v_new[base_src + d]) * invV;
+        if (INT8) {
+            kc[base_dst + d] = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(fminf(fmaxf(fk, -127.0f), 127.0f))));
+            vc[base_dst + d] = static_cast<uint8_t>(static_cast<int8_t>(__float2int_rn(fminf(fmaxf(fv, -127.0f), 127.0f))));
+        } else {
+            __nv_fp8_e4m3 ek = static_cast<__nv_fp8_e4m3>(fk);
+            __nv_fp8_e4m3 ev = static_cast<__nv_fp8_e4m3>(fv);
+            kc[base_dst + d] = ek.__x;
+            vc[base_dst + d] = ev.__x;
+        }
+    }
+}
+
+__global__ void kv_append_fp8_unit_scale_kernel(
+    const __nv_bfloat16* __restrict__ k_new,
+    const __nv_bfloat16* __restrict__ v_new,
+    uint8_t* __restrict__ kc,
+    uint8_t* __restrict__ vc,
+    float* __restrict__ k_scale,
+    float* __restrict__ v_scale,
+    const int* __restrict__ n_committed,
+    int K, int NKV, int HD, int ring
+) {
+    int kvh = blockIdx.x;
+    int token = blockIdx.y;
+    if (token >= K || kvh >= NKV) return;
+    int slot = *n_committed + token;
+    if (ring > 0) {
+        if (token + ring < K) return;
+        slot = slot % ring;
+    }
+    size_t base_src = ((size_t)token * NKV + kvh) * HD;
+    size_t base_dst = ((size_t)slot * NKV + kvh) * HD;
+    int tid = threadIdx.x;
+
+    if (tid == 0) {
+        k_scale[(size_t)slot * NKV + kvh] = 1.0f;
+        v_scale[(size_t)slot * NKV + kvh] = 1.0f;
+    }
+    for (int d = tid; d < HD; d += blockDim.x) {
+        __nv_fp8_e4m3 ek = static_cast<__nv_fp8_e4m3>(__bfloat162float(k_new[base_src + d]));
+        __nv_fp8_e4m3 ev = static_cast<__nv_fp8_e4m3>(__bfloat162float(v_new[base_src + d]));
         kc[base_dst + d] = ek.__x;
         vc[base_dst + d] = ev.__x;
     }
@@ -498,7 +541,53 @@ extern "C" int nv_kernels_kv_append_fp8(
     if (K > 65535) return NVK_ERR_GRID_AXIS;
     int block = HD; if (block > 512) block = 512; if (block < 32) block = 32;
     dim3 grid((unsigned)NKV, (unsigned)K);
-    treeverifyfp8::kv_append_fp8_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
+    treeverifyfp8::kv_append_fp8_kernel<false><<<grid, block, 0, (cudaStream_t)stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(k_new),
+        reinterpret_cast<const __nv_bfloat16*>(v_new),
+        kc, vc, k_scale, v_scale, n_committed, K, NKV, HD, ring);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_kv_append_int8(
+    void* stream,
+    const uint16_t* k_new,
+    const uint16_t* v_new,
+    uint8_t* kc,
+    uint8_t* vc,
+    float* k_scale,
+    float* v_scale,
+    const int* n_committed,
+    int K, int NKV, int HD, int ring
+) {
+    if (K <= 0 || NKV <= 0 || HD <= 0) return 0;
+    if (ring < 0) return -3;
+    if (K > 65535) return NVK_ERR_GRID_AXIS;
+    int block = HD; if (block > 512) block = 512; if (block < 32) block = 32;
+    dim3 grid((unsigned)NKV, (unsigned)K);
+    treeverifyfp8::kv_append_fp8_kernel<true><<<grid, block, 0, (cudaStream_t)stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(k_new),
+        reinterpret_cast<const __nv_bfloat16*>(v_new),
+        kc, vc, k_scale, v_scale, n_committed, K, NKV, HD, ring);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_kv_append_fp8_unit_scale(
+    void* stream,
+    const uint16_t* k_new,
+    const uint16_t* v_new,
+    uint8_t* kc,
+    uint8_t* vc,
+    float* k_scale,
+    float* v_scale,
+    const int* n_committed,
+    int K, int NKV, int HD, int ring
+) {
+    if (K <= 0 || NKV <= 0 || HD <= 0) return 0;
+    if (ring < 0) return -3;
+    if (K > 65535) return NVK_ERR_GRID_AXIS;
+    int block = HD; if (block > 512) block = 512; if (block < 32) block = 32;
+    dim3 grid((unsigned)NKV, (unsigned)K);
+    treeverifyfp8::kv_append_fp8_unit_scale_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(k_new),
         reinterpret_cast<const __nv_bfloat16*>(v_new),
         kc, vc, k_scale, v_scale, n_committed, K, NKV, HD, ring);

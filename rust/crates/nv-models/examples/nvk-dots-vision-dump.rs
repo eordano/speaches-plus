@@ -70,16 +70,12 @@ fn main() -> Result<()> {
             .to_vec())
     };
     let loader = nv_weights::WeightLoader::open_dir(&cli.dots_dir, &Device::Cpu)?;
-    let tower = DotsVisionTowerWgpu::from_loader(
-        &loader,
-        "vision_tower.",
-        DotsVisionConfig::default(),
-    )?;
+    let tower =
+        DotsVisionTowerWgpu::from_loader(&loader, "vision_tower.", DotsVisionConfig::default())?;
     let hidden = DotsVisionConfig::default().hidden_size;
     let style = PromptStyle::from_env();
 
-    std::fs::create_dir_all(&cli.out)
-        .with_context(|| format!("create {}", cli.out.display()))?;
+    std::fs::create_dir_all(&cli.out).with_context(|| format!("create {}", cli.out.display()))?;
     let data = std::fs::read_to_string(&cli.data)
         .with_context(|| format!("read {}", cli.data.display()))?;
     let mut index = std::fs::File::create(cli.out.join("index.jsonl"))?;
@@ -122,8 +118,7 @@ fn main() -> Result<()> {
             rows.len(),
             n_vis * hidden
         );
-        let (mut ids, vision_start) =
-            build_prompt_tokens(&encode, mode.prompt(), n_vis, style)?;
+        let (mut ids, vision_start) = build_prompt_tokens(encode, mode.prompt(), n_vis, style)?;
         let completion_start = ids.len();
         ids.extend(encode(&row.text)?);
         ids.push(cli.eos_id);
@@ -159,7 +154,14 @@ fn main() -> Result<()> {
             ids.len()
         );
     }
-    ensure!(written > 0, "no samples written from {}", cli.data.display());
-    eprintln!("[dots-vision-dump] wrote {written} samples to {}", cli.out.display());
+    ensure!(
+        written > 0,
+        "no samples written from {}",
+        cli.data.display()
+    );
+    eprintln!(
+        "[dots-vision-dump] wrote {written} samples to {}",
+        cli.out.display()
+    );
     Ok(())
 }

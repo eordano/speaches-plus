@@ -1,6 +1,308 @@
 #[cfg(feature = "cuda")]
 use super::*;
 
+#[cfg(any(test, feature = "cuda"))]
+const NV_Q38_SOLO_DEVICE_ARGMAX_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_HOST_FEED: &str =
+    "NV_Q38_SOLO_DEVICE_ARGMAX";
+
+#[cfg(any(test, feature = "cuda"))]
+fn solo_device_argmax_default_on_user_sign_off_2026_09_12(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.is_none() || raw == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+mod solo_device_argmax_default_tests {
+    use super::solo_device_argmax_default_on_user_sign_off_2026_09_12 as selected;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_unset_changes_and_zero_restores_host_feed() {
+        assert!(selected(None));
+        assert!(selected(Some(OsStr::new("1"))));
+        for raw in ["0", "", " 1", "1 ", "true", "gate"] {
+            assert!(
+                !selected(Some(OsStr::new(raw))),
+                "explicit {raw:?} stays off"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_remains_explicit_off() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(!selected(Some(OsStr::from_bytes(&[0xff]))));
+    }
+}
+
+#[cfg(any(test, feature = "cuda"))]
+fn qwen_emitted_token_ids_fnv1a64_u32_le(tokens: &[u32]) -> u64 {
+    tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+#[cfg(any(test, feature = "cuda"))]
+#[derive(Default)]
+struct QwenReadyBlocks {
+    first: Option<(std::time::Instant, u64)>,
+    last: Option<std::time::Instant>,
+    first_block_tokens: u32,
+    tokens: u32,
+}
+
+#[cfg(any(test, feature = "cuda"))]
+impl QwenReadyBlocks {
+    fn retain(&mut self, ready: std::time::Instant, block: u64) {
+        let first = *self.first.get_or_insert((ready, block));
+        self.first_block_tokens += u32::from(block == first.1);
+        self.last = Some(ready);
+        self.tokens += 1;
+    }
+
+    fn generation_seconds(&self) -> Option<f64> {
+        let elapsed = self.last?.checked_duration_since(self.first?.0)?;
+        (!elapsed.is_zero()).then_some(elapsed.as_secs_f64())
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct QwenGenerationTrace {
+    id: u64,
+    route: &'static str,
+    depth: usize,
+    allocated_context: usize,
+    context_limit: usize,
+    engine_arm: Option<&'static str>,
+    capture_active: Option<bool>,
+    block: u64,
+    ready: std::time::Instant,
+    blocks: QwenReadyBlocks,
+}
+
+#[cfg(feature = "cuda")]
+impl QwenGenerationTrace {
+    fn selected(
+        dense: bool,
+        route: &'static str,
+        depth: usize,
+        allocated_context: usize,
+        context_limit: usize,
+    ) -> Option<Self> {
+        if !dense || !crate::oapi::chat::oapi_phase_walls_selected_from_env() {
+            return None;
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Some(Self {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            route,
+            depth,
+            allocated_context,
+            context_limit,
+            engine_arm: None,
+            capture_active: None,
+            block: 0,
+            ready: std::time::Instant::now(),
+            blocks: QwenReadyBlocks::default(),
+        })
+    }
+
+    fn retain(&mut self) {
+        self.blocks.retain(self.ready, self.block);
+    }
+
+    fn next_block(&mut self) {
+        self.ready = std::time::Instant::now();
+        self.block += 1;
+    }
+
+    fn report(self, completion_tokens: u32, finish_reason: &str) {
+        let seconds = self.blocks.generation_seconds();
+        eprintln!(
+            "Q38-GENERATION {}",
+            serde_json::json!({
+                "id": self.id,
+                "route": self.route,
+                "engine_arm": self.engine_arm,
+                "capture_active_at_finish": self.capture_active,
+                "prompt_tokens": self.depth,
+                "allocated_context": self.allocated_context,
+                "context_limit": self.context_limit,
+                "retained_tokens": self.blocks.tokens,
+                "completion_tokens": completion_tokens,
+                "counts_match": self.blocks.tokens == completion_tokens,
+                "first_block_tokens": self.blocks.first_block_tokens,
+                "host_ready_generation_seconds": seconds,
+                "host_ready_generation_tok_s": seconds.map(|s|
+                    (self.blocks.tokens - self.blocks.first_block_tokens) as f64 / s),
+                "finish_reason": finish_reason,
+                "terminal_event_enqueued": true,
+            })
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn qwen_generation_trace_deliverable(tail_sent: bool, done: SsePush) -> bool {
+    tail_sent && done == SsePush::Sent
+}
+
+#[cfg(test)]
+mod qwen_ready_blocks_tests {
+    use super::QwenReadyBlocks;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn excludes_every_retained_token_in_the_first_ready_block() {
+        let t = Instant::now();
+        let mut blocks = QwenReadyBlocks::default();
+        for (ready, block) in [
+            (t, 0),
+            (t, 0),
+            (t + Duration::from_millis(100), 1),
+            (t + Duration::from_millis(100), 1),
+        ] {
+            blocks.retain(ready, block);
+        }
+        assert_eq!(blocks.tokens, 4);
+        assert_eq!(blocks.first_block_tokens, 2);
+        assert_eq!(blocks.generation_seconds(), Some(0.1));
+        assert_eq!(
+            (blocks.tokens - blocks.first_block_tokens) as f64 / 0.1,
+            20.0
+        );
+    }
+
+    #[test]
+    fn no_interval_is_reported_for_empty_or_single_block_output() {
+        let mut blocks = QwenReadyBlocks::default();
+        assert_eq!(blocks.generation_seconds(), None);
+        let t = Instant::now();
+        blocks.retain(t, 0);
+        blocks.retain(t, 0);
+        assert_eq!(blocks.generation_seconds(), None);
+        assert_eq!(blocks.tokens, blocks.first_block_tokens);
+    }
+
+    #[test]
+    fn distinct_blocks_with_equal_clock_values_do_not_merge_their_counts() {
+        let mut blocks = QwenReadyBlocks::default();
+        let t = Instant::now();
+        blocks.retain(t, 0);
+        blocks.retain(t, 1);
+        assert_eq!(blocks.first_block_tokens, 1);
+        assert_eq!(blocks.tokens, 2);
+        assert_eq!(blocks.generation_seconds(), None);
+    }
+}
+
+#[cfg(any(test, feature = "cuda"))]
+struct SoloQueue {
+    waiting: std::sync::Arc<tokio::sync::Semaphore>,
+    capacity: usize,
+    timeout: std::time::Duration,
+}
+
+#[cfg(any(test, feature = "cuda"))]
+impl SoloQueue {
+    fn new(capacity: usize, timeout: std::time::Duration) -> Self {
+        Self {
+            waiting: std::sync::Arc::new(tokio::sync::Semaphore::new(capacity)),
+            capacity,
+            timeout,
+        }
+    }
+
+    async fn lock<T: Send>(
+        &self,
+        model: std::sync::Arc<tokio::sync::Mutex<T>>,
+        tx: &tokio::sync::mpsc::Sender<crate::oapi::chat::ChatEvent>,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<T>>> {
+        if tx.is_closed() {
+            return Ok(None);
+        }
+        if let Ok(guard) = model.clone().try_lock_owned() {
+            return Ok(Some(guard));
+        }
+        let busy = |waited_ms| crate::oapi::chat::EngineBusy::new(self.capacity, waited_ms);
+        let _waiting = self
+            .waiting
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| busy(0))?;
+        tokio::select! {
+            biased;
+            _ = tx.closed() => Ok(None),
+            result = tokio::time::timeout(self.timeout, model.lock_owned()) => {
+                result.map(Some).map_err(|_| busy(self.timeout.as_millis() as u64).into())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn solo_queue() -> &'static SoloQueue {
+    static QUEUE: std::sync::OnceLock<SoloQueue> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(|| {
+        SoloQueue::new(
+            chat_permits(std::env::var("NV_CHAT_CONCURRENCY").ok().as_deref()),
+            std::time::Duration::from_millis(chat_queue_ms(
+                std::env::var("NV_CHAT_QUEUE_MS").ok().as_deref(),
+            )),
+        )
+    })
+}
+
+#[cfg(test)]
+mod solo_queue_tests {
+    use super::SoloQueue;
+    use crate::oapi::chat::{ChatEvent, EngineBusy};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Mutex};
+
+    #[tokio::test(start_paused = true)]
+    async fn solo_queue_bounds_waiters_and_recovers_after_release_and_timeout() {
+        let queue = SoloQueue::new(1, Duration::from_millis(50));
+        let model = Arc::new(Mutex::new(()));
+        let (tx, _rx) = mpsc::channel::<ChatEvent>(1);
+        let active = queue.lock(model.clone(), &tx).await.unwrap().unwrap();
+        let mut waiting = Box::pin(queue.lock(model.clone(), &tx));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        let error = queue.lock(model.clone(), &tx).await.unwrap_err();
+        assert_eq!(error.downcast_ref::<EngineBusy>().unwrap().waited_ms, 0);
+        let error = waiting.await.unwrap_err();
+        assert_eq!(error.downcast_ref::<EngineBusy>().unwrap().waited_ms, 50);
+        assert_eq!(queue.waiting.available_permits(), 1);
+
+        let mut waiting = Box::pin(queue.lock(model.clone(), &tx));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        drop(active);
+        drop(waiting.await.unwrap().unwrap());
+        drop(queue.lock(model, &tx).await.unwrap().unwrap());
+        assert_eq!(queue.waiting.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_disconnected_solo_waiter_releases_capacity_without_taking_the_model() {
+        let queue = SoloQueue::new(1, Duration::from_secs(60));
+        let model = Arc::new(Mutex::new(()));
+        let active = model.clone().lock_owned().await;
+        let (tx, rx) = mpsc::channel::<ChatEvent>(1);
+        let mut waiting = Box::pin(queue.lock(model.clone(), &tx));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        drop(rx);
+        assert!(waiting.await.unwrap().is_none());
+        assert_eq!(queue.waiting.available_permits(), 1);
+        assert!(model.try_lock().is_err());
+        drop(active);
+        assert!(queue.lock(model, &tx).await.unwrap().is_none());
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) const SOLO_BODY_SENDS_TIME_OUT_BECAUSE_UNDER_NV_Q38_BATCH_1_RUN_SOLO_RUNS_THESE_BODIES_ON_THE_SINGLE_THREAD_DISPATCHER_WHERE_ONE_NON_READING_CLIENT_PARKED_EVERY_QUEUED_JOB_AND_ON_THE_ENGINE_RUNTIME_THEY_HOLD_THE_MODEL_MUTEX_COST_THE_STALLED_CLIENT_LOSES_ITS_STREAM_AFTER_NV_SSE_SEND_TIMEOUT_MS:
     () = ();
@@ -28,6 +330,19 @@ async fn solo_push(
     let out = push_event_async_opt(tx, ev, timeout).await;
     log_sse_abort(out, "qwen-solo");
     out
+}
+
+#[cfg(feature = "cuda")]
+async fn solo_started(
+    tx: &mpsc::Sender<ChatEvent>,
+    prompt_tokens: u32,
+    timeout: Option<std::time::Duration>,
+) -> bool {
+    if solo_push(tx, ChatEvent::Started { prompt_tokens }, timeout).await != SsePush::Sent {
+        return false;
+    }
+    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
+    true
 }
 
 #[cfg(feature = "cuda")]
@@ -102,6 +417,92 @@ pub(crate) async fn run_sampling_qwen3_5_moe(
 }
 
 #[cfg(feature = "cuda")]
+fn qwen_solo_sample_device_token_or_checked_host(
+    sampler: &mut ChatSampler,
+    device_token: Option<u32>,
+    host_logits: impl FnOnce() -> anyhow::Result<Vec<f32>>,
+) -> anyhow::Result<SampleOutput> {
+    if let Some(token) = device_token.filter(|&token| token != 0 && sampler.fast_greedy()) {
+        sampler.record_token(token);
+        return Ok(SampleOutput {
+            token,
+            logprob: None,
+            top: Vec::new(),
+            exhausted: false,
+        });
+    }
+    Ok(sampler.sample(&host_logits()?))
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod solo_device_greedy_tests {
+    use super::*;
+
+    fn greedy() -> ChatSampler {
+        ChatSampler::new(
+            nv_layers::sampler::SamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            1,
+            None,
+            Vec::new(),
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn device_zero_preserves_invalid_rows_ties_and_host_errors() {
+        for row in [
+            vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
+            vec![3.0, 3.0, f32::NAN],
+            vec![f32::INFINITY, 3.0, 3.0],
+        ] {
+            let expected = greedy().sample(&row);
+            let actual =
+                qwen_solo_sample_device_token_or_checked_host(&mut greedy(), Some(0), || Ok(row))
+                    .unwrap();
+            assert_eq!(actual.token, expected.token);
+            assert_eq!(actual.exhausted, expected.exhausted);
+        }
+        assert!(qwen_solo_sample_device_token_or_checked_host(
+            &mut greedy(),
+            Some(0),
+            || anyhow::bail!("host copy failed"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn device_nonzero_skips_host_copy_only_for_unmodified_greedy_sampling() {
+        let mut sampler = greedy();
+        let result = qwen_solo_sample_device_token_or_checked_host(&mut sampler, Some(7), || {
+            panic!("finite nonzero winner must not copy logits")
+        })
+        .unwrap();
+        assert_eq!(result.token, 7);
+        assert!(!result.exhausted);
+        assert_eq!(sampler.counts.get(&7), Some(&1));
+        for mode in 0..3 {
+            let mut sampler = greedy();
+            match mode {
+                0 => sampler.logprobs = true,
+                1 => sampler.logit_bias.push((0, 10.0)),
+                _ => sampler.params.presence_penalty = 1.0,
+            }
+            let result =
+                qwen_solo_sample_device_token_or_checked_host(&mut sampler, Some(7), || {
+                    Ok(vec![3.0, 1.0])
+                })
+                .unwrap();
+            assert_eq!(result.token, 0);
+            assert!(!result.exhausted);
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 async fn run_sampling_qwen3_5_moe_graphed(
     model: Arc<tokio::sync::Mutex<nv_models::graph_engine::GraphedQwen3Moe>>,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -112,6 +513,9 @@ async fn run_sampling_qwen3_5_moe_graphed(
     tx: &mpsc::Sender<ChatEvent>,
 ) -> anyhow::Result<()> {
     let t_gen = std::time::Instant::now();
+    let Some(mut engine) = solo_queue().lock(model, tx).await? else {
+        return Ok(());
+    };
     let encoded = tokenizer
         .encode(req.prompt.as_str(), false)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
@@ -120,13 +524,21 @@ async fn run_sampling_qwen3_5_moe_graphed(
     crate::oapi::chat::oapi_phase_wall(t_gen, "gen_tokenized");
 
     let max_new = effective_max_new(req.max_new_tokens, default_max_new);
-    let send_timeout = solo_send_timeout_on_the_engine_runtime_zero_clamps_to_1ms_like_the_gemma4_paths();
+    let send_timeout =
+        solo_send_timeout_on_the_engine_runtime_zero_clamps_to_1ms_like_the_gemma4_paths();
+    let allocated_context = engine.cache().max_seq_len();
+    let window = allocated_context.min(engine.underlying().config().max_position_embeddings);
+    let Some((_cache_len, max_new)) = kv_window(prompt_ids.len(), max_new, window) else {
+        anyhow::bail!(
+            "prompt of {} tokens does not fit the {window}-token KV window",
+            prompt_ids.len()
+        );
+    };
 
-    if solo_push(tx, ChatEvent::Started { prompt_tokens }, send_timeout).await != SsePush::Sent {
-        return Ok(());
-    }
-    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
     if prompt_ids.is_empty() {
+        if !solo_started(tx, prompt_tokens, send_timeout).await {
+            return Ok(());
+        }
         let _ = solo_push(
             tx,
             ChatEvent::Done {
@@ -139,18 +551,7 @@ async fn run_sampling_qwen3_5_moe_graphed(
         return Ok(());
     }
 
-    let mut engine = model.lock().await;
     crate::oapi::chat::oapi_phase_wall(t_gen, "gen_engine_lock_acquired");
-    let window = engine
-        .cache()
-        .max_seq_len()
-        .min(engine.underlying().config().max_position_embeddings);
-    let Some((_cache_len, max_new)) = kv_window(prompt_ids.len(), max_new, window) else {
-        anyhow::bail!(
-            "prompt of {} tokens does not fit the {window}-token KV window",
-            prompt_ids.len()
-        );
-    };
     let mut sampler = ChatSampler::for_request(&req, &tokenizer, eos_ids, max_new)?;
     sampler.seed_prompt(&prompt_ids);
 
@@ -165,6 +566,9 @@ async fn run_sampling_qwen3_5_moe_graphed(
                 k,
                 &prompt_ids,
             )?;
+            if !solo_started(tx, prompt_tokens, send_timeout).await {
+                return Ok(());
+            }
             return run_qwen36_moe_mtp_greedy_rounds(
                 session,
                 &tokenizer,
@@ -189,7 +593,17 @@ async fn run_sampling_qwen3_5_moe_graphed(
                 k,
                 &prompt_ids,
             )?;
+            let generation_trace = QwenGenerationTrace::selected(
+                true,
+                "mtp-graphed-solo",
+                prompt_ids.len(),
+                allocated_context,
+                window,
+            );
             crate::oapi::chat::oapi_phase_wall(t_gen, "gen_q38_session_started");
+            if !solo_started(tx, prompt_tokens, send_timeout).await {
+                return Ok(());
+            }
             return run_qwen38_mtp_rounds_streaming(
                 session,
                 &tokenizer,
@@ -199,17 +613,42 @@ async fn run_sampling_qwen3_5_moe_graphed(
                 k,
                 tx,
                 send_timeout,
+                generation_trace,
             )
             .await;
         }
     }
 
+    let device_greedy = engine.underlying().dense_intermediate().is_some()
+        && sampler.fast_greedy()
+        && solo_device_argmax_default_on_user_sign_off_2026_09_12(
+            std::env::var_os(
+                NV_Q38_SOLO_DEVICE_ARGMAX_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_HOST_FEED,
+            ).as_deref(),
+        );
+    tracing::debug!(
+        device_argmax = device_greedy,
+        "qwen CUDA solo decode sampling"
+    );
     engine.reset()?;
     let row = engine.prefill(&prompt_ids)?;
     let mut last_out = sampler.sample(&row);
     let mut last = last_out.token;
     if last_out.exhausted {
         anyhow::bail!("no legal token at prefill: the sampling mask left every candidate at -inf");
+    }
+    let mut generation_trace = QwenGenerationTrace::selected(
+        engine.underlying().dense_intermediate().is_some(),
+        "plain-graphed-solo",
+        prompt_ids.len(),
+        allocated_context,
+        window,
+    );
+    if let Some(trace) = &mut generation_trace {
+        trace.capture_active = Some(engine.capture_active());
+    }
+    if !solo_started(tx, prompt_tokens, send_timeout).await {
+        return Ok(());
     }
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
@@ -224,6 +663,9 @@ async fn run_sampling_qwen3_5_moe_graphed(
             break;
         }
         generated_ids.push(last);
+        if let Some(trace) = &mut generation_trace {
+            trace.retain();
+        }
         completion_tokens = generated_ids.len() as u32;
 
         let new_text = detok.push(last)?;
@@ -261,9 +703,19 @@ async fn run_sampling_qwen3_5_moe_graphed(
         }
 
         engine.forward_decode(last)?;
-        let row = engine.logits_host()?;
-        last_out = sampler.sample(&row);
+        let device_token = if device_greedy {
+            Some(engine.next_token_argmax_on_device()?)
+        } else {
+            None
+        };
+        last_out =
+            qwen_solo_sample_device_token_or_checked_host(&mut sampler, device_token, || {
+                engine.logits_host()
+            })?;
         last = last_out.token;
+        if let Some(trace) = &mut generation_trace {
+            trace.next_block();
+        }
         if last_out.exhausted {
             anyhow::bail!(
                 "no legal token at step {step}: the sampling mask left every candidate at -inf"
@@ -271,44 +723,59 @@ async fn run_sampling_qwen3_5_moe_graphed(
         }
     }
 
+    let mut tail_sent = generated_ids.is_empty();
     if !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
+            tail_sent = true;
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
-                let _ = solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await;
+                tail_sent =
+                    solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await == SsePush::Sent;
             }
         }
     }
 
-    let _ = solo_push(
+    let done = solo_push(
         tx,
         ChatEvent::Done {
-            finish_reason,
+            finish_reason: finish_reason.clone(),
             completion_tokens,
         },
         send_timeout,
     )
     .await;
+    if qwen_generation_trace_deliverable(tail_sent, done) {
+        if let Some(mut trace) = generation_trace {
+            trace.capture_active = Some(engine.capture_active());
+            trace.report(completion_tokens, &finish_reason);
+        }
+    }
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
-async fn tokenize_and_send_started(
+async fn tokenize_before_prefill(
     tokenizer: &Arc<tokenizers::Tokenizer>,
     req: &ChatGenerateRequest,
     tx: &mpsc::Sender<ChatEvent>,
     send_timeout: Option<std::time::Duration>,
+    window: usize,
 ) -> anyhow::Result<Option<Vec<u32>>> {
     let encoded = tokenizer
         .encode(req.prompt.as_str(), false)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoded.get_ids().to_vec();
     let prompt_tokens = prompt_ids.len() as u32;
-    if solo_push(tx, ChatEvent::Started { prompt_tokens }, send_timeout).await != SsePush::Sent {
-        return Ok(None);
-    }
-    yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
+    anyhow::ensure!(
+        prompt_ids.len() < window,
+        "prompt of {prompt_tokens} tokens does not fit the {window}-token KV window"
+    );
     if prompt_ids.is_empty() {
+        if !solo_started(tx, prompt_tokens, send_timeout).await {
+            return Ok(None);
+        }
         let _ = solo_push(
             tx,
             ChatEvent::Done {
@@ -337,12 +804,17 @@ async fn run_sampling_qwen3_5_moe_eager(
     qwen_mtp: Option<QwenMtpHead>,
     tx: &mpsc::Sender<ChatEvent>,
 ) -> anyhow::Result<()> {
-    let send_timeout = solo_send_timeout_on_the_engine_runtime_zero_clamps_to_1ms_like_the_gemma4_paths();
-    let Some(prompt_ids) = tokenize_and_send_started(&tokenizer, &req, tx, send_timeout).await?
+    let Some(model) = solo_queue().lock(model, tx).await? else {
+        return Ok(());
+    };
+    let send_timeout =
+        solo_send_timeout_on_the_engine_runtime_zero_clamps_to_1ms_like_the_gemma4_paths();
+    let window = kv_max_seq_len.min(model.config().max_position_embeddings);
+    let Some(prompt_ids) =
+        tokenize_before_prefill(&tokenizer, &req, tx, send_timeout, window).await?
     else {
         return Ok(());
     };
-    let model = model.lock().await;
     let disp: Option<&dyn nv_models::qwen3_5_moe::MoeDispatch> = moe_dispatch
         .as_deref()
         .map(|d| d as &dyn nv_models::qwen3_5_moe::MoeDispatch);
@@ -400,7 +872,9 @@ pub(crate) async fn run_qwen36_solo_via_scheduler(
 ) -> anyhow::Result<()> {
     let send_timeout =
         solo_send_timeout_via_scheduler_zero_restores_the_old_infinite_wait_matching_sched_push();
-    let Some(prompt_ids) = tokenize_and_send_started(tokenizer, &req, tx, send_timeout).await?
+    let window = kv_max_seq_len.min(model.config().max_position_embeddings);
+    let Some(prompt_ids) =
+        tokenize_before_prefill(tokenizer, &req, tx, send_timeout, window).await?
     else {
         return Ok(());
     };
@@ -478,6 +952,9 @@ async fn run_qwen36_moe_eager_mtp_or_plain(
             max_seq,
             moe_dispatch,
         )?;
+        if !solo_started(tx, prompt_ids.len() as u32, send_timeout).await {
+            return Ok(());
+        }
         return run_qwen36_moe_mtp_greedy_rounds(
             session,
             tokenizer,
@@ -613,7 +1090,9 @@ pub(crate) async fn run_qwen38_solo_via_scheduler(
 ) -> anyhow::Result<()> {
     let send_timeout =
         solo_send_timeout_via_scheduler_zero_restores_the_old_infinite_wait_matching_sched_push();
-    let Some(prompt_ids) = tokenize_and_send_started(tokenizer, &req, tx, send_timeout).await?
+    let window = kv_max_seq_len.min(model.config().max_position_embeddings);
+    let Some(prompt_ids) =
+        tokenize_before_prefill(tokenizer, &req, tx, send_timeout, window).await?
     else {
         return Ok(());
     };
@@ -715,6 +1194,19 @@ async fn run_qwen38_dense_solo_body(
     if last_out.exhausted {
         anyhow::bail!("no legal token at prefill: the sampling mask left every candidate at -inf");
     }
+    let mut generation_trace = QwenGenerationTrace::selected(
+        model.dense_intermediate().is_some(),
+        "plain-eager-solo",
+        prompt_ids.len(),
+        cache.max_seq_len(),
+        window,
+    );
+    if let Some(trace) = &mut generation_trace {
+        trace.capture_active = Some(false);
+    }
+    if !solo_started(tx, prompt_ids.len() as u32, send_timeout).await {
+        return Ok(());
+    }
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
     let mut emitter = StreamEmitter::new(&req.stop);
@@ -728,6 +1220,9 @@ async fn run_qwen38_dense_solo_body(
             break;
         }
         generated_ids.push(last);
+        if let Some(trace) = &mut generation_trace {
+            trace.retain();
+        }
         completion_tokens = generated_ids.len() as u32;
 
         let new_text = detok.push(last)?;
@@ -772,6 +1267,9 @@ async fn run_qwen38_dense_solo_body(
         drop(step_logits);
         last_out = sampler.sample(&step_row);
         last = last_out.token;
+        if let Some(trace) = &mut generation_trace {
+            trace.next_block();
+        }
         if last_out.exhausted {
             anyhow::bail!(
                 "no legal token at step {step}: the sampling mask left every candidate at -inf"
@@ -779,24 +1277,34 @@ async fn run_qwen38_dense_solo_body(
         }
     }
 
+    let mut tail_sent = generated_ids.is_empty();
     if !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(tokenizer, &generated_ids)
+        {
+            tail_sent = true;
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
-                let _ = solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await;
+                tail_sent =
+                    solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await == SsePush::Sent;
             }
         }
     }
 
-    let _ = solo_push(
+    let done = solo_push(
         tx,
         ChatEvent::Done {
-            finish_reason,
+            finish_reason: finish_reason.clone(),
             completion_tokens,
         },
         send_timeout,
     )
     .await;
+    if qwen_generation_trace_deliverable(tail_sent, done) {
+        if let Some(trace) = generation_trace {
+            trace.report(completion_tokens, &finish_reason);
+        }
+    }
     Ok(())
 }
 
@@ -820,6 +1328,11 @@ async fn run_qwen38_mtp_greedy_rounds(
     let session = nv_specdecode::qwen38_mtp::Qwen38MtpDecodeSession::start(
         model, mtp, k, prompt_ids, max_seq,
     )?;
+    let generation_trace =
+        QwenGenerationTrace::selected(true, "mtp-eager-solo", prompt_ids.len(), max_seq, window);
+    if !solo_started(tx, prompt_ids.len() as u32, send_timeout).await {
+        return Ok(());
+    }
     run_qwen38_mtp_rounds_streaming(
         session,
         tokenizer,
@@ -829,6 +1342,7 @@ async fn run_qwen38_mtp_greedy_rounds(
         k,
         tx,
         send_timeout,
+        generation_trace,
     )
     .await
 }
@@ -844,7 +1358,12 @@ async fn run_qwen38_mtp_rounds_streaming<S: nv_models::qwen3_5_mtp::MtpMoeServin
     k: usize,
     tx: &mpsc::Sender<ChatEvent>,
     send_timeout: Option<std::time::Duration>,
+    mut generation_trace: Option<QwenGenerationTrace>,
 ) -> anyhow::Result<()> {
+    if let Some(trace) = &mut generation_trace {
+        trace.engine_arm = Some(session.arm_name());
+        trace.capture_active = Some(session.capture_active());
+    }
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
     let mut emitter = StreamEmitter::new(&req.stop);
     let mut detok = IncrementalDetok::new(tokenizer.clone());
@@ -859,6 +1378,9 @@ async fn run_qwen38_mtp_rounds_streaming<S: nv_models::qwen3_5_mtp::MtpMoeServin
                 break 'stream;
             }
             generated_ids.push(tok);
+            if let Some(trace) = &mut generation_trace {
+                trace.retain();
+            }
             completion_tokens = generated_ids.len() as u32;
             let new_text = detok.push(tok)?;
             let (piece, stop_hit) = emitter.step(new_text);
@@ -881,9 +1403,16 @@ async fn run_qwen38_mtp_rounds_streaming<S: nv_models::qwen3_5_mtp::MtpMoeServin
             break 'stream;
         }
         pending = session.round()?;
+        if let Some(trace) = &mut generation_trace {
+            trace.next_block();
+        }
     }
 
     let s = session.stats();
+    let suffix = session.suffix_rounds_drafted_accepted();
+    let (suffix_rounds, suffix_drafted, suffix_accepted) = suffix.unwrap_or_default();
+    let tracking = session.acceptance_tracking_k2_k3_switches();
+    let (adaptive_k2_rounds, adaptive_k3_rounds, adaptive_switches) = tracking.unwrap_or_default();
     tracing::info!(
         arm = session.arm_name(),
         capture_active = session.capture_active(),
@@ -894,30 +1423,270 @@ async fn run_qwen38_mtp_rounds_streaming<S: nv_models::qwen3_5_mtp::MtpMoeServin
         tokens_per_round = format!("{:.2}", s.tokens_per_round()).as_str(),
         k,
         completion_tokens,
+        suffix_enabled = suffix.is_some(),
+        suffix_rounds,
+        suffix_drafted,
+        suffix_accepted,
+        accept_tracking_enabled = tracking.is_some(),
+        adaptive_k2_rounds,
+        adaptive_k3_rounds,
+        adaptive_switches,
+        draft_ms = s.draft_ms,
+        verify_ms = s.verify_ms,
+        commit_ms = s.commit_ms,
+        emitted_fnv1a64 = format!(
+            "{:016x}",
+            qwen_emitted_token_ids_fnv1a64_u32_le(&generated_ids)
+        )
+        .as_str(),
         "qwen3.8 mtp self-speculative request done"
     );
 
+    let mut tail_sent = generated_ids.is_empty();
     if !generated_ids.is_empty() {
         if let Ok(full) =
             crate::oapi::chat_engine::stream::decode_keeping_wire(tokenizer, &generated_ids)
         {
+            tail_sent = true;
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
-                let _ = solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await;
+                tail_sent =
+                    solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await == SsePush::Sent;
             }
         }
     }
 
-    let _ = solo_push(
+    let done = solo_push(
         tx,
         ChatEvent::Done {
-            finish_reason,
+            finish_reason: finish_reason.clone(),
             completion_tokens,
         },
         send_timeout,
     )
     .await;
+    if qwen_generation_trace_deliverable(tail_sent, done) {
+        if let Some(mut trace) = generation_trace {
+            trace.capture_active = Some(session.capture_active());
+            trace.report(completion_tokens, &finish_reason);
+        }
+    }
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod qwen_generation_streaming_tests {
+    use super::*;
+    use nv_models::qwen3_5_mtp::{MtpMoeServingRounds, MtpSpecStats};
+
+    #[test]
+    fn emitted_token_hash_preserves_u32_byte_order_and_empty_stream() {
+        assert_eq!(
+            qwen_emitted_token_ids_fnv1a64_u32_le(&[]),
+            0xcbf29ce484222325
+        );
+        assert_eq!(
+            qwen_emitted_token_ids_fnv1a64_u32_le(&[0]),
+            0x4d25767f9dce13f5
+        );
+        assert_eq!(
+            qwen_emitted_token_ids_fnv1a64_u32_le(&[0x01020304]),
+            0xb345225e3644edb5
+        );
+        assert_eq!(
+            qwen_emitted_token_ids_fnv1a64_u32_le(&[1, 256, 65536, u32::MAX]),
+            0xd171144022ec4b52
+        );
+        assert_eq!(
+            FakeRounds::new(0, []).suffix_rounds_drafted_accepted(),
+            None
+        );
+    }
+
+    struct FakeRounds {
+        anchor: u32,
+        rounds: std::collections::VecDeque<Vec<u32>>,
+        stats: MtpSpecStats,
+    }
+
+    impl FakeRounds {
+        fn new(anchor: u32, rounds: impl IntoIterator<Item = Vec<u32>>) -> Self {
+            Self {
+                anchor,
+                rounds: rounds.into_iter().collect(),
+                stats: MtpSpecStats::default(),
+            }
+        }
+    }
+
+    impl MtpMoeServingRounds for FakeRounds {
+        fn anchor(&self) -> u32 {
+            self.anchor
+        }
+
+        fn round_fits(&self) -> bool {
+            !self.rounds.is_empty()
+        }
+
+        fn round(&mut self) -> anyhow::Result<Vec<u32>> {
+            let out = self.rounds.pop_front().unwrap_or_default();
+            self.stats.rounds += 1;
+            self.stats.emitted += out.len();
+            Ok(out)
+        }
+
+        fn stats(&self) -> &MtpSpecStats {
+            &self.stats
+        }
+
+        fn arm_name(&self) -> &'static str {
+            "fake-rounds"
+        }
+
+        fn capture_active(&self) -> bool {
+            false
+        }
+    }
+
+    fn tiny_tokenizer() -> Arc<tokenizers::Tokenizer> {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                ["alpha", "beta", "gamma", "<eos>"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, token)| ((*token).to_string(), i as u32))
+                    .collect(),
+            )
+            .build()
+            .unwrap();
+        Arc::new(tokenizers::Tokenizer::new(model))
+    }
+
+    fn request(max_new_tokens: usize) -> ChatGenerateRequest {
+        ChatGenerateRequest {
+            prompt: "alpha".into(),
+            max_new_tokens,
+            stop: vec![],
+            seed: Some(0),
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            repetition_penalty: None,
+            guided: None,
+            guided_think_close: None,
+            logit_bias: vec![],
+            logprobs: false,
+            top_logprobs: 0,
+            kv_resume: None,
+            kv_store: None,
+            mm: None,
+        }
+    }
+
+    fn trace() -> QwenGenerationTrace {
+        QwenGenerationTrace {
+            id: 1,
+            route: "fake-mtp",
+            depth: 1,
+            allocated_context: 16,
+            context_limit: 16,
+            engine_arm: None,
+            capture_active: None,
+            block: 0,
+            ready: std::time::Instant::now(),
+            blocks: QwenReadyBlocks::default(),
+        }
+    }
+
+    fn event_shape(event: ChatEvent) -> (&'static str, Option<(String, u32)>) {
+        match event {
+            ChatEvent::TextDelta(_) => ("text", None),
+            ChatEvent::Done {
+                finish_reason,
+                completion_tokens,
+            } => ("done", Some((finish_reason, completion_tokens))),
+            _ => ("other", None),
+        }
+    }
+
+    async fn budget_events(with_trace: bool) -> Vec<(&'static str, Option<(String, u32)>)> {
+        let (tx, mut rx) = mpsc::channel(16);
+        run_qwen38_mtp_rounds_streaming(
+            FakeRounds::new(0, [vec![1, 2]]),
+            &tiny_tokenizer(),
+            &request(2),
+            2,
+            &[3],
+            2,
+            &tx,
+            None,
+            with_trace.then(trace),
+        )
+        .await
+        .unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event_shape(event));
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn trace_preserves_stream_events_and_output_budget_truncation() {
+        let off = budget_events(false).await;
+        let on = budget_events(true).await;
+        assert_eq!(on, off);
+        assert_eq!(on.last(), Some(&("done", Some(("length".into(), 2)))));
+    }
+
+    #[tokio::test]
+    async fn eos_before_retention_reports_zero_tokens_and_stop() {
+        let (tx, mut rx) = mpsc::channel(4);
+        run_qwen38_mtp_rounds_streaming(
+            FakeRounds::new(3, std::iter::empty()),
+            &tiny_tokenizer(),
+            &request(4),
+            4,
+            &[3],
+            2,
+            &tx,
+            None,
+            Some(trace()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(ChatEvent::Done {
+                ref finish_reason,
+                completion_tokens: 0,
+            }) if finish_reason == "stop"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_delivery_is_not_reportable() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        run_qwen38_mtp_rounds_streaming(
+            FakeRounds::new(3, std::iter::empty()),
+            &tiny_tokenizer(),
+            &request(4),
+            4,
+            &[3],
+            2,
+            &tx,
+            None,
+            Some(trace()),
+        )
+        .await
+        .unwrap();
+        assert!(!qwen_generation_trace_deliverable(true, SsePush::Closed));
+        assert!(!qwen_generation_trace_deliverable(true, SsePush::TimedOut));
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -940,7 +1709,8 @@ pub(crate) async fn run_sampling_qwen3(
     let prompt_tokens = prompt_ids.len() as u32;
 
     let max_new = effective_max_new(req.max_new_tokens, default_max_new);
-    let send_timeout = solo_send_timeout_on_the_engine_runtime_zero_clamps_to_1ms_like_the_gemma4_paths();
+    let send_timeout =
+        solo_send_timeout_on_the_engine_runtime_zero_clamps_to_1ms_like_the_gemma4_paths();
 
     if solo_push(tx, ChatEvent::Started { prompt_tokens }, send_timeout).await != SsePush::Sent {
         return Ok(());
@@ -1043,7 +1813,9 @@ pub(crate) async fn run_sampling_qwen3(
     }
 
     if !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
                 let _ = solo_push(tx, ChatEvent::TextDelta(tail), send_timeout).await;

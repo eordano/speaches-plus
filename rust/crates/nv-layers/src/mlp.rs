@@ -72,6 +72,9 @@ impl Mlp {
             _ => unreachable!(),
         };
         let stream = crate::cuda_stream::current_stream(&dev);
+        if let Some(output) = self.down_proj.try_forward_silu_nvfp4(&gate, &up)? {
+            return Ok(output);
+        }
         let gate_c = gate.contiguous()?;
         let up_c = up.contiguous()?;
         let n = gate_c.elem_count();

@@ -220,7 +220,6 @@ impl Rope {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-
         if crate::linear::this_call_is_building_an_autograd_graph(q) {
             return self.apply_candle(q, k, positions);
         }
@@ -360,7 +359,6 @@ impl Rope {
         k: &Tensor,
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-
         if crate::linear::this_call_is_building_an_autograd_graph(q) {
             return self.apply_candle(q, k, positions);
         }
@@ -510,7 +508,7 @@ impl Rope {
 
         let rotary_dim = self.cfg.head_dim;
         anyhow::ensure!(
-            rotary_dim < head_dim && rotary_dim % 2 == 0,
+            rotary_dim < head_dim && rotary_dim.is_multiple_of(2),
             "partial rope: rotary {rotary_dim} must be even and below head_dim {head_dim}"
         );
         anyhow::ensure!(
@@ -784,9 +782,29 @@ fn positions_to_i32_cuda(positions: &Tensor, target_device: &Device) -> Result<T
     Ok(Tensor::from_vec(host_i32, n, target_device)?)
 }
 
+pub const ROPE_POS_RESIDENT_SKIPS_A_DEVICE_ROUNDTRIP_THAT_FENCES_THE_WHOLE_METAL_QUEUE: &str =
+    "normalize_positions_u32 round-trips positions through the host even when they are already \
+     u32 on the target device, and on Metal that to_vec1 is a wait_until_completed drain of \
+     every queued command -- the qlora window forward pays it twice per layer per bucket (96 \
+     pipeline drains per step). NV_ROPE_POS_RESIDENT=1 returns the resident u32 tensor as-is; \
+     index_select consumes identical index values from identical bytes, so the arm is bitwise \
+     by construction";
+
+fn rope_pos_resident_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NV_ROPE_POS_RESIDENT").as_deref() == Ok("1"))
+}
+
 fn normalize_positions_u32(positions: &Tensor, target_device: &Device) -> Result<Tensor> {
     let n = positions.elem_count();
     let flat = positions.reshape(n)?;
+    if rope_pos_resident_enabled()
+        && flat.dtype() == DType::U32
+        && flat.device().same_device(target_device)
+    {
+        let _ = ROPE_POS_RESIDENT_SKIPS_A_DEVICE_ROUNDTRIP_THAT_FENCES_THE_WHOLE_METAL_QUEUE;
+        return Ok(flat.contiguous()?);
+    }
     let host_u32: Vec<u32> = match flat.dtype() {
         DType::U32 => flat.to_device(&Device::Cpu)?.to_vec1::<u32>()?,
         DType::U8 => flat
@@ -1102,5 +1120,234 @@ mod tests {
             max_abs > 1e-4,
             "expected divergence when axes differ, but max|Δ| = {max_abs}"
         );
+    }
+}
+
+pub const NV_TRAIN_ROPE_FUSED_ENV_DEFAULT_ON_0_RESTORES_THE_CANDLE_NARROW_MUL_CAT_CHAIN: &str =
+    "NV_TRAIN_ROPE_FUSED";
+
+pub fn train_rope_op_serves(x: &Tensor) -> bool {
+    x.device().is_cuda()
+        && matches!(x.dtype(), DType::BF16 | DType::F32)
+        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            NV_TRAIN_ROPE_FUSED_ENV_DEFAULT_ON_0_RESTORES_THE_CANDLE_NARROW_MUL_CAT_CHAIN,
+        )
+}
+
+#[cfg(feature = "cuda")]
+pub struct RopeTrainOp {
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    head_dim: usize,
+    rotary_dim: usize,
+    scale: f32,
+}
+
+#[cfg(feature = "cuda")]
+impl RopeTrainOp {
+    fn table_ptrs(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> candle_core::Result<(u64, u64, u64)> {
+        use cudarc::driver::DevicePtr;
+        let f32_ptr = |t: &Tensor| -> candle_core::Result<u64> {
+            let (st, l) = t.storage_and_layout();
+            let candle_core::Storage::Cuda(c) = &*st else {
+                return Err(candle_core::Error::Msg("rope train op: table not cuda".into()));
+            };
+            let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(stream);
+            Ok(p + (l.start_offset() * 4) as u64)
+        };
+        let (pst, pl) = self.positions.storage_and_layout();
+        let candle_core::Storage::Cuda(pc) = &*pst else {
+            return Err(candle_core::Error::Msg("rope train op: positions not cuda".into()));
+        };
+        let (pp, _gp) = pc.as_cuda_slice::<u32>()?.device_ptr(stream);
+        let pos = pp + (pl.start_offset() * 4) as u64;
+        Ok((f32_ptr(&self.cos)?, f32_ptr(&self.sin)?, pos))
+    }
+
+    fn launch_ptrs(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        x: u64,
+        y: u64,
+        dtype: DType,
+        dims: &[usize],
+        bwd: bool,
+    ) -> candle_core::Result<()> {
+        let heads = dims[dims.len() - 2];
+        let tokens = dims.iter().product::<usize>() / (heads * self.head_dim);
+        if self.positions.elem_count() != tokens {
+            return Err(candle_core::Error::Msg(format!(
+                "rope train op: {} positions for {tokens} tokens",
+                self.positions.elem_count()
+            )));
+        }
+        let (cp, sp, pp) = self.table_ptrs(stream)?;
+        let is_bf16 = match dtype {
+            DType::BF16 => 1,
+            DType::F32 => 0,
+            other => return Err(candle_core::Error::Msg(format!("rope train op: dtype {other:?}"))),
+        };
+        let rc = unsafe {
+            if bwd {
+                nv_kernels::cuda::rope_train_bwd(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    x as *const std::ffi::c_void,
+                    y as *mut std::ffi::c_void,
+                    cp as *const f32,
+                    sp as *const f32,
+                    pp as *const u32,
+                    tokens as i64,
+                    heads as i32,
+                    self.head_dim as i32,
+                    self.rotary_dim as i32,
+                    self.scale,
+                    is_bf16,
+                )
+            } else {
+                nv_kernels::cuda::rope_train_fwd(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    x as *const std::ffi::c_void,
+                    y as *mut std::ffi::c_void,
+                    cp as *const f32,
+                    sp as *const f32,
+                    pp as *const u32,
+                    tokens as i64,
+                    heads as i32,
+                    self.head_dim as i32,
+                    self.rotary_dim as i32,
+                    self.scale,
+                    is_bf16,
+                )
+            }
+        };
+        if rc != 0 {
+            return Err(candle_core::Error::Msg(format!("rope_train rc={rc} bwd={bwd}")));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl candle_core::CustomOp1 for RopeTrainOp {
+    fn name(&self) -> &'static str {
+        "rope_train"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s: &candle_core::CpuStorage,
+        _l: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        Err(candle_core::Error::Msg("rope_train is CUDA-only".into()))
+    }
+
+    fn cuda_fwd(
+        &self,
+        s: &candle_core::CudaStorage,
+        l: &candle_core::Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, candle_core::Shape)> {
+        use candle_core::backend::BackendStorage;
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let dev = s.device().clone();
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let dims = l.shape().dims().to_vec();
+        let n = dims.iter().product::<usize>();
+        let Some((start, _end)) = l.contiguous_offsets() else {
+            return Err(candle_core::Error::Msg("rope train op: input must be contiguous".into()));
+        };
+        let out = match s.dtype() {
+            DType::BF16 => {
+                let x = s.as_cuda_slice::<half::bf16>()?;
+                let xv = x.slice(start..);
+                let (xp, _gx) = xv.device_ptr(&stream);
+                let mut y: cudarc::driver::CudaSlice<half::bf16> = unsafe { stream.alloc::<half::bf16>(n) }
+                    .map_err(|e| candle_core::Error::Msg(format!("rope train op alloc: {e:?}")))?;
+                {
+                    let (yp, _gy) = y.device_ptr_mut(&stream);
+                    self.launch_ptrs(&stream, xp, yp, DType::BF16, &dims, false)?;
+                }
+                candle_core::CudaStorage::wrap_cuda_slice(y, dev)
+            }
+            DType::F32 => {
+                let x = s.as_cuda_slice::<f32>()?;
+                let xv = x.slice(start..);
+                let (xp, _gx) = xv.device_ptr(&stream);
+                let mut y: cudarc::driver::CudaSlice<f32> = unsafe { stream.alloc::<f32>(n) }
+                    .map_err(|e| candle_core::Error::Msg(format!("rope train op alloc: {e:?}")))?;
+                {
+                    let (yp, _gy) = y.device_ptr_mut(&stream);
+                    self.launch_ptrs(&stream, xp, yp, DType::F32, &dims, false)?;
+                }
+                candle_core::CudaStorage::wrap_cuda_slice(y, dev)
+            }
+            other => return Err(candle_core::Error::Msg(format!("rope train op: dtype {other:?}"))),
+        };
+        Ok((out, l.shape().clone()))
+    }
+
+    fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
+        use cudarc::driver::DevicePtr;
+        let candle_core::Device::Cuda(dev) = arg.device() else {
+            return Err(candle_core::Error::Msg("rope train op bwd: not cuda".into()));
+        };
+        let stream = crate::cuda_stream::current_stream(dev);
+        let g = grad_res.detach().to_dtype(arg.dtype())?.contiguous()?;
+        let dims = g.dims().to_vec();
+        let dx = crate::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(arg.device(), g.dtype(), &dims)
+            .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+        let gp = {
+            let (st, l) = g.storage_and_layout();
+            let candle_core::Storage::Cuda(c) = &*st else {
+                return Err(candle_core::Error::Msg("rope train op bwd: grad not cuda".into()));
+            };
+            match g.dtype() {
+                DType::BF16 => {
+                    let (p, _g) = c.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
+                    p + (l.start_offset() * 2) as u64
+                }
+                DType::F32 => {
+                    let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(&stream);
+                    p + (l.start_offset() * 4) as u64
+                }
+                other => return Err(candle_core::Error::Msg(format!("rope train op bwd: dtype {other:?}"))),
+            }
+        };
+        let dp = crate::step_arena::device_ptr_for_a_kernel_to_write(&dx)
+            .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+        self.launch_ptrs(&stream, gp, dp, g.dtype(), &dims, true)?;
+        Ok(Some(dx))
+    }
+}
+
+impl Rope {
+    #[cfg(feature = "cuda")]
+    pub fn apply_train_partial_scaled(
+        &self,
+        x: &Tensor,
+        positions: &Tensor,
+        rotary_dim: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<Tensor> {
+        anyhow::ensure!(
+            rotary_dim == self.cfg.head_dim && rotary_dim <= head_dim,
+            "rope train op: rotary_dim {rotary_dim} must be the table's head_dim {} and at most {head_dim}",
+            self.cfg.head_dim
+        );
+        let positions = if positions.dtype() == DType::U32 && positions.device().same_device(x.device()) {
+            positions.reshape(positions.elem_count())?.contiguous()?
+        } else {
+            normalize_positions_u32(positions, x.device())?
+        };
+        let op = RopeTrainOp {
+            cos: self.cos.clone(),
+            sin: self.sin.clone(),
+            positions,
+            head_dim,
+            rotary_dim,
+            scale,
+        };
+        Ok(x.contiguous()?.apply_op1(op)?)
     }
 }

@@ -66,7 +66,10 @@ impl AuTConfig {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("audio_config must be an object"))?;
         let geti = |k: &str, d: usize| -> usize {
-            obj.get(k).and_then(|x| x.as_u64()).map(|x| x as usize).unwrap_or(d)
+            obj.get(k)
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize)
+                .unwrap_or(d)
         };
         Ok(Self {
             d_model: geti("d_model", 1280),
@@ -125,7 +128,10 @@ impl AudioLayer {
             ))
         };
         let lin = |o: usize, i: usize| -> Result<Linear> {
-            Linear::new(Tensor::zeros((o, i), dtype, device)?, Some(Tensor::zeros(o, dtype, device)?))
+            Linear::new(
+                Tensor::zeros((o, i), dtype, device)?,
+                Some(Tensor::zeros(o, dtype, device)?),
+            )
         };
         Ok(Self {
             attn_ln: ln(d)?,
@@ -183,7 +189,11 @@ pub struct AudioEncoder {
 impl AudioEncoder {
     pub fn new(cfg: &AuTConfig, device: &Device) -> Result<Self> {
         if !cfg.d_model.is_multiple_of(cfg.n_heads) {
-            anyhow::bail!("AuTConfig: d_model {} not divisible by n_heads {}", cfg.d_model, cfg.n_heads);
+            anyhow::bail!(
+                "AuTConfig: d_model {} not divisible by n_heads {}",
+                cfg.d_model,
+                cfg.n_heads
+            );
         }
         let dtype = cfg.dtype;
         let ds = cfg.downsample_hidden_size;
@@ -213,7 +223,10 @@ impl AudioEncoder {
             conv2d1: conv(1, ds)?,
             conv2d2: conv(ds, ds)?,
             conv2d3: conv(ds, ds)?,
-            conv_out: Linear::new(Tensor::zeros((cfg.d_model, conv_out_in), dtype, device)?, None)?,
+            conv_out: Linear::new(
+                Tensor::zeros((cfg.d_model, conv_out_in), dtype, device)?,
+                None,
+            )?,
             positional,
             layers,
             ln_post: ln(cfg.d_model)?,
@@ -239,9 +252,13 @@ impl AudioEncoder {
     pub fn forward(&self, mel: &Tensor) -> Result<Tensor> {
         let (mel_c, frames) = mel.dims2().map_err(|e| anyhow::anyhow!(e))?;
         if mel_c != self.cfg.num_mel_bins {
-            anyhow::bail!("AudioEncoder::forward: expected {} mel bins, got {}", self.cfg.num_mel_bins, mel_c);
+            anyhow::bail!(
+                "AudioEncoder::forward: expected {} mel bins, got {}",
+                self.cfg.num_mel_bins,
+                mel_c
+            );
         }
-        let chunk = (self.cfg.n_window * 2) as usize;
+        let chunk = self.cfg.n_window * 2;
         let mut chunk_lengths: Vec<usize> = Vec::new();
         let mut off = 0usize;
         while off < frames {
@@ -308,7 +325,8 @@ impl AudioEncoder {
             anyhow::bail!("AudioEncoder::forward: produced {total} tokens, expected {expect}");
         }
 
-        let window = max_len_after_cnn_full(max_chunk_len) * (self.cfg.n_window_infer / (self.cfg.n_window * 2));
+        let window = max_len_after_cnn_full(max_chunk_len)
+            * (self.cfg.n_window_infer / (self.cfg.n_window * 2));
         let window = window.max(1);
         let mut outs: Vec<Tensor> = Vec::new();
         let mut w0 = 0usize;
@@ -344,11 +362,33 @@ impl AudioEncoder {
             let b = load_1d(weights, name_b, oc, dtype)?;
             Conv2d::new(w, Some(b), 2, 1)
         };
-        self.conv2d1 = conv("thinker.audio_tower.conv2d1.weight", "thinker.audio_tower.conv2d1.bias", 1, ds)?;
-        self.conv2d2 = conv("thinker.audio_tower.conv2d2.weight", "thinker.audio_tower.conv2d2.bias", ds, ds)?;
-        self.conv2d3 = conv("thinker.audio_tower.conv2d3.weight", "thinker.audio_tower.conv2d3.bias", ds, ds)?;
-        self.conv_out =
-            Linear::new(load_2d(weights, "thinker.audio_tower.conv_out.weight", (d, conv_out_in), dtype)?, None)?;
+        self.conv2d1 = conv(
+            "thinker.audio_tower.conv2d1.weight",
+            "thinker.audio_tower.conv2d1.bias",
+            1,
+            ds,
+        )?;
+        self.conv2d2 = conv(
+            "thinker.audio_tower.conv2d2.weight",
+            "thinker.audio_tower.conv2d2.bias",
+            ds,
+            ds,
+        )?;
+        self.conv2d3 = conv(
+            "thinker.audio_tower.conv2d3.weight",
+            "thinker.audio_tower.conv2d3.bias",
+            ds,
+            ds,
+        )?;
+        self.conv_out = Linear::new(
+            load_2d(
+                weights,
+                "thinker.audio_tower.conv_out.weight",
+                (d, conv_out_in),
+                dtype,
+            )?,
+            None,
+        )?;
         count += 7;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
@@ -358,7 +398,8 @@ impl AudioEncoder {
             layer.q_proj = load_lin_bias(weights, &format!("{p}.self_attn.q_proj"), d, d, dtype)?;
             layer.k_proj = load_lin_bias(weights, &format!("{p}.self_attn.k_proj"), d, d, dtype)?;
             layer.v_proj = load_lin_bias(weights, &format!("{p}.self_attn.v_proj"), d, d, dtype)?;
-            layer.out_proj = load_lin_bias(weights, &format!("{p}.self_attn.out_proj"), d, d, dtype)?;
+            layer.out_proj =
+                load_lin_bias(weights, &format!("{p}.self_attn.out_proj"), d, d, dtype)?;
             layer.fc1 = load_lin_bias(weights, &format!("{p}.fc1"), ffn, d, dtype)?;
             layer.fc2 = load_lin_bias(weights, &format!("{p}.fc2"), d, ffn, dtype)?;
             count += 16;
@@ -373,69 +414,72 @@ impl AudioEncoder {
 }
 
 pub fn whisper_log_mel_128(samples: &[f32]) -> Result<(Vec<f32>, usize)> {
-        let capped = samples.len().min(MAX_SECONDS * SAMPLE_RATE);
-        let samples = &samples[..capped];
-        let frames = samples.len() / HOP_LENGTH;
-        if frames == 0 {
-            anyhow::bail!("whisper_log_mel_128: audio too short ({} samples)", samples.len());
-        }
-        let n_mels = 128usize;
-        let n_bins = N_FFT / 2 + 1;
-        let hann = build_hann_window();
-        let filters = build_mel_filters(n_mels);
+    let capped = samples.len().min(MAX_SECONDS * SAMPLE_RATE);
+    let samples = &samples[..capped];
+    let frames = samples.len() / HOP_LENGTH;
+    if frames == 0 {
+        anyhow::bail!(
+            "whisper_log_mel_128: audio too short ({} samples)",
+            samples.len()
+        );
+    }
+    let n_mels = 128usize;
+    let n_bins = N_FFT / 2 + 1;
+    let hann = build_hann_window();
+    let filters = build_mel_filters(n_mels);
 
-        let pad = N_FFT / 2;
-        let mut padded = vec![0f32; samples.len() + N_FFT];
-        for i in 0..pad {
-            padded[i] = samples[pad - i];
-        }
-        padded[pad..pad + samples.len()].copy_from_slice(samples);
-        for i in 0..pad {
-            let src = samples.len().saturating_sub(2 + i);
-            padded[pad + samples.len() + i] = samples[src];
-        }
+    let pad = N_FFT / 2;
+    let mut padded = vec![0f32; samples.len() + N_FFT];
+    for i in 0..pad {
+        padded[i] = samples[pad - i];
+    }
+    padded[pad..pad + samples.len()].copy_from_slice(samples);
+    for i in 0..pad {
+        let src = samples.len().saturating_sub(2 + i);
+        padded[pad + samples.len() + i] = samples[src];
+    }
 
-        let mut mel = vec![0f32; n_mels * frames];
-        let (cos_tab, sin_tab) = dft_tables();
-        let mut power = vec![0f32; n_bins];
-        for frame in 0..frames {
-            let start = frame * HOP_LENGTH;
-            for (k, pw) in power.iter_mut().enumerate() {
-                let mut re = 0f32;
-                let mut im = 0f32;
-                for n in 0..N_FFT {
-                    let x = padded[start + n] * hann[n];
-                    re += x * cos_tab[k * N_FFT + n];
-                    im -= x * sin_tab[k * N_FFT + n];
-                }
-                *pw = re * re + im * im;
+    let mut mel = vec![0f32; n_mels * frames];
+    let (cos_tab, sin_tab) = dft_tables();
+    let mut power = vec![0f32; n_bins];
+    for frame in 0..frames {
+        let start = frame * HOP_LENGTH;
+        for (k, pw) in power.iter_mut().enumerate() {
+            let mut re = 0f32;
+            let mut im = 0f32;
+            for n in 0..N_FFT {
+                let x = padded[start + n] * hann[n];
+                re += x * cos_tab[k * N_FFT + n];
+                im -= x * sin_tab[k * N_FFT + n];
             }
-            for m in 0..n_mels {
-                let row = &filters[m * n_bins..(m + 1) * n_bins];
-                let mut sum = 0f32;
-                for k in 0..n_bins {
-                    sum += row[k] * power[k];
-                }
-                mel[m * frames + frame] = sum;
-            }
+            *pw = re * re + im * im;
         }
+        for m in 0..n_mels {
+            let row = &filters[m * n_bins..(m + 1) * n_bins];
+            let mut sum = 0f32;
+            for k in 0..n_bins {
+                sum += row[k] * power[k];
+            }
+            mel[m * frames + frame] = sum;
+        }
+    }
 
-        let eps = 1e-10f32;
-        let mut max_val = f32::NEG_INFINITY;
-        for v in mel.iter_mut() {
-            *v = v.max(eps).log10();
-            if *v > max_val {
-                max_val = *v;
-            }
+    let eps = 1e-10f32;
+    let mut max_val = f32::NEG_INFINITY;
+    for v in mel.iter_mut() {
+        *v = v.max(eps).log10();
+        if *v > max_val {
+            max_val = *v;
         }
-        let floor = max_val - 8.0;
-        for v in mel.iter_mut() {
-            if *v < floor {
-                *v = floor;
-            }
-            *v = (*v + 4.0) / 4.0;
+    }
+    let floor = max_val - 8.0;
+    for v in mel.iter_mut() {
+        if *v < floor {
+            *v = floor;
         }
-        Ok((mel, frames))
+        *v = (*v + 4.0) / 4.0;
+    }
+    Ok((mel, frames))
 }
 
 fn conv_freq_out(mel_bins: usize) -> usize {
@@ -450,7 +494,12 @@ fn max_len_after_cnn_full(max_chunk_len: usize) -> usize {
     audio_tokens_for_mel_frames(max_chunk_len).max(1)
 }
 
-fn whisper_sinusoids(length: usize, channels: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+fn whisper_sinusoids(
+    length: usize,
+    channels: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
     if !channels.is_multiple_of(2) {
         anyhow::bail!("whisper_sinusoids needs even channels, got {channels}");
     }
@@ -546,8 +595,15 @@ fn mel_to_hz(m: f32) -> f32 {
     }
 }
 
-fn load_1d(weights: &nv_weights::WeightLoader, name: &str, dim: usize, dtype: DType) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+fn load_1d(
+    weights: &nv_weights::WeightLoader,
+    name: &str,
+    dim: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 1 || d[0] != dim {
         anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
@@ -555,8 +611,15 @@ fn load_1d(weights: &nv_weights::WeightLoader, name: &str, dim: usize, dtype: DT
     Ok(w)
 }
 
-fn load_2d(weights: &nv_weights::WeightLoader, name: &str, shape: (usize, usize), dtype: DType) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+fn load_2d(
+    weights: &nv_weights::WeightLoader,
+    name: &str,
+    shape: (usize, usize),
+    dtype: DType,
+) -> Result<Tensor> {
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
         anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
@@ -564,15 +627,27 @@ fn load_2d(weights: &nv_weights::WeightLoader, name: &str, shape: (usize, usize)
     Ok(w)
 }
 
-fn load_nd(weights: &nv_weights::WeightLoader, name: &str, shape: &[usize], dtype: DType) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+fn load_nd(
+    weights: &nv_weights::WeightLoader,
+    name: &str,
+    shape: &[usize],
+    dtype: DType,
+) -> Result<Tensor> {
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     if w.dims() != shape {
         anyhow::bail!("{name}: expected {:?}, got {:?}", shape, w.dims());
     }
     Ok(w)
 }
 
-fn load_ln(weights: &nv_weights::WeightLoader, prefix: &str, dim: usize, dtype: DType) -> Result<LayerNorm> {
+fn load_ln(
+    weights: &nv_weights::WeightLoader,
+    prefix: &str,
+    dim: usize,
+    dtype: DType,
+) -> Result<LayerNorm> {
     let w = load_1d(weights, &format!("{prefix}.weight"), dim, dtype)?;
     let b = load_1d(weights, &format!("{prefix}.bias"), dim, dtype)?;
     Ok(LayerNorm::new(w, b, 1e-5))
@@ -629,7 +704,10 @@ mod tests {
                 total += n.max(0) as usize;
                 off += chunk;
             }
-            assert_eq!(got, total, "frames {frames}: law {got} != per-chunk conv {total}");
+            assert_eq!(
+                got, total,
+                "frames {frames}: law {got} != per-chunk conv {total}"
+            );
         }
         assert_eq!(audio_tokens_for_mel_frames(300), 39);
         assert_eq!(audio_tokens_for_mel_frames(100), 13);
@@ -663,7 +741,10 @@ mod tests {
         let frames = 250usize;
         let mel = Tensor::zeros((128, frames), DType::F32, &Device::Cpu).unwrap();
         let out = enc.forward(&mel).unwrap();
-        assert_eq!(out.dims(), &[audio_tokens_for_mel_frames(frames), cfg.output_dim]);
+        assert_eq!(
+            out.dims(),
+            &[audio_tokens_for_mel_frames(frames), cfg.output_dim]
+        );
     }
 
     #[test]

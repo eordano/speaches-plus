@@ -54,7 +54,11 @@ impl AudioEouModel {
         audio_window_ms: u32,
         pad_alignment: AudioPadAlignment,
     ) -> Self {
-        let mel_filters = Arc::new(crate::mel_scale::build_mel_filters(N_MELS, N_FFT, SAMPLE_RATE as usize));
+        let mel_filters = Arc::new(crate::mel_scale::build_mel_filters(
+            N_MELS,
+            N_FFT,
+            SAMPLE_RATE as usize,
+        ));
         let hann = Arc::new(crate::mel_scale::hann_window(N_FFT));
         Self {
             session,

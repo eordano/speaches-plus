@@ -90,7 +90,6 @@ mod tests {
 
     #[test]
     fn the_chunked_target_rounds_down_and_never_up() {
-
         let lim = RewindLimits::positional(1024, 0, 64);
         for lcp in [0usize, 1, 63, 64, 65, 127, 128, 200] {
             if let Some(t) = lim.target(500, lcp) {
@@ -99,25 +98,33 @@ mod tests {
             }
         }
         assert_eq!(lim.target(500, 128), Some(128));
-        assert_eq!(lim.target(500, 191), Some(128), "191 must land on 128, not 192");
+        assert_eq!(
+            lim.target(500, 191),
+            Some(128),
+            "191 must land on 128, not 192"
+        );
     }
 
     #[test]
     fn a_decoder_that_cannot_rewind_positionally_admits_nothing() {
-
         let none = RewindLimits::NONE;
         assert_eq!(none.max_advance(), None);
         for (frontier, target) in [(10usize, 1usize), (10, 10), (0, 0), (100, 50)] {
-            assert!(!none.admits(frontier, target), "NONE admitted {target}/{frontier}");
+            assert!(
+                !none.admits(frontier, target),
+                "NONE admitted {target}/{frontier}"
+            );
         }
         assert_eq!(none.target(10, 5), None);
     }
 
     #[test]
     fn the_ring_reserves_a_slot_so_a_rewind_cannot_eat_its_own_window() {
-
         let lim = RewindLimits::positional(8, 4, 0);
-        assert_eq!(lim.max_advance(), Some(8 + 1 - (4 + RING_REWIND_RESERVED_SLOTS)));
+        assert_eq!(
+            lim.max_advance(),
+            Some(8 + 1 - (4 + RING_REWIND_RESERVED_SLOTS))
+        );
         assert!(lim.admits(100, 96), "a 4-token rewind fits");
         assert!(!lim.admits(100, 95), "a 5-token rewind exceeds the ring");
 
@@ -125,23 +132,42 @@ mod tests {
         assert_eq!(tight.max_advance(), Some(0), "saturating, never wrapped");
         assert!(!tight.admits(100, 99));
 
-        assert_eq!(RewindLimits::positional(0, 4, 0).max_advance(), Some(usize::MAX));
+        assert_eq!(
+            RewindLimits::positional(0, 4, 0).max_advance(),
+            Some(usize::MAX)
+        );
     }
 
     #[test]
     fn a_target_of_zero_or_one_past_the_frontier_is_refused() {
         let lim = RewindLimits::positional(1024, 0, 0);
-        assert!(!lim.admits(10, 0), "zero is not a reuse, it is a cold start");
-        assert!(!lim.admits(10, 11), "past the frontier there is no KV to keep");
-        assert!(lim.admits(10, 10), "the frontier itself is the exact-extend case");
+        assert!(
+            !lim.admits(10, 0),
+            "zero is not a reuse, it is a cold start"
+        );
+        assert!(
+            !lim.admits(10, 11),
+            "past the frontier there is no KV to keep"
+        );
+        assert!(
+            lim.admits(10, 10),
+            "the frontier itself is the exact-extend case"
+        );
     }
 
     #[test]
     fn the_exact_extend_case_needs_the_decoder_to_be_standing_on_the_frontier() {
-
         assert_eq!(exact_extend_target(8, 8, 8), Some(8));
-        assert_eq!(exact_extend_target(8, 12, 8), Some(8), "lcp past the frontier still extends");
-        assert_eq!(exact_extend_target(8, 7, 8), None, "lcp short of the frontier diverged");
+        assert_eq!(
+            exact_extend_target(8, 12, 8),
+            Some(8),
+            "lcp past the frontier still extends"
+        );
+        assert_eq!(
+            exact_extend_target(8, 7, 8),
+            None,
+            "lcp short of the frontier diverged"
+        );
         assert_eq!(
             exact_extend_target(8, 8, 9),
             None,

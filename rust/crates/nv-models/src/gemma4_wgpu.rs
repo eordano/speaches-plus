@@ -20,8 +20,8 @@ pub fn flash_splits() -> u32 {
     wk::flash_decode::splits_env() as u32
 }
 
-pub const DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN: &str =
-    "NV_G4_WGPU_DEPTH_STACK";
+pub const DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN:
+    &str = "NV_G4_WGPU_DEPTH_STACK";
 
 pub fn depth_stack_enabled() -> bool {
     match std::env::var(
@@ -431,17 +431,23 @@ const GEMV4_PK_SG_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv4_pk_
 
 const FP8_PK_BINDINGS_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4w_fp8_pk_bindings.wgsl");
 
-const GEMV_Q8_PK_TREE_PROLOGUE: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_tree_prologue.wgsl");
+const GEMV_Q8_PK_TREE_PROLOGUE: &str =
+    include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_tree_prologue.wgsl");
 
-const GEMV_Q8_PK_TREE_TEMPLATE: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_tree_template.wgsl");
+const GEMV_Q8_PK_TREE_TEMPLATE: &str =
+    include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_tree_template.wgsl");
 
-const GEMV_Q8_PK_SG_PROLOGUE: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_sg_prologue.wgsl");
+const GEMV_Q8_PK_SG_PROLOGUE: &str =
+    include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_sg_prologue.wgsl");
 
-const GEMV_Q8_PK_SG_TEMPLATE: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_sg_template.wgsl");
+const GEMV_Q8_PK_SG_TEMPLATE: &str =
+    include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_sg_template.wgsl");
 
-const GEMV_Q8_PK_TREE_LEGACY: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_tree_legacy.wgsl");
+const GEMV_Q8_PK_TREE_LEGACY: &str =
+    include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_tree_legacy.wgsl");
 
-const GEMV_Q8_PK_SG_LEGACY: &str = include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_sg_legacy.wgsl");
+const GEMV_Q8_PK_SG_LEGACY: &str =
+    include_str!("../../nv-kernels/wgsl/g4w_gemv_q8_pk_sg_legacy.wgsl");
 
 pub fn attn_fp8_legacy_epilogue() -> u32 {
     attn_variant().legacy_epilogue
@@ -2417,7 +2423,9 @@ pub fn pf_flash_full_attention_enabled_via_nv_g4_wgpu_pf_flash_default_off_pendi
 pub fn pf_flash_portable_arm_forced_via_nv_g4_wgpu_pf_flash_portable_for_testing_on_sg_adapters(
 ) -> bool {
     matches!(
-        std::env::var("NV_G4_WGPU_PF_FLASH_PORTABLE").ok().as_deref(),
+        std::env::var("NV_G4_WGPU_PF_FLASH_PORTABLE")
+            .ok()
+            .as_deref(),
         Some("1") | Some("on")
     )
 }
@@ -2437,7 +2445,11 @@ pub fn pf_flash_pipeline_specs_stage1_tiled_slotml_arm_matching_the_qwen_nll_sig
             "q3w_pf_flash1_fp8kv_tiled_slotml_wg",
         )
     };
-    let src2 = format!("{}\n{}", compose(wk::flash_decode::WGSL), PF_FLASH2_PK_MK_WGSL);
+    let src2 = format!(
+        "{}\n{}",
+        compose(wk::flash_decode::WGSL),
+        PF_FLASH2_PK_MK_WGSL
+    );
     [
         (src1, label1, entry1),
         (src2, "g4w-pf-flash2-pk-mk", "g4w_flash_splitk_stage2_pk_mk"),
@@ -2454,8 +2466,7 @@ pub fn prefill_m_wide_via_nv_g4_wgpu_pf_m_in_mk_max_row_tiles() -> usize {
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
         Some(m) if m > MK_MAX => {
-            m.min(PF_WIDE_M_MAX_VIA_MK_MAX_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS) / MK_MAX
-                * MK_MAX
+            m.min(PF_WIDE_M_MAX_VIA_MK_MAX_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS) / MK_MAX * MK_MAX
         }
         Some(0) | Some(1) => 0,
         Some(m) => m.clamp(2, MK_MAX),
@@ -2466,8 +2477,8 @@ pub fn prefill_m_wide_via_nv_g4_wgpu_pf_m_in_mk_max_row_tiles() -> usize {
 pub const PF_COOP_TN2_SG2_KU4_STAGES_4096_F16_WELL_UNDER_THE_24576_BUDGET: (u32, u32, u32) =
     (2, 2, 4);
 
-pub fn pf_coop_w4a16_ffn_opt_in_default_off_because_only_measured_on_this_blackwell_adapter(
-) -> bool {
+pub fn pf_coop_w4a16_ffn_opt_in_default_off_because_only_measured_on_this_blackwell_adapter() -> bool
+{
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_G4_PF_COOP")
 }
 
@@ -2767,11 +2778,13 @@ pub fn weight_format_boot_line() -> String {
             "checkpoint".to_string()
         }
     };
-    let lmhead = if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_LMHEAD_INT8") {
-        "int8"
-    } else {
-        "checkpoint"
-    };
+    let lmhead =
+        if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_LMHEAD_INT8")
+        {
+            "int8"
+        } else {
+            "checkpoint"
+        };
     let w4 = match W4PtqSpec::from_env() {
         Some(s) => format!(
             " w4_ptq={} ({:.4} B/weight if served w4a16)",
@@ -2857,8 +2870,7 @@ fn build_pipelines(
     let src_kv = compose(wk::kv_fp8::WGSL);
     let src_flash = format!("{}\n{}", compose(wk::flash_decode::WGSL), FLASH2_PK_WGSL);
     const FLASH2_UNROLLED_PK_SUMS_EXACTLY_16_SPLITS_SSC_REGISTERS_ARE_BAKED: u32 = 16;
-    let flash2_pk = if splits == FLASH2_UNROLLED_PK_SUMS_EXACTLY_16_SPLITS_SSC_REGISTERS_ARE_BAKED
-    {
+    let flash2_pk = if splits == FLASH2_UNROLLED_PK_SUMS_EXACTLY_16_SPLITS_SSC_REGISTERS_ARE_BAKED {
         mk_pipeline(ctx, "g4w-flash2-pk", &src_flash, FLASH2_PK_ENTRY)?
     } else {
         mk_pipeline(
@@ -2880,7 +2892,11 @@ fn build_pipelines(
         const FOLD_REDUCE_IS_SG_SHUFFLE_WB_TREES_LOSE_AT_EVERY_DEPTH_SG_DRIFTS_1ULP_AT_HD512: bool =
             true;
         let sg = FOLD_REDUCE_IS_SG_SHUFFLE_WB_TREES_LOSE_AT_EVERY_DEPTH_SG_DRIFTS_1ULP_AT_HD512;
-        let tile = if flash_sd_enabled() { flash_tile_env() } else { 0 };
+        let tile = if flash_sd_enabled() {
+            flash_tile_env()
+        } else {
+            0
+        };
         let (entry, generated) = if flash_sd_enabled() && tile >= 2 {
             (
                 wk::flash_decode::fold_stage1_entry_sd_tiled(fold_hd_max, flash_fold, tile),
@@ -2905,7 +2921,12 @@ fn build_pipelines(
         );
         Some((
             flash_fold,
-            mk_pipeline(ctx, &format!("g4w-flash1-fold{flash_fold}t{tile}"), &src, &entry)?,
+            mk_pipeline(
+                ctx,
+                &format!("g4w-flash1-fold{flash_fold}t{tile}"),
+                &src,
+                &entry,
+            )?,
         ))
     } else {
         None
@@ -3986,7 +4007,9 @@ fn upload_coop_lin_when_host_kept_the_nvfp4_original(
         sf: GpuTensor::upload(
             ctx,
             "g4w-pf-coop-sf",
-            &bytes_to_words(&unswizzle_nvfp4_scales_row_major_for_the_coop_kernels_plain_sf_index(l)),
+            &bytes_to_words(
+                &unswizzle_nvfp4_scales_row_major_for_the_coop_kernels_plain_sf_index(l),
+            ),
         ),
         n: l.n,
         k: l.k,
@@ -4095,7 +4118,7 @@ fn upload_proj(
                 mk_input_globals_one_per_slot: GpuTensor::upload(
                     ctx,
                     "g4w-lin4-mk-glob",
-                    &vec![l.input_global; MK_MAX],
+                    &[l.input_global; MK_MAX],
                 ),
                 deep,
                 v2,
@@ -4351,7 +4374,8 @@ impl Gemma4Wgpu {
             mk4: None,
         };
 
-        let o_nvfp4 = nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_O_NVFP4");
+        let o_nvfp4 =
+            nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_O_NVFP4");
         let quant_k_max = weights
             .layers
             .iter()
@@ -4388,7 +4412,9 @@ impl Gemma4Wgpu {
         ctx.poll_blocking().map_err(err)?;
         let final_norm = GpuTensor::upload(ctx, "g4w-final-norm", &pack_pairs(&weights.final_norm));
 
-        let lmhead_i8 = nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_LMHEAD_INT8");
+        let lmhead_i8 = nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call(
+            "NV_WGPU_LMHEAD_INT8",
+        );
         let kv_slots = bt_slots.max(1);
         let lmhead_i8_bufs = if lmhead_i8 {
             anyhow::ensure!(
@@ -4577,7 +4603,11 @@ impl Gemma4Wgpu {
             BtBufs {
                 core: PfBufs {
                     splice_rows: GpuTensor::zeroed(ctx, "g4w-bt-splice-rows", h),
-                    splice_mask: GpuTensor::upload(ctx, "g4w-bt-splice-mask", &vec![0u32; s.max(4)]),
+                    splice_mask: GpuTensor::upload(
+                        ctx,
+                        "g4w-bt-splice-mask",
+                        &vec![0u32; s.max(4)],
+                    ),
                     hid_a: GpuTensor::zeroed(ctx, "g4w-bt-hid-a", h),
                     hid_b: GpuTensor::zeroed(ctx, "g4w-bt-hid-b", h),
                     t0: GpuTensor::zeroed(ctx, "g4w-bt-t0", h),
@@ -5227,14 +5257,10 @@ impl Gemma4Wgpu {
                 .any(|p| matches!(p, GpuProj::Nvfp4 { .. }))
         });
         let nvfp4_mk_unservable = layer_gpu.iter().any(|l| {
-            [&l.qkv, &l.o, &l.gate_up, &l.down]
-                .iter()
-                .any(|p| match p {
-                    GpuProj::Nvfp4 { n, k, .. } => {
-                        !(k / 16).is_multiple_of(4) || !n.is_multiple_of(2)
-                    }
-                    _ => false,
-                })
+            [&l.qkv, &l.o, &l.gate_up, &l.down].iter().any(|p| match p {
+                GpuProj::Nvfp4 { n, k, .. } => !(k / 16).is_multiple_of(4) || !n.is_multiple_of(2),
+                _ => false,
+            })
         });
         if nvfp4_mk_unservable {
             if pf_m > 0 {
@@ -5576,8 +5602,9 @@ impl Gemma4Wgpu {
                 };
                 match flash_arm {
                     Some((((f1, f2), fdu), scr)) => {
-                        let tiles =
-                            m.div_ceil(PF_FLASH_TILE_ROWS_BAKED_AS_FDT_ROWS_32_IN_THE_SHARED_TILED_KERNEL);
+                        let tiles = m.div_ceil(
+                            PF_FLASH_TILE_ROWS_BAKED_AS_FDT_ROWS_32_IN_THE_SHARED_TILED_KERNEL,
+                        );
                         b.push(
                             f1.clone(),
                             &[
@@ -5666,9 +5693,16 @@ impl Gemma4Wgpu {
                     (m as u32, 1, 1),
                 );
                 match (&pf_coop, &lg.gate_up_coop) {
-                    (Some(cc), Some(cl)) => {
-                        b.pf_coop_w4a16(cc, cl, pfb.t1.raw(), m, hidden / 2, pfb.gu_pack.raw(), 0, inter)
-                    }
+                    (Some(cc), Some(cl)) => b.pf_coop_w4a16(
+                        cc,
+                        cl,
+                        pfb.t1.raw(),
+                        m,
+                        hidden / 2,
+                        pfb.gu_pack.raw(),
+                        0,
+                        inter,
+                    ),
                     _ => b.gemv_mk(
                         &lg.gate_up,
                         pfb.t1.raw(),
@@ -5702,9 +5736,16 @@ impl Gemma4Wgpu {
                     (ggrid.0, m as u32, 1),
                 );
                 match (&pf_coop, &lg.down_coop) {
-                    (Some(cc), Some(cl)) => {
-                        b.pf_coop_w4a16(cc, cl, pfb.act_pack.raw(), m, inter / 2, pfb.t0.raw(), 0, hidden / 2)
-                    }
+                    (Some(cc), Some(cl)) => b.pf_coop_w4a16(
+                        cc,
+                        cl,
+                        pfb.act_pack.raw(),
+                        m,
+                        inter / 2,
+                        pfb.t0.raw(),
+                        0,
+                        hidden / 2,
+                    ),
                     _ => b.gemv_mk(
                         &lg.down,
                         pfb.act_pack.raw(),
@@ -6841,11 +6882,16 @@ impl Gemma4Wgpu {
             Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
         };
         if dispatch::profile::enabled() && ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> =
-                pf.passes.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)).collect();
+            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = pf
+                .passes
+                .iter()
+                .map(|p| (&*p.pipeline, &p.bind, p.grid))
+                .collect();
             let labels: Vec<String> = pf.passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(ctx, &raw, &labels).map_err(|e| {
-                anyhow::anyhow!("profiled prefill chunk submit (sliced past the 1792-pass query ceiling): {e}")
+                anyhow::anyhow!(
+                    "profiled prefill chunk submit (sliced past the 1792-pass query ceiling): {e}"
+                )
             })?;
         } else {
             let cb = dispatch::encode_pass_list(

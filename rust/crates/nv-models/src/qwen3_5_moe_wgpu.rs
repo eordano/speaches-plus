@@ -89,7 +89,6 @@ pub struct QuantRowsParams {
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SiluPairParams {
-
     pub u_off_elems: u32,
     pub pad0: u32,
     pub pad1: u32,
@@ -524,7 +523,6 @@ impl Builder {
         });
         Ok(())
     }
-
 }
 
 pub fn nvfp4_gemv_source() -> String {
@@ -726,7 +724,9 @@ fn pf_sd_twin(body: &str, entries: &[&str]) -> String {
     for anchor in [PF_SD_K_SCALE_ANCHOR, PF_SD_V_SCALE_ANCHOR] {
         let folded = format!(
             "{}{PF_SD_SCALE_FOLD_2POW120};",
-            anchor.strip_suffix(';').expect("scale anchors end the statement")
+            anchor
+                .strip_suffix(';')
+                .expect("scale anchors end the statement")
         );
         sd = sd.replacen(anchor, &folded, 1);
     }
@@ -805,8 +805,10 @@ pub fn pf_flash_tiled_source_sd(subgroup: bool) -> String {
             "q3w_pf_flash1_fp8kv_tiled_slotml_sg",
         ]);
     }
-    let sd = pf_sd_twin(body, &entries)
-        .replace("e4m3_decode(", "e4m3_shift_decode_scale_must_carry_2pow120(");
+    let sd = pf_sd_twin(body, &entries).replace(
+        "e4m3_decode(",
+        "e4m3_shift_decode_scale_must_carry_2pow120(",
+    );
     compose(&format!("{}\n{}", wk::flash_decode::WGSL, sd))
 }
 
@@ -1140,7 +1142,9 @@ fn pf_gemm_bf16_mrow_source(m: usize) -> String {
     );
     b.push_str("                }\n");
     b.push_str("            } else {\n");
-    b.push_str("                gm_y[mi * gm_p.y_stride_words + (base >> 1u)] = bf16_pack(lo, hi);\n");
+    b.push_str(
+        "                gm_y[mi * gm_p.y_stride_words + (base >> 1u)] = bf16_pack(lo, hi);\n",
+    );
     b.push_str("            }\n");
     b.push_str("        }\n");
     b.push_str("    }\n}\n");
@@ -1701,7 +1705,10 @@ impl Qwen3MoeWgpu {
         self.rope_cs_buffers.len()
     }
 
-    pub fn read_attn_qf32_and_out_for_test(&self, attn_layer: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+    pub fn read_attn_qf32_and_out_for_test(
+        &self,
+        attn_layer: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let (qf, at) = self
             .attn_probes
             .get(attn_layer)
@@ -1888,15 +1895,17 @@ impl Qwen3MoeWgpu {
         let mixed_out = b.zeros("q3w-mix", (hidden_words * 4) as u64);
         let moe_out = b.zeros("q3w-moeout", (hidden_words * 4) as u64);
 
-        let pf_mrow_m = if pf_mrow_default_on_since_real_weights_first_token_parity_and_1_84x_at_8k() {
-            let mut m = prefill_m().min(PF_MROW_M_MAX_VIA_16_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS);
-            if m > PF_MROW_GEMM_M_MAX && m % PF_MROW_GEMM_M_MAX == 1 {
-                m -= 1;
-            }
-            m
-        } else {
-            0
-        };
+        let pf_mrow_m =
+            if pf_mrow_default_on_since_real_weights_first_token_parity_and_1_84x_at_8k() {
+                let mut m =
+                    prefill_m().min(PF_MROW_M_MAX_VIA_16_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS);
+                if m > PF_MROW_GEMM_M_MAX && m % PF_MROW_GEMM_M_MAX == 1 {
+                    m -= 1;
+                }
+                m
+            } else {
+                0
+            };
         let mut pf_mrow: Option<PfMrowBufs> = if pf_mrow_m >= 2 {
             let m = pf_mrow_m;
             anyhow::ensure!(
@@ -1908,7 +1917,9 @@ impl Qwen3MoeWgpu {
             let mk_groups = m.div_ceil(PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS);
             let fd = ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("q3w-pf-fd"),
-                size: (m + mk_groups + PF_FD_ONE_TRAILING_SLOT_VIEWS_THE_WHOLE_CHUNK_FOR_TILED_FLASH)
+                size: (m
+                    + mk_groups
+                    + PF_FD_ONE_TRAILING_SLOT_VIEWS_THE_WHOLE_CHUNK_FOR_TILED_FLASH)
                     as u64
                     * PF_MROW_BIND_OFFSET_ALIGN_BYTES,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -2230,7 +2241,12 @@ impl Qwen3MoeWgpu {
                     "q3w-vf-resadd",
                     &s.resscale,
                     "residual_add_scale_bf16",
-                    &[(0, &moe_out_rows), (1, &res_rows), (2, &res2_rows), (3, &vp)],
+                    &[
+                        (0, &moe_out_rows),
+                        (1, &res_rows),
+                        (2, &res2_rows),
+                        (3, &vp),
+                    ],
                     grid,
                 )?;
                 let tok = b.zeros("q3w-vf-tok", (m * 4) as u64);
@@ -2786,12 +2802,12 @@ impl Qwen3MoeWgpu {
         let stride = PF_MROW_BIND_OFFSET_ALIGN_BYTES as usize;
         let rows = PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS;
         let groups = m.div_ceil(rows);
-        let mut fdb =
-            vec![
-                0u8;
-                (m + groups + PF_FD_ONE_TRAILING_SLOT_VIEWS_THE_WHOLE_CHUNK_FOR_TILED_FLASH)
-                    * stride
-            ];
+        let mut fdb = vec![
+            0u8;
+            (m + groups
+                + PF_FD_ONE_TRAILING_SLOT_VIEWS_THE_WHOLE_CHUNK_FOR_TILED_FLASH)
+                * stride
+        ];
         for (t, slot) in fdb.chunks_exact_mut(stride).enumerate() {
             let mut fd = self.fd_base;
             if t < m {
@@ -2899,10 +2915,7 @@ impl Qwen3MoeWgpu {
             fd.total = (self.pos + i + 1) as u32;
             host.extend_from_slice(bytemuck::bytes_of(&fd));
         }
-        let list = self
-            .pf_list
-            .clone()
-            .expect("prefill chunk without pf list");
+        let list = self.pf_list.clone().expect("prefill chunk without pf list");
         self.ctx.queue.write_buffer(&list, 0, &host);
         let scope = if self.pf_validated {
             None
@@ -3190,7 +3203,10 @@ impl Qwen3MoeWgpu {
         chunk: &[u32],
         rows: &[(usize, &[u32])],
     ) -> Result<()> {
-        let e = self.pfm.as_ref().expect("M-row spliced chunk without the pf list");
+        let e = self
+            .pfm
+            .as_ref()
+            .expect("M-row spliced chunk without the pf list");
         let m = e.m;
         let hidden_words = self.config.hidden_size / 2;
         anyhow::ensure!(
@@ -3479,7 +3495,9 @@ struct Q8eParams {
 }
 
 fn fuse_silu_quant_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q3_WGPU_FUSE_SILU_QUANT")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_Q3_WGPU_FUSE_SILU_QUANT",
+    )
 }
 
 pub fn quant_lane_mode() -> Option<usize> {
@@ -3845,7 +3863,9 @@ fn mrow2_upgrade(
 ) -> (wk::gemv_nvfp4_v2::V2Kernel, &'static str) {
     let mrow2 = wk::gemv_nvfp4_v2::V2Kernel::MRow2;
     if pk_entry != wk::gemv_nvfp4_v2::MROW_PK_ENTRY
-        || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q3_WGPU_NVFP4_MROW2")
+        || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_Q3_WGPU_NVFP4_MROW2",
+        )
         || !mrow2.shape_ok(k)
         || !wk::gemv_nvfp4_v2::pk_capable(mrow2, cfg)
     {
@@ -4383,11 +4403,20 @@ fn pf_push_gemm_bf16_m(
                      pf_mrow_m and gemm_tail disagree"
                 )
             })?;
-            anyhow::ensure!(*tr == rows, "{label}: tail kernel is {tr} rows, want {rows}");
+            anyhow::ensure!(
+                *tr == rows,
+                "{label}: tail kernel is {tr} rows, want {rows}"
+            );
             (ts, te)
         };
         if done == 0 {
-            b.push(label, src, entry, &[(0, &w.w), (1, x), (2, &p), (3, y)], grid)?;
+            b.push(
+                label,
+                src,
+                entry,
+                &[(0, &w.w), (1, x), (2, &p), (3, y)],
+                grid,
+            )?;
         } else {
             let xb = (done * x_stride_words * 4) as u64;
             let yb = (done * y_stride_words * 4) as u64;
@@ -4453,7 +4482,14 @@ fn pf_push_gemv_i8_slots(
         label,
         &s.i8e,
         entry,
-        &[(0, &ex.w), (1, &ex.s), (2, x), (3, y), (4, &p), (5, sel_zeros)],
+        &[
+            (0, &ex.w),
+            (1, &ex.s),
+            (2, x),
+            (3, y),
+            (4, &p),
+            (5, sel_zeros),
+        ],
         (groups, 1, slots as u32),
     )
 }
@@ -5823,95 +5859,95 @@ fn build_attn(
                 (((n_h * hd / 2) as u32).div_ceil(64), m as u32, 1),
             )?;
         } else {
-        for t in 0..m as u64 {
-            let posb = t * (PF_MROW_POS_STRIDE_WORDS as u64 * 4);
-            let fdb = t * PF_MROW_BIND_OFFSET_ALIGN_BYTES;
-            b.push_pf_off(
-                "q3w-pf-at-qknorm",
-                &s.attn,
-                "q3w_attn_norm_rope_qk",
-                &[
-                    (0, &at.q_raw, t * qraw_bytes),
-                    (1, &qkn, 0),
-                    (2, &csb, 0),
-                    (3, &p.pos_strided_one_i32_per_256b_slot, posb),
-                    (4, &at.k_raw, t * kraw_bytes),
-                    (5, &at.q, t * at.q_stride_bytes),
-                    (6, &np, 0),
-                    (7, &at.q_f32, t * at.qf32_stride_bytes),
-                    (8, &at.k, t * at.k_stride_bytes),
-                ],
-                ((n_h + n_kv) as u32, 1, 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-at-kvq-k",
-                &s.kvq,
-                wk::kv_fp8::QUANTIZE_ENTRY,
-                &[
-                    (0, &at.k, t * at.k_stride_bytes),
-                    (1, &kc, 0),
-                    (2, &ksc, 0),
-                    (3, &p.pos_strided_one_i32_per_256b_slot, posb),
-                    (4, &kvq_p, 0),
-                ],
-                (n_kv as u32, 1, 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-at-kvq-v",
-                &s.kvq,
-                wk::kv_fp8::QUANTIZE_ENTRY,
-                &[
-                    (0, &at.vk_raw, t * vkraw_bytes),
-                    (1, &vc, 0),
-                    (2, &vsc, 0),
-                    (3, &p.pos_strided_one_i32_per_256b_slot, posb),
-                    (4, &kvq_p, 0),
-                ],
-                (n_kv as u32, 1, 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-at-flash1",
-                &s.flash,
-                if flash_sd_enabled() {
-                    wk::flash_decode::ENTRY_STAGE1_FP8_SD
-                } else {
-                    wk::flash_decode::ENTRY_STAGE1_FP8
-                },
-                &[
-                    (0, &at.q_f32, t * at.qf32_stride_bytes),
-                    (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                    (5, &kc, 0),
-                    (6, &vc, 0),
-                    (7, &scratch, 0),
-                    (8, &ksc, 0),
-                    (9, &vsc, 0),
-                ],
-                (n_h as u32, flash_splits(), 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-at-flash2",
-                &s.flash,
-                wk::flash_decode::ENTRY_STAGE2,
-                &[
-                    (3, &at.attn, t * at.attn_stride_bytes),
-                    (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                    (7, &scratch, 0),
-                ],
-                (n_h as u32, 1, 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-at-gate",
-                &s.attn,
-                "q3w_attn_gate",
-                &[
-                    (30, &at.attn, t * at.attn_stride_bytes),
-                    (31, &at.q_raw, t * qraw_bytes),
-                    (32, &at.gated, t * gated_bytes),
-                    (33, &agp, 0),
-                ],
-                gate_grid,
-            )?;
-        }
+            for t in 0..m as u64 {
+                let posb = t * (PF_MROW_POS_STRIDE_WORDS as u64 * 4);
+                let fdb = t * PF_MROW_BIND_OFFSET_ALIGN_BYTES;
+                b.push_pf_off(
+                    "q3w-pf-at-qknorm",
+                    &s.attn,
+                    "q3w_attn_norm_rope_qk",
+                    &[
+                        (0, &at.q_raw, t * qraw_bytes),
+                        (1, &qkn, 0),
+                        (2, &csb, 0),
+                        (3, &p.pos_strided_one_i32_per_256b_slot, posb),
+                        (4, &at.k_raw, t * kraw_bytes),
+                        (5, &at.q, t * at.q_stride_bytes),
+                        (6, &np, 0),
+                        (7, &at.q_f32, t * at.qf32_stride_bytes),
+                        (8, &at.k, t * at.k_stride_bytes),
+                    ],
+                    ((n_h + n_kv) as u32, 1, 1),
+                )?;
+                b.push_pf_off(
+                    "q3w-pf-at-kvq-k",
+                    &s.kvq,
+                    wk::kv_fp8::QUANTIZE_ENTRY,
+                    &[
+                        (0, &at.k, t * at.k_stride_bytes),
+                        (1, &kc, 0),
+                        (2, &ksc, 0),
+                        (3, &p.pos_strided_one_i32_per_256b_slot, posb),
+                        (4, &kvq_p, 0),
+                    ],
+                    (n_kv as u32, 1, 1),
+                )?;
+                b.push_pf_off(
+                    "q3w-pf-at-kvq-v",
+                    &s.kvq,
+                    wk::kv_fp8::QUANTIZE_ENTRY,
+                    &[
+                        (0, &at.vk_raw, t * vkraw_bytes),
+                        (1, &vc, 0),
+                        (2, &vsc, 0),
+                        (3, &p.pos_strided_one_i32_per_256b_slot, posb),
+                        (4, &kvq_p, 0),
+                    ],
+                    (n_kv as u32, 1, 1),
+                )?;
+                b.push_pf_off(
+                    "q3w-pf-at-flash1",
+                    &s.flash,
+                    if flash_sd_enabled() {
+                        wk::flash_decode::ENTRY_STAGE1_FP8_SD
+                    } else {
+                        wk::flash_decode::ENTRY_STAGE1_FP8
+                    },
+                    &[
+                        (0, &at.q_f32, t * at.qf32_stride_bytes),
+                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
+                        (5, &kc, 0),
+                        (6, &vc, 0),
+                        (7, &scratch, 0),
+                        (8, &ksc, 0),
+                        (9, &vsc, 0),
+                    ],
+                    (n_h as u32, flash_splits(), 1),
+                )?;
+                b.push_pf_off(
+                    "q3w-pf-at-flash2",
+                    &s.flash,
+                    wk::flash_decode::ENTRY_STAGE2,
+                    &[
+                        (3, &at.attn, t * at.attn_stride_bytes),
+                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
+                        (7, &scratch, 0),
+                    ],
+                    (n_h as u32, 1, 1),
+                )?;
+                b.push_pf_off(
+                    "q3w-pf-at-gate",
+                    &s.attn,
+                    "q3w_attn_gate",
+                    &[
+                        (30, &at.attn, t * at.attn_stride_bytes),
+                        (31, &at.q_raw, t * qraw_bytes),
+                        (32, &at.gated, t * gated_bytes),
+                        (33, &agp, 0),
+                    ],
+                    gate_grid,
+                )?;
+            }
         }
         push_quant_rows(
             b,
@@ -6629,7 +6665,7 @@ fn build_moe(
         let sel_slots: &wgpu::Buffer = &mo.sel_flat;
         let grouped_on = pf_token_parallel_default_on_escape_to_per_token_copies()
             && pf_moe_grouped_default_on_reuses_expert_weight_loads_across_sorted_slots()
-            && e + 1 <= 257;
+            && e < 257;
         if grouped_on {
             let psp = b.uni(
                 "q3w-pf-moe-sort-p",
@@ -6644,12 +6680,7 @@ fn build_moe(
                 "q3w-pf-moe-sort",
                 &s.pf_moe,
                 "q3w_pf_group_slots_by_expert_for_weight_load_reuse",
-                &[
-                    (5, &psp),
-                    (6, &mo.ids),
-                    (7, &mo.sel_sorted),
-                    (8, &mo.perm),
-                ],
+                &[(5, &psp), (6, &mo.ids), (7, &mo.sel_sorted), (8, &mo.perm)],
                 (1, 1, 1),
             )?;
         }

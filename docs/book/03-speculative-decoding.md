@@ -332,8 +332,9 @@ positions `committed + depth` where depth is `[0, 1, 2, 3, 1, 2]` (the
 `VERIFY_TREE_TWO_BRANCH_M6_*` constants in `qwen3_5_moe.rs`). Branch A is the
 ordinary top-1 draft chain; branch B is the drafter's top-2 token at the first
 draft position plus one continuation drafted from it (one extra drafter step
-per round, its step-0 hidden reused). The env needs `NV_MTP_K=3`,
-`NV_Q38_DRAFT_FAST=1` and refuses the `NV_Q38_MTP_P_MIN` cut; suffix rounds
+per round, its step-0 hidden reused). The env needs `NV_MTP_K=3` and the
+default-on `NV_Q38_DRAFT_FAST` device-chained draft loop (`=0` refuses the
+tree), and refuses the `NV_Q38_MTP_P_MIN` cut; suffix rounds
 bypass the tree, so the sufspec composition rule is unchanged.
 
 Three mechanisms once pinned the verify to chains; each now has a tree arm:
@@ -347,7 +348,7 @@ Three mechanisms once pinned the verify to chains; each now has a tree arm:
   `gdn_tree_parity` at the q38 serving shape. The non-mrow row-sequential GDN
   fallbacks refuse tree rounds (`lin_attn_step` errors instead of committing
   lossy logits), so the tree requires the mrow chunk path
-  (`NV_Q38_VERIFY_TC=1` or `NV_Q38_MROW_VERIFY=1`).
+  (`NV_Q38_VERIFY_TC` on -- the default -- or `NV_Q38_MROW_VERIFY=1`).
 - **Attention parent-path masks.** Tree rounds route between the same two
   mk-verify arms as chains (the `NV_Q38_MK_VERIFY_KVSHARE` knee gate decides),
   and both arms carry the hole. Each row keeps its chain suffix window
@@ -423,7 +424,7 @@ the logits readback are all row-count-proportional, so m=6 verify costs
 ~+1.4 ms over m=4 at depth 256 growing to ~+4 ms at 32768. On the champion
 basis (suffix on, kvshare knee gate) the tree measures -2.4% to -14.6%
 effective decode tok/s across 256/8192/32768 and the three workload classes
-(`perf/runs.jsonl` build_name `q38 tree`, the `it2` rows). Two changes could
+(the private run ledger build_name `q38 tree`, the `it2` rows). Two changes could
 move the economics. A row-shared m-row attention exists as a third
 verify arm (`NV_Q38_MK_VERIFY_ROWSHARED`, one launch scoring an smem KV tile
 against all m x group query rows, holes included) but does not move them on
@@ -442,7 +443,7 @@ are green (`fp8_mk_ratio_oracle`, `qwen38_tctile_gate`). Forced on the
 champion basis it measures round_ms_median 32.7->30.7 at 8192, 36.6->32.8 at
 32768, and 63.8->45.5 at 172032 -- effective decode 46.3->61.6 tok/s, +33%
 at the depth where attention dominates the round -- and loses only at 256
-where the gate would run the mk arm anyway (`perf/runs.jsonl` build_name
+where the gate would run the mk arm anyway (the private run ledger build_name
 'q38 tctile'). Stream identity cannot gate it:
 mma tiles reassociate the score sums, the bf16 attention output sits 1-2 ulp
 from the mk arm's, and the MoE router amplifies that into confidently
@@ -452,8 +453,10 @@ reorders its l/acc sums). The certification that ships it is
 baseline-calibrated aggregates instead (`qwen38_tctile_cert.rs`, rows
 'q38 tctile-cert'): acceptance and tokens-per-round per workload class,
 self-scored NLL of the emitted text through the shared plain path, and a
-teacher-forced verify-walk vs the accepted arm's own bands; the fleet
-profile sets `NV_Q38_MK_VERIFY_TCTILE=gate` on that basis.
+teacher-forced verify-walk vs the accepted arm's own bands; on that basis
+`NV_Q38_MK_VERIFY_TCTILE` unset (or `=gate`) engages the arm at or past
+the 8192 knee by default, `=1` forces it always-on, and `=0` restores the
+pre-champion mk ladder.
 `NV_Q38_CERT_VARIANTS` adds prompt variants per class and the measured
 variance rule: within-class prompt scatter (accept sd up to 0.26 tiled,
 0.05-0.10 agentic) dominates any arm effect, matched-prompt deltas
@@ -530,6 +533,59 @@ checking stop conditions after each append so a sequence can finish mid-round.
 Blocks are allocated for `1 + draft_len()` slots up front, and a sequence that
 cannot be extended has its drafts cleared and is preempted back to `Waiting`
 rather than failed.
+
+### The qwen3.8 verify row range: contiguous 2..=24, one launch shape to 8
+
+The mk verify attention route (`mk_verify_route_available`) serves any row
+count in 2..=24
+(`MK_VERIFY_ROWS_MAX_24_ROWS_PAST_8_CHUNK_THROUGH_THE_8_ROW_TEMPLATES_AND_24_TIMES_32_SPLITS_FILLS_THE_SCRATCH_POOL`).
+The CUDA row switches in `flash_decode.cu` instantiate the splitk mk kernel at
+rows 1..8 only; a block deeper than 8 is chunked inside
+`nv_kernels_flash_decode_fused_fp8kv_mk_paged` into 8-row launches whose
+per-chunk `delta` reproduces each row's global attention bounds exactly — the
+same algebra the head-dim-512 path uses — so every common row of two different
+block depths is bitwise identical. Giant-M template instantiations are the
+wrong shape here: per-thread accumulators scale with M, and the register spill
+they cause at deep KV costs more than the chunk's extra KV read (measured and
+removed; `q38-mrow-past8-measured-20260904`). Each row switch carries a
+`default:` returning rc −31, so a row count with no case is a loud error, never
+a silently-empty launch that times fast.
+
+Two structures stop at 8 by design and stay there: the rowshared/tctile
+one-launch arms (their `qsh` smem block and `warp % M` row map are 8-row
+layouts; `one_launch_rows_fit` excludes deeper blocks, which fall to the
+chunked mk ladder) and the serving draft ceiling
+(`SUFFIX_DRAFT_OVERRIDE_CEILING_7_BECAUSE_DEEP_RUNGS_ARE_PRICED_BUT_THE_TCTILE_ARM_STOPS_AT_8_THE_GDN_MROW_CAP_AT_16_AND_ONLY_THE_TCTILE_CERT_MAY_FLIP_IT`).
+The GDN mrow verify path serves rows to
+`MROW_VERIFY_ROWS_MAX_16_THE_GDN_CHUNK_KERNEL_T_CAP`; a deeper block drops its
+GDN layers to the sequential scan, which dominates the block's cost at every
+depth.
+
+**What holds and what drifts across depths.** Row 0 of a verify block is
+bitwise m-invariant through m=8 — two gates hold it: the nv-models ladder gate
+(`mk_verify_rows_are_bitwise_m_invariant_across_the_rung_ladder_2_to_24...`)
+compares every common-prefix row bitwise across rungs at the kernel level, and
+`qwen38_verify_m_invariance` sweeps the rung ladder eager and graphed on the
+real checkpoint. Past m=8 row 0 drifts by up to a scale step because
+`matmul_fp8`'s host path quantizes activations with a dynamic per-tensor amax
+over the whole m-row block: deeper blocks can move the block amax, which moves
+row 0's fp8 bytes. That drift is quantization-scale jitter, not a wrong path —
+the gate bounds it
+(`ROW0_DRIFT_BAND_8_0_PAST_THE_CONTIGUOUS_CAP...`) and requires top-1
+agreement — but it means a deeper-than-8 verify is not bit-lossless against
+decode until that activation scale is per-row. `NV_VERIFY_ONE_ARITH_ROWS`
+(default 8; serving never exceeds 8) extends the fp8 LT span-4 plan pinning so
+rows past 8 ride the same GEMM plan family as rows below it.
+
+**The t(m) economics** (`q38-mrow-past8-measured-20260904`, measured via
+`NV_Q38_MROW_PAST8=1` on `qwen38_mrow_slope_ledger`): the per-row cost stays on
+the shallow-depth linear fit through m=16, so a D≈16 adaptive draft pays for
+itself below the tctile knee. Past the knee the deep rows lose the tctile arm
+and pay the mk-ladder premium per chunk, and a 24-row block additionally pays
+the GDN sequential-scan fallback. Lifting either cliff — chunking the tctile
+arm past 8, or raising the GDN mrow cap — is priced in that row; a serving flip
+of the draft ceiling is judged on `qwen38_tctile_cert`, never on the tiled
+comparator.
 
 ### Why the wgpu dense graph has no verify path
 
@@ -772,6 +828,12 @@ numerically identical to one `sdpa`**; short prompts stay a single block.
 `NV_DFLASH_NO_GRAPH`, `NV_DFLASH_GRAPH_EAGER`, `NV_LAGUNA_GRAPH`,
 `NV_LAGUNA_DFLASH_GRAPH`, `NV_MK_VERIFY_HD512`.
 
+*Deep verify rows (measurement only; serving stays at draft ceiling 7):*
+`NV_VERIFY_ONE_ARITH_ROWS` (default 8, max 24 — extends the fp8 LT span-4 plan
+pinning past 8 rows so deep rungs ride the m≤8 plan family),
+`NV_Q38_MROW_PAST8=1` (adds rungs 12/16/24 to `qwen38_mrow_slope_ledger` and
+sets the former), `NV_NVFP4_GEMV_ROWS` (m1-gemv route row ceiling, default 8).
+
 *Laguna serving:* `NV_LAGUNA_SERVE_SPEC`, `NV_LAGUNA_SERVE_DRAFT`,
 `NV_LAGUNA_DFLASH_DIR`, `NV_LAGUNA_SERVE_STATS`, `NV_LAGUNA_HOST_SAMPLE`,
 `NV_LAGUNA_TAP_LIST`, `NV_LAGUNA_NORM_MODE`, `NV_LAGUNA_FP8_KV`,
@@ -788,7 +850,10 @@ rate.
 `NV_EAGLE_DRAFT_F32`, `NV_DFLASH_ROPE_THETA`, `NV_DFLASH_ROPE_THETA_POLICY`,
 `NV_DFLASH_ROPE_THETA_DEPTH_CTX`, `NV_DFLASH_WINDOW_MODE`, `NV_SPEC_VEGAS`,
 `NV_SPEC_VEGAS_K`, `NV_Q38_DRAFT_FP8`, `NV_Q38_DRAFT_FAST`,
-`NV_Q38_MTP_REANCHOR`.
+`NV_Q38_MTP_REANCHOR` (user-signed default-on, 2026-09-11; `=0` restores pre-norm input), `NV_Q38_DRAFTER_KV_FP8` (default-on; `=0` restores
+the bf16 drafter KV), `NV_Q38_DRAFTER_ATTN_TC` (default-on; `=0` restores
+the scalar drafter QK), `NV_Q38_DRAFTER_KV_WINDOW` (opt-in ring, rides the
+fp8 drafter KV).
 
 *Accept path and windows:* `NV_SPEC_NO_GPU_ACCEPT`, `NV_DFLASH_HOST_ACCEPT`,
 `NV_DFLASH_HOST_CTX`, `NV_DFLASH_DEVICE_DRAFTS`, `NV_DFLASH_DEVICE_ROUND`,
@@ -819,6 +884,6 @@ contract); 04-kernels-and-quantization.md (`tree_verify_attn_bf16`,
 `argmax_bf16`, `dflash_accept_f32`, `token_map_u32`); 05-backends.md (why the
 graph and accept kernels are CUDA-only, and `wgpu_spec.rs` as the portable
 reference); 06-serving-surface.md (`x-spec-decode`, streaming, admission control
-pricing a cached verify graph as sticky VRAM); 08.4-PERFORMANCE.md — every
+pricing a cached verify graph as sticky VRAM); the basis-tuple quoting rule — every
 number deliberately omitted from this chapter needs a basis tuple to be
 quotable.

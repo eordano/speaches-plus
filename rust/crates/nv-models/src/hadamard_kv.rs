@@ -45,7 +45,7 @@ pub fn rotate_row(row: &mut [f32]) -> Result<()> {
 }
 
 pub fn rotate_rows(vals: &mut [f32], head_dim: usize) -> Result<()> {
-    if head_dim == 0 || vals.len() % head_dim != 0 {
+    if head_dim == 0 || !vals.len().is_multiple_of(head_dim) {
         bail!(
             "hadamard_kv: {} values do not divide into rows of {head_dim}",
             vals.len()
@@ -65,7 +65,11 @@ pub fn hadamard_matrix(n: usize, dtype: DType, device: &Device) -> Result<Tensor
     let mut m = vec![0f32; n * n];
     for (r, row) in m.chunks_mut(n).enumerate() {
         for (c, v) in row.iter_mut().enumerate() {
-            let sign = if (r & c).count_ones() % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (r & c).count_ones() % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
             *v = sign * inv;
         }
     }
@@ -250,7 +254,8 @@ mod tests {
     #[test]
     fn the_rotation_is_off_until_its_env_var_is_set() {
         assert!(
-            !hadamard_kv_enabled() || nv_config::env_arm_opt_in_eq_some_1_reread_every_call(HADAMARD_KV_ENV),
+            !hadamard_kv_enabled()
+                || nv_config::env_arm_opt_in_eq_some_1_reread_every_call(HADAMARD_KV_ENV),
             "the rotation changes stored K bit-for-bit, so it is a numerical default and may \
              not arrive without being asked for"
         );

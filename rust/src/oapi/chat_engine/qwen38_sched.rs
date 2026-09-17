@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
+#[cfg(feature = "cuda")]
 use super::*;
 
 pub(crate) const Q38_SCHED_POLICY_FORMATION_WINDOW_THEN_SOLO_XOR_GROUP: &str =
@@ -8,7 +9,8 @@ pub(crate) const Q38_SCHED_POLICY_FORMATION_WINDOW_THEN_SOLO_XOR_GROUP: &str =
      MTP/eager path, two or more run as a lane group with MTP bypassed for the whole group; the \
      window is a deadline, never a sleep: a companion already queued or arriving mid-window \
      forms the group the moment it lands, because the first lane prefill outlasts the window \
-     anyway";
+     anyway; NV_CHAT_QUEUE_MS bounds pending work, and zero reserves an idle dispatcher with \
+     no formation wait or rejects immediately when any accepted work remains";
 
 pub(crate) const Q38_SCHED_POLICY_LATE_JOINERS_WAIT_FOR_FULL_GROUP_DRAIN: &str =
     "a group admits joiners while its formation prefills run, capped at the lane count, and \
@@ -34,8 +36,8 @@ pub(crate) const GROUP_FORMATION_PREFILL_WALL_IS_THE_GDN_PREFILL_SCAN_NOT_THE_LA
 
 pub(crate) fn group_formation_prefill_scan_arm() -> &'static str {
     let _ = GROUP_FORMATION_PREFILL_WALL_IS_THE_GDN_PREFILL_SCAN_NOT_THE_LANE_COUNT_SO_STREAM_CONCURRENCY_IS_THE_WRONG_LEVER;
-    if nv_layers::linear_attn::chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths()
-    {
+    if nv_layers::linear_attn::chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths(
+    ) {
         "gdn_chunk"
     } else {
         "gdn_candle_token_sequential"
@@ -148,6 +150,7 @@ pub(crate) use gpu::*;
 #[cfg(feature = "cuda")]
 mod gpu {
     use super::*;
+    use crate::oapi::chat::EngineBusy;
     use nv_models::qwen3_5_moe::qwen36_batch::Qwen36BatchLanes;
     use nv_models::qwen3_5_moe::qwen38_batch::form_pack_env_opt_in_nv_q38_form_pack_1_packed_formation_prefill_rides_the_m_row_gemm_routes_so_it_requires_nv_q38_batch_gemm_1 as form_pack_env;
     use nv_models::qwen3_5_moe::qwen38_batch::Qwen38BatchLanes;
@@ -172,7 +175,8 @@ mod gpu {
         std::env::var("NV_Q38_SOLO_VIA_LANES").ok().as_deref() == Some("1")
     }
 
-    pub(crate) const Q38_SCHED_PACKED_FORMATION_PREFILLS_EVERY_ADMITTED_LANE_IN_ONE_WIDE_CALL: &str =
+    pub(crate) const Q38_SCHED_PACKED_FORMATION_PREFILLS_EVERY_ADMITTED_LANE_IN_ONE_WIDE_CALL:
+        &str =
         "with NV_Q38_FORM_PACK=1 (which requires NV_Q38_BATCH_GEMM=1) an all-greedy group defers \
          its per-lane prefills until admission closes and runs them as one packed forward whose \
          ffn, norms and head ride the packed rows while each mixer segment runs the solo prefill \
@@ -185,6 +189,98 @@ mod gpu {
     pub(crate) struct SchedJob {
         pub(crate) req: ChatGenerateRequest,
         pub(crate) tx: mpsc::Sender<ChatEvent>,
+        admitted: tokio::sync::oneshot::Sender<()>,
+        deadline: Option<Instant>,
+        reservation: SchedReservation,
+    }
+
+    struct SchedReservation(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl SchedReservation {
+        fn acquire(
+            outstanding: &Arc<std::sync::atomic::AtomicUsize>,
+            only_if_idle: bool,
+        ) -> Option<Self> {
+            use std::sync::atomic::Ordering;
+            if only_if_idle {
+                outstanding
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .ok()?;
+            } else {
+                outstanding.fetch_add(1, Ordering::AcqRel);
+            }
+            Some(Self(outstanding.clone()))
+        }
+    }
+
+    impl Drop for SchedReservation {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    impl SchedJob {
+        fn is_waiting(&self) -> bool {
+            !self.tx.is_closed()
+                && !self.admitted.is_closed()
+                && self
+                    .deadline
+                    .is_none_or(|deadline| Instant::now() < deadline)
+        }
+
+        fn formation_window_ms(&self, configured: u64) -> u64 {
+            if self.deadline.is_none() {
+                0
+            } else {
+                configured
+            }
+        }
+
+        fn claim(
+            self,
+        ) -> Option<(
+            ChatGenerateRequest,
+            mpsc::Sender<ChatEvent>,
+            SchedReservation,
+        )> {
+            if !self.is_waiting() {
+                return None;
+            }
+            self.admitted.send(()).ok()?;
+            Some((self.req, self.tx, self.reservation))
+        }
+    }
+
+    async fn reject_unclaimed_job_at_deadline(
+        mut admitted: tokio::sync::oneshot::Receiver<()>,
+        tx: mpsc::Sender<ChatEvent>,
+        lanes: usize,
+        queued_at: Instant,
+        deadline: Option<Instant>,
+    ) {
+        let accepted = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            result = async {
+                match deadline {
+                    Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut admitted).await,
+                    None => Ok((&mut admitted).await),
+                }
+            } => {
+                match result {
+                    Ok(Ok(())) => true,
+                    Ok(Err(_)) => false,
+                    Err(_) => {
+                        admitted.close();
+                        admitted.try_recv().is_ok()
+                    }
+                }
+            }
+        };
+        if !accepted {
+            let busy = EngineBusy::new(lanes, queued_at.elapsed().as_millis() as u64);
+            let _ = tx.try_send(ChatEvent::Error(busy.to_string()));
+        }
     }
 
     pub(crate) const SCHED_SENDS_TIME_OUT_AND_EVICT_BECAUSE_ONE_UNREAD_CLIENT_CHANNEL_PARKED_EVERY_LANE_ON_THE_SINGLE_THREAD_DISPATCHER_COST_THE_STALLED_CLIENT_LOSES_ITS_STREAM_AFTER_NV_SSE_SEND_TIMEOUT_MS_AND_0_RESTORES_THE_OLD_INFINITE_WAIT:
@@ -404,9 +500,10 @@ mod gpu {
     }
 
     pub(crate) struct QwenBatchScheduler {
-        jobs: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SchedJob>>>,
+        jobs: std::sync::Mutex<Option<mpsc::Sender<SchedJob>>>,
         worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
         lanes_n: usize,
+        outstanding: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl QwenBatchScheduler {
@@ -431,8 +528,11 @@ mod gpu {
                 ),
                 _ => {}
             }
-            let (jobs_tx, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
             let lanes_n = lanes.lanes();
+            let queued_jobs = lanes_n.max(chat_permits(
+                std::env::var("NV_CHAT_CONCURRENCY").ok().as_deref(),
+            ));
+            let (jobs_tx, jobs_rx) = mpsc::channel(queued_jobs);
             let worker = std::thread::Builder::new()
                 .name("qwen-batch-sched".into())
                 .spawn(move || {
@@ -456,6 +556,7 @@ mod gpu {
                 jobs: std::sync::Mutex::new(Some(jobs_tx)),
                 worker: std::sync::Mutex::new(Some(worker)),
                 lanes_n,
+                outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }))
         }
 
@@ -468,28 +569,64 @@ mod gpu {
             req: ChatGenerateRequest,
             tx: mpsc::Sender<ChatEvent>,
         ) -> anyhow::Result<()> {
+            let queue_ms = chat_queue_ms(std::env::var("NV_CHAT_QUEUE_MS").ok().as_deref());
+            self.submit_with_queue_ms(req, tx, queue_ms)
+        }
+
+        fn submit_with_queue_ms(
+            &self,
+            req: ChatGenerateRequest,
+            tx: mpsc::Sender<ChatEvent>,
+            queue_ms: u64,
+        ) -> anyhow::Result<()> {
+            if tx.is_closed() {
+                return Ok(());
+            }
+            let busy = || anyhow::Error::new(EngineBusy::new(self.lanes_n, 0));
+            let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+                busy().context(format!("qwen scheduler needs a request runtime: {e}"))
+            })?;
             let guard = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
             let sender = guard
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("qwen batch scheduler is shut down"))?;
+                .ok_or_else(|| busy().context("qwen batch scheduler is shut down"))?;
+            let reservation = SchedReservation::acquire(&self.outstanding, queue_ms == 0)
+                .ok_or_else(|| busy().context("zero queue wait requires an idle qwen scheduler"))?;
+            let queued_at = Instant::now();
+            let deadline =
+                (queue_ms > 0).then(|| queued_at + std::time::Duration::from_millis(queue_ms));
+            let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
             sender
-                .send(SchedJob { req, tx })
-                .map_err(|_| anyhow::anyhow!("qwen batch scheduler dispatcher exited"))
+                .try_send(SchedJob {
+                    req,
+                    tx: tx.clone(),
+                    admitted: admitted_tx,
+                    deadline,
+                    reservation,
+                })
+                .map_err(|e| {
+                    busy().context(match e {
+                        mpsc::error::TrySendError::Full(_) => "qwen batch scheduler queue is full",
+                        mpsc::error::TrySendError::Closed(_) => {
+                            "qwen batch scheduler dispatcher exited"
+                        }
+                    })
+                })?;
+            runtime.spawn(reject_unclaimed_job_at_deadline(
+                admitted_rx,
+                tx,
+                self.lanes_n,
+                queued_at,
+                deadline,
+            ));
+            Ok(())
         }
     }
 
     impl Drop for QwenBatchScheduler {
         fn drop(&mut self) {
-            self.jobs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(h) = self
-                .worker
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
+            self.jobs.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(h) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = h.join();
             }
         }
@@ -497,7 +634,7 @@ mod gpu {
 
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_loop(
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<SchedJob>,
+        mut rx: mpsc::Receiver<SchedJob>,
         mut lanes: QwenLanePool,
         mtp: Option<QwenMtpHead>,
         tokenizer: Arc<tokenizers::Tokenizer>,
@@ -516,13 +653,17 @@ mod gpu {
             Q38_SCHED_POLICY_LATE_JOINERS_WAIT_FOR_FULL_GROUP_DRAIN,
         );
         while let Some(first) = rx.recv().await {
+            if !first.is_waiting() {
+                continue;
+            }
             let t_first = Instant::now();
-            let window_ms = lanes.window_ms();
+            let window_ms = first.formation_window_ms(lanes.window_ms());
             let admission_deadline = t_first + std::time::Duration::from_millis(window_ms);
             let mut jobs = vec![first];
             while jobs.len() < lanes.lanes() {
                 match rx.try_recv() {
-                    Ok(j) => jobs.push(j),
+                    Ok(j) if j.is_waiting() => jobs.push(j),
+                    Ok(_) => continue,
                     Err(_) => break,
                 }
             }
@@ -536,11 +677,12 @@ mod gpu {
                     )
                     .await
                     {
-                        Ok(Some(j)) => {
+                        Ok(Some(j)) if j.is_waiting() => {
                             jobs.push(j);
                             while jobs.len() < lanes.lanes() {
                                 match rx.try_recv() {
-                                    Ok(j) => jobs.push(j),
+                                    Ok(j) if j.is_waiting() => jobs.push(j),
+                                    Ok(_) => continue,
                                     Err(_) => break,
                                 }
                             }
@@ -548,9 +690,14 @@ mod gpu {
                                 break;
                             }
                         }
+                        Ok(Some(_)) => continue,
                         Ok(None) | Err(_) => break,
                     }
                 }
+            }
+            jobs.retain(SchedJob::is_waiting);
+            if jobs.is_empty() {
+                continue;
             }
             let a_lone_request_keeps_the_eager_solo_route_unless_the_lanes_arm_is_on_and_no_mtp_head_would_be_bypassed =
                 mtp.is_some()
@@ -598,7 +745,9 @@ mod gpu {
         default_max_new: usize,
         job: SchedJob,
     ) {
-        let SchedJob { req, tx } = job;
+        let Some((req, tx, _reservation)) = job.claim() else {
+            return;
+        };
         let send_timeout = sched_send_timeout();
         if let Err(err) = lanes
             .quiesce_graphs_before_external_eager_work_because_solo_requests_share_the_capture_stream()
@@ -668,6 +817,7 @@ mod gpu {
         pending_finish: Option<&'static str>,
         stop_free_so_deferred_emission_cannot_miss_a_stop_hit: bool,
         sse_timeout_none_is_the_old_infinite_wait: Option<std::time::Duration>,
+        _reservation: Option<SchedReservation>,
     }
 
     impl GroupMember {
@@ -840,6 +990,13 @@ mod gpu {
         }
     }
 
+    fn evict_closed_members(members: &mut [GroupMember], roster: &mut GroupRoster) {
+        for member in members.iter_mut().filter(|m| m.alive && m.tx.is_closed()) {
+            member.abandon();
+            roster.leave(member.lane);
+        }
+    }
+
     struct AdmittedLane {
         lane: usize,
         tx: mpsc::Sender<ChatEvent>,
@@ -847,9 +1004,48 @@ mod gpu {
         prompt_ids: Vec<u32>,
         sampler: ChatSampler,
         max_new: usize,
+        reservation: SchedReservation,
     }
 
-    async fn admit_job_roster_tokenize_started_window_sampler_without_prefilling(
+    async fn validate_batch_request_window_before_prefill(
+        tx: &mpsc::Sender<ChatEvent>,
+        prompt_tokens: usize,
+        requested: usize,
+        window: usize,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<usize> {
+        let max_new = if prompt_tokens == 0 {
+            0
+        } else if let Some((_cache_len, max_new)) = kv_window(prompt_tokens, requested, window) {
+            max_new
+        } else {
+            let _ = sched_push(
+                tx,
+                ChatEvent::Error(format!(
+                    "prompt of {prompt_tokens} tokens does not fit the {window}-token KV window"
+                )),
+                timeout,
+            )
+            .await;
+            return None;
+        };
+        if max_new == 0
+            && sched_push(
+                tx,
+                ChatEvent::Started {
+                    prompt_tokens: prompt_tokens as u32,
+                },
+                timeout,
+            )
+            .await
+                != SsePush::Sent
+        {
+            return None;
+        }
+        Some(max_new)
+    }
+
+    async fn admit_job_roster_tokenize_window_sampler_without_prefilling(
         lanes: &mut QwenLanePool,
         tokenizer: &Arc<tokenizers::Tokenizer>,
         eos_ids: &[u32],
@@ -857,7 +1053,7 @@ mod gpu {
         roster: &mut GroupRoster,
         job: SchedJob,
     ) -> Option<AdmittedLane> {
-        let SchedJob { req, tx } = job;
+        let (req, tx, reservation) = job.claim()?;
         let send_timeout = sched_send_timeout();
         let Some(lane) = roster.join() else {
             let _ = sched_push(
@@ -874,52 +1070,25 @@ mod gpu {
             Ok(e) => e.get_ids().to_vec(),
             Err(e) => {
                 roster.leave(lane);
-                let _ =
-                    sched_push(&tx, ChatEvent::Error(format!("tokenize: {e}")), send_timeout).await;
+                let _ = sched_push(
+                    &tx,
+                    ChatEvent::Error(format!("tokenize: {e}")),
+                    send_timeout,
+                )
+                .await;
                 return None;
             }
         };
-        if sched_push(
+        let Some(max_new) = validate_batch_request_window_before_prefill(
             &tx,
-            ChatEvent::Started {
-                prompt_tokens: prompt_ids.len() as u32,
-            },
+            prompt_ids.len(),
+            effective_max_new(req.max_new_tokens, default_max_new),
+            lanes.lane_max_seq_len(),
             send_timeout,
         )
         .await
-            != SsePush::Sent
-        {
-            roster.leave(lane);
-            return None;
-        }
-        if prompt_ids.is_empty() {
-            roster.leave(lane);
-            let _ = sched_push(
-                &tx,
-                ChatEvent::Done {
-                    finish_reason: "length".into(),
-                    completion_tokens: 0,
-                },
-                send_timeout,
-            )
-            .await;
-            return None;
-        }
-        let requested = effective_max_new(req.max_new_tokens, default_max_new);
-        let Some((_cache_len, max_new)) =
-            kv_window(prompt_ids.len(), requested, lanes.lane_max_seq_len())
         else {
             roster.leave(lane);
-            let _ = sched_push(
-                &tx,
-                ChatEvent::Error(format!(
-                    "prompt of {} tokens does not fit the {}-token KV window",
-                    prompt_ids.len(),
-                    lanes.lane_max_seq_len()
-                )),
-                send_timeout,
-            )
-            .await;
             return None;
         };
         if max_new == 0 {
@@ -939,8 +1108,7 @@ mod gpu {
             Ok(s) => s,
             Err(e) => {
                 roster.leave(lane);
-                let _ =
-                    sched_push(&tx, ChatEvent::Error(format!("{e:#}")), send_timeout).await;
+                let _ = sched_push(&tx, ChatEvent::Error(format!("{e:#}")), send_timeout).await;
                 return None;
             }
         };
@@ -952,6 +1120,7 @@ mod gpu {
             prompt_ids,
             sampler,
             max_new,
+            reservation,
         })
     }
 
@@ -968,9 +1137,10 @@ mod gpu {
             lane,
             tx,
             req,
-            prompt_ids: _,
+            prompt_ids,
             sampler,
             max_new,
+            reservation,
         } = adm;
         let send_timeout = sched_send_timeout();
         if roster.mark_prefilled(lane).is_err() {
@@ -981,6 +1151,19 @@ mod gpu {
                 send_timeout,
             )
             .await;
+            return;
+        }
+        if sched_push(
+            &tx,
+            ChatEvent::Started {
+                prompt_tokens: prompt_ids.len() as u32,
+            },
+            send_timeout,
+        )
+        .await
+            != SsePush::Sent
+        {
+            roster.leave(lane);
             return;
         }
         let logprobs = req.logprobs;
@@ -1002,6 +1185,7 @@ mod gpu {
             pending_finish: None,
             stop_free_so_deferred_emission_cannot_miss_a_stop_hit: req.stop.is_empty(),
             sse_timeout_none_is_the_old_infinite_wait: send_timeout,
+            _reservation: Some(reservation),
         };
         m.consume_sampled_token_and_stream_it_so_ttft_is_paid_at_the_lanes_own_prefill(
             tokenizer,
@@ -1027,6 +1211,10 @@ mod gpu {
         mut adm: AdmittedLane,
     ) {
         let lane = adm.lane;
+        if adm.tx.is_closed() {
+            roster.leave(lane);
+            return;
+        }
         let send_timeout = sched_send_timeout();
         let prefill_by_device_argmax =
             adm.sampler.fast_greedy() && lanes.device_argmax_default_on();
@@ -1102,7 +1290,7 @@ mod gpu {
         prefill_ms: &mut Vec<f64>,
         job: SchedJob,
     ) {
-        let Some(adm) = admit_job_roster_tokenize_started_window_sampler_without_prefilling(
+        let Some(adm) = admit_job_roster_tokenize_window_sampler_without_prefilling(
             lanes,
             tokenizer,
             eos_ids,
@@ -1123,7 +1311,7 @@ mod gpu {
     #[allow(clippy::too_many_arguments)]
     async fn run_group(
         lanes: &mut QwenLanePool,
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<SchedJob>,
+        rx: &mut mpsc::Receiver<SchedJob>,
         tokenizer: &Arc<tokenizers::Tokenizer>,
         eos_ids: &[u32],
         default_max_new: usize,
@@ -1146,18 +1334,20 @@ mod gpu {
         let mut packed_used = false;
         while admitted < lanes.lanes() {
             if let Some(job) = pending.pop_front() {
+                if !job.is_waiting() {
+                    continue;
+                }
                 admitted += 1;
                 if packed_formation_armed {
-                    if let Some(adm) =
-                        admit_job_roster_tokenize_started_window_sampler_without_prefilling(
-                            lanes,
-                            tokenizer,
-                            eos_ids,
-                            default_max_new,
-                            &mut roster,
-                            job,
-                        )
-                        .await
+                    if let Some(adm) = admit_job_roster_tokenize_window_sampler_without_prefilling(
+                        lanes,
+                        tokenizer,
+                        eos_ids,
+                        default_max_new,
+                        &mut roster,
+                        job,
+                    )
+                    .await
                     {
                         deferred.push(adm);
                     }
@@ -1195,6 +1385,14 @@ mod gpu {
                 }
             }
         }
+        deferred.retain(|adm| {
+            if adm.tx.is_closed() {
+                roster.leave(adm.lane);
+                false
+            } else {
+                true
+            }
+        });
         if !deferred.is_empty() {
             let every_deferred_member_is_greedy_so_one_device_argmax_serves_the_packed_call =
                 deferred.iter().all(|a| a.sampler.fast_greedy());
@@ -1259,6 +1457,9 @@ mod gpu {
             while admitted < lanes.lanes() {
                 match rx.try_recv() {
                     Ok(job) => {
+                        if !job.is_waiting() {
+                            continue;
+                        }
                         admitted += 1;
                         join_prefill_and_stream_the_first_token(
                             lanes,
@@ -1300,6 +1501,7 @@ mod gpu {
                 m.emitted_tokens = m.generated_ids.len();
             }
             'pgroup: loop {
+                evict_closed_members(&mut members, &mut roster);
                 let mut feed: Vec<Option<u32>> = vec![None; lanes.lanes()];
                 for m in members.iter().filter(|m| m.alive) {
                     feed[m.lane] = Some(m.last.token);
@@ -1334,7 +1536,8 @@ mod gpu {
                 let t_host = Instant::now();
                 for m in members.iter_mut() {
                     let was_alive_so_an_eviction_during_emit_must_free_its_lane = m.alive;
-                    m.emit_pending_deltas_then_any_deferred_finish(tokenizer).await;
+                    m.emit_pending_deltas_then_any_deferred_finish(tokenizer)
+                        .await;
                     if was_alive_so_an_eviction_during_emit_must_free_its_lane && !m.alive {
                         roster.leave(m.lane);
                     }
@@ -1379,7 +1582,8 @@ mod gpu {
             }
             let t_host = Instant::now();
             for m in members.iter_mut() {
-                m.emit_pending_deltas_then_any_deferred_finish(tokenizer).await;
+                m.emit_pending_deltas_then_any_deferred_finish(tokenizer)
+                    .await;
             }
             host_ms += t_host.elapsed().as_secs_f64() * 1e3;
             emit_group_drain_attrib(
@@ -1397,6 +1601,7 @@ mod gpu {
             return;
         }
         'group: loop {
+            evict_closed_members(&mut members, &mut roster);
             let mut feed: Vec<Option<u32>> = vec![None; lanes.lanes()];
             for m in members.iter().filter(|m| m.alive) {
                 feed[m.lane] = Some(m.last.token);
@@ -1615,6 +1820,261 @@ mod gpu {
             }
         }
 
+        fn scheduler_without_worker(
+            capacity: usize,
+        ) -> (QwenBatchScheduler, mpsc::Receiver<SchedJob>) {
+            let (tx, rx) = mpsc::channel(capacity);
+            (
+                QwenBatchScheduler {
+                    jobs: std::sync::Mutex::new(Some(tx)),
+                    worker: std::sync::Mutex::new(None),
+                    lanes_n: capacity,
+                    outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+                rx,
+            )
+        }
+
+        fn reservation() -> SchedReservation {
+            SchedReservation::acquire(&Arc::new(std::sync::atomic::AtomicUsize::new(0)), false)
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn zero_queue_reserves_an_idle_scheduler_without_waiting_for_formation() {
+            let (scheduler, mut jobs) = scheduler_without_worker(2);
+            let (tx, _rx) = mpsc::channel(2);
+            scheduler
+                .submit_with_queue_ms(greedy_req(), tx.clone(), 0)
+                .unwrap();
+            let job = jobs.recv().await.unwrap();
+            assert!(job.is_waiting(), "zero wait must accept an idle dispatcher");
+            assert_eq!(job.formation_window_ms(30), 0);
+            let claimed = job
+                .claim()
+                .expect("the idle dispatcher was reserved at submission");
+            let err = scheduler
+                .submit_with_queue_ms(greedy_req(), tx.clone(), 0)
+                .unwrap_err();
+            assert!(err.downcast_ref::<EngineBusy>().is_some());
+            assert!(
+                jobs.is_empty(),
+                "zero wait must never queue behind active work"
+            );
+            drop(claimed);
+            scheduler.submit_with_queue_ms(greedy_req(), tx, 0).unwrap();
+            assert!(jobs.recv().await.unwrap().claim().is_some());
+        }
+
+        #[tokio::test]
+        async fn zero_queue_rejects_pending_work_and_failed_enqueues_release_the_reservation() {
+            let (scheduler, mut jobs) = scheduler_without_worker(1);
+            let (tx, _rx) = mpsc::channel(2);
+            scheduler
+                .submit_with_queue_ms(greedy_req(), tx.clone(), 30_000)
+                .unwrap();
+            assert!(scheduler
+                .submit_with_queue_ms(greedy_req(), tx.clone(), 30_000)
+                .is_err());
+            assert!(scheduler
+                .submit_with_queue_ms(greedy_req(), tx.clone(), 0)
+                .is_err());
+            drop(jobs.recv().await.unwrap());
+            scheduler.submit_with_queue_ms(greedy_req(), tx, 0).unwrap();
+            assert!(jobs.recv().await.unwrap().claim().is_some());
+        }
+
+        #[tokio::test]
+        async fn batch_window_validation_defers_started_until_prefill_except_for_zero_output() {
+            let (tx, mut rx) = mpsc::channel(2);
+            assert!(
+                validate_batch_request_window_before_prefill(&tx, 9, 4, 8, None)
+                    .await
+                    .is_none()
+            );
+            assert!(
+                matches!(rx.recv().await, Some(ChatEvent::Error(msg)) if crate::oapi::chat::is_prompt_overflow(&msg))
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "oversized prompts must never emit Started"
+            );
+            assert_eq!(
+                validate_batch_request_window_before_prefill(&tx, 2, 4, 8, None).await,
+                Some(4)
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "admission must not bypass the caller's prefill deadline"
+            );
+            assert_eq!(
+                validate_batch_request_window_before_prefill(&tx, 0, 4, 8, None).await,
+                Some(0)
+            );
+            assert!(matches!(
+                rx.recv().await,
+                Some(ChatEvent::Started { prompt_tokens: 0 })
+            ));
+            assert_eq!(
+                validate_batch_request_window_before_prefill(&tx, 7, 4, 8, None).await,
+                Some(0)
+            );
+            assert!(matches!(
+                rx.recv().await,
+                Some(ChatEvent::Started { prompt_tokens: 7 })
+            ));
+        }
+
+        #[tokio::test]
+        async fn scheduler_queue_rejects_excess_work_and_accepts_after_a_slot_is_freed() {
+            let (scheduler, mut jobs) = scheduler_without_worker(2);
+            let (tx, _rx) = mpsc::channel(8);
+            scheduler.submit(greedy_req(), tx.clone()).unwrap();
+            scheduler.submit(greedy_req(), tx.clone()).unwrap();
+            let err = scheduler.submit(greedy_req(), tx.clone()).unwrap_err();
+            assert!(err.downcast_ref::<EngineBusy>().is_some());
+            assert!(format!("{err:#}").contains("queue is full"));
+            drop(jobs.recv().await.unwrap());
+            scheduler.submit(greedy_req(), tx).unwrap();
+            assert_eq!(jobs.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn exited_scheduler_and_shutdown_scheduler_are_retryable() {
+            let (scheduler, jobs) = scheduler_without_worker(1);
+            drop(jobs);
+            let (tx, _rx) = mpsc::channel(1);
+            let err = scheduler.submit(greedy_req(), tx.clone()).unwrap_err();
+            assert!(err.downcast_ref::<EngineBusy>().is_some());
+            scheduler.jobs.lock().unwrap().take();
+            let err = scheduler.submit(greedy_req(), tx).unwrap_err();
+            assert!(err.downcast_ref::<EngineBusy>().is_some());
+        }
+
+        #[tokio::test]
+        async fn queued_request_times_out_without_the_dispatcher_polling_it() {
+            let (tx, mut rx) = mpsc::channel(1);
+            let (admitted, admission) = tokio::sync::oneshot::channel();
+            let queued_at = Instant::now();
+            let deadline = Some(queued_at + Duration::from_millis(20));
+            let job = SchedJob {
+                req: greedy_req(),
+                tx: tx.clone(),
+                admitted,
+                deadline,
+                reservation: reservation(),
+            };
+            let watcher = tokio::spawn(reject_unclaimed_job_at_deadline(
+                admission, tx, 2, queued_at, deadline,
+            ));
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("queue deadline must run while the GPU dispatcher is unavailable")
+                .unwrap();
+            assert!(
+                matches!(event, ChatEvent::Error(ref msg) if crate::oapi::chat::is_busy_shed(msg))
+            );
+            assert!(!job.is_waiting());
+            assert!(
+                job.claim().is_none(),
+                "timed-out work must never reach prefill"
+            );
+            watcher.await.unwrap();
+            assert!(
+                rx.recv().await.is_none(),
+                "a shed request must have one terminal event"
+            );
+        }
+
+        #[tokio::test]
+        async fn claimed_request_cancels_its_queue_deadline_without_started_or_releasing_active_work(
+        ) {
+            let (tx, mut rx) = mpsc::channel(1);
+            let (admitted, admission) = tokio::sync::oneshot::channel();
+            let queued_at = Instant::now();
+            let deadline = Some(queued_at + Duration::from_secs(10));
+            let outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let job = SchedJob {
+                req: greedy_req(),
+                tx: tx.clone(),
+                admitted,
+                deadline,
+                reservation: SchedReservation::acquire(&outstanding, false).unwrap(),
+            };
+            let claimed = job.claim().expect("unexpired live work must be admitted");
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                reject_unclaimed_job_at_deadline(admission, tx, 2, queued_at, deadline),
+            )
+            .await
+            .expect("acknowledgement must cancel the watchdog immediately");
+            assert!(
+                rx.try_recv().is_err(),
+                "admission must not emit Started or a busy event"
+            );
+            drop(rx);
+            assert_eq!(
+                outstanding.load(std::sync::atomic::Ordering::Acquire),
+                1,
+                "HTTP timeout must leave the admitted worker reservation held"
+            );
+            drop(claimed);
+            assert_eq!(
+                outstanding.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "only worker exit releases its reservation"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn admission_racing_the_deadline_has_exactly_one_winner() {
+            for _ in 0..64 {
+                let (tx, mut rx) = mpsc::channel(1);
+                let (admitted, admission) = tokio::sync::oneshot::channel();
+                let deadline = Instant::now();
+                let claiming = tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    admitted.send(()).is_ok()
+                });
+                reject_unclaimed_job_at_deadline(admission, tx, 2, deadline, Some(deadline)).await;
+                if claiming.await.unwrap() {
+                    assert!(
+                        rx.recv().await.is_none(),
+                        "admission and busy must never both win"
+                    );
+                } else {
+                    assert!(
+                        matches!(rx.recv().await, Some(ChatEvent::Error(msg)) if crate::oapi::chat::is_busy_shed(&msg))
+                    );
+                    assert!(rx.recv().await.is_none());
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn disconnected_queued_request_cancels_its_watchdog_without_admission() {
+            let (tx, rx) = mpsc::channel(1);
+            let (admitted, admission) = tokio::sync::oneshot::channel();
+            let queued_at = Instant::now();
+            let deadline = Some(queued_at + Duration::from_secs(30));
+            let job = SchedJob {
+                req: greedy_req(),
+                tx: tx.clone(),
+                admitted,
+                deadline,
+                reservation: reservation(),
+            };
+            drop(rx);
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                reject_unclaimed_job_at_deadline(admission, tx, 2, queued_at, deadline),
+            )
+            .await
+            .expect("a disconnected client must not retain its watchdog until the deadline");
+            assert!(!job.is_waiting());
+            assert!(job.claim().is_none());
+        }
+
         const EOS: u32 = 2;
 
         fn member(
@@ -1648,7 +2108,30 @@ mod gpu {
                 pending_finish: None,
                 stop_free_so_deferred_emission_cannot_miss_a_stop_hit: true,
                 sse_timeout_none_is_the_old_infinite_wait: timeout,
+                _reservation: None,
             }
+        }
+
+        #[test]
+        fn disconnected_member_leaves_before_the_next_gpu_feed_without_changing_its_sibling() {
+            let tok = tiny_tokenizer();
+            let (healthy_tx, _healthy_rx) = mpsc::channel(1);
+            let (closed_tx, closed_rx) = mpsc::channel(1);
+            let mut roster = GroupRoster::new(2);
+            let mut members = vec![
+                member(roster.join().unwrap(), healthy_tx, &tok, None, 4),
+                member(roster.join().unwrap(), closed_tx, &tok, None, 4),
+            ];
+            roster.mark_prefilled(0).unwrap();
+            roster.mark_prefilled(1).unwrap();
+            drop(closed_rx);
+            evict_closed_members(&mut members, &mut roster);
+            assert!(members[0].alive && !members[0].abandoned);
+            assert!(!members[1].alive && members[1].abandoned);
+            assert_eq!(
+                roster.step_plan(&[Some(0), None]).unwrap(),
+                Some(vec![Some(0)])
+            );
         }
 
         #[tokio::test]
@@ -1764,7 +2247,10 @@ mod gpu {
 
         #[test]
         fn zero_ms_maps_to_the_old_infinite_wait_and_positive_ms_maps_to_a_deadline() {
-            assert_eq!(sse_timeout_opt_from_ms_zero_keeps_the_old_infinite_wait(0), None);
+            assert_eq!(
+                sse_timeout_opt_from_ms_zero_keeps_the_old_infinite_wait(0),
+                None
+            );
             assert_eq!(
                 sse_timeout_opt_from_ms_zero_keeps_the_old_infinite_wait(10_000),
                 Some(Duration::from_millis(10_000))
@@ -1860,7 +2346,10 @@ mod roster_state_machine {
         let mut r = GroupRoster::new(2);
         let lane = r.join().unwrap();
         r.mark_prefilled(lane).unwrap();
-        assert!(r.step_plan(&[Some(1)]).is_err(), "short feed must be refused");
+        assert!(
+            r.step_plan(&[Some(1)]).is_err(),
+            "short feed must be refused"
+        );
         assert!(
             r.step_plan(&[Some(1), Some(2)]).is_err(),
             "a token on a vacant lane must be refused"

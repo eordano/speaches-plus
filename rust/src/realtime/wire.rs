@@ -875,9 +875,7 @@ impl OutboundEvent {
             ItemDeleted(..) => "conversation.item.deleted",
             ItemTruncatedClientAck(..) => "conversation.item.truncated",
             AssistantTruncated(..) => "conversation.item.assistant_truncated",
-            TranscriptionCompleted(..) => {
-                "conversation.item.input_audio_transcription.completed"
-            }
+            TranscriptionCompleted(..) => "conversation.item.input_audio_transcription.completed",
             TranscriptionDelta(..) => "conversation.item.input_audio_transcription.delta",
             TranscriptionFailed(..) => "conversation.item.input_audio_transcription.failed",
             ItemDone(..) => "conversation.item.done",
@@ -1168,7 +1166,11 @@ mod tests {
     fn typeshared_event_type_enum_matches_type_name_for_every_variant() {
         let mut seen = std::collections::HashSet::new();
         for t in RealtimeServerEventType::ALL {
-            assert!(seen.insert(t.wire_name()), "duplicate name {}", t.wire_name());
+            assert!(
+                seen.insert(t.wire_name()),
+                "duplicate name {}",
+                t.wire_name()
+            );
         }
         assert_eq!(seen.len(), 39);
         let names = [

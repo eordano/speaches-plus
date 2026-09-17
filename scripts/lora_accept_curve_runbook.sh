@@ -70,7 +70,7 @@ gpu_gate() {
 
 gpu_wait_idle() {
   local limit=$1 what=$2 deadline used
-  deadline=$(( $(date +%s) + STAGE3_IDLE_WAIT_S ))
+  deadline=$(($(date +%s) + STAGE3_IDLE_WAIT_S))
   used=$(gpu_used_mib)
   if [ "$used" -ge "$limit" ]; then
     echo "waiting for $what: memory.used=${used}MiB >= ${limit}MiB -- stop the serving process now (stages 0-2 needed it live, stage 3 needs the card); polling up to ${STAGE3_IDLE_WAIT_S}s"
@@ -145,11 +145,11 @@ stage "3 GPU BLOCK: acceptance curve, base vs real adapter, per-round verify-cha
 gpu_wait_idle "$TWO_ENGINE_STAGE_IDLE_GATE_MIB" "the two-engine wgpu measurement"
 cd "$PROJECT_ROOT/rust"
 NV_QWEN38_WGPU_TEST=1 \
-NV_QWEN38_DIR="$BASE_DIR" \
-NV_LORA_CURVE_ADAPTER_DIR="$ADAPTER_DIR" \
-NV_LORA_CURVE_PROMPTS="$OUT_DIR/prompt_windows.json" \
-NV_LORA_CURVE_EMITTED="$EMITTED" \
-NVK_LANE=${NVK_LANE:-gape} NVK_PKG=nv-specdecode NVK_FEATURES=cuda,wgpu \
+  NV_QWEN38_DIR="$BASE_DIR" \
+  NV_LORA_CURVE_ADAPTER_DIR="$ADAPTER_DIR" \
+  NV_LORA_CURVE_PROMPTS="$OUT_DIR/prompt_windows.json" \
+  NV_LORA_CURVE_EMITTED="$EMITTED" \
+  NVK_LANE=${NVK_LANE:-gape} NVK_PKG=nv-specdecode NVK_FEATURES=cuda,wgpu \
   scripts/nvk.sh probe --test lora_qwen38_wgpu_real_adapter_accept_curve_perfb -- \
   --ignored --nocapture 2>&1 | tee "$OUT_DIR/accept_curve.log"
 

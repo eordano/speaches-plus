@@ -25,6 +25,23 @@ fn lgw_gather_embed(@builtin(global_invocation_id) gid: vec3<u32>) {
     lgg_out[i] = lgg_embed[row * lgg_p.hidden_words + i];
 }
 
+@group(0) @binding(34) var<storage, read> lgg_list: array<vec4<u32>>;
+
+@compute @workgroup_size(256)
+fn lgw_gather_embed_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= lgg_p.hidden_words) {
+        return;
+    }
+    let t = gid.y;
+    let tok = lgg_list[t].x;
+    if (tok < lgg_p.row_off || tok >= lgg_p.row_off + lgg_p.n_rows) {
+        return;
+    }
+    let row = tok - lgg_p.row_off;
+    lgg_out[t * lgg_p.hidden_words + i] = lgg_embed[row * lgg_p.hidden_words + i];
+}
+
 struct LgSiluParams {
     n_words: u32,
     pad0: u32,

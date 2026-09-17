@@ -6,7 +6,7 @@ Rust implementation of the speaches realtime endpoint.
 arbitrary TTS response text via libespeak-ng phonemization.
 
 `IMPLEMENTATION.md` is the canonical as-built reference.
-`../docs/book/01.4-STATUS.md` tracks PRD-phase progress. `../CLAUDE.md`
+`../CLAUDE.md`
 has the working conventions + operational gotchas. Build discipline
 (nvk.sh, lanes, measurement traps) is owned by the root `README.md`
 §"Building and testing", `../CLAUDE.md`, and
@@ -88,6 +88,9 @@ the hub, each overridable):
 | `NV_CHAT_MODEL_DIR` | Qwen 3.6 snapshot consumed by `NvEngineChat` |
 | `CT2_MODEL` | Whisper-CT2 snapshot consumed by `ct2rs` |
 | `KOKORO_MODEL` / `KOKORO_VOICES` | Kokoro ONNX (legacy hub entries) |
+| (compiled in) | optional release-safe Kokoro voices from `rust/voices/*.npy`; see `python/tts/kokoro/IMPLEMENTATION.md` |
+| `NV_VOICES_DATA_DIR` | voices workspace root; the runtime voice store is `<dir>/voices/<name>/` (all kinds, `/v1/voices`), also the `/v1/voice-profiles` root; see `docs/book/07.2-voices.md` |
+| `KOKORO_ADAPTED_SESSIONS` | resident per-voice ONNX sessions for `kokoro-adapter` voices (default 2, ~330 MB each) |
 | `SILERO_VAD_MODEL` | Silero VAD ONNX |
 | `NV_TTS_MODEL_DIR` | Qwen3-TTS snapshot |
 | `NV_EMBED_MODEL_DIR` | Qwen3-Embedding snapshot |

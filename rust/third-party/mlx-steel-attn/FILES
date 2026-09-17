@@ -1,0 +1,16 @@
+67722214ff487ec95df675e2f135ccd7fbe639b6eb6ab98b14bcefa58d66ba95  mlx/backend/metal/kernels/steel/attn/attn.h
+3e9334c9ec3298fc7fb21a9468816d1b7c6e3c11da8494df7ae4fc7a4c04f570  mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h
+e435f413d71d44ca4ad72a59d192046be77388f63936179c58882286f4cc5dab  mlx/backend/metal/kernels/steel/attn/loader.h
+6f22866c76a1f15cf27681d3a8700f3419412a954d00e0810c87f7dac82ddeab  mlx/backend/metal/kernels/steel/attn/mma.h
+f03c6ed73d7298fa69b75a49e7eec54954b6fafd59530a1f175934215412ed80  mlx/backend/metal/kernels/steel/attn/params.h
+6479114663c5923a7ee2f9fc1cf9d5e99e680d47d793251749989056a8a63141  mlx/backend/metal/kernels/steel/attn/transforms.h
+b03cea6a7d5cfe814e6838d8536e2aacdcafd2744cb408e954fda336ce21759a  mlx/backend/metal/kernels/steel/defines.h
+c84af31e2c57154f2a8a24fa7f9fe2449765cce9a66f3f035846ed3c03b6a8b0  mlx/backend/metal/kernels/steel/gemm/gemm.h
+ed49c8b9c73957f0cbc9dea30f484cf84fb821aece68233d6d1967856200d5c7  mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
+c1b82153670b1e18371a6e88fdbcf440af692957775c2f837700315ab8a5112e  mlx/backend/metal/kernels/steel/gemm/loader.h
+9b37709de40c3acaa5411875e52c8d26e6de093261741f671fbdab9c39a852b7  mlx/backend/metal/kernels/steel/gemm/mma.h
+6711e72e32310eafb088895d5a6d20fcfca814158f5b38eb72b6e69d9d773e43  mlx/backend/metal/kernels/steel/gemm/params.h
+73487e29beab5af9478bc931c49b5e8d66937c2fa2651499867f47ac5529afc2  mlx/backend/metal/kernels/steel/gemm/transforms.h
+d4c36298145d1c5617a94f07dbfabf6ac932afe2fd7ea0c9291f1fb385c5404a  mlx/backend/metal/kernels/steel/utils.h
+886eccaac4f8f00eab5a10551fdb5315df7ab7462aba13d69bb95765c1a4735e  mlx/backend/metal/kernels/steel/utils/integral_constant.h
+4766c5a3809d3cf7740e63acc5703ef76b6b4e85d8baf16602c9d517a2fd426c  mlx/backend/metal/kernels/steel/utils/type_traits.h

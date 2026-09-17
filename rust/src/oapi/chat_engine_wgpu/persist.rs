@@ -131,7 +131,12 @@ pub fn gc_response_store(dir: &std::path::Path) {
             let p = e.path();
             let name = p.file_name()?.to_str()?;
             (name.starts_with("resp_") && name.ends_with(".nvkv"))
-                .then(|| e.metadata().ok().and_then(|m| m.modified().ok()).map(|t| (t, p)))
+                .then(|| {
+                    e.metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| (t, p))
+                })
                 .flatten()
         })
         .collect();
@@ -305,8 +310,14 @@ fn read_header(map: &memmap2::Mmap) -> anyhow::Result<(Header, usize)> {
     anyhow::ensure!(map.len() >= 12, "file shorter than magic + header length");
     anyhow::ensure!(&map[..8] == SNAPSHOT_MAGIC, "bad magic");
     let hlen = u32::from_le_bytes(map[8..12].try_into().unwrap()) as usize;
-    anyhow::ensure!(hlen <= HEADER_MAX, "header of {hlen} bytes exceeds HEADER_MAX");
-    anyhow::ensure!(map.len() >= 12 + hlen, "file shorter than its declared header");
+    anyhow::ensure!(
+        hlen <= HEADER_MAX,
+        "header of {hlen} bytes exceeds HEADER_MAX"
+    );
+    anyhow::ensure!(
+        map.len() >= 12 + hlen,
+        "file shorter than its declared header"
+    );
     let h: Header = serde_json::from_slice(&map[12..12 + hlen])?;
     anyhow::ensure!(
         h.frontier > 0 && h.frontier <= h.max_seq,
@@ -390,7 +401,8 @@ pub fn restore_file(
             live.len() == h.layers.len()
                 && live.iter().zip(h.layers.iter()).all(|((li, l), hl)| {
                     *li == hl.li
-                        && (0..4).all(|c| l[c] == hl.chunks[c].0 && hl.chunks[c].1 <= hl.chunks[c].0)
+                        && (0..4)
+                            .all(|c| l[c] == hl.chunks[c].0 && hl.chunks[c].1 <= hl.chunks[c].0)
                 }),
             "kv layer geometry mismatch"
         );
@@ -678,7 +690,8 @@ mod state_disk_macro_tests {
         let mut m = FakeStateModel::new();
         let one_blob: KvCacheSnapshot = (vec![9, 9, 9], Vec::new(), Vec::new(), Vec::new());
         assert!(
-            m.kv_cache_restore(0, &one_blob).expect("the shape the macro writes"),
+            m.kv_cache_restore(0, &one_blob)
+                .expect("the shape the macro writes"),
             "the one-blob shape must restore"
         );
         assert_eq!(m.restored, vec![0]);

@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
@@ -12,7 +13,7 @@ use nv_models::deepseek_ocr::{
 
 use nv_models::deepseek_ocr::default_snapshot_dir as default_dir;
 
-fn load_rgb(path: &PathBuf) -> Result<RgbImage> {
+fn load_rgb(path: &Path) -> Result<RgbImage> {
     RgbImage::decode_file(path)
 }
 

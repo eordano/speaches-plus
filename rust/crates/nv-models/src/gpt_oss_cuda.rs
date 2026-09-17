@@ -73,7 +73,13 @@ impl GptOssKvCache {
         self.current_len = 0;
     }
 
-    fn write_at(&mut self, layer: usize, start: usize, k_new: &Tensor, v_new: &Tensor) -> Result<()> {
+    fn write_at(
+        &mut self,
+        layer: usize,
+        start: usize,
+        k_new: &Tensor,
+        v_new: &Tensor,
+    ) -> Result<()> {
         let t = k_new.dims()[1];
         let end = start + t;
         anyhow::ensure!(
@@ -337,7 +343,10 @@ impl GptOssCuda {
             bf16_tensor(lm_head, (config.vocab_size, hidden), device)?,
             None,
         )?;
-        let final_norm = RmsNorm::new(bf16_tensor(final_norm, hidden, device)?, config.rms_norm_eps);
+        let final_norm = RmsNorm::new(
+            bf16_tensor(final_norm, hidden, device)?,
+            config.rms_norm_eps,
+        );
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -455,10 +464,11 @@ impl GptOssCuda {
         );
 
         let tok_t = Tensor::from_vec(tokens.to_vec(), seq, &self.device)?;
-        let mut x = self
-            .embed_weight
-            .index_select(&tok_t, 0)?
-            .reshape((1usize, seq, self.config.hidden_size))?;
+        let mut x = self.embed_weight.index_select(&tok_t, 0)?.reshape((
+            1usize,
+            seq,
+            self.config.hidden_size,
+        ))?;
         let pos_t = Tensor::from_vec(
             positions.iter().map(|p| *p as i32).collect::<Vec<i32>>(),
             (1usize, seq),
@@ -469,7 +479,7 @@ impl GptOssCuda {
             x = self.layer_forward(i, &x, &pos_t, cache, seq, write_start)?;
         }
         cache.current_len = write_start + seq;
-        Ok(self.final_norm.forward(&x)?)
+        self.final_norm.forward(&x)
     }
 
     fn layer_forward(
@@ -501,11 +511,17 @@ impl GptOssCuda {
             .forward(&normed)?
             .reshape((1usize, seq, n_kv, hd))?;
 
-        let (q_rot, k_rot) = self
-            .rope
-            .apply(&q.to_dtype(DType::F32)?, &k.to_dtype(DType::F32)?, positions)?;
-        let q = q_rot.affine(self.attention_scaling, 0.0)?.to_dtype(DType::BF16)?;
-        let k = k_rot.affine(self.attention_scaling, 0.0)?.to_dtype(DType::BF16)?;
+        let (q_rot, k_rot) = self.rope.apply(
+            &q.to_dtype(DType::F32)?,
+            &k.to_dtype(DType::F32)?,
+            positions,
+        )?;
+        let q = q_rot
+            .affine(self.attention_scaling, 0.0)?
+            .to_dtype(DType::BF16)?;
+        let k = k_rot
+            .affine(self.attention_scaling, 0.0)?
+            .to_dtype(DType::BF16)?;
 
         cache.write_at(idx, write_start, &k.contiguous()?, &v.contiguous()?)?;
         let total = write_start + seq;

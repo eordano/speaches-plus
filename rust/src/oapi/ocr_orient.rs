@@ -20,7 +20,9 @@ const POLARITY_MARGIN_KEEPS_CURRENT_ON_TIES: f64 = 1.1;
 const MIN_INK_ROWS_FOR_A_VERDICT: usize = 6;
 
 pub fn auto_orient_enabled() -> bool {
-    std::env::var(AUTO_ORIENT_ENV).map(|v| v == "1").unwrap_or(false)
+    std::env::var(AUTO_ORIENT_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 pub fn rot_cw90_rgb(img: &RgbImage) -> RgbImage {
@@ -448,7 +450,12 @@ pub fn maybe_auto_orient(img: RgbImage) -> RgbImage {
     }
     let rot = detect_content_rotation(&grey_from_rgb(&img));
     if rot != ContentRotation::Upright {
-        tracing::info!(?rot, w = img.w, h = img.h, "ocr auto-orient rotating content");
+        tracing::info!(
+            ?rot,
+            w = img.w,
+            h = img.h,
+            "ocr auto-orient rotating content"
+        );
     }
     apply_rotation_rgb(img, rot)
 }
@@ -496,7 +503,10 @@ mod tests {
         let cases = [
             (rot_cw90_grey(&upright), ContentRotation::ApplyCcw90),
             (rot_180_grey(&upright), ContentRotation::Apply180),
-            (rot_cw90_grey(&rot_180_grey(&upright)), ContentRotation::ApplyCw90),
+            (
+                rot_cw90_grey(&rot_180_grey(&upright)),
+                ContentRotation::ApplyCw90,
+            ),
         ];
         for (rotated, expect) in cases {
             assert_eq!(
@@ -515,8 +525,8 @@ mod tests {
             .unwrap()
             .write_to(&mut png, nv_imgdec::image::ImageFormat::Png)
             .unwrap();
-        let rotated = reencode_rotated(&png.into_inner(), ContentRotation::ApplyCw90)
-            .expect("reencode cw90");
+        let rotated =
+            reencode_rotated(&png.into_inner(), ContentRotation::ApplyCw90).expect("reencode cw90");
         let back = nv_imgdec::decode_rgb8(&rotated).expect("decode rotated png");
         assert_eq!(
             (back.width() as usize, back.height() as usize),

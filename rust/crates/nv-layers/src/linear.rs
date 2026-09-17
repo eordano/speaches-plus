@@ -82,10 +82,6 @@ fn force_dense_bf16_enabled() -> bool {
     FORCE_DENSE_BF16.with(|c| c.get())
 }
 
-pub fn nvfp4_true_m_from(raw: Option<&str>) -> bool {
-    raw.is_some_and(|v| v != "0")
-}
-
 pub fn fp8_scale_mode_from(raw: Option<&str>) -> nv_quant::fp8::Fp8ScaleMode {
     use nv_quant::fp8::Fp8ScaleMode;
     match raw {
@@ -237,7 +233,47 @@ pub const LOOPING_THE_M1_GEMV_COSTS_ONE_FULL_WEIGHT_READ_PER_ROW_SO_IT_ONLY_OUTR
      no serving path wires today";
 
 #[cfg(feature = "cuda")]
-pub const NVFP4_VERIFY_BLOCK_ROWS_LOOPED_THROUGH_THE_M1_GEMV_SO_A_DRAFT_BLOCK_REPRODUCES_DECODE: usize = 8;
+pub const NVFP4_VERIFY_BLOCK_ROWS_LOOPED_THROUGH_THE_M1_GEMV_SO_A_DRAFT_BLOCK_REPRODUCES_DECODE:
+    usize = 8;
+
+#[cfg(feature = "cuda")]
+pub const NVFP4_GEMV_MROWS_LADDER_MATCHES_THE_CUDA_SWITCH_AND_ROWS_ABOVE_IT_STILL_LOOP: usize = 8;
+
+#[cfg(feature = "cuda")]
+pub fn nvfp4_gemv_mrows_case_instantiated_mirroring_gemv_act_mrows_case_instantiated(
+    rows: usize,
+) -> bool {
+    rows <= NVFP4_GEMV_MROWS_LADDER_MATCHES_THE_CUDA_SWITCH_AND_ROWS_ABOVE_IT_STILL_LOOP
+        || rows == 12
+        || rows == 16
+        || rows == 24
+}
+
+#[cfg(feature = "cuda")]
+pub const ONE_MROWS_LAUNCH_READS_THE_WEIGHT_BLOCK_ONCE_FOR_EVERY_VERIFY_ROW_INSTEAD_OF_ONCE_PER_ROW: &str =
+    "nvfp4_gemv_bf16act_kernel<MROWS> keeps one warp on output row n and accumulates MROWS \
+     independent acc[] against MROWS activation rows from a single uint2 weight load, so an \
+     m-row verify block costs ONE full weight read and ONE launch where the row loop cost m of \
+     each -- the cost LOOPING_THE_M1_GEMV_COSTS_ONE_FULL_WEIGHT_READ_PER_ROW_SO_IT_ONLY_OUTRUNS_\
+     THE_PADDED_CUTLASS_TILE_AT_ONE_ROW measured. It stays bit-identical to the row loop rather \
+     than merely close to it: acc[r] runs the same fmaf chain, in the same order, over the same \
+     scale and the same input bytes that the MROWS=1 instantiation runs, and MROWS=1 IS the \
+     instantiation nv_kernels_nvfp4_gemv_bf16act now calls, so decode and verify share one \
+     kernel body by construction. That keeps \
+     A_VERIFY_BLOCK_MUST_TAKE_THE_SAME_KERNEL_DECODE_TAKES_OR_IT_CANNOT_REPRODUCE_DECODES_ROWS \
+     true while removing the per-row cost that held NV_NVFP4_M1_GEMV off every spec-decode \
+     deployment";
+
+#[cfg(feature = "cuda")]
+pub const THE_VERIFY_BLOCK_BATCHES_THE_GEMV_BUT_NEVER_THE_NORM_BECAUSE_A_MULTI_ROW_RMSNORM_TAKES_A_DIFFERENT_LADDER_THAN_DECODES_BATCH_ONE: &str =
+    "nv_kernels_rmsnorm_bf16 tries rmsnorm_m1_split_launch and rmsnorm_m1_wide_launch before the \
+     stock one-block-per-row kernel, and those rungs are batch-one arms -- rmsnorm.cu names it \
+     g_norm_m1_split_partials_one_row_per_rung_because_the_arm_serves_batch_one_only. Folding an \
+     m-row block in one rmsnorm call would therefore reduce on a DIFFERENT ladder than the \
+     batch-one call decode makes, and the folded row would stop being bit-identical to decode's. \
+     So the prenorm route folds each row with its own batch-one rmsnorm and batches only the \
+     gemv that follows: m norm launches plus one gemv, against the m norm plus m gemv launches \
+     the row loop paid, with the weight read dropping from m to 1";
 
 #[cfg(feature = "cuda")]
 pub const THE_STAGED_FP8_GEMV_KEEPS_BF16_ACTIVATIONS_AND_PAYS_M_SCALAR_MACS_PER_WEIGHT_BYTE_WHILE_THE_CUBLASLT_E4M3_TILE_QUANTISES_THE_ACTIVATIONS_AND_PAYS_NONE: &str =
@@ -257,6 +293,22 @@ pub const E4M3_STAGED_GEMV_OUTRUNS_THE_TILE_TO_THIS_MANY_ROWS_AND_LOSES_WIDER_SO
 
 #[cfg(feature = "cuda")]
 pub const VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC: usize = 8;
+
+#[cfg(feature = "cuda")]
+fn verify_one_arithmetic_rows_ceiling_env_nv_verify_one_arith_rows_default_8_max_24_serving_never_exceeds_8_only_the_mrow_ladder_raises_it(
+) -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("NV_VERIFY_ONE_ARITH_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC)
+            .clamp(
+                VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC,
+                24,
+            )
+    })
+}
 
 #[cfg(feature = "cuda")]
 pub const VERIFY_INTERIOR_REACHES_3_TO_7_ARE_THE_SHAPES_WHOSE_TILE_FALLBACK_SPLIT_THE_VERIFY_RANGE:
@@ -335,13 +387,80 @@ fn e4m3_route_line_once_per_slot_and_row_count_because_a_single_once_only_ever_r
 }
 
 #[cfg(feature = "cuda")]
+thread_local! {
+    static QWEN38_BATCH_E4M3_GROUP_SCOPE:
+        std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "cuda")]
+pub struct Qwen38BatchE4m3GroupScopeGuard {
+    previous: usize,
+    same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen38BatchE4m3GroupScopeGuard {
+    pub fn enter(batch_size: usize) -> Self {
+        let previous = QWEN38_BATCH_E4M3_GROUP_SCOPE.with(|scope| {
+            let previous = scope.get();
+            scope.set(batch_size);
+            previous
+        });
+        Self {
+            previous,
+            same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for Qwen38BatchE4m3GroupScopeGuard {
+    fn drop(&mut self) {
+        let _ = QWEN38_BATCH_E4M3_GROUP_SCOPE.try_with(|scope| scope.set(self.previous));
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+enum E4m3GroupPolicy {
+    SixOrEightLaneBatchDefault,
+    Disabled,
+    Rows(i32),
+}
+
+#[cfg(feature = "cuda")]
+impl E4m3GroupPolicy {
+    fn from_env_value(raw: Option<&str>) -> Self {
+        match raw {
+            None => Self::SixOrEightLaneBatchDefault,
+            Some("1") => Self::Rows(2),
+            Some(v) => v
+                .parse::<i32>()
+                .ok()
+                .filter(|r| [1, 2, 4].contains(r))
+                .map(Self::Rows)
+                .unwrap_or(Self::Disabled),
+        }
+    }
+
+    fn rows_per_warp(self) -> Option<i32> {
+        match self {
+            Self::SixOrEightLaneBatchDefault => QWEN38_BATCH_E4M3_GROUP_SCOPE
+                .with(|scope| matches!(scope.get(), 6 | 8).then_some(2)),
+            Self::Disabled => None,
+            Self::Rows(rows) => Some(rows),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn e4m3_group_rows_per_warp() -> Option<i32> {
-    static R: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
-    *R.get_or_init(|| match std::env::var("NV_Q38_E4M3_GROUP").ok().as_deref() {
-        None | Some("0") | Some("") => None,
-        Some("1") => Some(2),
-        Some(v) => v.parse::<i32>().ok().filter(|r| [1, 2, 4].contains(r)),
-    })
+    static POLICY: std::sync::OnceLock<E4m3GroupPolicy> = std::sync::OnceLock::new();
+    POLICY
+        .get_or_init(|| {
+            E4m3GroupPolicy::from_env_value(std::env::var("NV_Q38_E4M3_GROUP").ok().as_deref())
+        })
+        .rows_per_warp()
 }
 
 #[cfg(feature = "cuda")]
@@ -376,12 +495,6 @@ fn nvfp4_gemv_row_block_ceiling() -> usize {
 }
 
 #[cfg(feature = "cuda")]
-fn nvfp4_true_m_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| nvfp4_true_m_from(std::env::var("NV_NVFP4_TRUE_M").ok().as_deref()))
-}
-
-#[cfg(feature = "cuda")]
 fn small_m_det_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| small_m_det_from(std::env::var("NV_BF16_SMALLM_DET").ok().as_deref()))
@@ -391,6 +504,163 @@ fn small_m_det_enabled() -> bool {
 fn nvfp4_quant_fullpad_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NV_NVFP4_QUANT_FULLPAD").is_ok_and(|v| v != "0"))
+}
+
+#[cfg(feature = "cuda")]
+static CFX_RUNTIME_OVERRIDE_MINUS1_UNSET_0_OFF_1_ON_FOR_INTERLEAVED_AB_ONLY:
+    std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+#[cfg(feature = "cuda")]
+pub fn nvfp4_cfx_set_runtime_override_for_interleaved_ab(on: Option<bool>) {
+    let v = match on {
+        None => -1i8,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    CFX_RUNTIME_OVERRIDE_MINUS1_UNSET_0_OFF_1_ON_FOR_INTERLEAVED_AB_ONLY
+        .store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+static CFX_PREFILL_TOTAL_TOKENS_HINT_0_UNSET_SET_PER_PREFILL_BY_THE_SERVING_LOOP:
+    std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "cuda")]
+pub fn nvfp4_cfx_set_prefill_total_tokens_hint(total_tokens: usize) {
+    CFX_PREFILL_TOTAL_TOKENS_HINT_0_UNSET_SET_PER_PREFILL_BY_THE_SERVING_LOOP
+        .store(total_tokens, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cuda")]
+fn nvfp4_cfx_min_context_tokens_the_measured_e2e_crossover_is_between_8k_loss_and_16k_win() -> usize
+{
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("NV_Q38_CFX_MIN_CTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(14336)
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn nvfp4_cfx_env_opt_in_nv_q38_mlp_fp4_cfx_1_captured_colfax_cubins_beat_dp_k256_by_4_to_5pct_at_the_serving_chunk(
+) -> bool {
+    match CFX_RUNTIME_OVERRIDE_MINUS1_UNSET_0_OFF_1_ON_FOR_INTERLEAVED_AB_ONLY
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        0 => return false,
+        1 => return true,
+        _ => {}
+    }
+    static FORCE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    if let Some(v) = FORCE.get_or_init(|| match std::env::var("NV_Q38_MLP_FP4_CFX").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }) {
+        return *v;
+    }
+    let total = CFX_PREFILL_TOTAL_TOKENS_HINT_0_UNSET_SET_PER_PREFILL_BY_THE_SERVING_LOOP
+        .load(std::sync::atomic::Ordering::Relaxed);
+    total
+        >= nvfp4_cfx_min_context_tokens_the_measured_e2e_crossover_is_between_8k_loss_and_16k_win()
+}
+
+#[cfg(feature = "cuda")]
+pub fn nvfp4_cfx_effective_route_selected_for_current_prefill_hint() -> bool {
+    nvfp4_cfx_env_opt_in_nv_q38_mlp_fp4_cfx_1_captured_colfax_cubins_beat_dp_k256_by_4_to_5pct_at_the_serving_chunk()
+}
+
+#[cfg(feature = "cuda")]
+const NVFP4_CFX_CUBIN_EMBEDDED_SO_THE_DEFAULT_ON_16K_PATH_NEEDS_NO_CACHE_DIR: [(
+    usize,
+    usize,
+    usize,
+    &str,
+    &[u8],
+); 3] = [
+    (
+        4096,
+        17408,
+        5120,
+        "gateup.cubin",
+        include_bytes!("cfx_cubins/gateup.cubin"),
+    ),
+    (
+        4096,
+        34816,
+        5120,
+        "gateupfused.cubin",
+        include_bytes!("cfx_cubins/gateupfused.cubin"),
+    ),
+    (
+        4096,
+        5120,
+        17408,
+        "down.cubin",
+        include_bytes!("cfx_cubins/down.cubin"),
+    ),
+];
+
+#[cfg(feature = "cuda")]
+fn nvfp4_cfx_load_all_once_from_cubin_dir() {
+    static LOADED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| {
+        let dir_override = std::env::var("NV_Q38_CFX_CUBIN_DIR").ok();
+        for (m, n, k, fname, embedded) in
+            NVFP4_CFX_CUBIN_EMBEDDED_SO_THE_DEFAULT_ON_16K_PATH_NEEDS_NO_CACHE_DIR
+        {
+            let bytes: std::borrow::Cow<[u8]> = match &dir_override {
+                Some(dir) => match std::fs::read(format!("{dir}/{fname}")) {
+                    Ok(b) => std::borrow::Cow::Owned(b),
+                    Err(e) => {
+                        eprintln!(
+                            "[linear] NV_Q38_CFX_CUBIN_DIR set but {dir}/{fname} unreadable ({e}); \
+                             shape {m}x{n}x{k} stays on the cutlass arm"
+                        );
+                        continue;
+                    }
+                },
+                None => std::borrow::Cow::Borrowed(embedded),
+            };
+            let rc = unsafe {
+                nv_kernels::cuda::nvfp4_cfx_load(
+                    bytes.as_ptr() as *const std::ffi::c_void,
+                    bytes.len(),
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                )
+            };
+            if rc != 0 {
+                eprintln!(
+                    "[linear] nvfp4_cfx_load({fname}) rc={rc}; shape {m}x{n}x{k} stays on the \
+                     cutlass arm"
+                );
+            }
+        }
+    });
+}
+
+#[cfg(feature = "cuda")]
+fn nvfp4_cfx_route_ready(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    if !nvfp4_cfx_env_opt_in_nv_q38_mlp_fp4_cfx_1_captured_colfax_cubins_beat_dp_k256_by_4_to_5pct_at_the_serving_chunk()
+    {
+        return false;
+    }
+    if unsafe { nv_kernels::cuda::nvfp4_cfx_shape_index(m as i32, n as i32, k as i32) } < 0 {
+        return false;
+    }
+    if !stream_is_capturing(stream) {
+        nvfp4_cfx_load_all_once_from_cubin_dir();
+    }
+    unsafe { nv_kernels::cuda::nvfp4_cfx_ready(m as i32, n as i32, k as i32) == 1 }
 }
 
 #[cfg(feature = "cuda")]
@@ -473,6 +743,192 @@ struct Fp8Storage {
     scale_mode: nv_quant::fp8::Fp8ScaleMode,
     cuda_device: candle_core::CudaDevice,
     runner: Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
+    marlin_fp8_twin_built_once_from_the_resident_e4m3_rows:
+        std::sync::OnceLock<Option<Arc<MarlinFp8Prepared>>>,
+    dx_fp8_twin_of_the_transposed_weight_bytes_with_the_channel_scale_folded_into_dy:
+        std::sync::OnceLock<Option<Arc<Fp8DxTwin>>>,
+}
+
+#[cfg(feature = "cuda")]
+pub struct Fp8DxTwin {
+    pub wq_t: cudarc::driver::CudaSlice<u8>,
+    pub unit_scales_for_the_k_in_rows: cudarc::driver::CudaSlice<f32>,
+    pub channel_scale_bf16: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+pub struct MarlinFp8Prepared {
+    pub b_q_marlin: cudarc::driver::CudaSlice<u32>,
+    pub scales_bf16: cudarc::driver::CudaSlice<u16>,
+    pub n: usize,
+    pub k: usize,
+}
+
+#[cfg(feature = "cuda")]
+const MARLIN_FP8_ROWS_MAX_16_IS_THE_INSTANTIATED_THREAD_M_BLOCKS_1: usize = 16;
+
+#[cfg(feature = "cuda")]
+fn marlin_fp8_rows_opt_in() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_MARLIN_FP8_ROWS")
+}
+
+#[cfg(feature = "cuda")]
+fn build_marlin_fp8_twin(s: &Fp8Storage, n: usize, k: usize) -> Result<MarlinFp8Prepared> {
+    anyhow::ensure!(
+        s.scale_mode == nv_quant::fp8::Fp8ScaleMode::PerOuterRow && s.weight_scale_rows.len() == n,
+        "marlin fp8 twin needs per-outer-row scales (n={n} k={k} mode={:?})",
+        s.scale_mode
+    );
+    let stream = s.cuda_device.cuda_stream();
+    let bytes = stream
+        .clone_dtoh(&s.weight_u8)
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin dtoh: {e:?}"))?;
+    marlin_fp8_twin_from_e4m3_rows_host(&s.cuda_device, &bytes, &s.weight_scale_rows, n, k)
+}
+
+#[cfg(feature = "cuda")]
+pub fn marlin_fp8_twin_from_e4m3_rows_dev(
+    dev: &candle_core::CudaDevice,
+    weight_bytes: &cudarc::driver::CudaSlice<u8>,
+    row_scale: &cudarc::driver::CudaSlice<f32>,
+    n: usize,
+    k: usize,
+) -> Result<MarlinFp8Prepared> {
+    let stream = dev.cuda_stream();
+    let bytes = stream
+        .clone_dtoh(weight_bytes)
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin dtoh: {e:?}"))?;
+    let scales = stream
+        .clone_dtoh(row_scale)
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin dtoh scales: {e:?}"))?;
+    marlin_fp8_twin_from_e4m3_rows_host(dev, &bytes, &scales, n, k)
+}
+
+#[cfg(feature = "cuda")]
+pub fn marlin_fp8_twin_from_e4m3_rows_host(
+    dev: &candle_core::CudaDevice,
+    bytes: &[u8],
+    scale_rows: &[f32],
+    n: usize,
+    k: usize,
+) -> Result<MarlinFp8Prepared> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    anyhow::ensure!(
+        n % 64 == 0 && k % 16 == 0,
+        "marlin fp8 twin needs n%64==0 and k%16==0 (n={n} k={k})"
+    );
+    anyhow::ensure!(
+        scale_rows.len() == n,
+        "marlin fp8 twin: {} scales for n={n}",
+        scale_rows.len()
+    );
+    let stream = dev.cuda_stream();
+    anyhow::ensure!(
+        bytes.len() == n * k,
+        "marlin fp8 twin: {} weight bytes != n*k",
+        bytes.len()
+    );
+    let kmajor = nv_quant::marlin_fp8::kmajor_int32_from_e4m3_rows(bytes, n, k);
+    let scales = nv_quant::marlin_fp8::marlin_per_channel_scales_bf16(scale_rows, n);
+    #[allow(deprecated)]
+    let d_kmajor: cudarc::driver::CudaSlice<u32> = stream
+        .clone_htod(&kmajor)
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin htod: {e:?}"))?;
+    let mut b_q_marlin: cudarc::driver::CudaSlice<u32> = stream
+        .alloc_zeros::<u32>(k * n / 4)
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin alloc: {e:?}"))?;
+    let rc = unsafe {
+        let (pi, _g1) = d_kmajor.device_ptr(&stream);
+        let (po, _g2) = b_q_marlin.device_ptr_mut(&stream);
+        nv_kernels::cuda::marlin_repack_w4a16(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            pi as *const std::ffi::c_void,
+            po as *mut std::ffi::c_void,
+            k as i32,
+            n as i32,
+            8,
+        )
+    };
+    anyhow::ensure!(rc == 0, "marlin fp8 twin repack rc={rc}");
+    #[allow(deprecated)]
+    let scales_bf16: cudarc::driver::CudaSlice<u16> = stream
+        .clone_htod(&scales)
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin htod scales: {e:?}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| anyhow::anyhow!("marlin fp8 twin sync: {e:?}"))?;
+    Ok(MarlinFp8Prepared {
+        b_q_marlin,
+        scales_bf16,
+        n,
+        k,
+    })
+}
+
+#[cfg(feature = "cuda")]
+pub fn marlin_fp8_rows_gemm_into(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    tw: &MarlinFp8Prepared,
+    x_bf16_ptr: u64,
+    m: usize,
+    out: &mut cudarc::driver::CudaSlice<half::bf16>,
+) -> Result<()> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    anyhow::ensure!(
+        (1..=MARLIN_FP8_ROWS_MAX_16_IS_THE_INSTANTIATED_THREAD_M_BLOCKS_1).contains(&m)
+            && out.len() >= m * tw.n,
+        "marlin fp8 rows: m={m} out={} n={}",
+        out.len(),
+        tw.n
+    );
+    let mut elems = 0i32;
+    let rc = unsafe { nv_kernels::cuda::marlin_workspace_elems(&mut elems as *mut i32) };
+    anyhow::ensure!(rc == 0 && elems > 0, "marlin workspace elems rc={rc}");
+    let workspace: cudarc::driver::CudaSlice<i32> = stream
+        .alloc_zeros::<i32>(elems as usize)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut c_tmp_floats = 0i64;
+    let rc = unsafe { nv_kernels::cuda::marlin_nvfp4_c_tmp_floats(&mut c_tmp_floats as *mut i64) };
+    anyhow::ensure!(rc == 0 && c_tmp_floats > 0, "marlin c_tmp floats rc={rc}");
+    let mut c_tmp: cudarc::driver::CudaSlice<f32> = unsafe {
+        stream
+            .alloc::<f32>(c_tmp_floats as usize)
+            .map_err(|e| anyhow::anyhow!(e))?
+    };
+    let rc = {
+        let (bp, _gb) = tw.b_q_marlin.device_ptr(stream);
+        let (sp, _gs) = tw.scales_bf16.device_ptr(stream);
+        let (cp, _gc) = out.device_ptr_mut(stream);
+        let (tp, _gt) = c_tmp.device_ptr_mut(stream);
+        let (wp, _gw) = workspace.device_ptr(stream);
+        unsafe {
+            nv_kernels::cuda::marlin_gemm_fp8_w8a16(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                x_bf16_ptr as *const std::ffi::c_void,
+                bp as *const std::ffi::c_void,
+                sp as *const std::ffi::c_void,
+                cp as *mut std::ffi::c_void,
+                tp as *mut std::ffi::c_void,
+                c_tmp_floats,
+                wp as *mut std::ffi::c_void,
+                m as i32,
+                tw.n as i32,
+                tw.k as i32,
+            )
+        }
+    };
+    anyhow::ensure!(
+        rc == 0,
+        "marlin fp8 w8a16 rows rc={rc} m={m} n={} k={}",
+        tw.n,
+        tw.k
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+pub fn marlin_fp8_rows_env_on() -> bool {
+    marlin_fp8_rows_opt_in()
 }
 
 #[cfg(feature = "cuda")]
@@ -485,7 +941,487 @@ struct Nvfp4Storage {
 
     weight_alpha_dev: cudarc::driver::CudaSlice<f32>,
     input_stored_global: f32,
+    bf16act_row_limit: usize,
     a_staging: Mutex<std::collections::HashMap<(usize, usize), StagedActivations>>,
+    marlin_w4a16_twin_built_once_from_the_resident_nvfp4_buffers:
+        std::sync::OnceLock<Option<Arc<MarlinNvfp4Prepared>>>,
+    dx_marlin_twin_of_the_transposed_weight_requantized_once_to_nvfp4_so_the_input_gradient_never_touches_a_bf16_copy:
+        std::sync::OnceLock<Option<Arc<MarlinNvfp4Prepared>>>,
+}
+
+#[cfg(feature = "cuda")]
+pub struct MarlinNvfp4Prepared {
+    pub b_q_marlin: cudarc::driver::CudaSlice<u32>,
+    pub scales_e5m3: cudarc::driver::CudaSlice<u8>,
+    pub global_scale_dev: cudarc::driver::CudaSlice<f32>,
+    pub n: usize,
+    pub k: usize,
+    pub folded_pow2: i32,
+}
+
+pub const NV_TRAIN_DX_QUANT_TWIN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_RESTORES_THE_TRANSIENT_BF16_DEQUANT_THE_INPUT_GRADIENT_OF_A_FROZEN_NVFP4_LINEAR_RUNS_A_MARLIN_W4A16_GEMM_ON_A_TRANSPOSED_NVFP4_TWIN:
+    &str = "NV_TRAIN_DX_QUANT_TWIN";
+
+pub fn train_dx_quant_twin_enabled() -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        NV_TRAIN_DX_QUANT_TWIN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_RESTORES_THE_TRANSIENT_BF16_DEQUANT_THE_INPUT_GRADIENT_OF_A_FROZEN_NVFP4_LINEAR_RUNS_A_MARLIN_W4A16_GEMM_ON_A_TRANSPOSED_NVFP4_TWIN,
+    )
+}
+
+struct RunOnDrop<F: FnMut()>(F);
+impl<F: FnMut()> Drop for RunOnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+fn scopeguard_like<F: FnMut()>(f: F) -> RunOnDrop<F> {
+    RunOnDrop(f)
+}
+
+pub const DX_TWIN_FOLD_IS_DEVICE_RESIDENT_SO_THE_HOST_FIELD_CARRIES_MINUS_ONE: i32 = -1;
+
+#[cfg(feature = "cuda")]
+fn build_dx_marlin_nvfp4_twin_on_the_device(
+    lin: &Linear,
+    s: &Nvfp4Storage,
+) -> Result<MarlinNvfp4Prepared> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let stream = crate::cuda_stream::current_stream(&s.cuda_device);
+    let (n_out, k_in) = (lin.out_features, lin.in_features);
+    let t_build = std::time::Instant::now();
+    static BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nth = BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let _report_the_build_because_a_twin_built_inside_a_measured_step_is_step_time =
+        scopeguard_like(move || {
+            if nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_TRAIN_DX_TWIN_BUILD_LOG") {
+                eprintln!(
+                    "[dx_nvfp4_twin] device build #{nth} [{n_out}x{k_in}] {:.3} ms enqueued",
+                    t_build.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        });
+    anyhow::ensure!(
+        n_out % 16 == 0 && k_in % 16 == 0 && (k_in * (n_out / 16)) % 64 == 0,
+        "dx twin: [{n_out}x{k_in}] does not tile the NVFP4 twin layout"
+    );
+    let words = n_out * k_in / 8;
+    let kb = n_out / 16;
+    let alpha = s.weight_alpha * s.input_stored_global;
+    let mut kmajor: cudarc::driver::CudaSlice<u32> = unsafe { stream.alloc::<u32>(words) }
+        .map_err(|e| anyhow::anyhow!("dx twin kmajor: {e:?}"))?;
+    let mut scales_linear: cudarc::driver::CudaSlice<u8> = unsafe { stream.alloc::<u8>(k_in * kb) }
+        .map_err(|e| anyhow::anyhow!("dx twin scales: {e:?}"))?;
+    let rc = unsafe {
+        let (wp, _g0) = s.weight_u8.device_ptr(&stream);
+        let (sp, _g1) = s.weight_scales_cm.device_ptr(&stream);
+        let (kp, _g2) = kmajor.device_ptr_mut(&stream);
+        let (lp, _g3) = scales_linear.device_ptr_mut(&stream);
+        nv_kernels::cuda::dx_twin_nvfp4_requant_transposed_kmajor(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            wp as *const u8,
+            sp as *const u8,
+            alpha,
+            n_out as i32,
+            k_in as i32,
+            kp as *mut u32,
+            lp as *mut u8,
+        )
+    };
+    anyhow::ensure!(rc == 0, "dx twin requant rc={rc}");
+    let mut b_q_marlin: cudarc::driver::CudaSlice<u32> = stream
+        .alloc_zeros::<u32>(words)
+        .map_err(|e| anyhow::anyhow!("dx twin alloc: {e:?}"))?;
+    let rc = unsafe {
+        let (pi, _g1) = kmajor.device_ptr(&stream);
+        let (po, _g2) = b_q_marlin.device_ptr_mut(&stream);
+        nv_kernels::cuda::marlin_repack_w4a16(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            pi as *const std::ffi::c_void,
+            po as *mut std::ffi::c_void,
+            n_out as i32,
+            k_in as i32,
+            4,
+        )
+    };
+    anyhow::ensure!(rc == 0, "dx twin repack rc={rc}");
+    let mut scales_e5m3: cudarc::driver::CudaSlice<u8> =
+        unsafe { stream.alloc::<u8>(k_in * kb) }
+            .map_err(|e| anyhow::anyhow!("dx twin e5m3: {e:?}"))?;
+    let mut global_scale_dev: cudarc::driver::CudaSlice<f32> =
+        unsafe { stream.alloc::<f32>(1) }.map_err(|e| anyhow::anyhow!("dx twin global: {e:?}"))?;
+    let mut vmin: cudarc::driver::CudaSlice<u32> =
+        unsafe { stream.alloc::<u32>(1) }.map_err(|e| anyhow::anyhow!("dx twin vmin: {e:?}"))?;
+    let mut flags: cudarc::driver::CudaSlice<i32> =
+        unsafe { stream.alloc::<i32>(1) }.map_err(|e| anyhow::anyhow!("dx twin flags: {e:?}"))?;
+    let rc = unsafe {
+        let (lp, _g0) = scales_linear.device_ptr(&stream);
+        let (ep, _g1) = scales_e5m3.device_ptr_mut(&stream);
+        let (gp, _g2) = global_scale_dev.device_ptr_mut(&stream);
+        let (vp, _g3) = vmin.device_ptr_mut(&stream);
+        let (fp, _g4) = flags.device_ptr_mut(&stream);
+        nv_kernels::cuda::dx_twin_nvfp4_scales_to_marlin(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            lp as *const u8,
+            k_in as i32,
+            kb as i32,
+            1.0,
+            ep as *mut u8,
+            gp as *mut f32,
+            vp as *mut u32,
+            fp as *mut i32,
+        )
+    };
+    anyhow::ensure!(rc == 0, "dx twin scales rc={rc}");
+    Ok(MarlinNvfp4Prepared {
+        b_q_marlin,
+        scales_e5m3,
+        global_scale_dev,
+        n: k_in,
+        k: n_out,
+        folded_pow2: DX_TWIN_FOLD_IS_DEVICE_RESIDENT_SO_THE_HOST_FIELD_CARRIES_MINUS_ONE,
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn build_dx_marlin_nvfp4_twin_on_the_host_the_bitwise_oracle_of_the_device_build(
+    lin: &Linear,
+    s: &Nvfp4Storage,
+) -> Result<MarlinNvfp4Prepared> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let stream = s.cuda_device.cuda_stream();
+    let (n_out, k_in) = (lin.out_features, lin.in_features);
+    let dequant =
+        lin.device_dequant_transient_so_the_dx_gemm_reads_bf16_without_a_host_round_trip(&stream)?;
+    let host: Vec<half::bf16> = stream
+        .clone_dtoh(&dequant)
+        .map_err(|e| anyhow::anyhow!("dx twin dtoh: {e:?}"))?;
+    drop(dequant);
+    let mut rows_t: Vec<Vec<f32>> = vec![vec![0f32; n_out]; k_in];
+    for r in 0..n_out {
+        for c in 0..k_in {
+            rows_t[c][r] = host[r * k_in + c].to_f32();
+        }
+    }
+    drop(host);
+    let packed = nv_quant::nvfp4::Nvfp4Tensor::quantize_rows_with_global(&rows_t, 1.0);
+    drop(rows_t);
+    let kmajor = nv_quant::marlin_nvfp4::kmajor_int32_from_packed_rows(&packed.data, k_in, n_out);
+    let sc = nv_quant::marlin_nvfp4::marlin_scales_from_linear(&packed.scales, k_in, n_out, 1.0);
+    #[allow(deprecated)]
+    let d_kmajor: cudarc::driver::CudaSlice<u32> = stream
+        .clone_htod(&kmajor)
+        .map_err(|e| anyhow::anyhow!("dx twin htod kmajor: {e:?}"))?;
+    let mut b_q_marlin: cudarc::driver::CudaSlice<u32> = stream
+        .alloc_zeros::<u32>(n_out * k_in / 8)
+        .map_err(|e| anyhow::anyhow!("dx twin alloc: {e:?}"))?;
+    let rc = unsafe {
+        let (pi, _g1) = d_kmajor.device_ptr(&stream);
+        let (po, _g2) = b_q_marlin.device_ptr_mut(&stream);
+        nv_kernels::cuda::marlin_repack_w4a16(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            pi as *const std::ffi::c_void,
+            po as *mut std::ffi::c_void,
+            n_out as i32,
+            k_in as i32,
+            4,
+        )
+    };
+    anyhow::ensure!(rc == 0, "dx twin repack rc={rc}");
+    #[allow(deprecated)]
+    let scales_e5m3: cudarc::driver::CudaSlice<u8> = stream
+        .clone_htod(&sc.bytes_e5m3)
+        .map_err(|e| anyhow::anyhow!("dx twin htod scales: {e:?}"))?;
+    #[allow(deprecated)]
+    let global_scale_dev: cudarc::driver::CudaSlice<f32> = stream
+        .clone_htod(&[sc.global_scale_processed])
+        .map_err(|e| anyhow::anyhow!("dx twin htod global: {e:?}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| anyhow::anyhow!("dx twin sync: {e:?}"))?;
+    Ok(MarlinNvfp4Prepared {
+        b_q_marlin,
+        scales_e5m3,
+        global_scale_dev,
+        n: k_in,
+        k: n_out,
+        folded_pow2: sc.folded_pow2,
+    })
+}
+
+pub const DX_TWIN_FROM_64_ROWS_BECAUSE_A_PER_EXPERT_CALL_OF_A_FEW_ROWS_PAYS_MORE_FOR_THE_MARLIN_LAUNCH_THAN_FOR_THE_DEQUANT: usize = 64;
+
+#[cfg(feature = "cuda")]
+struct DxGemmScratch {
+    workspace: cudarc::driver::CudaSlice<i32>,
+    c_tmp: cudarc::driver::CudaSlice<f32>,
+    c_tmp_floats: i64,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for DxGemmScratch {}
+
+#[cfg(feature = "cuda")]
+static DX_GEMM_SCRATCH_PER_STREAM_BECAUSE_A_WORKSPACE_MEMSET_AND_TWO_ALLOCS_PER_BACKWARD_ARE_THE_LAUNCH_FLOOR: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<usize, DxGemmScratch>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(feature = "cuda")]
+fn build_dx_fp8_twin_of_the_transposed_weight(lin: &Linear, s: &Fp8Storage) -> Result<Fp8DxTwin> {
+    let dev = Device::Cuda(s.cuda_device.clone());
+    let (n_out, k_in) = (lin.out_features, lin.in_features);
+    let w = Tensor::from_storage(
+        candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+            s.weight_u8
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("fp8 dx twin clone bytes: {e:?}"))?,
+            s.cuda_device.clone(),
+        )),
+        (n_out, k_in),
+        candle_core::op::BackpropOp::none(),
+        false,
+    );
+    let wt = w.t()?.contiguous()?;
+    let wq_t = {
+        let (st, _l) = wt.storage_and_layout();
+        match &*st {
+            candle_core::Storage::Cuda(c) => c
+                .as_cuda_slice::<u8>()?
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("fp8 dx twin clone transposed: {e:?}"))?,
+            _ => anyhow::bail!("fp8 dx twin: not cuda"),
+        }
+    };
+    let stream = s.cuda_device.cuda_stream();
+    #[allow(deprecated)]
+    let unit_scales_for_the_k_in_rows: cudarc::driver::CudaSlice<f32> = stream
+        .clone_htod(&vec![1f32; k_in])
+        .map_err(|e| anyhow::anyhow!("fp8 dx twin htod unit scales: {e:?}"))?;
+    let channel_scale_bf16 =
+        Tensor::from_vec(s.weight_scale_rows.clone(), n_out, &dev)?.to_dtype(DType::BF16)?;
+    Ok(Fp8DxTwin {
+        wq_t,
+        unit_scales_for_the_k_in_rows,
+        channel_scale_bf16,
+    })
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn fp8_dx_gemm_dy_rowquantized_e4m3_times_the_transposed_twin(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    s: &Fp8Storage,
+    tw: &Fp8DxTwin,
+    dy_bf16: &Tensor,
+    m: usize,
+    n_out: usize,
+    k_in: usize,
+    out: &mut cudarc::driver::CudaSlice<half::bf16>,
+) -> Result<()> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let dy_scaled = dy_bf16
+        .broadcast_mul(&tw.channel_scale_bf16.reshape((1, n_out))?)?
+        .contiguous()?;
+    let mut dy_q: cudarc::driver::CudaSlice<u8> =
+        unsafe { stream.alloc::<u8>(m * n_out) }.map_err(|e| anyhow::anyhow!(e))?;
+    let mut a_scales: cudarc::driver::CudaSlice<f32> =
+        unsafe { stream.alloc::<f32>(m) }.map_err(|e| anyhow::anyhow!(e))?;
+    let rc = {
+        let (st, l) = dy_scaled.storage_and_layout();
+        let c = match &*st {
+            candle_core::Storage::Cuda(c) => c,
+            _ => anyhow::bail!("fp8 dx: dy not cuda"),
+        };
+        let dsl = c.as_cuda_slice::<half::bf16>()?;
+        let dview = dsl.slice(l.start_offset()..);
+        let (dp, _g) = dview.device_ptr(stream);
+        let (qp, _gq) = dy_q.device_ptr_mut(stream);
+        let (sp, _gs) = a_scales.device_ptr_mut(stream);
+        unsafe {
+            nv_kernels::cuda::rowquant_e4m3(
+                stream.cu_stream() as *mut _,
+                dp as *const u16,
+                qp as *mut u8,
+                sp as *mut f32,
+                m as i32,
+                n_out as i32,
+            )
+        }
+    };
+    anyhow::ensure!(rc == 0, "fp8 dx rowquant rc={rc}");
+    {
+        let mut runner = s
+            .runner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("fp8 runner poisoned: {e}"))?;
+        runner.with_stream(stream, |runner| {
+            runner.matmul_e4m3_weight_row(
+                &dy_q,
+                &tw.wq_t,
+                out,
+                m as u64,
+                k_in as u64,
+                n_out as u64,
+                &s.a_scale_dev,
+                &s.a_scale_dev,
+            )
+        })?;
+    }
+    let (dp, _gd) = out.device_ptr_mut(stream);
+    let (rp, _gr) = a_scales.device_ptr(stream);
+    let (cp, _gc) = tw.unit_scales_for_the_k_in_rows.device_ptr(stream);
+    let rc = unsafe {
+        nv_kernels::cuda::scale_rowcol_bf16(
+            stream.cu_stream() as *mut _,
+            dp as *mut u16,
+            rp as *const f32,
+            cp as *const f32,
+            m as i32,
+            k_in as i32,
+        )
+    };
+    anyhow::ensure!(rc == 0, "fp8 dx scale_rowcol rc={rc}");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn marlin_nvfp4_dx_gemm(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    tw: &MarlinNvfp4Prepared,
+    dy_bf16_ptr: u64,
+    m: usize,
+    out: &mut cudarc::driver::CudaSlice<half::bf16>,
+) -> Result<()> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    anyhow::ensure!(
+        out.len() >= m * tw.n,
+        "dx gemm: out {} < m*n {}",
+        out.len(),
+        m * tw.n
+    );
+    let scratch = DX_GEMM_SCRATCH_PER_STREAM_BECAUSE_A_WORKSPACE_MEMSET_AND_TWO_ALLOCS_PER_BACKWARD_ARE_THE_LAUNCH_FLOOR
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut scratch = scratch
+        .lock()
+        .map_err(|e| anyhow::anyhow!("dx gemm scratch poisoned: {e}"))?;
+    let key = nv_quant::stream_cache_key(stream);
+    if !scratch.contains_key(&key) {
+        let mut elems = 0i32;
+        let rc = unsafe { nv_kernels::cuda::marlin_workspace_elems(&mut elems as *mut i32) };
+        anyhow::ensure!(rc == 0 && elems > 0, "marlin workspace elems rc={rc}");
+        let workspace: cudarc::driver::CudaSlice<i32> = stream
+            .alloc_zeros::<i32>(elems as usize)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut c_tmp_floats = 0i64;
+        let rc =
+            unsafe { nv_kernels::cuda::marlin_nvfp4_c_tmp_floats(&mut c_tmp_floats as *mut i64) };
+        anyhow::ensure!(rc == 0 && c_tmp_floats > 0, "marlin c_tmp floats rc={rc}");
+        let c_tmp: cudarc::driver::CudaSlice<f32> = unsafe {
+            stream
+                .alloc::<f32>(c_tmp_floats as usize)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        scratch.insert(
+            key,
+            DxGemmScratch {
+                workspace,
+                c_tmp,
+                c_tmp_floats,
+            },
+        );
+    }
+    let sc = scratch.get_mut(&key).expect("inserted above");
+    let c_tmp_floats = sc.c_tmp_floats;
+    let (workspace, c_tmp) = (&sc.workspace, &mut sc.c_tmp);
+    let rc = {
+        let (bp, _gb) = tw.b_q_marlin.device_ptr(stream);
+        let (sp, _gs) = tw.scales_e5m3.device_ptr(stream);
+        let (gp, _gg) = tw.global_scale_dev.device_ptr(stream);
+        let (cp, _gc) = out.device_ptr_mut(stream);
+        let (tp, _gt) = c_tmp.device_ptr_mut(stream);
+        let (wp, _gw) = workspace.device_ptr(stream);
+        unsafe {
+            nv_kernels::cuda::marlin_gemm_nvfp4_w4a16(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                dy_bf16_ptr as *const std::ffi::c_void,
+                bp as *const std::ffi::c_void,
+                sp as *const std::ffi::c_void,
+                gp as *const f32,
+                cp as *mut std::ffi::c_void,
+                tp as *mut std::ffi::c_void,
+                c_tmp_floats,
+                wp as *mut std::ffi::c_void,
+                m as i32,
+                tw.n as i32,
+                tw.k as i32,
+            )
+        }
+    };
+    anyhow::ensure!(
+        rc == 0,
+        "marlin nvfp4 dx gemm rc={rc} m={m} n={} k={}",
+        tw.n,
+        tw.k
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn build_marlin_nvfp4_twin(s: &Nvfp4Storage, n: usize, k: usize) -> Result<MarlinNvfp4Prepared> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let stream = s.cuda_device.cuda_stream();
+    let packed = stream
+        .clone_dtoh(&s.weight_u8)
+        .map_err(|e| anyhow::anyhow!("marlin twin dtoh weights: {e:?}"))?;
+    let swizzled = stream
+        .clone_dtoh(&s.weight_scales_cm)
+        .map_err(|e| anyhow::anyhow!("marlin twin dtoh scales: {e:?}"))?;
+    anyhow::ensure!(
+        packed.len() == n * k / 2,
+        "marlin twin: packed bytes {} != n*k/2 for n={n} k={k}",
+        packed.len()
+    );
+    let kmajor = nv_quant::marlin_nvfp4::kmajor_int32_from_packed_rows(&packed, n, k);
+    let global = s.weight_alpha * s.input_stored_global;
+    let sc = nv_quant::marlin_nvfp4::marlin_scales_from_swizzled(&swizzled, n, k, global);
+    #[allow(deprecated)]
+    let d_kmajor: cudarc::driver::CudaSlice<u32> = stream
+        .clone_htod(&kmajor)
+        .map_err(|e| anyhow::anyhow!("marlin twin htod kmajor: {e:?}"))?;
+    let mut b_q_marlin: cudarc::driver::CudaSlice<u32> = stream
+        .alloc_zeros::<u32>(k * n / 8)
+        .map_err(|e| anyhow::anyhow!("marlin twin alloc: {e:?}"))?;
+    let rc = unsafe {
+        let (pi, _g1) = d_kmajor.device_ptr(&stream);
+        let (po, _g2) = b_q_marlin.device_ptr_mut(&stream);
+        nv_kernels::cuda::marlin_repack_w4a16(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            pi as *const std::ffi::c_void,
+            po as *mut std::ffi::c_void,
+            k as i32,
+            n as i32,
+            4,
+        )
+    };
+    anyhow::ensure!(rc == 0, "marlin twin repack rc={rc}");
+    #[allow(deprecated)]
+    let scales_e5m3: cudarc::driver::CudaSlice<u8> = stream
+        .clone_htod(&sc.bytes_e5m3)
+        .map_err(|e| anyhow::anyhow!("marlin twin htod scales: {e:?}"))?;
+    #[allow(deprecated)]
+    let global_scale_dev: cudarc::driver::CudaSlice<f32> = stream
+        .clone_htod(&[sc.global_scale_processed])
+        .map_err(|e| anyhow::anyhow!("marlin twin htod global: {e:?}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| anyhow::anyhow!("marlin twin sync: {e:?}"))?;
+    Ok(MarlinNvfp4Prepared {
+        b_q_marlin,
+        scales_e5m3,
+        global_scale_dev,
+        n,
+        k,
+        folded_pow2: sc.folded_pow2,
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -507,6 +1443,7 @@ pub(crate) fn leaf_gradient_loss_was_explicitly_allowed() -> bool {
     std::env::var("NV_ALLOW_LEAF_GRADIENT_LOSS").ok().as_deref() == Some("1")
 }
 
+#[cfg(feature = "cuda")]
 fn a_quantized_fast_path_cannot_be_differentiated(path: &str, x: &Tensor) -> Result<()> {
     if this_call_is_building_an_autograd_graph(x) {
         anyhow::bail!(
@@ -563,10 +1500,7 @@ impl Bf16LinearOp {
 
     fn weight_cuda_view(
         &self,
-    ) -> candle_core::Result<(
-        std::sync::RwLockReadGuard<'_, candle_core::Storage>,
-        usize,
-    )> {
+    ) -> candle_core::Result<(std::sync::RwLockReadGuard<'_, candle_core::Storage>, usize)> {
         let (w_storage, wl) = self.weight().storage_and_layout();
         Ok((w_storage, wl.start_offset()))
     }
@@ -817,6 +1751,16 @@ impl candle_core::CustomOp1 for QuantLinearOp {
         };
         let dev = storage.device.clone();
         let stream = crate::cuda_stream::current_stream(&dev);
+        let _span = crate::prof_events::span(
+            match (&twin.storage, m >= DX_TWIN_FROM_64_ROWS_BECAUSE_A_PER_EXPERT_CALL_OF_A_FEW_ROWS_PAYS_MORE_FOR_THE_MARLIN_LAUNCH_THAN_FOR_THE_DEQUANT) {
+                (LinearStorage::Nvfp4(_), true) => "fwd_quant_linear_nvfp4_m64plus",
+                (LinearStorage::Nvfp4(_), false) => "fwd_quant_linear_nvfp4_small_m",
+                (LinearStorage::Fp8E4m3(_), true) => "fwd_quant_linear_fp8_m64plus",
+                (LinearStorage::Fp8E4m3(_), false) => "fwd_quant_linear_fp8_small_m",
+                _ => "fwd_quant_linear_other",
+            },
+            &stream,
+        );
         let mut x_owned: cudarc::driver::CudaSlice<bf16> = unsafe {
             stream
                 .alloc::<bf16>(m * k)
@@ -864,16 +1808,13 @@ impl candle_core::CustomOp1 for QuantLinearOp {
                 candle_core::Storage::Cuda(s) => s,
                 _ => {
                     return Err(candle_core::Error::Msg(
-                        "QuantLinearOp forward: expected cuda storage for the gemm output"
-                            .into(),
+                        "QuantLinearOp forward: expected cuda storage for the gemm output".into(),
                     ))
                 }
             };
             let y_slice = y_cuda.as_cuda_slice::<bf16>()?;
             let (y_start, y_end) = yl.contiguous_offsets().ok_or_else(|| {
-                candle_core::Error::Msg(
-                    "QuantLinearOp forward: non-contiguous gemm output".into(),
-                )
+                candle_core::Error::Msg("QuantLinearOp forward: non-contiguous gemm output".into())
             })?;
             let y_view = y_slice.slice(y_start..y_end);
             stream
@@ -892,6 +1833,7 @@ impl candle_core::CustomOp1 for QuantLinearOp {
         _res: &Tensor,
         grad_res: &Tensor,
     ) -> candle_core::Result<Option<Tensor>> {
+        use cudarc::driver::DevicePtr;
         use half::bf16;
         use nv_quant::matmul::TensorCoreGemm;
 
@@ -913,14 +1855,85 @@ impl candle_core::CustomOp1 for QuantLinearOp {
             }
         };
         let stream = crate::cuda_stream::current_stream(&dev);
+        let k = twin.in_features;
+        let _span = crate::prof_events::span(
+            match (&twin.storage, m >= DX_TWIN_FROM_64_ROWS_BECAUSE_A_PER_EXPERT_CALL_OF_A_FEW_ROWS_PAYS_MORE_FOR_THE_MARLIN_LAUNCH_THAN_FOR_THE_DEQUANT) {
+                (LinearStorage::Nvfp4(_), true) => "bwd_quant_linear_nvfp4_twin_m64plus",
+                (LinearStorage::Nvfp4(_), false) => "bwd_quant_linear_nvfp4_transient_small_m",
+                (LinearStorage::Fp8E4m3(_), true) => "bwd_quant_linear_fp8_twin_m64plus",
+                (LinearStorage::Fp8E4m3(_), false) => "bwd_quant_linear_fp8_transient_small_m",
+                _ => "bwd_quant_linear_other",
+            },
+            &stream,
+        );
+        if train_dx_quant_twin_enabled()
+            && m >= DX_TWIN_FROM_64_ROWS_BECAUSE_A_PER_EXPERT_CALL_OF_A_FEW_ROWS_PAYS_MORE_FOR_THE_MARLIN_LAUNCH_THAN_FOR_THE_DEQUANT
+        {
+            if let (LinearStorage::Fp8E4m3(s), Some(tw)) =
+                (&twin.storage, twin.dx_fp8_twin_of_the_transposed_weight())
+            {
+                let mut dx_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+                    stream.alloc::<bf16>(m * k).map_err(|e| {
+                        candle_core::Error::Msg(format!("QuantLinearOp alloc dx: {e}"))
+                    })?
+                };
+                fp8_dx_gemm_dy_rowquantized_e4m3_times_the_transposed_twin(
+                    &stream, s, &tw, &dy, m, n, k, &mut dx_dev,
+                )
+                .map_err(|e| {
+                    candle_core::Error::Msg(format!("QuantLinearOp backward fp8 twin gemm: {e:#}"))
+                })?;
+                let dx = candle_core::Tensor::from_storage(
+                    candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                        dx_dev, dev,
+                    )),
+                    (m, k),
+                    candle_core::op::BackpropOp::none(),
+                    false,
+                );
+                return Ok(Some(dx.to_dtype(arg.dtype())?));
+            }
+            if let Some(tw) = twin.dx_marlin_nvfp4_twin_of_the_transposed_weight() {
+                let mut dx_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+                    stream.alloc::<bf16>(m * k).map_err(|e| {
+                        candle_core::Error::Msg(format!("QuantLinearOp alloc dx: {e}"))
+                    })?
+                };
+                let dy_ptr = {
+                    let (dy_storage, dyl) = dy.storage_and_layout();
+                    let dy_cuda = match &*dy_storage {
+                        candle_core::Storage::Cuda(s) => s,
+                        _ => {
+                            return Err(candle_core::Error::Msg(
+                                "QuantLinearOp backward: expected cuda storage for dy".into(),
+                            ))
+                        }
+                    };
+                    let dy_slice = dy_cuda.as_cuda_slice::<bf16>()?;
+                    let (p, _g) = dy_slice.device_ptr(&stream);
+                    p as u64 + (dyl.start_offset() * 2) as u64
+                };
+                marlin_nvfp4_dx_gemm(&stream, &tw, dy_ptr, m, &mut dx_dev).map_err(|e| {
+                    candle_core::Error::Msg(format!(
+                        "QuantLinearOp backward nvfp4 twin gemm: {e:#}"
+                    ))
+                })?;
+                let dx = candle_core::Tensor::from_storage(
+                    candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                        dx_dev, dev,
+                    )),
+                    (m, k),
+                    candle_core::op::BackpropOp::none(),
+                    false,
+                );
+                return Ok(Some(dx.to_dtype(arg.dtype())?));
+            }
+        }
         let w_dequant = twin
-            .device_dequant_transient_so_the_dx_gemm_reads_bf16_without_a_host_round_trip(
-                &stream,
-            )
+            .device_dequant_transient_so_the_dx_gemm_reads_bf16_without_a_host_round_trip(&stream)
             .map_err(|e| {
                 candle_core::Error::Msg(format!("QuantLinearOp backward dequant: {e:#}"))
             })?;
-        let k = twin.in_features;
         let mut dx_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
             stream
                 .alloc::<bf16>(m * k)
@@ -954,9 +1967,7 @@ impl candle_core::CustomOp1 for QuantLinearOp {
                 1.0,
                 0.0,
             )
-            .map_err(|e| {
-                candle_core::Error::Msg(format!("QuantLinearOp backward gemm: {e:#}"))
-            })?;
+            .map_err(|e| candle_core::Error::Msg(format!("QuantLinearOp backward gemm: {e:#}")))?;
         }
         drop(w_dequant);
         let dx = candle_core::Tensor::from_storage(
@@ -1102,6 +2113,96 @@ impl Linear {
     }
 
     #[cfg(feature = "cuda")]
+    pub fn dx_fp8_twin_of_the_transposed_weight(&self) -> Option<Arc<Fp8DxTwin>> {
+        match &self.storage {
+            LinearStorage::Fp8E4m3(s) => s
+                .dx_fp8_twin_of_the_transposed_weight_bytes_with_the_channel_scale_folded_into_dy
+                .get_or_init(|| match build_dx_fp8_twin_of_the_transposed_weight(self, s) {
+                    Ok(t) => Some(Arc::new(t)),
+                    Err(e) => {
+                        eprintln!(
+                            "[dx_fp8_twin] build failed for [{}x{}]: {e:#}; the input gradient falls back to the transient dequant",
+                            self.out_features, self.in_features
+                        );
+                        None
+                    }
+                })
+                .clone(),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn dx_marlin_nvfp4_twin_of_the_transposed_weight(
+        &self,
+    ) -> Option<Arc<MarlinNvfp4Prepared>> {
+        match &self.storage {
+            LinearStorage::Nvfp4(s) => s
+                .dx_marlin_twin_of_the_transposed_weight_requantized_once_to_nvfp4_so_the_input_gradient_never_touches_a_bf16_copy
+                .get_or_init(|| match build_dx_marlin_nvfp4_twin_on_the_device(self, s) {
+                    Ok(t) => Some(Arc::new(t)),
+                    Err(e) => {
+                        eprintln!(
+                            "[dx_nvfp4_twin] build failed for [{}x{}]: {e:#}; the input gradient falls back to the transient dequant",
+                            self.out_features, self.in_features
+                        );
+                        None
+                    }
+                })
+                .clone(),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn dx_marlin_nvfp4_twin_built_on_the_host_oracle(&self) -> Result<MarlinNvfp4Prepared> {
+        match &self.storage {
+            LinearStorage::Nvfp4(s) => {
+                build_dx_marlin_nvfp4_twin_on_the_host_the_bitwise_oracle_of_the_device_build(
+                    self, s,
+                )
+            }
+            _ => anyhow::bail!("the dx twin oracle needs an NVFP4 storage"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn dx_marlin_nvfp4_twin_built_on_the_device(&self) -> Result<MarlinNvfp4Prepared> {
+        match &self.storage {
+            LinearStorage::Nvfp4(s) => build_dx_marlin_nvfp4_twin_on_the_device(self, s),
+            _ => anyhow::bail!("the device dx twin needs an NVFP4 storage"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn marlin_nvfp4_w4a16_twin(&self) -> Option<Arc<MarlinNvfp4Prepared>> {
+        match &self.storage {
+            LinearStorage::Nvfp4(s) => s
+                .marlin_w4a16_twin_built_once_from_the_resident_nvfp4_buffers
+                .get_or_init(|| {
+                    match build_marlin_nvfp4_twin(s, self.out_features, self.in_features) {
+                        Ok(t) => {
+                            eprintln!(
+                                "[marlin_nvfp4_twin] built n={} k={} fold_pow2={}",
+                                t.n, t.k, t.folded_pow2
+                            );
+                            Some(Arc::new(t))
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[marlin_nvfp4_twin] unavailable n={} k={}: {e:#}",
+                                self.out_features, self.in_features
+                            );
+                            None
+                        }
+                    }
+                })
+                .clone(),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn fp8_scale_parts(&self) -> Option<(&[f32], nv_quant::fp8::Fp8ScaleMode)> {
         match &self.storage {
             LinearStorage::Fp8E4m3(s) => Some((&s.weight_scale_rows, s.scale_mode)),
@@ -1120,7 +2221,7 @@ impl Linear {
             LinearStorage::Fp8E4m3(s)
                 if s.scale_mode == nv_quant::fp8::Fp8ScaleMode::PerOuterRow
                     && self.bias.is_none()
-                    && self.in_features % 16 == 0 =>
+                    && self.in_features.is_multiple_of(16) =>
             {
                 Some((&s.weight_u8, &s.b_scale_rows_dev))
             }
@@ -1179,7 +2280,7 @@ impl Linear {
                     &scales_sw,
                     self.out_features,
                     self.in_features,
-                    s.weight_alpha,
+                    s.weight_alpha * s.input_stored_global,
                 );
                 let bf: Vec<bf16> = vals.iter().map(|&v| bf16::from_f32(v)).collect();
                 let t = Tensor::from_vec(
@@ -1243,7 +2344,7 @@ impl Linear {
                         wp as *const u8,
                         sp as *const u8,
                         op as *mut u16,
-                        s.weight_alpha,
+                        s.weight_alpha * s.input_stored_global,
                         self.out_features as i32,
                         self.in_features as i32,
                     )
@@ -1373,6 +2474,53 @@ impl Linear {
     }
 
     #[cfg(feature = "cuda")]
+    pub fn try_forward_silu_nvfp4(&self, gate: &Tensor, up: &Tensor) -> Result<Option<Tensor>> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("NV_Q38_SILU_NVFP4").as_deref() == Ok("1"))
+            || self.in_features != 17408
+            || self.out_features != 5120
+            || self.has_lora()
+            || gate.dtype() != DType::BF16
+            || up.dtype() != DType::BF16
+            || !matches!(gate.device(), Device::Cuda(_))
+        {
+            return Ok(None);
+        }
+        let LinearStorage::Nvfp4(s) = &self.storage else {
+            return Ok(None);
+        };
+        let dims = gate.dims();
+        anyhow::ensure!(
+            dims == up.dims()
+                && dims.last() == Some(&self.in_features)
+                && gate.device().same_device(up.device()),
+            "NVFP4 SiLU gate/up shape or device mismatch"
+        );
+        let leading = gate.elem_count() / self.in_features;
+        if !matches!(leading, 2048 | 4096)
+            || leading <= s.bf16act_row_limit
+            || (nvfp4_m1_gemv_opted_in() && leading <= nvfp4_gemv_row_block_ceiling())
+        {
+            return Ok(None);
+        }
+        a_quantized_fast_path_cannot_be_differentiated("NVFP4 SiLU up", up)?;
+        let gate2 = gate.reshape((leading, self.in_features))?;
+        let up2 = up.reshape((leading, self.in_features))?.contiguous()?;
+        let out2 = self.matmul_nvfp4_impl(s, &gate2, leading, None, Some(&up2))?;
+        let mut shape = dims[..dims.len() - 1].to_vec();
+        shape.push(self.out_features);
+        let mut out = out2.reshape(shape)?;
+        if let Some(bias) = &self.bias {
+            out = out.broadcast_add(&bias.to_dtype(out.dtype())?)?;
+        }
+        static TRACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[linear] NV_Q38_SILU_NVFP4 engaged m={leading} k=17408 n=5120 arithmetic=candle_bf16 learned_weights=nvfp4");
+        }
+        Ok(Some(out))
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn forward_prenorm_nvfp4(
         &self,
         x_pre: &Tensor,
@@ -1404,6 +2552,7 @@ impl Linear {
                 weight_bf16: norm_weight,
                 eps,
             }),
+            None,
         )?;
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(self.out_features);
@@ -1477,7 +2626,7 @@ impl Linear {
         if leading == 1
             && !force_dense
             && !force_dense_bf16_enabled()
-            && self.in_features % 2 == 0
+            && self.in_features.is_multiple_of(2)
             && std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_err()
         {
             return self.matmul_bf16_gemv(weight, &x_bf, &dev);
@@ -1554,7 +2703,7 @@ impl Linear {
             return self.matmul_bf16_dx_only(weight, x_bf);
         }
         let w_bf = weight.contiguous()?;
-        let stream = crate::cuda_stream::current_stream(&dev);
+        let stream = crate::cuda_stream::current_stream(dev);
         let n = self.out_features;
         let k = self.in_features;
 
@@ -1678,7 +2827,7 @@ impl Linear {
 
         if leading == 1
             && !force_dense_bf16_enabled()
-            && k % 2 == 0
+            && k.is_multiple_of(2)
             && std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_err()
         {
             let w_bf = weight.contiguous()?;
@@ -1876,10 +3025,33 @@ impl Linear {
         self.matmul_fallback(weight, x2)
     }
 
+    const FALLBACK_TAKES_THE_PRETRANSPOSED_RESIDENT_INSTEAD_OF_REMATERIALIZING_IT: &'static str =
+        "weight_t is built as weight.t().contiguous() at construction, byte-identical to what \
+         this fallback used to materialize on every forward, so reusing it is bitwise by \
+         construction and stops a full weight-sized transpose per call (the qlora window paid \
+         ~9 GB of rematerialized transposes per training step); the shape guard keeps narrowed \
+         and quant-dequant callers on the materializing path, and the needs_bf16_upcast guard \
+         keeps cpu bf16 on the f32-upcast path because the candle cpu backend has no bf16 matmul \
+         and every cpu oracle depends on that upcast";
+
     fn matmul_fallback(&self, weight: &Tensor, x2: &Tensor) -> Result<Tensor> {
         let on_cpu = matches!(x2.device(), candle_core::Device::Cpu);
         let needs_bf16_upcast =
             on_cpu && (weight.dtype() == DType::BF16 || x2.dtype() == DType::BF16);
+        if !needs_bf16_upcast {
+            if let LinearStorage::Bf16 {
+                weight_t: Some(wt), ..
+            } = &self.storage
+            {
+                let same_shape = wt.dims() == [self.in_features, self.out_features]
+                    && weight.dims() == [self.out_features, self.in_features];
+                if same_shape && wt.dtype() == x2.dtype() && wt.device().same_device(x2.device()) {
+                    let _ =
+                        Self::FALLBACK_TAKES_THE_PRETRANSPOSED_RESIDENT_INSTEAD_OF_REMATERIALIZING_IT;
+                    return Ok(x2.matmul(wt)?);
+                }
+            }
+        }
         if needs_bf16_upcast {
             let orig_dtype = x2.dtype();
             let x_f32 = x2.to_dtype(DType::F32)?;
@@ -1907,8 +3079,7 @@ impl Linear {
     #[cfg(feature = "cuda")]
     fn matmul_quant_dx_only(&self, x2: &Tensor) -> Result<Tensor> {
         let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
-        let y_bf =
-            x_bf.apply_op1(QuantLinearOp::sharing_the_resident_quantized_storage(self)?)?;
+        let y_bf = x_bf.apply_op1(QuantLinearOp::sharing_the_resident_quantized_storage(self)?)?;
         Ok(y_bf.to_dtype(x2.dtype())?)
     }
 
@@ -1931,6 +3102,9 @@ impl Linear {
             self.in_features,
             &format!("scale_mode={:?} xdtype={:?}", s.scale_mode, x2.dtype()),
         );
+        if let Some(out) = self.matmul_fp8_marlin_rows(s, x2, leading, &dev)? {
+            return Ok(out);
+        }
         if let Some(out) = self.matmul_fp8_small_m_gemv(s, x2, leading, &dev)? {
             return Ok(out);
         }
@@ -1974,16 +3148,18 @@ impl Linear {
                 .runner
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Fp8 runner mutex poisoned: {e}"))?;
-            runner.matmul_e4m3_weight_row(
-                &x_fp8_dev,
-                &s.weight_u8,
-                &mut d_dev,
-                m,
-                n,
-                k,
-                &a_scale_dev_call,
-                &s.b_scale_dev,
-            )?
+            runner.with_stream(&stream, |runner| {
+                runner.matmul_e4m3_weight_row(
+                    &x_fp8_dev,
+                    &s.weight_u8,
+                    &mut d_dev,
+                    m,
+                    n,
+                    k,
+                    &a_scale_dev_call,
+                    &s.b_scale_dev,
+                )
+            })?
         }
 
         let out_storage = candle_core::CudaStorage::wrap_cuda_slice(d_dev, dev);
@@ -1995,6 +3171,64 @@ impl Linear {
             false,
         );
         Ok(out)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn matmul_fp8_marlin_rows(
+        &self,
+        s: &Fp8Storage,
+        x2: &Tensor,
+        leading: usize,
+        dev: &candle_core::CudaDevice,
+    ) -> Result<Option<Tensor>> {
+        use cudarc::driver::DevicePtr;
+        use half::bf16;
+        if !marlin_fp8_rows_opt_in()
+            || s.scale_mode != nv_quant::fp8::Fp8ScaleMode::PerOuterRow
+            || !(1..=MARLIN_FP8_ROWS_MAX_16_IS_THE_INSTANTIATED_THREAD_M_BLOCKS_1)
+                .contains(&leading)
+            || self.out_features % 64 != 0
+            || self.in_features % 16 != 0
+            || x2.dtype() != DType::BF16
+        {
+            return Ok(None);
+        }
+        let Some(tw) = s
+            .marlin_fp8_twin_built_once_from_the_resident_e4m3_rows
+            .get()
+            .cloned()
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let n = self.out_features;
+        let stream = crate::cuda_stream::current_stream(dev);
+        let x_bf = x2.contiguous()?;
+        let mut c_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(leading * n)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        {
+            let (x_storage, xl) = x_bf.storage_and_layout();
+            let x_cuda = match &*x_storage {
+                candle_core::Storage::Cuda(st) => st,
+                _ => anyhow::bail!("expected cuda storage for fp8 marlin input"),
+            };
+            let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
+            let x_view = x_slice.slice(xl.start_offset()..);
+            let (xp, _gx) = x_view.device_ptr(&stream);
+            marlin_fp8_rows_gemm_into(&stream, &tw, xp, leading, &mut c_dev)?;
+        }
+        static MARLIN_FP8_ROWS_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+        MARLIN_FP8_ROWS_FIRED_ONCE.call_once(|| eprintln!("[marlin_fp8_rows] fired m={leading} n={n} k={} (bf16 rows on the fp8 Marlin twin, fp32 reduce)", tw.k));
+        let out_storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev.clone());
+        Ok(Some(candle_core::Tensor::from_storage(
+            candle_core::Storage::Cuda(out_storage),
+            (leading, n),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )))
     }
 
     #[cfg(feature = "cuda")]
@@ -2011,7 +3245,7 @@ impl Linear {
 
         if s.scale_mode != nv_quant::fp8::Fp8ScaleMode::PerOuterRow
             || !(1..=16).contains(&leading)
-            || self.in_features % 16 != 0
+            || !self.in_features.is_multiple_of(16)
             || x2.dtype() != DType::BF16
         {
             return Ok(None);
@@ -2099,7 +3333,7 @@ impl Linear {
                             nvk::gemv_e4m3_untiled_staging_reaches_this_m(k as i32) as usize;
                         let chunk_rows_past_the_staging_cap = leading > reach
                             && leading
-                                <= VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC
+                                <= verify_one_arithmetic_rows_ceiling_env_nv_verify_one_arith_rows_default_8_max_24_serving_never_exceeds_8_only_the_mrow_ladder_raises_it()
                             && VERIFY_INTERIOR_REACHES_3_TO_7_ARE_THE_SHAPES_WHOSE_TILE_FALLBACK_SPLIT_THE_VERIFY_RANGE
                                 .contains(&reach);
                         if chunk_rows_past_the_staging_cap {
@@ -2169,19 +3403,17 @@ impl Linear {
         let n = self.out_features;
         let k = self.in_features;
         anyhow::ensure!(
-            k % 16 == 0,
+            k.is_multiple_of(16),
             "fp8 row-scaled linear: in_features {k} % 16 != 0; cuBLASLt e4m3 needs 16-element \
              aligned K and every q38 fp8 module satisfies it, so a trip here is a new module"
         );
         let stream = crate::cuda_stream::current_stream(dev);
         let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
 
-        let mut x_q: cudarc::driver::CudaSlice<u8> = unsafe {
-            stream.alloc::<u8>(m * k).map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut a_scale_rows: cudarc::driver::CudaSlice<f32> = unsafe {
-            stream.alloc::<f32>(m).map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut x_q: cudarc::driver::CudaSlice<u8> =
+            unsafe { stream.alloc::<u8>(m * k).map_err(|e| anyhow::anyhow!(e))? };
+        let mut a_scale_rows: cudarc::driver::CudaSlice<f32> =
+            unsafe { stream.alloc::<f32>(m).map_err(|e| anyhow::anyhow!(e))? };
         {
             let (x_storage, xl) = x_bf.storage_and_layout();
             let x_cuda = match &*x_storage {
@@ -2216,9 +3448,10 @@ impl Linear {
                 .runner
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Fp8 runner mutex poisoned: {e}"))?;
+            runner.with_stream(&stream, |runner| {
             let chunk_rows_past_the_m6_plan = m
                 > LT_TILE_ROWS_PER_CHUNK_6_THE_WIDEST_ROW_COUNT_WHOSE_HEURISTIC_PLAN_FAMILY_COVERS_EVERY_SHIPPED_VERIFY_CELL
-                && m <= VERIFY_ROWS_TEMPLATE_CAP_8_THE_RANGE_THAT_MUST_STAY_ON_ONE_ARITHMETIC;
+                && m <= verify_one_arithmetic_rows_ceiling_env_nv_verify_one_arith_rows_default_8_max_24_serving_never_exceeds_8_only_the_mrow_ladder_raises_it();
             if chunk_rows_past_the_m6_plan {
                 let _ = A_ROW_CHUNKED_LT_TILE_RIDES_THE_M6_PLAN_BECAUSE_THE_HEURISTIC_MOVES_PLANS_BETWEEN_M6_AND_M7;
                 let span = LT_TILE_SPAN_4_THE_PRODUCTION_MTP_VERIFY_LAUNCH_WHOSE_PLAN_FAMILY_ALSO_COVERS_M5_AND_M6_AT_THE_CHEAPEST_ROW_COUNT;
@@ -2270,6 +3503,8 @@ impl Linear {
                     &s.a_scale_dev,
                 )?
             }
+            Ok(())
+            })?;
         }
         {
             let (dp, _gd) = d_dev.device_ptr_mut(&stream);
@@ -2301,7 +3536,7 @@ impl Linear {
         if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
             return self.matmul_quant_dx_only(x2);
         }
-        self.matmul_nvfp4_impl(s, x2, leading, None)
+        self.matmul_nvfp4_impl(s, x2, leading, None, None)
     }
 
     #[cfg(feature = "cuda")]
@@ -2325,6 +3560,31 @@ impl Linear {
         match &self.storage {
             LinearStorage::Nvfp4(s) => self.matmul_nvfp4_m1_gemv(s, &x2, 1, None),
             _ => anyhow::bail!("forward_nvfp4_gemv_m1: linear is not NVFP4-resident"),
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn set_nvfp4_bf16act_rows_before_sharing(&mut self, max_rows: usize) -> Result<()> {
+        anyhow::ensure!(
+            max_rows > 0,
+            "NVFP4 BF16-activation row limit must be positive"
+        );
+        let storage = match &mut self.storage {
+            LinearStorage::Nvfp4(storage) => storage,
+            _ => anyhow::bail!("NVFP4 BF16-activation policy requires NVFP4 storage"),
+        };
+        let storage = Arc::get_mut(storage).ok_or_else(|| {
+            anyhow::anyhow!("NVFP4 BF16-activation policy must be set before storage is shared")
+        })?;
+        storage.bf16act_row_limit = max_rows;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_bf16act_row_limit(&self) -> Option<usize> {
+        match &self.storage {
+            LinearStorage::Nvfp4(storage) => Some(storage.bf16act_row_limit),
+            _ => None,
         }
     }
 
@@ -2388,32 +3648,79 @@ impl Linear {
                     let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
                     let w_view = w_slice.slice(wl.start_offset()..);
                     let (nw_ptr, _gn) = w_view.device_ptr(&stream);
+                    let folds_in_the_gemv = unsafe {
+                        nv_kernels::cuda::nvfp4_gemv_prenorm_fuses_this_row(self.in_features as i32)
+                    } != 0;
+                    let batched = rows > 1
+                        && !folds_in_the_gemv
+                        && nvfp4_gemv_mrows_case_instantiated_mirroring_gemv_act_mrows_case_instantiated(
+                            rows,
+                        );
                     let mut buf: cudarc::driver::CudaSlice<bf16> = unsafe {
                         stream
-                            .alloc::<bf16>(self.in_features)
+                            .alloc::<bf16>(if batched {
+                                rows * self.in_features
+                            } else {
+                                self.in_features
+                            })
                             .map_err(|e| anyhow::anyhow!(e))?
                     };
                     let rc_fused = {
                         let (xn_ptr, _gxn) = buf.device_ptr_mut(&stream);
+                        let xn_base = xn_ptr as usize;
                         let mut rc_rows = 0i32;
-                        for row in 0..rows {
-                            rc_rows = unsafe {
-                                nv_kernels::cuda::nvfp4_gemv_bf16act_prenorm(
-                                    stream.cu_stream() as *mut c_void,
-                                    w_ptr as *const u8,
-                                    s_ptr as *const u8,
-                                    (x_base + row * x_row_bytes) as *const u16,
-                                    nw_ptr as *const u16,
-                                    xn_ptr as *mut u16,
-                                    (d_base + row * d_row_bytes) as *mut u16,
-                                    bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
-                                    self.out_features as i32,
-                                    self.in_features as i32,
-                                    pn.eps,
-                                )
-                            };
-                            if rc_rows != 0 {
-                                break;
+                        if batched {
+                            for row in 0..rows {
+                                rc_rows = unsafe {
+                                    nv_kernels::cuda::rmsnorm_bf16(
+                                        stream.cu_stream() as *mut c_void,
+                                        (x_base + row * x_row_bytes) as *const u16,
+                                        nw_ptr as *const u16,
+                                        (xn_base + row * x_row_bytes) as *mut u16,
+                                        1,
+                                        self.in_features,
+                                        pn.eps,
+                                    )
+                                };
+                                if rc_rows != 0 {
+                                    break;
+                                }
+                            }
+                            if rc_rows == 0 {
+                                rc_rows = unsafe {
+                                    nv_kernels::cuda::nvfp4_gemv_bf16act_mrows(
+                                        stream.cu_stream() as *mut c_void,
+                                        w_ptr as *const u8,
+                                        s_ptr as *const u8,
+                                        xn_base as *const u16,
+                                        d_base as *mut u16,
+                                        bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                                        self.out_features as i32,
+                                        self.in_features as i32,
+                                        rows as i32,
+                                    )
+                                };
+                            }
+                        } else {
+                            for row in 0..rows {
+                                rc_rows = unsafe {
+                                    nv_kernels::cuda::nvfp4_gemv_bf16act_prenorm(
+                                        stream.cu_stream() as *mut c_void,
+                                        w_ptr as *const u8,
+                                        s_ptr as *const u8,
+                                        (x_base + row * x_row_bytes) as *const u16,
+                                        nw_ptr as *const u16,
+                                        xn_base as *mut u16,
+                                        (d_base + row * d_row_bytes) as *mut u16,
+                                        bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                                        self.out_features as i32,
+                                        self.in_features as i32,
+                                        pn.eps,
+                                    )
+                                };
+                                if rc_rows != 0 {
+                                    break;
+                                }
                             }
                         }
                         rc_rows
@@ -2422,25 +3729,43 @@ impl Linear {
                     rc_fused
                 }
                 _ => {
-                    let mut rc_rows = 0i32;
-                    for row in 0..rows {
-                        rc_rows = unsafe {
-                            nv_kernels::cuda::nvfp4_gemv_bf16act(
+                    if nvfp4_gemv_mrows_case_instantiated_mirroring_gemv_act_mrows_case_instantiated(
+                        rows,
+                    ) {
+                        unsafe {
+                            nv_kernels::cuda::nvfp4_gemv_bf16act_mrows(
                                 stream.cu_stream() as *mut c_void,
                                 w_ptr as *const u8,
                                 s_ptr as *const u8,
-                                (x_base + row * x_row_bytes) as *const u16,
-                                (d_base + row * d_row_bytes) as *mut u16,
+                                x_base as *const u16,
+                                d_base as *mut u16,
                                 bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
                                 self.out_features as i32,
                                 self.in_features as i32,
+                                rows as i32,
                             )
-                        };
-                        if rc_rows != 0 {
-                            break;
                         }
+                    } else {
+                        let mut rc_rows = 0i32;
+                        for row in 0..rows {
+                            rc_rows = unsafe {
+                                nv_kernels::cuda::nvfp4_gemv_bf16act(
+                                    stream.cu_stream() as *mut c_void,
+                                    w_ptr as *const u8,
+                                    s_ptr as *const u8,
+                                    (x_base + row * x_row_bytes) as *const u16,
+                                    (d_base + row * d_row_bytes) as *mut u16,
+                                    bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                                    self.out_features as i32,
+                                    self.in_features as i32,
+                                )
+                            };
+                            if rc_rows != 0 {
+                                break;
+                            }
+                        }
+                        rc_rows
                     }
-                    rc_rows
                 }
             }
         };
@@ -2465,6 +3790,7 @@ impl Linear {
         x2: &Tensor,
         leading: usize,
         prenorm: Option<FusedPreNorm<'_>>,
+        silu_up: Option<&Tensor>,
     ) -> Result<Tensor> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use half::bf16;
@@ -2480,7 +3806,7 @@ impl Linear {
         let stream = crate::cuda_stream::current_stream(&dev);
         let n = self.out_features as u64;
         let k = self.in_features as u64;
-        if (self.in_features % BLOCK_SIZE) != 0 {
+        if !self.in_features.is_multiple_of(BLOCK_SIZE) {
             anyhow::bail!(
                 "NVFP4 Linear: in_features {} must be a multiple of {}",
                 self.in_features,
@@ -2501,32 +3827,32 @@ impl Linear {
             anyhow::bail!("NVFP4 Linear: empty input batch");
         }
 
+        if s.bf16act_row_limit > 0 && m_logical <= s.bf16act_row_limit {
+            return self.matmul_nvfp4_m1_gemv(s, x2, m_logical, prenorm.as_ref());
+        }
+
         if nvfp4_m1_gemv_opted_in() && m_logical <= nvfp4_gemv_row_block_ceiling() {
             return self.matmul_nvfp4_m1_gemv(s, x2, m_logical, prenorm.as_ref());
         }
 
-        let true_m = nvfp4_true_m_enabled() && {
-            let runner = s
-                .runner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("NVFP4 runner mutex poisoned: {e}"))?;
-            runner.supports_true_m(
-                m_logical as u64,
-                self.out_features as u64,
-                self.in_features as u64,
-            )
-        };
-        let m_padded = if true_m {
-            m_logical
-        } else {
-            m_logical.max(MIN_TILE)
-        };
+        let m_padded = m_logical.max(MIN_TILE);
 
         let x_bf = x2.to_dtype(DType::BF16)?.contiguous()?;
 
+        let cfx_route = prenorm.is_none()
+            && m_padded == m_logical
+            && nvfp4_cfx_route_ready(&stream, m_padded, self.out_features, self.in_features);
+
         let blocks_per_row = self.in_features / BLOCK_SIZE;
-        let packed_bytes = m_padded * self.in_features / 2;
-        let scales_bytes = ((m_padded + 127) / 128) * 128 * ((blocks_per_row + 3) / 4) * 4;
+        let (packed_bytes, scales_bytes) = if cfx_route {
+            let m96 = m_padded.div_ceil(96) * 96;
+            (m96 * self.in_features / 2, m96 * blocks_per_row)
+        } else {
+            (
+                m_padded * self.in_features / 2,
+                m_padded.div_ceil(128) * 128 * blocks_per_row.div_ceil(4) * 4,
+            )
+        };
 
         let mut d_padded: cudarc::driver::CudaSlice<bf16> = unsafe {
             stream
@@ -2543,22 +3869,19 @@ impl Linear {
                 .map_err(|e| anyhow::anyhow!("NVFP4 staging mutex poisoned: {e}"))?;
             if !stream_is_capturing(&stream) {
                 map.retain(|k, v| v.epoch == nv_quant::stream_epoch(k.0));
-                if !map.contains_key(&key) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(key) {
                     let a = stream
                         .alloc_zeros::<u8>(packed_bytes)
                         .map_err(|e| anyhow::anyhow!(e))?;
                     let sc = stream
                         .alloc_zeros::<u8>(scales_bytes)
                         .map_err(|e| anyhow::anyhow!(e))?;
-                    map.insert(
-                        key,
-                        StagedActivations {
-                            epoch: nv_quant::stream_epoch(key.0),
-                            hwm_rows: 0,
-                            packed: a,
-                            scales: sc,
-                        },
-                    );
+                    entry.insert(StagedActivations {
+                        epoch: nv_quant::stream_epoch(key.0),
+                        hwm_rows: 0,
+                        packed: a,
+                        scales: sc,
+                    });
                 }
             }
             if map.contains_key(&key) {
@@ -2620,7 +3943,46 @@ impl Linear {
                 let (x_ptr, _gx) = x_view.device_ptr(&stream);
                 let (a_ptr, _ga) = a_data.device_ptr_mut(&stream);
                 let (s_ptr, _gs) = a_scales.device_ptr_mut(&stream);
-                let rc = if let Some(pn) = prenorm.as_ref() {
+                let rc = if let Some(up) = silu_up {
+                    let (up_storage, ul) = up.storage_and_layout();
+                    let candle_core::Storage::Cuda(up_cuda) = &*up_storage else {
+                        anyhow::bail!("NVFP4 SiLU up requires CUDA storage");
+                    };
+                    let up_slice = up_cuda.as_cuda_slice::<bf16>()?;
+                    let up_view =
+                        up_slice.slice(ul.start_offset()..ul.start_offset() + up.elem_count());
+                    let (up_ptr, _gu) = up_view.device_ptr(&stream);
+                    unsafe {
+                        nv_kernels::cuda::quantize_nvfp4_silu_candle_bf16(
+                            stream.cu_stream() as *mut c_void,
+                            x_ptr as *const u16,
+                            up_ptr as *const u16,
+                            a_ptr as *mut u8,
+                            s_ptr as *mut u8,
+                            s.input_stored_global,
+                            (if cfx_route {
+                                m_padded.div_ceil(96) * 96
+                            } else {
+                                m_padded
+                            }) as i32,
+                            m_logical as i32,
+                            self.in_features as i32,
+                            if cfx_route { 96 } else { 128 },
+                        )
+                    }
+                } else if cfx_route {
+                    unsafe {
+                        nv_kernels::cuda::quantize_nvfp4_bf16_sf96(
+                            stream.cu_stream() as *mut c_void,
+                            x_ptr as *const u16,
+                            a_ptr as *mut u8,
+                            s_ptr as *mut u8,
+                            s.input_stored_global,
+                            m_logical as i32,
+                            self.in_features as i32,
+                        )
+                    }
+                } else if let Some(pn) = prenorm.as_ref() {
                     let w_c = pn.weight_bf16.clone();
                     let (w_storage, wl) = w_c.storage_and_layout();
                     let w_cuda = match &*w_storage {
@@ -2676,24 +4038,59 @@ impl Linear {
                 }
             }
 
-            let mut runner = s
-                .runner
-                .lock()
-                .map_err(|e| anyhow::anyhow!("NVFP4 runner mutex poisoned: {e}"))?;
+            if cfx_route {
+                static CFX_FIRINGS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let prev = CFX_FIRINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if prev == 0 && std::env::var("NV_Q38_CFX_TRACE").is_ok() {
+                    eprintln!(
+                        "[linear] cfx route ENGAGED first fire m={m_padded} n={} k={}",
+                        self.out_features, self.in_features
+                    );
+                }
+                let (ap, _ga) = a_data.device_ptr(&stream);
+                let (asp, _gas) = a_scales.device_ptr(&stream);
+                let (wp, _gw) = s.weight_u8.device_ptr(&stream);
+                let (wsp, _gws) = s.weight_scales_cm.device_ptr(&stream);
+                let (alp, _gal) = s.weight_alpha_dev.device_ptr(&stream);
+                let (dp, _gd) = d_padded.device_ptr_mut(&stream);
+                let rc = unsafe {
+                    nv_kernels::cuda::nvfp4_cfx_gemm_bf16(
+                        stream.cu_stream() as *mut c_void,
+                        ap as *const c_void,
+                        asp as *const c_void,
+                        wp as *const c_void,
+                        wsp as *const c_void,
+                        alp as *const f32,
+                        dp as *mut c_void,
+                        m_padded as i32,
+                        self.out_features as i32,
+                        self.in_features as i32,
+                    )
+                };
+                if rc != 0 {
+                    anyhow::bail!("nvfp4_cfx_gemm_bf16 rc={rc}");
+                }
+            } else {
+                let mut runner = s
+                    .runner
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("NVFP4 runner mutex poisoned: {e}"))?;
 
-            runner.set_stream(stream.clone());
-            runner.matmul_scaled_alpha_dev(
-                a_data,
-                a_scales,
-                &s.weight_u8,
-                &s.weight_scales_cm,
-                &mut d_padded,
-                m_padded as u64,
-                n,
-                k,
-                &s.weight_alpha_dev,
-                s.weight_alpha,
-            )?;
+                runner.set_stream(stream.clone());
+                runner.matmul_scaled_alpha_dev(
+                    a_data,
+                    a_scales,
+                    &s.weight_u8,
+                    &s.weight_scales_cm,
+                    &mut d_padded,
+                    m_padded as u64,
+                    n,
+                    k,
+                    &s.weight_alpha_dev,
+                    s.weight_alpha,
+                )?;
+            }
         }
 
         let d_storage = candle_core::CudaStorage::wrap_cuda_slice(d_padded, dev);
@@ -2857,7 +4254,23 @@ impl Linear {
             scale_mode,
             cuda_device: dev,
             runner,
+            marlin_fp8_twin_built_once_from_the_resident_e4m3_rows: std::sync::OnceLock::new(),
+            dx_fp8_twin_of_the_transposed_weight_bytes_with_the_channel_scale_folded_into_dy:
+                std::sync::OnceLock::new(),
         }));
+        if marlin_fp8_rows_opt_in() && out_features % 64 == 0 && in_features % 16 == 0 {
+            if let LinearStorage::Fp8E4m3(st) = &storage {
+                let _ = st
+                    .marlin_fp8_twin_built_once_from_the_resident_e4m3_rows
+                    .get_or_init(|| match build_marlin_fp8_twin(st, out_features, in_features) {
+                        Ok(t) => Some(Arc::new(t)),
+                        Err(e) => {
+                            eprintln!("[marlin_fp8_twin] unavailable n={out_features} k={in_features}: {e:#}");
+                            None
+                        }
+                    });
+            }
+        }
         Ok(Self {
             kind: LinearKind::Fp8E4m3 {
                 a_scale: 1.0,
@@ -3026,7 +4439,12 @@ impl Linear {
             weight_alpha,
             weight_alpha_dev,
             input_stored_global,
+            bf16act_row_limit: 0,
             a_staging: Mutex::new(std::collections::HashMap::new()),
+            marlin_w4a16_twin_built_once_from_the_resident_nvfp4_buffers: std::sync::OnceLock::new(
+            ),
+            dx_marlin_twin_of_the_transposed_weight_requantized_once_to_nvfp4_so_the_input_gradient_never_touches_a_bf16_copy:
+                std::sync::OnceLock::new(),
         }));
         Ok(Self {
             kind: LinearKind::Nvfp4,
@@ -3044,6 +4462,18 @@ impl Linear {
         device: &Device,
         runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
     ) -> Result<Self> {
+        Self::from_bf16_quantized_nvfp4_dev_with_stored_input_global(
+            weight, bias, device, runner, 1.0,
+        )
+    }
+
+    pub fn from_bf16_quantized_nvfp4_dev_with_stored_input_global(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+        stored_input_global: f32,
+    ) -> Result<Self> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use half::bf16;
         use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
@@ -3055,7 +4485,7 @@ impl Linear {
         }
         let out_features = dims[0];
         let in_features = dims[1];
-        if in_features % BLOCK_SIZE != 0 {
+        if !in_features.is_multiple_of(BLOCK_SIZE) {
             anyhow::bail!(
                 "nvfp4 dev quant: in_features {} must be a multiple of {}",
                 in_features,
@@ -3085,10 +4515,15 @@ impl Linear {
         } else {
             1.0
         };
-        let weight_alpha = if stored_weight_global.is_finite() && stored_weight_global != 0.0 {
-            1.0 / stored_weight_global
+        let safe_ig = if stored_input_global.is_finite() && stored_input_global != 0.0 {
+            stored_input_global
         } else {
             1.0
+        };
+        let weight_alpha = if stored_weight_global.is_finite() && stored_weight_global != 0.0 {
+            1.0 / stored_weight_global / safe_ig
+        } else {
+            1.0 / safe_ig
         };
 
         let stream = crate::cuda_stream::current_stream(&dev);
@@ -3138,7 +4573,7 @@ impl Linear {
             device,
             runner,
             weight_alpha,
-            1.0,
+            safe_ig,
         )
     }
 
@@ -3269,9 +4704,8 @@ pub fn fp8_rowscale_dequant_bf16_host(
                     let scale = chunk_scales[r];
                     let src_row = &src_chunk[r * in_features..(r + 1) * in_features];
                     for (dst, b) in dst_row.iter_mut().zip(src_row) {
-                        *dst = half::bf16::from_f32(
-                            f32::from(float8::F8E4M3::from_bits(*b)) * scale,
-                        );
+                        *dst =
+                            half::bf16::from_f32(f32::from(float8::F8E4M3::from_bits(*b)) * scale);
                     }
                 }
             });
@@ -3285,8 +4719,7 @@ pub fn checkpoint_module_is_fp8_e4m3_weight_with_scale(
     module: &str,
 ) -> bool {
     weights.has(&format!("{module}.weight_scale"))
-        && weights.st_dtype_of(&format!("{module}.weight"))
-            == Some(nv_weights::StDtype::F8_E4M3)
+        && weights.st_dtype_of(&format!("{module}.weight")) == Some(nv_weights::StDtype::F8_E4M3)
 }
 
 pub fn fp8_e4m3_rowscale_checkpoint_dequant_linear(
@@ -3389,9 +4822,7 @@ pub fn fp8_e4m3_rowscale_checkpoint_resident_linear(
     };
     let stream = crate::cuda_stream::current_stream(&dev);
     #[allow(deprecated)]
-    let weight_u8 = stream
-        .clone_htod(bytes)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let weight_u8 = stream.clone_htod(bytes).map_err(|e| anyhow::anyhow!(e))?;
     Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
         weight_u8,
         row_scales,
@@ -3407,16 +4838,80 @@ pub fn fp8_e4m3_rowscale_checkpoint_resident_linear(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    mod qwen38_e4m3_batch_scope {
+        use super::*;
+
+        #[test]
+        fn unset_policy_is_batch_scoped_and_nested_guards_restore_the_previous_route() {
+            let policy = E4m3GroupPolicy::from_env_value(None);
+            assert_eq!(policy.rows_per_warp(), None);
+            for batch_size in 0..=16 {
+                let _batch = Qwen38BatchE4m3GroupScopeGuard::enter(batch_size);
+                let expected = matches!(batch_size, 6 | 8).then_some(2);
+                assert_eq!(policy.rows_per_warp(), expected, "batch_size={batch_size}");
+                for nested_size in 0..=16 {
+                    let _nested = Qwen38BatchE4m3GroupScopeGuard::enter(nested_size);
+                    assert_eq!(
+                        policy.rows_per_warp(),
+                        matches!(nested_size, 6 | 8).then_some(2),
+                        "batch_size={batch_size} nested_size={nested_size}"
+                    );
+                }
+                assert_eq!(
+                    policy.rows_per_warp(),
+                    expected,
+                    "outer batch scope restored"
+                );
+            }
+            assert_eq!(policy.rows_per_warp(), None);
+        }
+
+        #[test]
+        fn explicit_values_keep_their_routes_inside_and_outside_the_batch_scope() {
+            let cases = [
+                ("0", None),
+                ("", None),
+                ("invalid", None),
+                ("3", None),
+                ("1", Some(2)),
+                ("01", Some(1)),
+                ("2", Some(2)),
+                ("4", Some(4)),
+            ];
+            for batch_size in [0, 1, 4, 6, 8, 10] {
+                let _scope = Qwen38BatchE4m3GroupScopeGuard::enter(batch_size);
+                for (raw, expected) in cases {
+                    assert_eq!(
+                        E4m3GroupPolicy::from_env_value(Some(raw)).rows_per_warp(),
+                        expected,
+                        "explicit {raw:?} must retain its route when batch_size={batch_size}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn batch_scope_does_not_escape_to_another_thread_or_survive_unwinding() {
+            let policy = E4m3GroupPolicy::from_env_value(None);
+            let unwound = std::panic::catch_unwind(|| {
+                let _batch = Qwen38BatchE4m3GroupScopeGuard::enter(6);
+                assert_eq!(policy.rows_per_warp(), Some(2));
+                assert_eq!(
+                    std::thread::spawn(move || policy.rows_per_warp())
+                        .join()
+                        .unwrap(),
+                    None
+                );
+                panic!("exercise scope cleanup after a failed batch forward");
+            });
+            assert!(unwound.is_err());
+            assert_eq!(policy.rows_per_warp(), None);
+        }
+    }
     use candle_core::Device;
     use half::bf16;
-
-    #[test]
-    fn nvfp4_true_m_ships_default_off_and_zero_stays_off() {
-        assert!(!nvfp4_true_m_from(None));
-        assert!(!nvfp4_true_m_from(Some("0")));
-        assert!(nvfp4_true_m_from(Some("1")));
-        assert!(nvfp4_true_m_from(Some("")));
-    }
 
     #[test]
     fn small_m_det_ships_default_on_and_zero_disables() {

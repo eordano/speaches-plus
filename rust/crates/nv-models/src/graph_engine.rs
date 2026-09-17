@@ -2,25 +2,50 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
 use crate::gemma4_batch_graph::graph_teardown::GraphTeardown;
-use crate::host_serving_util::{
-    env_arm_opt_in_eq_some_1_reread_every_call, DeviceArgmaxTokenExit,
-};
+use crate::host_serving_util::{env_arm_opt_in_eq_some_1_reread_every_call, DeviceArgmaxTokenExit};
 use crate::qwen3_5_moe::{GroupedMoeDispatch, MoeDispatch, Qwen3Moe, Qwen3MoeKvCache};
 
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use nv_kernels::graph::CudaGraphRunner;
 use std::sync::Arc;
 
-pub const NV_Q38_BOOT_WARM_PREFILL_ENV_OPT_IN_1_RUNS_ONE_THROWAWAY_CHUNK_AT_ENGINE_BUILD_BECAUSE_THE_FIRST_REAL_CHUNK_PAYS_5S_OF_ONE_TIME_MODULE_AND_WORKSPACE_INIT_LANDING_IN_TTFT:
+pub const NV_Q38_BOOT_WARM_PREFILL_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_COLD_FIRST_REQUEST:
     &str = "NV_Q38_BOOT_WARM_PREFILL";
 
-fn boot_warm_prefill_env_opted_in() -> bool {
-    std::env::var(
-        NV_Q38_BOOT_WARM_PREFILL_ENV_OPT_IN_1_RUNS_ONE_THROWAWAY_CHUNK_AT_ENGINE_BUILD_BECAUSE_THE_FIRST_REAL_CHUNK_PAYS_5S_OF_ONE_TIME_MODULE_AND_WORKSPACE_INIT_LANDING_IN_TTFT,
+fn boot_warm_prefill_default_on_user_sign_off_2026_09_12(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.is_none() || raw == Some(std::ffi::OsStr::new("1"))
+}
+
+pub fn boot_warm_prefill_selected_from_env() -> bool {
+    boot_warm_prefill_default_on_user_sign_off_2026_09_12(std::env::var_os(
+        NV_Q38_BOOT_WARM_PREFILL_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_COLD_FIRST_REQUEST,
     )
-    .ok()
-    .as_deref()
-        == Some("1")
+    .as_deref())
+}
+
+#[cfg(test)]
+mod boot_warm_prefill_default_tests {
+    use super::boot_warm_prefill_default_on_user_sign_off_2026_09_12 as selected;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_unset_changes_and_zero_restores_cold_prefill() {
+        assert!(selected(None));
+        assert!(selected(Some(OsStr::new("1"))));
+        for raw in ["0", "", " 1", "1 ", "true", "gate"] {
+            assert!(
+                !selected(Some(OsStr::new(raw))),
+                "explicit {raw:?} stays off"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_remains_explicit_off() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(!selected(Some(OsStr::from_bytes(&[0xff]))));
+    }
 }
 
 pub const THE_EAGER_ALL_NAN_WAS_THE_GROUPED_MULTI_TOKEN_DEFECT_NOW_FIXED_NOT_THIS_DISABLE: &str =
@@ -169,7 +194,7 @@ impl GraphedQwen3Moe {
             prefill_graphs: None,
             _err_drain: CtxErrDrain(dev.cuda_stream().context().clone()),
         };
-        if boot_warm_prefill_env_opted_in() {
+        if boot_warm_prefill_selected_from_env() {
             let warm_tokens = crate::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
                 .unwrap_or(
                     crate::qwen3_5_moe::Q38_PREFILL_CHUNK_DEFAULT_TOKENS_MEASURED_LADDER_140K_AT_6_GIB_OVER_BOOT,
@@ -260,9 +285,7 @@ impl GraphedQwen3Moe {
             .cached_kernel_context_census_for_name_substring(needle)
     }
 
-    pub fn captured_graph_kernel_name_census(
-        &self,
-    ) -> std::collections::BTreeMap<String, usize> {
+    pub fn captured_graph_kernel_name_census(&self) -> std::collections::BTreeMap<String, usize> {
         self.runner.cached_kernel_name_census()
     }
 
@@ -367,6 +390,8 @@ impl GraphedQwen3Moe {
             self.cache.max_seq_len()
         );
         let seq = prompt.len();
+        #[cfg(feature = "cuda")]
+        nv_layers::linear::nvfp4_cfx_set_prefill_total_tokens_hint(self.current_pos + seq);
         let chunk_env = crate::qwen3_5_moe::q38_prefill_chunk_tokens_from_env();
         let graphed_prefill = crate::qwen3_5_moe::nv_q38_prefill_graph_env_opt_in()
             && self.capture_supported
@@ -436,6 +461,29 @@ impl GraphedQwen3Moe {
         &mut self,
         prompt: &[u32],
     ) -> Result<(Vec<f32>, Tensor)> {
+        let mut hidden_chunks = Vec::new();
+        let row =
+            self.prefill_hidden_chunks_serving_last_row_logits_visit(prompt, |_, _, hidden| {
+                hidden_chunks.push(hidden.force_contiguous()?);
+                Ok(())
+            })?;
+        let hidden = if hidden_chunks.len() == 1 {
+            hidden_chunks.remove(0)
+        } else {
+            let refs: Vec<&Tensor> = hidden_chunks.iter().collect();
+            Tensor::cat(&refs, 1)?
+        };
+        Ok((row, hidden))
+    }
+
+    pub fn prefill_hidden_chunks_serving_last_row_logits_visit<F>(
+        &mut self,
+        prompt: &[u32],
+        mut visit: F,
+    ) -> Result<Vec<f32>>
+    where
+        F: FnMut(&Qwen3Moe, &[u32], &Tensor) -> Result<()>,
+    {
         anyhow::ensure!(!prompt.is_empty(), "prefill_hidden: empty prompt");
         self.invalidate_graphs_synced()?;
         anyhow::ensure!(
@@ -446,44 +494,58 @@ impl GraphedQwen3Moe {
             self.cache.max_seq_len()
         );
         let seq = prompt.len();
-        let chunk = crate::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
-            .filter(|&c| seq > c)
-            .unwrap_or(seq);
-        let mut hidden_chunks: Vec<Tensor> = Vec::with_capacity(seq.div_ceil(chunk));
-        let mut last_logits: Option<Tensor> = None;
-        let mut fed = 0usize;
-        while fed < seq {
-            let n = chunk.min(seq - fed);
-            let tokens =
-                Tensor::from_vec(prompt[fed..fed + n].to_vec(), (1usize, n), &self.device)?;
-            let start = self.current_pos + fed;
-            let positions_v: Vec<i32> = (start as i32..(start + n) as i32).collect();
-            let positions = Tensor::from_vec(positions_v, n, &self.device)?;
-            let (lg, hd) = self.model.forward_with_cache_dispatched_hidden_rows(
-                &tokens,
-                &positions,
-                &mut self.cache,
-                self.moe_dispatch.as_deref(),
-                Some(1),
-            )?;
-            hidden_chunks.push(hd);
-            last_logits = Some(lg);
-            fed += n;
-        }
-        let logits =
-            last_logits.expect("prefill_hidden: the non-empty prompt fed at least one chunk");
-        let hidden = if hidden_chunks.len() == 1 {
-            hidden_chunks.remove(0)
+        #[cfg(feature = "cuda")]
+        nv_layers::linear::nvfp4_cfx_set_prefill_total_tokens_hint(self.current_pos + seq);
+        let chunk_env = crate::qwen3_5_moe::q38_prefill_chunk_tokens_from_env();
+        let graphed_prefill = crate::qwen3_5_moe::nv_q38_prefill_graph_env_opt_in()
+            && self.capture_supported
+            && self.moe_dispatch.is_none()
+            && chunk_env.is_some_and(|c| seq >= c);
+        let logits = if graphed_prefill {
+            let chunk = chunk_env.expect("gated on chunk_env.is_some");
+            if self.prefill_graphs.is_none() {
+                self.prefill_graphs = Some(self.model.new_prefill_graph_session(chunk)?);
+            }
+            let GraphedQwen3Moe {
+                model,
+                cache,
+                prefill_graphs,
+                ..
+            } = &mut *self;
+            model.prefill_chunks_graphed_visiting_hidden_rows_serving_last_row_logits(
+                prompt,
+                chunk,
+                cache,
+                prefill_graphs.as_mut().expect("created above"),
+                |model, piece, hidden| visit(model, piece, hidden),
+            )?
         } else {
-            let refs: Vec<&Tensor> = hidden_chunks.iter().collect();
-            Tensor::cat(&refs, 1)?
+            let chunk = chunk_env.filter(|&c| seq > c).unwrap_or(seq);
+            let mut last_logits = None;
+            let mut fed = 0usize;
+            while fed < seq {
+                let n = chunk.min(seq - fed);
+                let piece = &prompt[fed..fed + n];
+                let tokens = Tensor::from_vec(piece.to_vec(), (1usize, n), &self.device)?;
+                let start = self.current_pos + fed;
+                let positions_v: Vec<i32> = (start as i32..(start + n) as i32).collect();
+                let positions = Tensor::from_vec(positions_v, n, &self.device)?;
+                let (logits, hidden) = self.model.forward_with_cache_dispatched_hidden_rows(
+                    &tokens,
+                    &positions,
+                    &mut self.cache,
+                    self.moe_dispatch.as_deref(),
+                    Some(1),
+                )?;
+                visit(&self.model, piece, &hidden)?;
+                last_logits = Some(logits);
+                fed += n;
+            }
+            last_logits.expect("prefill_hidden: the non-empty prompt fed at least one chunk")
         };
         self.current_pos += seq;
-        let row: Vec<f32> = logits
-            .to_dtype(DType::F32)?
-            .flatten_all()?
-            .to_vec1()?;
-        Ok((row, hidden))
+        let row: Vec<f32> = logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        Ok(row)
     }
 
     pub fn ensure_verify_lane(&mut self, rows: usize) -> Result<()> {
@@ -494,7 +556,8 @@ impl GraphedQwen3Moe {
         anyhow::ensure!(
             self.cache.mk_verify_route_available(rows),
             "ensure_verify_lane: the mk verify attention route is unavailable for rows={rows} \
-             (NV_Q38_MK_VERIFY=0, rows > 8, or head_dim > 512); a captured verify would bake the \
+             (NV_Q38_MK_VERIFY=0, rows outside 2..=24, or head_dim > 512); a captured verify \
+             would bake the \
              kv length of the capture-time dequant view and read stale kv on every deeper replay"
         );
         if self
@@ -611,7 +674,9 @@ impl GraphedQwen3Moe {
             && self.capture_supported
             && !env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_OFF")
             && (self.moe_dispatch.is_some()
-                || self.dense_trunk_needs_no_moe_dispatch_for_capture_because_every_ffn_is_a_plain_mlp())
+                || self
+                    .dense_trunk_needs_no_moe_dispatch_for_capture_because_every_ffn_is_a_plain_mlp(
+                    ))
     }
 
     pub fn ensure_verify_tree_lane_two_branch_m6(&mut self) -> Result<()> {
@@ -756,7 +821,7 @@ impl GraphedQwen3Moe {
         let tokens = wrap_slice_u32(&lane.token_buf, &dev, (1usize, rows))?;
         let positions = wrap_slice_i32(&lane.pos_buf, &dev, rows)?;
         let _tc = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(
-            nv_layers::linear_attn::verify_tc_env_read_per_call_nv_q38_verify_tc_1_selects_projections_once_plus_lt_gemm_verify_arms(),
+            nv_layers::linear_attn::verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify(),
         );
         let (logits, hid) = model.forward_with_cache_dispatched_hidden_rows(
             &tokens,
@@ -839,7 +904,7 @@ impl GraphedQwen3Moe {
             let tokens = wrap_slice_u32(token_buf, &dev, (1usize, rows))?;
             let positions = wrap_slice_i32(pos_buf, &dev, rows)?;
             let _tc = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(
-                nv_layers::linear_attn::verify_tc_env_read_per_call_nv_q38_verify_tc_1_selects_projections_once_plus_lt_gemm_verify_arms(),
+                nv_layers::linear_attn::verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify(),
             );
             let (logits, hid) = model.forward_with_cache_dispatched_hidden_rows(
                 &tokens, &positions, cache, hook, None,
@@ -1095,7 +1160,7 @@ impl GraphedQwen3Moe {
 
     pub fn forward_decode(&mut self, token_id: u32) -> Result<()> {
         anyhow::ensure!(
-            self.current_pos + 1 <= self.cache.max_seq_len(),
+            self.current_pos < self.cache.max_seq_len(),
             "forward_decode: cache full at {}",
             self.current_pos
         );
@@ -1121,7 +1186,7 @@ impl GraphedQwen3Moe {
     pub fn next_token_argmax_on_device(&mut self) -> Result<u32> {
         if self.device_argmax_exit.is_none() {
             self.device_argmax_exit = Some(DeviceArgmaxTokenExit::alloc_scratch_and_sync(
-                &self.stream.context(),
+                self.stream.context(),
                 &self.stream,
                 self.model.vocab_size(),
             )?);
@@ -1191,7 +1256,8 @@ impl GraphedQwen3Moe {
         }
         if !self.runner.has_cached()
             && self.moe_dispatch.is_none()
-            && !self.dense_trunk_needs_no_moe_dispatch_for_capture_because_every_ffn_is_a_plain_mlp()
+            && !self
+                .dense_trunk_needs_no_moe_dispatch_for_capture_because_every_ffn_is_a_plain_mlp()
         {
             self.capture_failed = true;
             self.capture_active = false;
@@ -1361,7 +1427,9 @@ impl GraphedQwen3Moe {
     }
 }
 
-pub(crate) fn disable_event_tracking_no_earlier_than_the_first_capture(dev: &candle_core::CudaDevice) {
+pub(crate) fn disable_event_tracking_no_earlier_than_the_first_capture(
+    dev: &candle_core::CudaDevice,
+) {
     if env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_KEEP_EVENT_TRACKING") {
         return;
     }

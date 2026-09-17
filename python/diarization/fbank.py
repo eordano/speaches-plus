@@ -8,6 +8,7 @@ LOW_FREQ_HZ = 20.0
 HIGH_FREQ_HZ = 7600.0
 LOG_FLOOR = 1e-10
 POVEY_EXP = 0.85
+FRAMES_PER_FFT_BATCH = 2048
 
 class FBank:
     def __init__(self, num_mels: int, frame_length: int, frame_shift: int):
@@ -27,26 +28,30 @@ class FBank:
             )
         num_frames = 1 + (audio.shape[0] - self.frame_length) // self.frame_shift
         out = np.zeros((num_frames, self.num_mels), dtype=np.float32)
-        spectrum_bins = self.n_fft // 2 + 1
-        for frame_i in range(num_frames):
-            start = frame_i * self.frame_shift
-            frame_buf = np.zeros(self.n_fft, dtype=np.float32)
-            prev0 = audio[0] if start == 0 else audio[start - 1]
-            frame_buf[0] = audio[start] - PRE_EMPHASIS * prev0
-            window_slice = audio[start + 1 : start + self.frame_length]
-            prev_slice = audio[start : start + self.frame_length - 1]
-            frame_buf[1 : self.frame_length] = window_slice - PRE_EMPHASIS * prev_slice
-            frame_buf[: self.frame_length] *= self._window
-            spectrum = np.fft.rfft(frame_buf, n=self.n_fft)
-            power = (spectrum.real ** 2 + spectrum.imag ** 2).astype(np.float32)
-            for m, taps in enumerate(self._mel_filters):
-                acc = 0.0
-                for bin_idx, weight in taps:
-                    if bin_idx < spectrum_bins:
-                        acc += power[bin_idx] * weight
-                out[frame_i, m] = float(np.log(max(acc, LOG_FLOOR)))
+        for first in range(0, num_frames, FRAMES_PER_FFT_BATCH):
+            last = min(first + FRAMES_PER_FFT_BATCH, num_frames)
+            out[first:last] = self._compute_frames(audio, first, last)
         _cmn_in_place(out)
         return out.reshape(-1)
+
+    def _compute_frames(self, audio: np.ndarray, first: int, last: int) -> np.ndarray:
+        spectrum_bins = self.n_fft // 2 + 1
+        starts = np.arange(first, last) * self.frame_shift
+        idx = starts[:, None] + np.arange(self.frame_length)[None, :]
+        frame_buf = np.zeros((last - first, self.n_fft), dtype=np.float32)
+        frame_buf[:, : self.frame_length] = audio[idx] - PRE_EMPHASIS * audio[np.maximum(idx - 1, 0)]
+        frame_buf[:, : self.frame_length] *= self._window
+        spectrum = np.fft.rfft(frame_buf, n=self.n_fft, axis=1)
+        power = (spectrum.real ** 2 + spectrum.imag ** 2).astype(np.float32)
+        acc = np.zeros((last - first, self.num_mels), dtype=np.float32)
+        for m, taps in enumerate(self._mel_filters):
+            for bin_idx, weight in taps:
+                if bin_idx < spectrum_bins:
+                    acc[:, m] += power[:, bin_idx] * weight
+        floored = acc < LOG_FLOOR
+        logs = np.log(np.where(floored, 1.0, acc))
+        logs[floored] = np.float32(np.log(LOG_FLOOR))
+        return logs
 
 def _next_power_of_two(n: int) -> int:
     p = 1

@@ -18,12 +18,63 @@ exec'd into its command, so every process that LOOKS like gpu-flock is a
 waiter. Waiters read that identity and re-announce who blocks them once a
 minute with elapsed time, so a wedged holder is diagnosed from the waiting
 run's own log instead of lsof forensics.
+
+Fairness: flock(2) has no FIFO, so a tight re-acquire loop starves a
+periodic waiter (observed twice with two agent fleets sharing one GPU).
+Every waiter therefore drops a timestamped ticket into LOCKFILE.tickets/
+and defers to any older ticket whose pid is still alive; tickets from dead
+pids are garbage-collected by whoever sees them. This yields approximate
+FIFO without a broker process and stays compatible with waiters running
+the pre-ticket script (they simply never defer, as before).
 """
 
 import fcntl
 import os
 import sys
 import time
+
+
+def ticket_dir(lock_path: str) -> str:
+    return lock_path + ".tickets"
+
+
+def drop_ticket(lock_path: str) -> str:
+    d = ticket_dir(lock_path)
+    os.makedirs(d, exist_ok=True)
+    name = f"{time.time_ns():020d}-{os.getpid()}"
+    path = os.path.join(d, name)
+    with open(path, "w") as f:
+        f.write("")
+    return path
+
+
+def older_live_ticket_exists(lock_path: str, my_name: str) -> bool:
+    d = ticket_dir(lock_path)
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError:
+        return False
+    for name in entries:
+        if name >= my_name:
+            break
+        try:
+            pid = int(name.rsplit("-", 1)[1])
+        except (ValueError, IndexError):
+            pid = -1
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if alive:
+            return True
+        try:
+            os.unlink(os.path.join(d, name))
+        except OSError:
+            pass
+    return False
 
 
 def main() -> None:
@@ -34,29 +85,37 @@ def main() -> None:
     cmd = sys.argv[2:]
     os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+    ticket_path = drop_ticket(lock_path)
+    my_name = os.path.basename(ticket_path)
     t0 = time.time()
     announced = 0.0
     while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            now = time.time()
-            if now - announced >= 60.0 or announced == 0.0:
-                announced = now
-                holder = "unknown holder (pre-identity lock or truncated write)"
-                try:
-                    with open(lock_path, "r") as f:
-                        line = f.read(512).strip()
-                    if line:
-                        holder = line
-                except OSError:
-                    pass
-                sys.stderr.write(
-                    f"gpu-flock: waited {int(now - t0)}s for {lock_path}; "
-                    f"held by: {holder}\n"
-                )
-            time.sleep(2.0)
+        if not older_live_ticket_exists(lock_path, my_name):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                pass
+        now = time.time()
+        if now - announced >= 60.0 or announced == 0.0:
+            announced = now
+            holder = "unknown holder (pre-identity lock or truncated write)"
+            try:
+                with open(lock_path, "r") as f:
+                    line = f.read(512).strip()
+                if line:
+                    holder = line
+            except OSError:
+                pass
+            sys.stderr.write(
+                f"gpu-flock: waited {int(now - t0)}s for {lock_path}; "
+                f"held by: {holder}\n"
+            )
+        time.sleep(2.0)
+    try:
+        os.unlink(ticket_path)
+    except OSError:
+        pass
     ident = f"pid={os.getpid()} since={time.strftime('%H:%M:%S')} cmd={' '.join(cmd)[:300]}\n"
     try:
         os.ftruncate(fd, 0)

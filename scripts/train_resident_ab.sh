@@ -72,17 +72,17 @@ run_arm() {
     cd "$PROJECT_ROOT/rust"
     if [ "$arm" = "resident" ]; then export NV_TRAIN_QUANT_RESIDENT=1; else unset NV_TRAIN_QUANT_RESIDENT; fi
     NV_Q38_RESIDENT_AB_TEST=1 \
-    NV_Q38_AB_BASE="$BASE" \
-    NV_Q38_AB_DATA="$DATA" \
-    NV_Q38_AB_EVAL_DATA="$EVAL_DATA" \
-    NV_Q38_AB_OUT="$out_dir" \
-    NV_Q38_AB_STEPS="$STEPS" \
-    NV_Q38_AB_GRAD_LAYERS="$GRAD_LAYERS" \
-    NV_Q38_AB_RANK="$RANK" \
-    NV_Q38_AB_ALPHA="$ALPHA" \
-    NV_Q38_AB_LR="$LR" \
-    NV_Q38_AB_SEED="$SEED" \
-    NVK_LANE="$NVK_LANE" NVK_PKG=nv-train \
+      NV_Q38_AB_BASE="$BASE" \
+      NV_Q38_AB_DATA="$DATA" \
+      NV_Q38_AB_EVAL_DATA="$EVAL_DATA" \
+      NV_Q38_AB_OUT="$out_dir" \
+      NV_Q38_AB_STEPS="$STEPS" \
+      NV_Q38_AB_GRAD_LAYERS="$GRAD_LAYERS" \
+      NV_Q38_AB_RANK="$RANK" \
+      NV_Q38_AB_ALPHA="$ALPHA" \
+      NV_Q38_AB_LR="$LR" \
+      NV_Q38_AB_SEED="$SEED" \
+      NVK_LANE="$NVK_LANE" NVK_PKG=nv-train \
       scripts/nvk.sh test --no-fail-fast --test qwen38_quant_resident -- \
       --ignored --nocapture
   ) >"$log" 2>&1 || rc=$?

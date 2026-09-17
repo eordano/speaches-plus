@@ -11,6 +11,7 @@
 #include "../marlin.cuh"
 #include "../marlin_dtypes.cuh"
 #include "../scalar_type.h"
+#include "../m1_tail.cuh"
 
 #define MARLIN_KERNEL_PARAMS                                                   \
   const int4 *__restrict__ A, const int4 *__restrict__ B,                      \
@@ -22,7 +23,7 @@
       const int4 *__restrict__ zp_ptr, const int *__restrict__ g_idx,          \
       int num_groups, int prob_m, int prob_n, int prob_k, int lda, int *locks, \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce,                \
-      int max_shared_mem
+      int max_shared_mem, MARLIN_NAMESPACE_NAME::MarlinM1Tail m1_tail
 
 namespace MARLIN_NAMESPACE_NAME {
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id

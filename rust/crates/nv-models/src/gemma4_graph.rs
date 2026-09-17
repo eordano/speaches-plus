@@ -13,8 +13,7 @@ use nv_kernels::graph::CudaGraphRunner;
 use std::sync::Arc;
 
 #[cfg(feature = "cuda")]
-pub const GEMMA4_GRAPH_COINCIDENCE_GATE: &str =
-    "nv-models tests/gemma4_capture_stream_policy.rs";
+pub const GEMMA4_GRAPH_COINCIDENCE_GATE: &str = "nv-models tests/gemma4_capture_stream_policy.rs";
 
 #[cfg(feature = "cuda")]
 pub const WARM_PASS_MATERIALIZES_WHAT_CAPTURE_MUST_NOT_ALLOCATE: &str =
@@ -553,7 +552,9 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
         let amax_out = capture_stream
             .alloc_zeros::<u32>(k)
             .map_err(|e| anyhow::anyhow!(e))?;
-        capture_stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        capture_stream
+            .synchronize()
+            .map_err(|e| anyhow::anyhow!(e))?;
         let runner = CudaGraphRunner::new(capture_stream.clone());
         Ok(Self {
             model,
@@ -753,8 +754,7 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
             let ctx2 = capture_stream.context().clone();
             let e0 = ctx2.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
             let e1 = ctx2.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
-            e0.record(&capture_stream)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            e0.record(&capture_stream).map_err(|e| anyhow::anyhow!(e))?;
             Some((e0, e1))
         } else {
             None

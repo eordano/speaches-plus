@@ -1,9 +1,9 @@
 # 070-ocr — classical OCR fixture family
 
 Single-artifact classical OCR cases: a clean line, a paragraph, skewed pages,
-noise/contrast variants, and two real 1892 scan crops. Rendered-then-committed
-PNGs with exact ground truth by construction; the real-scan crops are
-transcribed by hand.
+noise/contrast variants, and two real 1892 scan crops. Rendered PNGs with
+exact ground truth by construction; the real-scan crops are transcribed by
+hand.
 
 Fixtures live directly under `conformance/fixtures/` as
 `070-ocr-<name>/` like every other family — there is no `ocr/` subtree. The
@@ -11,7 +11,9 @@ companion full-page band is `071-ocr-layout`; see
 `README-071-ocr-layout.md`.
 
 Each fixture dir holds `fixture.json` (declarative gates, runner-agnostic),
-`input.png`, and a `README.md`. PNGs are committed so tests are hermetic.
+`input.png`, and a `README.md`. Rendered PNGs are gitignored and rebuilt by
+`conformance/tools/regenerate-fixtures.sh`; only the two 1892 scan crops are
+tracked.
 
 ## Manifest shape
 
@@ -55,9 +57,10 @@ CER = Levenshtein / truth length after NFC + whitespace-squash normalization.
 
 ## Regenerating
 
-`conformance/tools/generate-070-ocr-fixtures.sh` rerenders the PNGs and
-rewrites each `fixture.json` + `README.md`. It writes into
-`conformance/fixtures/` by default (`OUT` overrides) and uses the nix-store
-imagemagick and DejaVuSans.ttf pinned in the script (`MAGICK` / `FONT`
-overrides). Neither real-scan fixture is produced by it. It is not a test-time
-dependency.
+`conformance/tools/regenerate-fixtures.sh` renders the PNGs into place (it
+runs `generate-070-ocr-fixtures.sh` into a scratch `OUT` and copies only
+`input.png`, warning if the tracked `fixture.json` drifted from the generator's).
+The generator alone also rewrites each `fixture.json` + `README.md`; it takes
+`MAGICK`, `FONT` (DejaVuSans.ttf, found via `fc-list` when unset), `SEED` for
+the two noise renders, and `OUT`. Neither real-scan fixture is produced by it.
+It is not a test-time dependency.

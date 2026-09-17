@@ -78,6 +78,8 @@ pub struct AudioSpeechRequest {
     pub input: Option<String>,
     pub voice: Option<String>,
     #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default)]
     pub speed: Option<f32>,
@@ -279,6 +281,16 @@ pub async fn handle(
                     Some("voice_profile_unsupported"),
                 );
             }
+            if nv_tts::is_store_unavailable(&err) {
+                warn!(error = %err, voice, "nv-tts voice store unavailable");
+                return openai_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("tts: {err:#}"),
+                    kind::SERVICE_UNAVAIL,
+                    Some("voice"),
+                    Some("voice_store_unavailable"),
+                );
+            }
             if let Some(silent) = err.downcast_ref::<SilentVocoder>() {
                 tracing::error!(error = %silent, "nv-tts refused: zero-init vocoder");
                 return openai_error(
@@ -446,17 +458,21 @@ fn write_wav_header(buf: &mut Vec<u8>, sample_rate: u32, channels: u16, pcm_byte
     buf.extend_from_slice(&pcm_bytes.to_le_bytes());
 }
 
-async fn route_to_kokoro(state: AppState, req: AudioSpeechRequest) -> Response {
-    let body = json!({
+fn kokoro_request_body(req: &AudioSpeechRequest) -> serde_json::Value {
+    json!({
         "model": req.model.clone(),
         "input": req.input.clone(),
         "voice": req.voice.clone(),
+        "language": req.language.clone(),
         "response_format": req.response_format.clone(),
         "speed": req.speed,
         "stream_format": req.stream_format.clone(),
         "sample_rate": req.sample_rate,
-    });
+    })
+}
 
+async fn route_to_kokoro(state: AppState, req: AudioSpeechRequest) -> Response {
+    let body = kokoro_request_body(&req);
     let kokoro = state.models.kokoro.clone();
     let speech_state = crate::tts::http::SpeechAppState::new(kokoro);
 
@@ -620,6 +636,7 @@ mod tests {
         stream_format: Option<&str>,
     ) -> AudioSpeechRequest {
         AudioSpeechRequest {
+            language: None,
             model: None,
             input: Some("hi".into()),
             voice: Some("serena".into()),
@@ -628,6 +645,18 @@ mod tests {
             sample_rate,
             stream_format: stream_format.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn public_speech_route_preserves_explicit_spanish_language_for_kokoro() {
+        let request: AudioSpeechRequest = serde_json::from_value(json!({
+            "model":"kokoro", "input":"Buenas tardes", "voice":"em_alex", "language":"es"
+        }))
+        .unwrap();
+        let forwarded: crate::tts::http::CreateSpeechRequestBody =
+            serde_json::from_value(kokoro_request_body(&request)).unwrap();
+        assert_eq!(forwarded.language.as_deref(), Some("es"));
+        assert_eq!(forwarded.voice.as_deref(), Some("em_alex"));
     }
 
     #[test]

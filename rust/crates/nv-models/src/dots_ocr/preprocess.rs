@@ -190,8 +190,7 @@ fn sample_ink_by(img: &RgbImage, is_ink: impl Fn(u16) -> bool) -> InkPoints {
         let mut x = 0;
         while x < img.w {
             let o = x * 3;
-            let luma =
-                (row[o] as u16 * 77 + row[o + 1] as u16 * 150 + row[o + 2] as u16 * 29) >> 8;
+            let luma = (row[o] as u16 * 77 + row[o + 1] as u16 * 150 + row[o + 2] as u16 * 29) >> 8;
             if is_ink(luma) {
                 pts.xs.push(x as f32);
                 pts.ys.push(y as f32);

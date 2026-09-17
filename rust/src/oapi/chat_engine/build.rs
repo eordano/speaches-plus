@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(any(feature = "cuda", test))]
+use anyhow::Context;
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,7 +52,10 @@ pub(crate) enum QwenMoeShared {
 
 #[cfg(feature = "cuda")]
 #[derive(Clone)]
-pub(crate) struct LagunaShared(Arc<nv_models::laguna::Laguna>);
+pub(crate) struct LagunaShared(
+    Arc<nv_models::laguna::Laguna>,
+    pub(crate) Arc<LagunaAdmission>,
+);
 #[cfg(feature = "cuda")]
 unsafe impl Send for LagunaShared {}
 #[cfg(feature = "cuda")]
@@ -65,19 +70,252 @@ impl std::ops::Deref for LagunaShared {
 
 #[cfg(feature = "cuda")]
 pub(crate) struct LagunaSpecServe {
-    pub(crate) jobs:
-        std::sync::Mutex<std::sync::mpsc::Sender<nv_models::laguna_serve::SpecServeJob>>,
+    pub(crate) jobs: LagunaSpecWorker<nv_models::laguna_serve::SpecServeJob>,
     pub(crate) max_seq: usize,
     pub(crate) num_spec: usize,
+    pub(crate) tail: LagunaWorkerTail,
+    pub(crate) capacity: usize,
+    pub(crate) queue: std::time::Duration,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LagunaWorkerTail {
+    Reserved,
+    PreparedPlain,
+    PreparedSpec,
+}
+
+#[cfg(feature = "cuda")]
+impl LagunaWorkerTail {
+    pub(crate) fn fits(
+        self,
+        prompt: usize,
+        output: usize,
+        num_spec: usize,
+        capacity: usize,
+    ) -> bool {
+        if prompt == 0 || output == 0 {
+            return false;
+        }
+        let required = match self {
+            Self::Reserved => output.checked_add(num_spec).and_then(|n| n.checked_add(2)),
+            Self::PreparedPlain => Some(output.max(2)),
+            Self::PreparedSpec => Some(output),
+        };
+        required
+            .and_then(|n| prompt.checked_add(n))
+            .is_some_and(|end| end <= capacity)
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug)]
+pub(crate) struct LagunaSpecWorker<T> {
+    jobs: Option<std::sync::mpsc::SyncSender<T>>,
+    thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl<T> LagunaSpecWorker<T> {
+    pub(crate) fn try_send(&self, job: T) -> Result<(), std::sync::mpsc::TrySendError<T>> {
+        match self.jobs.as_ref() {
+            Some(jobs) => jobs.try_send(job),
+            None => Err(std::sync::mpsc::TrySendError::Disconnected(job)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_sender(jobs: std::sync::mpsc::SyncSender<T>) -> Self {
+        Self {
+            jobs: Some(jobs),
+            thread: None,
+        }
+    }
+
+    fn close_and_join(&mut self) -> anyhow::Result<()> {
+        drop(self.jobs.take());
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        if thread.thread().id() == std::thread::current().id() {
+            tracing::warn!("Laguna spec worker owner dropped on its own thread; queue closed without self-join");
+            return Ok(());
+        }
+        match thread.join() {
+            Ok(result) => result.context("Laguna spec worker exited with an error"),
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                anyhow::bail!("Laguna spec worker panicked: {message}")
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl<T> Drop for LagunaSpecWorker<T> {
+    fn drop(&mut self) {
+        if let Err(error) = self.close_and_join() {
+            tracing::warn!(error = %format!("{error:#}"), "Laguna spec worker shutdown failed");
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn validate_laguna_packed_draft_arm(
+    required: bool,
+    mode: EngineBuildMode,
+    spec_enabled: bool,
+    draft_enabled: bool,
+) -> anyhow::Result<()> {
+    if required {
+        anyhow::ensure!(
+            mode != EngineBuildMode::AdapterServingLean && spec_enabled && draft_enabled,
+            "NV_LAGUNA_DFLASH_NVFP4=1 requires the full Laguna spec engine and draft; it conflicts with adapter-serving lean mode, NV_LAGUNA_SERVE_SPEC=0, or NV_LAGUNA_SERVE_DRAFT=0"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn required_laguna_draft_dir(raw: Option<std::ffi::OsString>) -> anyhow::Result<PathBuf> {
+    let path = raw.map(PathBuf::from).context(
+        "NV_LAGUNA_DFLASH_NVFP4=1 requires NV_LAGUNA_DFLASH_DIR to identify the draft source",
+    )?;
+    anyhow::ensure!(
+        path.is_dir(),
+        "NV_LAGUNA_DFLASH_NVFP4=1 draft source is not a directory: {}",
+        path.display()
+    );
+    Ok(path)
+}
+
+#[cfg(test)]
+fn start_laguna_spec_worker<T: Send + 'static>(
+    capacity: usize,
+    required: bool,
+    worker: impl FnOnce(std::sync::mpsc::Receiver<T>, std::sync::mpsc::Sender<bool>) -> anyhow::Result<()>
+        + Send
+        + 'static,
+) -> anyhow::Result<Option<(LagunaSpecWorker<T>, bool)>> {
+    start_laguna_spec_worker_with_graph_requirement(capacity, required, false, false, worker)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn start_laguna_spec_worker_with_graph_requirement<T: Send + 'static>(
+    capacity: usize,
+    required: bool,
+    graph_required: bool,
+    handoff_required: bool,
+    worker: impl FnOnce(std::sync::mpsc::Receiver<T>, std::sync::mpsc::Sender<bool>) -> anyhow::Result<()>
+        + Send
+        + 'static,
+) -> anyhow::Result<Option<(LagunaSpecWorker<T>, bool)>> {
+    let start = || -> anyhow::Result<_> {
+        let (jobs, requests) = std::sync::mpsc::sync_channel(capacity);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("laguna-spec-serve".into())
+            .spawn(move || {
+                let result = worker(requests, ready_tx);
+                if let Err(e) = &result {
+                    tracing::warn!(error = %format!("{e:#}"), "laguna spec serve loop exited");
+                }
+                result
+            })
+            .context("spawn Laguna spec worker")?;
+        let mut owned = LagunaSpecWorker {
+            jobs: Some(jobs),
+            thread: Some(thread),
+        };
+        match ready_rx.recv() {
+            Ok(has_draft) => {
+                anyhow::ensure!(
+                    !required || has_draft,
+                    "Laguna spec worker became ready without the required packed DFlash draft"
+                );
+                Ok((owned, has_draft))
+            }
+            Err(_) => {
+                owned
+                    .close_and_join()
+                    .context("initialize Laguna spec worker")?;
+                anyhow::bail!("Laguna spec worker exited before readiness")
+            }
+        }
+    };
+    match start() {
+        Ok(ready) => Ok(Some(ready)),
+        Err(e) if required => Err(e).context(
+            "NV_LAGUNA_DFLASH_NVFP4=1 requires packed DFlash serving; refusing plain or BF16 fallback",
+        ),
+        Err(e) if handoff_required => Err(e).context(
+            "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 requires the handoff worker; refusing per-request fallback",
+        ),
+        Err(e) if graph_required => Err(e).context(
+            "NV_LAGUNA_BATCH_GRAPH=1, m2 or m2-spec requires graph lane serving; refusing per-request fallback",
+        ),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "laguna spec serving engine init failed; using the per-request path");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn laguna_engine_spec_state<T>(ready: Option<(T, bool)>) -> (Option<T>, Option<&'static str>) {
+    match ready {
+        Some((worker, has_draft)) => (Some(worker), has_draft.then_some("on")),
+        None => (None, None),
+    }
 }
 
 #[cfg(feature = "cuda")]
 pub(crate) fn build_laguna_spec_serve(
     model: &LagunaShared,
     kv_max_seq_len: usize,
-) -> Option<Arc<LagunaSpecServe>> {
+    require_nvfp4: bool,
+) -> anyhow::Result<Option<(Arc<LagunaSpecServe>, bool)>> {
+    if nv_models::laguna_serve::bf16_prefill_handoff_opt_in() {
+        anyhow::ensure!(
+            laguna_serve_spec_enabled(),
+            "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 requires NV_LAGUNA_SERVE_SPEC=1"
+        );
+    }
+    let graph_required = nv_models::laguna_serve::batch_graph_enabled_from_env()?;
+    nv_models::laguna_serve::validate_m2_graph_selection()?;
+    nv_models::laguna_serve::validate_m2_spec_selection()?;
+    let spec_batch = nv_models::laguna_serve::batch_m2_spec_enabled_from_env();
+    let tail = if spec_batch {
+        LagunaWorkerTail::PreparedSpec
+    } else if nv_models::laguna_serve::batch_m2_graph_enabled_from_env() {
+        LagunaWorkerTail::PreparedPlain
+    } else {
+        LagunaWorkerTail::Reserved
+    };
+    if spec_batch {
+        anyhow::ensure!(
+            require_nvfp4 && laguna_serve_draft_enabled(),
+            "m2-spec requires packed DFlash; refusing plain or BF16 fallback"
+        );
+    }
+    if graph_required {
+        anyhow::ensure!(
+            laguna_serve_spec_enabled(),
+            "NV_LAGUNA_BATCH_GRAPH=1, m2 or m2-spec requires NV_LAGUNA_SERVE_SPEC=1"
+        );
+        anyhow::ensure!(spec_batch || (!laguna_serve_draft_enabled() && !require_nvfp4), "NV_LAGUNA_BATCH_GRAPH=1 or m2 requires NV_LAGUNA_SERVE_DRAFT=0 and packed DFlash disabled");
+    }
     if !laguna_serve_spec_enabled() {
-        return None;
+        anyhow::ensure!(
+            !require_nvfp4,
+            "NV_LAGUNA_DFLASH_NVFP4=1 requires NV_LAGUNA_SERVE_SPEC=1"
+        );
+        return Ok(None);
     }
     let draft_enabled = laguna_serve_draft_enabled();
     let num_spec = std::env::var("NV_DFLASH_K")
@@ -90,55 +328,86 @@ pub(crate) fn build_laguna_spec_serve(
             .and_then(|v| v.parse::<usize>().ok()),
         kv_max_seq_len,
     );
-    let (job_tx, job_rx) = std::sync::mpsc::channel();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let capacity = chat_permits(std::env::var("NV_CHAT_CONCURRENCY").ok().as_deref());
+    let queue = std::time::Duration::from_millis(chat_queue_ms(
+        std::env::var("NV_CHAT_QUEUE_MS").ok().as_deref(),
+    ));
     let shared = model.clone();
-    let draft_dir = draft_enabled.then(laguna_dflash_dir).flatten();
+    let draft_dir = if require_nvfp4 {
+        anyhow::ensure!(
+            draft_enabled,
+            "NV_LAGUNA_DFLASH_NVFP4=1 requires NV_LAGUNA_SERVE_DRAFT=1"
+        );
+        Some(required_laguna_draft_dir(std::env::var_os(
+            "NV_LAGUNA_DFLASH_DIR",
+        ))?)
+    } else {
+        draft_enabled.then(laguna_dflash_dir).flatten()
+    };
     if draft_enabled && draft_dir.is_none() {
         tracing::warn!("NV_LAGUNA_SERVE_DRAFT=1 but no dflash snapshot found; spec serving will run M=1 step graph only");
     }
-    let spawned = std::thread::Builder::new()
-        .name("laguna-spec-serve".into())
-        .spawn(move || {
+    let handoff_required = nv_models::laguna_serve::bf16_prefill_handoff_opt_in();
+    let ready = start_laguna_spec_worker_with_graph_requirement(
+        capacity,
+        require_nvfp4,
+        graph_required,
+        handoff_required,
+        move |job_rx, ready_tx| {
             let target = shared.0.clone();
             let device = target.device().clone();
-            let draft = draft_dir.and_then(|dir| {
-                match nv_models::laguna_serve::load_dflash_draft(&dir, &device) {
-                    Ok(d) => Some(d),
+            let draft = match draft_dir {
+                Some(dir) => match nv_models::laguna_serve::load_dflash_draft(&dir, &device) {
+                    Ok(d) => {
+                        if require_nvfp4 {
+                            let summary = d.quantization_summary();
+                            anyhow::ensure!(
+                            summary.packed_linears > 0 && summary.bf16_fallback_linears == 0,
+                            "required packed DFlash source {} loaded an incompatible weight format: {summary:?}",
+                            dir.display()
+                        );
+                        }
+                        Some(d)
+                    }
+                    Err(e) if require_nvfp4 => {
+                        return Err(e).with_context(|| {
+                            format!("load required packed DFlash draft from {}", dir.display())
+                        });
+                    }
                     Err(e) => {
                         tracing::warn!(error = %format!("{e:#}"), "laguna dflash draft load failed; spec serving will run M=1 step graph only");
                         None
                     }
-                }
-            });
-            if let Err(e) = nv_models::laguna_serve::spec_serve_loop(
+                },
+                None => None,
+            };
+            nv_models::laguna_serve::spec_serve_loop(
                 target, draft, num_spec, max_seq, job_rx, ready_tx,
-            ) {
-                tracing::warn!(error = %format!("{e:#}"), "laguna spec serve loop exited");
-            }
-        });
-    if spawned.is_err() {
-        tracing::warn!("failed to spawn laguna spec serve thread");
-        return None;
-    }
-    match ready_rx.recv() {
-        Ok(has_draft) => {
+            )
+            .context("initialize or run Laguna spec serving")
+        },
+    )?;
+    match ready {
+        Some((job_tx, has_draft)) => {
             tracing::info!(
                 has_draft,
                 num_spec,
                 max_seq,
                 "laguna spec serving engine ready"
             );
-            Some(Arc::new(LagunaSpecServe {
-                jobs: std::sync::Mutex::new(job_tx),
-                max_seq,
-                num_spec,
-            }))
+            Ok(Some((
+                Arc::new(LagunaSpecServe {
+                    jobs: job_tx,
+                    max_seq,
+                    num_spec,
+                    tail,
+                    capacity,
+                    queue,
+                }),
+                has_draft,
+            )))
         }
-        Err(_) => {
-            tracing::warn!("laguna spec serving engine init failed; using the per-request path");
-            None
-        }
+        None => Ok(None),
     }
 }
 
@@ -194,7 +463,8 @@ pub(crate) fn qwen_moe_grouped_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) const A_CANDLE_GRAPH_BODY_NEEDS_THE_DEVICE_STREAM: &str = "Device::new_cuda_with_stream \
+pub(crate) const A_CANDLE_GRAPH_BODY_NEEDS_THE_DEVICE_STREAM: &str =
+    "Device::new_cuda_with_stream \
      is what a family whose CUDA-graph body is a candle-core forward would need, because candle \
      launches only on candle_core::CudaDevice::cuda_stream() and \
      nv_models::gemma4_batch_graph::capture_stream::CaptureStream therefore has to capture on that \
@@ -204,8 +474,9 @@ pub(crate) const A_CANDLE_GRAPH_BODY_NEEDS_THE_DEVICE_STREAM: &str = "Device::ne
      GraphedGemma4Verify and nv_models::gemma4_batch_graph::Gemma4BatchGraphFamily -- they \
      capture Gemma4::forward_with_cache_into, forward_verify_dev and a candle layer loop. \
      Gemma4E4b also qualifies (gemma4_e4b.rs captures Gemma4E4b::forward_step_fast_body). Laguna \
-     does not: laguna_graph.rs does the candle handoff as a memcpy_dtod outside the capture and \
-     its captured body is raw, so forking is correct there. Gemma4Moe and Qwen3 build no graph";
+     raw solo path does not: laguna_graph.rs does the candle handoff as a memcpy_dtod outside \
+     capture. The opt-in m2 and m2-spec prepared Candle bodies require the non-null model stream; \
+     this does not clear Laguna's other routes. Gemma4Moe and Qwen3 build no graph";
 
 #[cfg(feature = "cuda")]
 pub(crate) const THE_GEMMA4_DEVICE_STREAM_FLIP_IS_BLOCKED_BY_A_MEASURED_SERVING_BREAK: &str =
@@ -237,13 +508,31 @@ pub(crate) fn device_stream_flip_is_cleared_for(family: ModelFamily) -> bool {
 }
 
 #[cfg(feature = "cuda")]
+fn laguna_spec_batch_needs_device_stream(family: ModelFamily, selector: &str) -> bool {
+    matches!(family, ModelFamily::Laguna) && selector == "m2-spec"
+}
+
+#[cfg(feature = "cuda")]
 pub(crate) fn capture_needs_the_device_stream(family: ModelFamily, raw_cfg: &str) -> bool {
     qwen_graph_decode_selected(family, raw_cfg)
         || qwen38_serve_graphed_selected(family, raw_cfg)
         || qwen38_batch_lanes_boot_selected(family, raw_cfg)
         || qwen36_batch_lanes_boot_selected(family, raw_cfg)
         || qwen36_mtp_captured_serving_selected(family, raw_cfg)
+        || laguna_spec_batch_needs_device_stream(
+            family,
+            &std::env::var("NV_LAGUNA_BATCH_GRAPH").unwrap_or_default(),
+        )
         || (graph_body_is_a_candle_forward(family) && device_stream_flip_is_cleared_for(family))
+        || laguna_prepared_b2_graph_captures_the_candle_forward_on_the_model_stream(family)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn laguna_prepared_b2_graph_captures_the_candle_forward_on_the_model_stream(
+    family: ModelFamily,
+) -> bool {
+    matches!(family, ModelFamily::Laguna)
+        && nv_models::laguna_serve::batch_m2_graph_enabled_from_env()
 }
 
 #[cfg(feature = "cuda")]
@@ -322,7 +611,7 @@ pub(crate) const GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL: [(&str
 pub(crate) const QWEN35_DENSE_SERVING_ARM_ENV: &str = "NV_QWEN35_DENSE_ARM";
 
 #[cfg(feature = "cuda")]
-pub(crate) const QWEN35_DENSE_9B_OPT_IN_ARMS_ITS_MEASURED_STACK_AND_NV_QWEN35_DENSE_ARM_0_IS_THE_ESCAPE: &str = "the qwen3.5-dense cuda path stays opt-in per QWEN35_DENSE_CUDA_OPT_IN_MATCHES_THE_WGPU_ORACLE_AND_STAYS_OPT_IN -- this arms it, it does not promote it, and without NV_QWEN35_DENSE_CUDA_SERVE=1 detect_family still refuses with backend_select::QWEN35_DENSE_NO_CUDA and the checkpoint still goes to wgpu. What changes is that taking the opt-in no longer means decoding with none of the eleven arms this checkpoint's speed-of-light round measured: try_load_inner arms QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL before Qwen3Moe::from_loader_dense_quantized, because NV_Q36_GDN_FP8 and NV_Q36_LM_HEAD_FP8 decide resident weight dtype at load and NV_Q36_GRAPHED_DECODE_FIX decides whether the kv cache allocates the splitk scratch that routes the 8 full-attention layers off the serial_smem decode kernel. Unarmed the path decodes at 12.514 ms/tok at 256 and 79.629 at 8192; armed it decodes at 5.425 and 5.900, and the depth term is where the defect really was -- serial_smem serializes a block reduce per KV position, which is why 256->8k cost 6.4x unarmed and costs 1.09x armed. It costs no quality and no VRAM: on ppl_qwen35_dense::qwen35_dense_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode the stack scores 4.833 against a 4.862 zero-env basis (better on the headline, and the largest single-arm cost in it is NV_Q36_GDN_FP8 at +0.042 -- a cost that stays UNRESOLVED because qwen3.5-9B has no measured reassociation null, its 3-rung ladder spanning only 0.025; the +0.0973 figure once cited here is a qwen3.8 wikitext arm delta, not a floor), its eager and graphed 128-step greedy chains are token-identical, and peak VRAM through a live 256-depth run drops 15877 -> 9183 MiB because the fp8 copies replace their bf16 originals. NV_QWEN35_DENSE_ARM=0 (or off) arms nothing and restores the unarmed opt-in path exactly. The stack is armed ONLY for the trunk it was measured on, QWEN35_DENSE_9B_TRUNK_THE_ARM_STACK_WAS_MEASURED_ON: qwen3.8-27B declares the same model_type qwen3_5 and lands in the same dense arm, but its published serving band belongs to a different twelve-arm stack with NV_NVFP4_M1_GEMV unset, so arming this one for it would flip a performance default nobody measured. Any other dense trunk keeps today's behavior and says so at load";
+pub(crate) const QWEN35_DENSE_9B_OPT_IN_ARMS_ITS_MEASURED_STACK_AND_NV_QWEN35_DENSE_ARM_0_IS_THE_ESCAPE: &str = "the qwen3.5-dense cuda path stays opt-in per QWEN35_DENSE_CUDA_OPT_IN_MATCHES_THE_WGPU_ORACLE_AND_STAYS_OPT_IN -- this arms it, it does not promote it, and without NV_QWEN35_DENSE_CUDA_SERVE=1 detect_family still refuses with backend_select::QWEN35_DENSE_NO_CUDA and the checkpoint still goes to wgpu. What changes is that taking the opt-in no longer means decoding with none of the eleven arms this checkpoint's speed-of-light round measured: try_load_inner arms QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL before Qwen3Moe::from_loader_dense_quantized, because NV_Q36_GDN_FP8 and NV_Q36_LM_HEAD_FP8 decide resident weight dtype at load and NV_Q36_GRAPHED_DECODE_FIX decides whether the kv cache allocates the splitk scratch that routes the 8 full-attention layers off the serial_smem decode kernel. Unarmed the path decodes at 12.514 ms/tok at 256 and 79.629 at 8192; armed it decodes at 5.425 and 5.900, and the depth term is where the defect really was -- serial_smem serializes a block reduce per KV position, which is why 256->8k cost 6.4x unarmed and costs 1.09x armed. It costs no quality and no VRAM: on ppl_qwen35_dense::qwen35_dense_chat_wrapped_continuation_teacher_forced_ppl_via_serving_decode the stack scores 4.833 against a 4.862 zero-env basis (better on the headline, and the largest single-arm cost in it is NV_Q36_GDN_FP8 at +0.042 -- a cost that stays UNRESOLVED because qwen3.5-9B has no measured reassociation null, its 3-rung ladder spanning only 0.025; the +0.0973 figure once cited here is a qwen3.8 wikitext arm delta, not a floor), its eager and graphed 128-step greedy chains are token-identical, and peak VRAM through a live 256-depth run drops 15877 -> 9183 MiB because the fp8 copies replace their bf16 originals. NV_QWEN35_DENSE_ARM=0 (or off) arms nothing and restores the unarmed opt-in path exactly -- and since the 2026-09-03 default-on sign-off of NV_Q36_GRAPHED_DECODE_FIX and NV_Q38_GDN_SPLIT the unarmed path already carries those two, so the 12.514/79.629 unarmed rows predate that flip and reproducing them needs both set to 0 explicitly. The stack is armed ONLY for the trunk it was measured on, QWEN35_DENSE_9B_TRUNK_THE_ARM_STACK_WAS_MEASURED_ON: qwen3.8-27B declares the same model_type qwen3_5 and lands in the same dense arm, but its published serving band belongs to a different twelve-arm stack with NV_NVFP4_M1_GEMV unset, so arming this one for it would flip a performance default nobody measured. Any other dense trunk keeps today's behavior and says so at load";
 
 #[cfg(feature = "cuda")]
 pub(crate) const QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL: [(&str, &str); 11] = [
@@ -342,6 +631,106 @@ pub(crate) const QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL: [(&s
 #[cfg(feature = "cuda")]
 pub(crate) const QWEN35_DENSE_9B_TRUNK_THE_ARM_STACK_WAS_MEASURED_ON: (usize, usize, usize) =
     (4096, 32, 12288);
+
+#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN38_DENSE_27B_NORM_WIDE_BATCH_IS_ARMED_ALONE_AND_UNCONDITIONALLY_BECAUSE_IT_IS_BITWISE_AND_HELPS_THE_VERIFY_BLOCK_THE_OTHER_ARM_CANNOT_TOUCH: &str =
+    "NV_NORM_M1_WIDE_BATCH=8 is armed for the qwen3.8-27B trunk on its own, outside \
+     QWEN38_DENSE_27B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL and without the spec-decode gate \
+     those keys carry, because it is the one arm here that is BITWISE and that helps precisely \
+     where MTP spends its time. nvk_norm_m1_wide_block_for_row refuses the wide rung above a \
+     batch cap that shipped as 1, and the constant carrying that cap records the reason as a \
+     measured negative on gemma4 head-dim norms (+12%) and the qwen3.5 PREFILL norm (2.6x) -- \
+     both large-batch shapes. An MTP verify block is m<=8 rows, which the cap lumped in with a \
+     4096-row prefill, so the trunk was paying the stock one-CTA-per-row shape on a card where 8 \
+     CTAs leave 188 SMs almost idle. Measured on qwen38_mrow_slope_ledger at depth 16384, the \
+     norms class falls 1.393 -> 0.548 ms and the whole m=8 verify forward 27.318 -> 26.471 ms, a \
+     3.1% cut of the block that is 93% of an MTP round. It is bitwise, not merely close: the \
+     wide-256 rung is the rung nv_kernels_norm_m1_wide_block already resolves to at m=1 and \
+     norm_m1_wide_batch_cap keeps one CTA per row, so every row runs the reduction it ran before \
+     -- norm_m1_wide_batch_at_m_rows_is_bitwise_against_the_stock_kernel proves it bit-for-bit at \
+     batch 1,2,3,4,6,8. The cap is armed HERE rather than flipped in the kernel because the \
+     negative it guards was measured on other families and this measurement was not: a global \
+     flip would repeat, in the opposite direction, the same over-broad reasoning that set the cap \
+     to 1. NV_NORM_M1_WIDE_BATCH=1 restores the stock shape exactly.";
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN38_DENSE_27B_NORM_WIDE_BATCH_KEY: (&str, &str) =
+    ("NV_NORM_M1_WIDE_BATCH", "8");
+
+pub(crate) const QWEN38_DENSE_27B_SERVING_ARM_ENV: &str = "NV_Q38_27B_SERVING_ARM";
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN38_DENSE_27B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL: [(&str, &str); 2] =
+    [("NV_Q38_GDN_NVFP4", "1"), ("NV_NVFP4_M1_GEMV", "1")];
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN38_DENSE_27B_TRUNK_THE_GDN_NVFP4_STACK_WAS_MEASURED_ON: (usize, usize, usize) =
+    (5120, 64, 17408);
+
+#[cfg(feature = "cuda")]
+pub(crate) const QWEN38_DENSE_27B_NVFP4_GDN_ARMS_ITS_TWO_KEY_STACK_AND_NV_Q38_27B_SERVING_ARM_0_IS_THE_ESCAPE: &str =
+    "qwen3.8-27B (the qwen3_5 dense trunk 5120/64/17408, distinct from the Qwen3.5-9B \
+     4096/32/12288 the eleven-arm stack was measured on) arms two keys together, armed by \
+     try_load_inner before from_loader_dense_quantized: NV_Q38_GDN_NVFP4=1 double-quants the \
+     fp8-checkpoint GDN qkvz/out projections to nvfp4 half-byte resident, and NV_NVFP4_M1_GEMV=1 \
+     routes those short-row nvfp4 linears onto nvfp4_gemv_bf16act instead of the padded generic \
+     nvfp4 GEMV. They are ONE decision: NV_Q38_GDN_NVFP4 alone is decode-NEUTRAL (the generic \
+     nvfp4 GEMV is no faster than fp8 for the 10240x5120 GDN shapes), and only the M1_GEMV route \
+     turns the half-byte read into speed. The instrument is the qwen3.8 wikitext ppl gate: \
+     decode-stepped chat-wrapped 9.879 -> 9.818 and raw-corpus prefill 11.994 -> 11.964 -- both \
+     BETTER, because the M1_GEMV bf16-activation precision gain outweighs the nvfp4 weight loss. \
+     What it buys, graphed serving decode: 16.780 -> 15.584 ms/tok at 8k (+7.7%) and 23.229 -> \
+     22.070 at 172k (+5.4%), closing about half the base-decode gap to llama.cpp-cuda. \
+     NV_Q38_27B_SERVING_ARM=0 restores the fp8-GDN pre-flip default exactly (the absence of both \
+     variables). The stack is armed ONLY when spec decode is NOT selected: NV_NVFP4_M1_GEMV \
+     routes short-row nvfp4 linears onto nvfp4_gemv_bf16act, which is the WRONG route for an MTP \
+     verify block, and arming it measurably slows the verify. That is the same harm \
+     GEMMA4_NVFP4_SERVES_THE_THREE_KEY_RECORD_ARM_AND_NV_G4_SERVING_ARM_0_IS_THE_ESCAPE records \
+     for gemma4 (k=4 verify 21.57 -> 54.3 ms). So with NV_DRAFTER=mtp this checkpoint arms \
+     nothing and keeps the fp8 GDN projections; without a drafter it takes the two-key stack and \
+     its base-decode win. \
+     Two things about that harm are now measured rather than assumed, and both say the gate \
+     stays. First, batching the verify block into one nvfp4_gemv_bf16act_kernel<MROWS> launch \
+     (ONE_MROWS_LAUNCH_READS_THE_WEIGHT_BLOCK_ONCE_FOR_EVERY_VERIFY_ROW_INSTEAD_OF_ONCE_PER_ROW) \
+     shrinks it but does not remove it: verify 26.91 -> 35.42 ms/round at 256 armed, against the \
+     23.91 -> 37.59 the pre-mrows row loop paid, and served decode still falls 276.9 -> 214.9 \
+     tok/s at 256 and 258.6 -> 205.2 at 8192. The residual is not GDN but MLP: \
+     nvfp4_m1_gemv_opted_in() is ONE global gate in nv_layers::linear::matmul_nvfp4_impl, so \
+     arming it also drags the 56 nvfp4 MLP layers off the padded cutlass tile -- which is FLAT in \
+     m -- onto a gemv that only wins at one row, and a 2.1-3.1x faster gemv still loses to the \
+     tile at the m=8 block the suffix arm produces. Second, the obvious escape is a measured \
+     QUALITY REJECT, not an oversight: NV_NVFP4_GEMV_ROWS=1 leaves the verify block on the tile \
+     and reads FASTER than the unarmed basis on the serving comparator (289.8/292.1 at 256, \
+     271.5/270.2 at 8192, +5.6% and +5.1%, verify 25.42 ms) with accept_rate an unchanged 1.000 \
+     -- and that witness is vacuous, because the comparator's exact-token tiled prompt makes \
+     suffix acceptance trivially perfect. The named three-class instrument rejects it: \
+     qwen38_tctile_cert_teacher_forced_verify_walk_divergence_and_nll_mk_kvshare_tctile_matched_streams \
+     fails at agentic nll delta +0.02661 against a 0.02248 band, self-scored NLL worsens on every \
+     class (agentic 0.3041 -> 0.3453, tiled 0.2326 -> 0.2390, freeform 0.6334 -> 0.7210) and every \
+     emitted_fnv moves, because m=1 decode on the gemv and m=8 verify on the tile is precisely what \
+     A_VERIFY_BLOCK_MUST_TAKE_THE_SAME_KERNEL_DECODE_TAKES_OR_IT_CANNOT_REPRODUCE_DECODES_ROWS \
+     forbids. A real fix therefore needs ONE kernel that is both tile-fast at m>1 and the kernel \
+     m=1 decode takes -- gemm_nvfp4_w4a16_mk_dual wired as BOTH routes, never as the verify \
+     route alone.";
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen38_spec_decode_selected_so_the_m1_gemv_verify_harm_outweighs_the_base_decode_win(
+) -> bool {
+    nv_specdecode::qwen38_mtp::mtp_drafter_selected_from_env()
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn qwen35_dense_trunk_is_the_measured_27b(raw_cfg: &str) -> bool {
+    let (hidden, layers, intermediate) = QWEN38_DENSE_27B_TRUNK_THE_GDN_NVFP4_STACK_WAS_MEASURED_ON;
+    nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(raw_cfg)
+        .map(|c| {
+            c.hidden_size == hidden
+                && c.num_hidden_layers == layers
+                && c.intermediate_size == intermediate
+        })
+        .unwrap_or(false)
+}
 
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -494,6 +883,30 @@ pub(crate) fn arm_the_serving_defaults_for_this_checkpoint(
                 "{}",
                 nv_models::gemma4::ATTN_PROJ_NVFP4_ALONE_IS_A_MEASURED_QUALITY_REJECT_RESCUED_ONLY_BY_NV_NVFP4_M1_GEMV
             );
+            Ok(())
+        }
+        ModelFamily::Qwen3_5Moe
+            if qwen3_5_dense && qwen35_dense_trunk_is_the_measured_27b(raw_cfg) =>
+        {
+            apply_serving_arm(
+                "qwen3.8-27B",
+                QWEN38_DENSE_27B_SERVING_ARM_ENV,
+                QWEN38_DENSE_27B_NVFP4_GDN_ARMS_ITS_TWO_KEY_STACK_AND_NV_Q38_27B_SERVING_ARM_0_IS_THE_ESCAPE,
+                &QWEN38_DENSE_27B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
+                serving_arm_from(
+                    std::env::var(QWEN38_DENSE_27B_SERVING_ARM_ENV).ok().as_deref(),
+                    !qwen38_spec_decode_selected_so_the_m1_gemv_verify_harm_outweighs_the_base_decode_win(),
+                ),
+            )?;
+            let (wide_k, wide_v) = QWEN38_DENSE_27B_NORM_WIDE_BATCH_KEY;
+            if std::env::var(wide_k).is_err() {
+                unsafe { std::env::set_var(wide_k, wide_v) };
+                tracing::info!(
+                    key = wide_k,
+                    value = wide_v,
+                    "qwen3.8-27B: arming the bitwise wide-norm batch cap for the m-row verify block"
+                );
+            }
             Ok(())
         }
         ModelFamily::Qwen3_5Moe if qwen3_5_dense => apply_serving_arm(
@@ -724,7 +1137,7 @@ pub(crate) fn plan_family_for(
         ModelFamily::Qwen3 => PlanFamily::Unmodeled("qwen3"),
         ModelFamily::Gemma4E4b => PlanFamily::Unmodeled("gemma4-e4b"),
         ModelFamily::Gemma4Moe => PlanFamily::Unmodeled("gemma4-moe"),
-        ModelFamily::Laguna => PlanFamily::Unmodeled("laguna"),
+        ModelFamily::Laguna => PlanFamily::Laguna,
         ModelFamily::Omni => PlanFamily::Unmodeled("omni"),
         ModelFamily::GptOss => PlanFamily::Unmodeled("gpt-oss"),
     }
@@ -804,10 +1217,7 @@ impl NvEngineChat {
     }
 
     #[cfg(feature = "cuda")]
-    pub(crate) fn try_load_inner(
-        model_dir: &Path,
-        mode: EngineBuildMode,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn try_load_inner(model_dir: &Path, mode: EngineBuildMode) -> anyhow::Result<Self> {
         use anyhow::Context;
         use candle_core::Device;
 
@@ -1157,10 +1567,11 @@ impl NvEngineChat {
                 })
             }
             ModelFamily::Gemma4E4b => {
-                if std::env::var("NV_E4B_CUDA_SERVE").as_deref() == Ok("0") {
+                if std::env::var("NV_E4B_CUDA_SERVE").as_deref() != Ok("1") {
                     anyhow::bail!(
-                        "gemma-4 E4B cuda serving disabled by NV_E4B_CUDA_SERVE=0; unset it to \
-                         serve this checkpoint on cuda, or serve it on the wgpu backend"
+                        "gemma-4 E4B cuda serving is opt-in: set NV_E4B_CUDA_SERVE=1 to serve this \
+                         checkpoint on cuda (the backend selector demands the same value), or serve \
+                         it on the wgpu backend"
                     );
                 }
                 let config = nv_models::gemma4::Gemma4Config::from_hf_json_str(&raw_cfg)
@@ -1207,9 +1618,8 @@ impl NvEngineChat {
             ModelFamily::Gemma4Moe => {
                 let config = nv_models::gemma4_moe::Gemma4MoeConfig::from_hf_json_str(&raw_cfg)
                     .with_context(|| format!("parse gemma4 moe {}", cfg_path.display()))?;
-                let model = match nv_models::gemma4_gguf::opted_in_qat_q4_gguf_for_snapshot(
-                    &config,
-                ) {
+                let model = match nv_models::gemma4_gguf::opted_in_qat_q4_gguf_for_snapshot(&config)
+                {
                     Some(gguf) => {
                         tracing::info!(
                             weights = %gguf.display(),
@@ -1228,7 +1638,10 @@ impl NvEngineChat {
                             candle_core::DType::BF16,
                         )
                         .with_context(|| {
-                            format!("instantiate Gemma4Moe from default qat gguf {}", gguf.display())
+                            format!(
+                                "instantiate Gemma4Moe from default qat gguf {}",
+                                gguf.display()
+                            )
                         })?
                     }
                     None => nv_models::gemma4_moe::Gemma4Moe::from_loader(
@@ -1495,10 +1908,7 @@ impl NvEngineChat {
                         );
                     let lane_kv = boot_plan.batch_lane_kv.unwrap_or(kv_max_seq_len);
                     let lanes = nv_models::qwen3_5_moe::qwen36_batch::Qwen36BatchLanes::new(
-                        model,
-                        &device,
-                        lane_kv,
-                        plan,
+                        model, &device, lane_kv, plan,
                     )
                     .context(
                         "NV_Q36_BATCH=1 was requested, so a lane pool that cannot build is a \
@@ -1607,6 +2017,20 @@ impl NvEngineChat {
                 })
             }
             ModelFamily::Laguna => {
+                if nv_models::laguna_serve::bf16_prefill_handoff_opt_in() {
+                    anyhow::ensure!(mode != EngineBuildMode::AdapterServingLean && laguna_serve_spec_enabled(),
+                        "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 requires full Laguna serving with NV_LAGUNA_SERVE_SPEC=1");
+                }
+                if nv_models::laguna_serve::batch_graph_enabled_from_env()? {
+                    anyhow::ensure!(mode != EngineBuildMode::AdapterServingLean, "NV_LAGUNA_BATCH_GRAPH=1, m2 or m2-spec requires the full Laguna serving engine; adapter-serving lean mode is incompatible");
+                }
+                let require_nvfp4 = nv_models::laguna_dflash::dflash_nvfp4_enabled()?;
+                validate_laguna_packed_draft_arm(
+                    require_nvfp4,
+                    mode,
+                    laguna_serve_spec_enabled(),
+                    laguna_serve_draft_enabled(),
+                )?;
                 let config = nv_models::laguna::LagunaConfig::from_hf_json_str(&raw_cfg)
                     .with_context(|| format!("parse laguna {}", cfg_path.display()))?;
                 let qconfig = nv_weights::QuantizationConfig::from_hf_json_str(&raw_cfg)
@@ -1626,19 +2050,20 @@ impl NvEngineChat {
                 let bos_token_id = bos_id_from_dir(model_dir);
                 let kv_max_seq_len =
                     kv_max_seq_len_for_unplanned_family("laguna", config.max_position_embeddings);
-                let shared = LagunaShared(Arc::new(model));
-                let laguna_spec = if mode == EngineBuildMode::AdapterServingLean {
-                    tracing::info!(
-                        "adapter-serving lean build: the laguna spec-serve engine is never \
+                let shared = LagunaShared(Arc::new(model), Arc::new(LagunaAdmission::from_env()));
+                let (laguna_spec, spec_status) =
+                    laguna_engine_spec_state(if mode == EngineBuildMode::AdapterServingLean {
+                        tracing::info!(
+                            "adapter-serving lean build: the laguna spec-serve engine is never \
                          built because its captured step-graph body (raw nv-* kernels plus \
                          candle proj fallbacks captured on a forked stream) never routes the \
                          nv-layers Linear hooks a resident adapter needs; adapter requests \
                          decode on the eager per-request path"
-                    );
-                    None
-                } else {
-                    build_laguna_spec_serve(&shared, kv_max_seq_len)
-                };
+                        );
+                        None
+                    } else {
+                        build_laguna_spec_serve(&shared, kv_max_seq_len, require_nvfp4)?
+                    });
                 Ok(Self {
                     inner: NvEngineInner {
                         model_id,
@@ -1652,7 +2077,7 @@ impl NvEngineChat {
                         bos_token_id,
                         eagle3: None,
                         dflash: None,
-                        spec_status: None,
+                        spec_status,
                         chat_template,
                         gemma4_engine: None,
                         laguna_spec,
@@ -2797,6 +3222,8 @@ mod drafter_dim_gate_real_checkpoints {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning: None,
+            reasoning_content: None,
         }];
         let prompt = eng.render_chat(&messages, &[], &crate::oapi::chat::ToolChoice::None);
         let req = ChatGenerateRequest {
@@ -2926,6 +3353,364 @@ mod gguf_seam_tests {
             "a dir with config.json must follow the normal required-files path: {msg}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod laguna_spec_startup_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn packed_arm_rejects_every_disabled_spec_route() {
+        for (mode, spec, draft) in [
+            (EngineBuildMode::AdapterServingLean, true, true),
+            (EngineBuildMode::Full, false, true),
+            (EngineBuildMode::Full, true, false),
+        ] {
+            let err = validate_laguna_packed_draft_arm(true, mode, spec, draft).unwrap_err();
+            assert!(err.to_string().contains("NV_LAGUNA_DFLASH_NVFP4=1"));
+            validate_laguna_packed_draft_arm(false, mode, spec, draft).unwrap();
+        }
+        validate_laguna_packed_draft_arm(true, EngineBuildMode::Full, true, true).unwrap();
+    }
+
+    #[test]
+    fn packed_arm_never_substitutes_a_cached_source_for_an_invalid_directory() {
+        assert!(required_laguna_draft_dir(None)
+            .unwrap_err()
+            .to_string()
+            .contains("NV_LAGUNA_DFLASH_DIR"));
+        let file = std::env::current_exe().unwrap();
+        let err = required_laguna_draft_dir(Some(file.clone().into_os_string())).unwrap_err();
+        assert!(err.to_string().contains(&file.display().to_string()));
+        let dir = file.parent().unwrap().to_path_buf();
+        assert_eq!(
+            required_laguna_draft_dir(Some(dir.clone().into_os_string())).unwrap(),
+            dir
+        );
+    }
+
+    #[test]
+    fn packed_startup_preserves_load_and_warmup_errors_before_readiness() {
+        for cause in [
+            "load draft: malformed packed scales",
+            "warmup: CUDA_ERROR_OUT_OF_MEMORY",
+        ] {
+            let err =
+                start_laguna_spec_worker::<()>(1, true, move |_, _ready| anyhow::bail!("{cause}"))
+                    .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains(cause), "lost startup cause: {message}");
+            assert!(
+                message.contains("NV_LAGUNA_DFLASH_NVFP4=1"),
+                "lost required arm: {message}"
+            );
+            assert!(
+                message.contains("refusing plain or BF16 fallback"),
+                "lost refusal: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_startup_rejects_panic_and_success_without_readiness() {
+        let panic = start_laguna_spec_worker::<()>(1, true, |_, _ready| {
+            panic!("draft initialization panic")
+        })
+        .unwrap_err();
+        assert!(format!("{panic:#}").contains("draft initialization panic"));
+        let closed = start_laguna_spec_worker::<()>(1, true, |requests, ready| {
+            drop(ready);
+            assert!(requests.recv().is_err());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{closed:#}").contains("exited before readiness"));
+    }
+
+    #[test]
+    fn packed_startup_rejects_ready_without_draft_and_releases_worker() {
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let err = start_laguna_spec_worker::<()>(1, true, move |requests, ready| {
+            ready.send(false)?;
+            assert!(requests.recv().is_err());
+            exited_tx.send(())?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("without the required packed DFlash draft"));
+        exited_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("refusal retained the worker queue");
+    }
+
+    #[test]
+    fn graph_lane_startup_preserves_failures_and_accepts_plain_readiness() {
+        for cause in [
+            "capture lane 1: CUDA_ERROR_OUT_OF_MEMORY",
+            "invalid graph lane selector",
+        ] {
+            let err = start_laguna_spec_worker_with_graph_requirement::<()>(
+                1,
+                false,
+                true,
+                false,
+                move |_, _ready| anyhow::bail!("{cause}"),
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(cause) && message.contains("refusing per-request fallback"),
+                "{message}"
+            );
+        }
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let (jobs, has_draft) = start_laguna_spec_worker_with_graph_requirement::<()>(
+            1,
+            false,
+            true,
+            false,
+            move |requests, ready| {
+                ready.send(false)?;
+                assert!(requests.recv().is_err());
+                exited_tx.send(())?;
+                Ok(())
+            },
+        )
+        .unwrap()
+        .expect("plain graph lanes must report worker readiness");
+        assert!(!has_draft);
+        drop(jobs);
+        exited_rx
+            .try_recv()
+            .expect("owned graph lane worker was not joined before Drop returned");
+    }
+
+    #[test]
+    fn default_startup_keeps_plain_and_per_request_fallbacks() {
+        for (has_draft, expected) in [(false, "off"), (true, "on")] {
+            let ready = start_laguna_spec_worker::<u32>(1, false, move |requests, ready| {
+                ready.send(has_draft)?;
+                assert_eq!(requests.recv()?, 7);
+                assert!(requests.recv().is_err());
+                Ok(())
+            })
+            .unwrap();
+            let (jobs, status) = laguna_engine_spec_state(ready);
+            assert_eq!(crate::oapi::chat::spec_decode_header_value(status), expected,
+                "the header reports the ready worker's loaded draft, not its name or a request's eventual route");
+            let mut jobs = jobs.expect("plain and draft-enabled readiness both retain the worker");
+            jobs.try_send(7).unwrap();
+            jobs.close_and_join().unwrap();
+        }
+        let unavailable = start_laguna_spec_worker::<()>(1, false, |_, _ready| {
+            anyhow::bail!("optional graph initialization failed")
+        })
+        .unwrap();
+        let (jobs, status) = laguna_engine_spec_state(unavailable);
+        assert!(jobs.is_none());
+        assert_eq!(crate::oapi::chat::spec_decode_header_value(status), "off");
+    }
+
+    #[test]
+    fn explicit_handoff_route_refuses_the_per_request_fallback_when_the_worker_cannot_start() {
+        let err = start_laguna_spec_worker_with_graph_requirement::<()>(1, false, false, true, move |_, _ready| {
+            anyhow::bail!("refusing the explicitly selected BF16 handoff route before allocating: source 10.18 GiB")
+        }).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("NV_LAGUNA_PREFILL_BF16_HANDOFF=1 requires the handoff worker; refusing per-request fallback") && message.contains("source 10.18 GiB"), "{message}");
+        let ready = start_laguna_spec_worker_with_graph_requirement::<()>(
+            1,
+            false,
+            false,
+            false,
+            move |_, _ready| anyhow::bail!("same failure without the handoff route selected"),
+        )
+        .unwrap();
+        assert!(
+            ready.is_none(),
+            "without an explicit route the init failure still demotes to the per-request path"
+        );
+    }
+
+    struct TeardownGate {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Drop for TeardownGate {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+        }
+    }
+
+    #[test]
+    fn ready_worker_drop_waits_for_actual_worker_teardown() {
+        let (entered, teardown_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (dropped, drop_finished) = mpsc::channel();
+        let (worker, _) = start_laguna_spec_worker::<()>(1, true, move |requests, ready| {
+            let _teardown = TeardownGate {
+                entered,
+                release: released,
+            };
+            ready.send(true)?;
+            anyhow::ensure!(requests.recv().is_err(), "drop did not close the queue");
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let dropping = std::thread::spawn(move || {
+            drop(worker);
+            dropped.send(()).unwrap();
+        });
+        teardown_started
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let premature = drop_finished.recv_timeout(Duration::from_millis(20));
+        release.send(()).unwrap();
+        dropping.join().unwrap();
+        assert!(
+            matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+            "worker owner returned before worker teardown completed"
+        );
+        drop_finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn startup_refusal_and_failure_join_actual_worker_teardown() {
+        for wrong_ready in [false, true] {
+            let (entered, teardown_started) = mpsc::channel();
+            let (release, released) = mpsc::channel();
+            let (completed, completion) = mpsc::channel();
+            let starting = std::thread::spawn(move || {
+                let result = start_laguna_spec_worker::<()>(1, true, move |requests, ready| {
+                    let _teardown = TeardownGate {
+                        entered,
+                        release: released,
+                    };
+                    if wrong_ready {
+                        ready.send(false)?;
+                        anyhow::ensure!(
+                            requests.recv().is_err(),
+                            "refusal did not close the queue"
+                        );
+                        Ok(())
+                    } else {
+                        drop(ready);
+                        anyhow::bail!("startup failure before teardown")
+                    }
+                });
+                completed.send(result).unwrap();
+            });
+            teardown_started
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            let premature = completion.recv_timeout(Duration::from_millis(20));
+            release.send(()).unwrap();
+            starting.join().unwrap();
+            assert!(
+                matches!(premature, Err(mpsc::RecvTimeoutError::Timeout)),
+                "startup returned while worker teardown remained active"
+            );
+            let error = completion
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err();
+            let expected = if wrong_ready {
+                "without the required packed DFlash draft"
+            } else {
+                "startup failure before teardown"
+            };
+            assert!(format!("{error:#}").contains(expected));
+        }
+    }
+
+    #[test]
+    fn ready_worker_shutdown_preserves_error_and_panic_diagnostics() {
+        for panics in [false, true] {
+            let (mut worker, _) =
+                start_laguna_spec_worker::<()>(1, true, move |requests, ready| {
+                    ready.send(true)?;
+                    anyhow::ensure!(requests.recv().is_err(), "shutdown did not close the queue");
+                    if panics {
+                        panic!("worker teardown panic");
+                    }
+                    anyhow::bail!("worker teardown error")
+                })
+                .unwrap()
+                .unwrap();
+            let error = worker.close_and_join().unwrap_err();
+            let expected = if panics {
+                "worker teardown panic"
+            } else {
+                "worker teardown error"
+            };
+            assert!(format!("{error:#}").contains(expected));
+            worker
+                .close_and_join()
+                .expect("shutdown must consume the handle even on error");
+        }
+    }
+
+    #[test]
+    fn worker_owner_dropped_on_its_thread_does_not_self_join() {
+        let (handle_tx, handle_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || -> anyhow::Result<()> {
+            let own_handle = handle_rx.recv()?;
+            let worker = LagunaSpecWorker::<()> {
+                jobs: None,
+                thread: Some(own_handle),
+            };
+            drop(worker);
+            finished_tx.send(())?;
+            Ok(())
+        });
+        handle_tx.send(thread).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker attempted to join itself");
+    }
+
+    #[test]
+    fn packed_ready_worker_keeps_the_bounded_queue_until_jobs_are_dropped() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let starter = std::thread::spawn(move || {
+            started_tx
+                .send(start_laguna_spec_worker::<u32>(
+                    1,
+                    true,
+                    move |requests, ready| {
+                        ready.send(true)?;
+                        release_rx.recv()?;
+                        anyhow::ensure!(requests.recv()? == 7, "worker received the wrong request");
+                        anyhow::ensure!(requests.recv().is_err(), "worker queue should be closed");
+                        exited_tx.send(())?;
+                        Ok(())
+                    },
+                ))
+                .unwrap();
+        });
+        let (jobs, has_draft) = started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("startup waited for a ready worker to exit")
+            .unwrap()
+            .unwrap();
+        assert!(has_draft);
+        jobs.try_send(7).unwrap();
+        assert!(matches!(jobs.try_send(8), Err(mpsc::TrySendError::Full(8))));
+        release_tx.send(()).unwrap();
+        drop(jobs);
+        exited_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not exit after queue closure");
+        starter.join().unwrap();
     }
 }
 
@@ -3074,7 +3859,10 @@ mod registry_policy_tests {
         );
         assert_eq!(
             reg.model_ids(),
-            &["gemma-4-E4B-it".to_string(), "ft:e4b:custom:1234".to_string()]
+            &[
+                "gemma-4-E4B-it".to_string(),
+                "ft:e4b:custom:1234".to_string()
+            ]
         );
     }
 
@@ -3349,10 +4137,13 @@ mod qwen3_5_dense_cuda_opt_in {
 
     #[test]
     fn without_the_opt_in_the_refusal_is_unchanged_and_still_names_wgpu() {
-        for cfg in [dense_config_json(), dense_config_json().replace(
-            "\"architectures\": [\"Qwen3_5ForConditionalGeneration\"],",
-            "",
-        )] {
+        for cfg in [
+            dense_config_json(),
+            dense_config_json().replace(
+                "\"architectures\": [\"Qwen3_5ForConditionalGeneration\"],",
+                "",
+            ),
+        ] {
             let err = detect_family_with_dense_cuda_serve(&cfg, false)
                 .expect_err("qwen3.5-dense must still be refused by default");
             let msg = format!("{err:#}");
@@ -3368,10 +4159,13 @@ mod qwen3_5_dense_cuda_opt_in {
 
     #[test]
     fn the_opt_in_routes_the_dense_checkpoint_at_the_qwen3_5_trunk() {
-        for cfg in [dense_config_json(), dense_config_json().replace(
-            "\"architectures\": [\"Qwen3_5ForConditionalGeneration\"],",
-            "",
-        )] {
+        for cfg in [
+            dense_config_json(),
+            dense_config_json().replace(
+                "\"architectures\": [\"Qwen3_5ForConditionalGeneration\"],",
+                "",
+            ),
+        ] {
             assert_eq!(
                 detect_family_with_dense_cuda_serve(&cfg, true).expect(
                     "with the opt-in, both the architectures entry and the bare model_type must \
@@ -3419,8 +4213,9 @@ mod qwen3_5_dense_cuda_opt_in {
 
     #[test]
     fn the_dense_trunk_is_hybrid_and_carries_no_experts() {
-        let cfg = nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(&dense_config_json())
-            .expect("parse dense config");
+        let cfg =
+            nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(&dense_config_json())
+                .expect("parse dense config");
         let trunk = cfg.trunk();
         assert_eq!(trunk.num_hidden_layers, 32);
         assert_eq!(trunk.num_experts, 0);
@@ -3502,7 +4297,7 @@ mod qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed {
   "text_config": {{
     "model_type": "qwen3_5_text",
     "hidden_size": 5120,
-    "num_hidden_layers": 48,
+    "num_hidden_layers": 64,
     "num_attention_heads": 20,
     "num_key_value_heads": 4,
     "head_dim": 256,
@@ -3515,7 +4310,7 @@ mod qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed {
     "rms_norm_eps": 1e-06,
     "attn_output_gate": true,
     "linear_num_key_heads": 16,
-    "linear_num_value_heads": 32,
+    "linear_num_value_heads": 48,
     "linear_key_head_dim": 128,
     "linear_value_head_dim": 128,
     "linear_conv_kernel_dim": 4,
@@ -3525,7 +4320,7 @@ mod qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed {
   }},
   "vision_config": {{"hidden_size": 1152, "depth": 27, "patch_size": 16, "temporal_patch_size": 2}}
 }}"#,
-            three_linear_then_one_full(48)
+            three_linear_then_one_full(64)
         )
     }
 
@@ -3570,10 +4365,13 @@ mod qwen3_8_routing_pins_mirror_release_keys_no_shipped_config_json_was_diffed {
 
     #[test]
     fn the_27b_shape_is_dense_refused_by_default_and_routed_to_the_dense_arm_by_the_opt_in() {
-        for cfg in [qwen38_27b_config_json(), qwen38_27b_config_json().replace(
-            "\"architectures\": [\"Qwen3_5ForConditionalGeneration\"],",
-            "",
-        )] {
+        for cfg in [
+            qwen38_27b_config_json(),
+            qwen38_27b_config_json().replace(
+                "\"architectures\": [\"Qwen3_5ForConditionalGeneration\"],",
+                "",
+            ),
+        ] {
             let err = detect_family_with_dense_cuda_serve(&cfg, false)
                 .expect_err("qwen3.8-27B must be refused by default exactly like qwen3.5-dense");
             assert_eq!(
@@ -3756,25 +4554,24 @@ mod a_serving_arm_is_one_decision_and_a_subset_of_its_keys_is_unreachable {
             .is_empty());
         }
         for on in [None, Some("1"), Some("on")] {
-            assert_eq!(serving_arm_from(on, true), ServingArm::ArmEveryKey, "{on:?}");
+            assert_eq!(
+                serving_arm_from(on, true),
+                ServingArm::ArmEveryKey,
+                "{on:?}"
+            );
         }
     }
 
     #[test]
     fn a_hand_set_key_that_disagrees_refuses_instead_of_serving_a_subset() {
-        let held: HashMap<&str, &str> = HashMap::from([
-            ("NV_ATTN_PROJ_QUANT", "nvfp4"),
-            ("NV_NVFP4_M1_GEMV", "0"),
-        ]);
+        let held: HashMap<&str, &str> =
+            HashMap::from([("NV_ATTN_PROJ_QUANT", "nvfp4"), ("NV_NVFP4_M1_GEMV", "0")]);
         let conflicts = arm_keys_the_operator_already_set_to_something_else(
             &GEMMA4_RECORD_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL,
             |k| held.get(k).map(|v| v.to_string()),
         );
         assert_eq!(
-            conflicts
-                .iter()
-                .map(|(k, _, _)| *k)
-                .collect::<Vec<_>>(),
+            conflicts.iter().map(|(k, _, _)| *k).collect::<Vec<_>>(),
             vec!["NV_NVFP4_M1_GEMV"],
             "a key the operator pinned away from the measured value is a refusal, not a silent \
              overwrite and not a partial arm"
@@ -3796,7 +4593,9 @@ mod a_serving_arm_is_one_decision_and_a_subset_of_its_keys_is_unreachable {
 
     #[test]
     fn quantized_attention_projections_without_the_gemv_rescue_are_refused_at_boot() {
-        for raw in ["nvfp4", "1", "on", "true", "yes", "all", "fp4", "qkv+o", "qkv", "o"] {
+        for raw in [
+            "nvfp4", "1", "on", "true", "yes", "all", "fp4", "qkv+o", "qkv", "o",
+        ] {
             assert!(
                 gemma4_attn_nvfp4_without_the_m1_gemv_rescue(Some(raw), None),
                 "NV_ATTN_PROJ_QUANT={raw} without NV_NVFP4_M1_GEMV=1 is the +0.748 ppl \
@@ -3840,7 +4639,7 @@ mod a_serving_arm_is_one_decision_and_a_subset_of_its_keys_is_unreachable {
             QWEN35_DENSE_9B_ARM_KEYS_ARE_ARMED_TOGETHER_OR_NOT_AT_ALL
                 .iter()
                 .map(|(k, v)| {
-                    assert_eq!(*v, "1", "{k} is an opt-in flag read as eq-some-1");
+                    assert_eq!(*v, "1", "{k} is armed as 1: opt-in eq-some-1 for nine keys, and a no-op re-pin for NV_Q36_GRAPHED_DECODE_FIX and NV_Q38_GDN_SPLIT since their 2026-09-03 default-on sign-off");
                     *k
                 })
                 .collect::<Vec<_>>(),
@@ -3871,16 +4670,35 @@ mod a_serving_arm_is_one_decision_and_a_subset_of_its_keys_is_unreachable {
         );
         assert!(
             !qwen35_dense_trunk_is_the_measured_9b(&qwen38_27b_config_json()),
-            "qwen3.8-27B lands in the same dense arm but its published serving band belongs to a \
-             different twelve-arm stack with NV_NVFP4_M1_GEMV unset; arming this stack for it \
-             would flip a performance default nobody measured"
+            "qwen3.8-27B (5120/64/17408) is NOT the Qwen3.5-9B trunk, so the eleven-arm 9B stack \
+             stops here; the 27B lands in the same dense arm but takes its OWN measured stack via \
+             qwen35_dense_trunk_is_the_measured_27b"
+        );
+        assert!(
+            qwen35_dense_trunk_is_the_measured_27b(&qwen38_27b_config_json()),
+            "hidden 5120 / 64 layers / intermediate 17408 is the qwen3.8-27B trunk the \
+             GDN-nvfp4 + M1_GEMV two-key stack was measured on (ppl 9.879->9.818 decode, \
+             11.994->11.964 prefill; +7.7%/+5.4% graphed decode)"
+        );
+        assert!(
+            !qwen35_dense_trunk_is_the_measured_27b(&qwen35_9b_config_json()),
+            "the 9B trunk must not trip the 27B GDN-nvfp4 stack"
         );
         assert_eq!(
             serving_arm_from(
                 None,
-                qwen35_dense_trunk_is_the_measured_9b(&qwen38_27b_config_json())
+                qwen35_dense_trunk_is_the_measured_27b(&qwen38_27b_config_json())
             ),
-            ServingArm::CheckpointOutsideTheMeasuredBasis
+            ServingArm::ArmEveryKey,
+            "the 27B trunk with no escape set arms its two-key GDN-nvfp4 stack by default"
+        );
+        assert_eq!(
+            serving_arm_from(
+                Some("0"),
+                qwen35_dense_trunk_is_the_measured_27b(&qwen38_27b_config_json())
+            ),
+            ServingArm::OperatorHeldTheEscape,
+            "NV_Q38_27B_SERVING_ARM=0 restores the fp8-GDN pre-flip default"
         );
     }
 
@@ -3915,6 +4733,18 @@ mod a_serving_arm_is_one_decision_and_a_subset_of_its_keys_is_unreachable {
                     "qwen3.8-27B",
                 ],
             ),
+            (
+                QWEN38_DENSE_27B_NVFP4_GDN_ARMS_ITS_TWO_KEY_STACK_AND_NV_Q38_27B_SERVING_ARM_0_IS_THE_ESCAPE,
+                vec![
+                    QWEN38_DENSE_27B_SERVING_ARM_ENV,
+                    "NV_Q38_GDN_NVFP4",
+                    "NV_NVFP4_M1_GEMV",
+                    "9.879 -> 9.818",
+                    "11.994 -> 11.964",
+                    "16.780 -> 15.584",
+                    "nvfp4_gemv_bf16act",
+                ],
+            ),
         ] {
             for needle in needles {
                 assert!(
@@ -3933,6 +4763,24 @@ mod capture_stream_device_policy {
 
     const GEMMA4_CFG: &str = r#"{"architectures": ["Gemma4ForCausalLM"], "model_type": "gemma4"}"#;
     const QWEN3_CFG: &str = r#"{"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}"#;
+
+    #[test]
+    fn only_explicit_laguna_m2_spec_requires_its_model_stream() {
+        for selector in ["", "0", "1", "m2", "m2-spec"] {
+            assert_eq!(
+                laguna_spec_batch_needs_device_stream(ModelFamily::Laguna, selector),
+                selector == "m2-spec"
+            );
+            assert!(!laguna_spec_batch_needs_device_stream(
+                ModelFamily::Qwen3,
+                selector
+            ));
+            assert!(!laguna_spec_batch_needs_device_stream(
+                ModelFamily::Gemma4,
+                selector
+            ));
+        }
+    }
 
     #[test]
     fn the_families_whose_graph_body_is_candle_are_named_even_though_none_is_flipped() {
@@ -3973,8 +4821,7 @@ mod capture_stream_device_policy {
     }
 
     #[test]
-    fn the_device_selection_is_the_qwen_graph_selector_the_q38_batch_opt_in_and_the_q36_mtp_captured_default(
-    ) {
+    fn the_device_selection_includes_only_the_named_captured_routes() {
         for (family, cfg) in [
             (ModelFamily::Qwen3, QWEN3_CFG),
             (ModelFamily::Gemma4, GEMMA4_CFG),
@@ -3988,11 +4835,13 @@ mod capture_stream_device_policy {
                 qwen_graph_decode_selected(family, cfg)
                     || qwen38_batch_lanes_boot_selected(family, cfg)
                     || qwen36_batch_lanes_boot_selected(family, cfg)
-                    || qwen36_mtp_captured_serving_selected(family, cfg),
+                    || qwen36_mtp_captured_serving_selected(family, cfg)
+                    || laguna_spec_batch_needs_device_stream(family, &std::env::var("NV_LAGUNA_BATCH_GRAPH").unwrap_or_default())
+                    || laguna_prepared_b2_graph_captures_the_candle_forward_on_the_model_stream(family),
                 "{family:?}: try_load_inner must keep choosing Device::new_cuda_with_stream on \
                  exactly the qwen-graph condition plus the NV_Q38_BATCH dense lane opt-in plus \
                  the NV_Q36_BATCH moe lane opt-in plus the NV_DRAFTER=mtp captured-verify \
-                 serving default and nothing else. Task #63 records grouped MoE on a \
+                 serving default plus explicit Laguna m2 or m2-spec. Task #63 records grouped MoE on a \
                  non-default stream producing all-NaN logits, and gemma4 prefill produced all \
                  -inf on the same axis; the permitted widenings are \
                  qwen38_batch_lanes_boot_selected, whose serving measurement is \
@@ -4088,8 +4937,9 @@ mod qwen3_default_weight_format_tests {
 
     #[test]
     fn a_typo_in_the_weights_env_is_refused_not_served() {
-        let err = qwen3_weight_qconfig_default_nvfp4(PLAIN_QWEN3_CFG_NO_QUANT_SECTION, Some("int4"))
-            .expect_err("unknown value must refuse");
+        let err =
+            qwen3_weight_qconfig_default_nvfp4(PLAIN_QWEN3_CFG_NO_QUANT_SECTION, Some("int4"))
+                .expect_err("unknown value must refuse");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("bf16") && msg.contains("nvfp4"),

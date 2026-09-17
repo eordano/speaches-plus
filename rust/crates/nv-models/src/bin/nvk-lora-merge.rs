@@ -2,9 +2,7 @@ use anyhow::{bail, Context, Result};
 use candle_core::{Device, Tensor};
 use clap::{Parser, Subcommand};
 use nv_train::{save_peft_raw, RawLora};
-use nv_weights::lora_merge::{
-    list_mergeable_modules, merge_lora_adapter_into_quantized_snapshot,
-};
+use nv_weights::lora_merge::{list_mergeable_modules, merge_lora_adapter_into_quantized_snapshot};
 use std::path::PathBuf;
 
 struct SplitmixNormal(u64);
@@ -59,7 +57,10 @@ enum Cmd {
         rank: usize,
         #[arg(long)]
         alpha: Option<f64>,
-        #[arg(long, default_value = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj")]
+        #[arg(
+            long,
+            default_value = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+        )]
         targets: String,
         #[arg(long, default_value_t = 5e-3)]
         b_std: f64,
@@ -95,15 +96,10 @@ fn main() -> Result<()> {
             let mods = list_mergeable_modules(&base)?;
             let mut rng = SplitmixNormal(seed ^ 0x10_9A_2C_55);
             let mut entries: Vec<RawLora> = Vec::new();
-            for m in mods
-                .iter()
-                .filter(|m| {
-                    m.module.starts_with("model.language_model.layers.")
-                        && leaves
-                            .iter()
-                            .any(|l| m.module.ends_with(&format!(".{l}")))
-                })
-            {
+            for m in mods.iter().filter(|m| {
+                m.module.starts_with("model.language_model.layers.")
+                    && leaves.iter().any(|l| m.module.ends_with(&format!(".{l}")))
+            }) {
                 let a_std = (1.0 / (m.in_features as f64).sqrt()) as f32;
                 let a = rng.tensor(a_std, (rank, m.in_features))?;
                 let b = rng.tensor(b_std as f32, (m.out_features, rank))?;
@@ -114,7 +110,10 @@ fn main() -> Result<()> {
                 });
             }
             if entries.is_empty() {
-                bail!("no modules matched targets {leaves:?} under {}", base.display());
+                bail!(
+                    "no modules matched targets {leaves:?} under {}",
+                    base.display()
+                );
             }
             let alpha = alpha.unwrap_or(rank as f64);
             save_peft_raw(

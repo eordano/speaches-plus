@@ -116,16 +116,22 @@ impl ParakeetTdt {
         let n = audio.len();
         let wave = Tensor::<f32>::from_array(([1usize, n], audio.to_vec().into_boxed_slice()))
             .map_err(ort_err)?;
-        let wave_len =
-            Tensor::<i64>::from_array(([1usize], vec![n as i64].into_boxed_slice()))
-                .map_err(ort_err)?;
+        let wave_len = Tensor::<i64>::from_array(([1usize], vec![n as i64].into_boxed_slice()))
+            .map_err(ort_err)?;
         let (feat_shape, feats, flen) = {
-            let mut pre = self.pre.lock().map_err(|_| anyhow!("parakeet pre poisoned"))?;
+            let mut pre = self
+                .pre
+                .lock()
+                .map_err(|_| anyhow!("parakeet pre poisoned"))?;
             let out = pre
                 .run(ort::inputs!["waveforms" => wave, "waveforms_lens" => wave_len])
                 .map_err(ort_err)?;
-            let (shape, data) = out["features"].try_extract_tensor::<f32>().map_err(ort_err)?;
-            let (_, lens) = out["features_lens"].try_extract_tensor::<i64>().map_err(ort_err)?;
+            let (shape, data) = out["features"]
+                .try_extract_tensor::<f32>()
+                .map_err(ort_err)?;
+            let (_, lens) = out["features_lens"]
+                .try_extract_tensor::<i64>()
+                .map_err(ort_err)?;
             (shape.to_vec(), data.to_vec(), lens[0])
         };
         let feat_dims: Vec<usize> = feat_shape.iter().map(|&d| d as usize).collect();
@@ -141,8 +147,12 @@ impl ParakeetTdt {
             let out = encoder
                 .run(ort::inputs!["audio_signal" => feat_tensor, "length" => feat_len])
                 .map_err(ort_err)?;
-            let (_, data) = out["outputs"].try_extract_tensor::<f32>().map_err(ort_err)?;
-            let (_, lens) = out["encoded_lengths"].try_extract_tensor::<i64>().map_err(ort_err)?;
+            let (_, data) = out["outputs"]
+                .try_extract_tensor::<f32>()
+                .map_err(ort_err)?;
+            let (_, lens) = out["encoded_lengths"]
+                .try_extract_tensor::<i64>()
+                .map_err(ort_err)?;
             (data.to_vec(), lens[0] as usize)
         };
         self.tdt_greedy(&enc, t_len)
@@ -164,15 +174,12 @@ impl ParakeetTdt {
             for (c, slot) in frame.iter_mut().enumerate() {
                 *slot = enc[c * t_len + t];
             }
-            let enc_t =
-                Tensor::<f32>::from_array(([1usize, ENC_DIM, 1], frame.into_boxed_slice()))
-                    .map_err(ort_err)?;
-            let targets =
-                Tensor::<i32>::from_array(([1usize, 1], vec![last].into_boxed_slice()))
-                    .map_err(ort_err)?;
-            let target_len =
-                Tensor::<i32>::from_array(([1usize], vec![1i32].into_boxed_slice()))
-                    .map_err(ort_err)?;
+            let enc_t = Tensor::<f32>::from_array(([1usize, ENC_DIM, 1], frame.into_boxed_slice()))
+                .map_err(ort_err)?;
+            let targets = Tensor::<i32>::from_array(([1usize, 1], vec![last].into_boxed_slice()))
+                .map_err(ort_err)?;
+            let target_len = Tensor::<i32>::from_array(([1usize], vec![1i32].into_boxed_slice()))
+                .map_err(ort_err)?;
             let st1 = Tensor::<f32>::from_array((
                 [STATE_LAYERS, 1usize, STATE_DIM],
                 s1.clone().into_boxed_slice(),
@@ -192,15 +199,21 @@ impl ParakeetTdt {
                     "input_states_2" => st2,
                 ])
                 .map_err(ort_err)?;
-            let (_, logits) = out["outputs"].try_extract_tensor::<f32>().map_err(ort_err)?;
+            let (_, logits) = out["outputs"]
+                .try_extract_tensor::<f32>()
+                .map_err(ort_err)?;
             let tok = argmax(&logits[..TOKEN_LOGITS]);
             let dur = argmax(&logits[TOKEN_LOGITS..TOKEN_LOGITS + TDT_DURATION_BINS.len()]);
             let mut skip = TDT_DURATION_BINS[dur];
             if tok as i32 != BLANK_ID {
                 ids.push(tok as i32);
                 last = tok as i32;
-                let (_, o1) = out["output_states_1"].try_extract_tensor::<f32>().map_err(ort_err)?;
-                let (_, o2) = out["output_states_2"].try_extract_tensor::<f32>().map_err(ort_err)?;
+                let (_, o1) = out["output_states_1"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(ort_err)?;
+                let (_, o2) = out["output_states_2"]
+                    .try_extract_tensor::<f32>()
+                    .map_err(ort_err)?;
                 s1.copy_from_slice(o1);
                 s2.copy_from_slice(o2);
                 symbols_this_frame += 1;

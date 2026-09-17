@@ -63,9 +63,7 @@ pub async fn realtime_ws(
 
     ws.max_message_size(max_msg)
         .max_frame_size(max_msg)
-        .on_upgrade(move |socket| {
-            super::hold_slot(guard, run_session(socket, q, models))
-        })
+        .on_upgrade(move |socket| super::hold_slot(guard, run_session(socket, q, models)))
 }
 
 async fn run_session(socket: WebSocket, query: RealtimeQuery, models: Arc<models::Models>) {
@@ -114,6 +112,7 @@ async fn run_session(socket: WebSocket, query: RealtimeQuery, models: Arc<models
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(text) => {
+                        crate::otel_http::trace_realtime_event(&writer_session_id, "output", &text);
                         if let Err(err) = sink.send(Message::Text(text.into())).await {
                             warn!(session_id = %writer_session_id, error = %err, "ws send failed");
                             break;
@@ -149,6 +148,7 @@ async fn run_session(socket: WebSocket, query: RealtimeQuery, models: Arc<models
         };
         match frame {
             Some(Ok(Message::Text(text))) => {
+                crate::otel_http::trace_realtime_event(&reader_session_id, "input", text.as_str());
                 let bytes = bytes::Bytes::copy_from_slice(text.as_str().as_bytes());
                 if let Err(err) = reader_session.handle_client_event("ws", bytes).await {
                     warn!(

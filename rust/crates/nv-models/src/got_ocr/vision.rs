@@ -87,10 +87,7 @@ impl GotVision {
                 "multi_modal_projector.multimodal_projector.weight",
                 &[1024, 1024],
             )?,
-            proj_b: get(
-                "multi_modal_projector.multimodal_projector.bias",
-                &[1024],
-            )?,
+            proj_b: get("multi_modal_projector.multimodal_projector.bias", &[1024])?,
             sam,
             ln_eps,
         })

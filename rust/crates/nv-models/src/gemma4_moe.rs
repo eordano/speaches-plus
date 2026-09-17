@@ -42,8 +42,8 @@ pub fn serving_default_expert_residency_bf16_with_nvfp4_opt_in() -> CudaExpertRe
 #[cfg(feature = "cuda")]
 fn expert_dims_meet_nvfp4_min_tile_so_tiny_fixtures_stay_bf16(hidden: usize, inter: usize) -> bool {
     use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
-    hidden % BLOCK_SIZE == 0
-        && inter % BLOCK_SIZE == 0
+    hidden.is_multiple_of(BLOCK_SIZE)
+        && inter.is_multiple_of(BLOCK_SIZE)
         && hidden >= MIN_TILE
         && inter >= MIN_TILE
         && 2 * inter >= MIN_TILE
@@ -227,10 +227,7 @@ impl Gemma4MoeBlock {
         let top_idx_host: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
         let top_weights_host: Vec<f32> = top_weights.flatten_all()?.to_vec1::<f32>()?;
         if prof {
-            moe_stall_prof::add(
-                &moe_stall_prof::ROUTE_ENQUEUE_NS,
-                (t1 - t0).as_nanos(),
-            );
+            moe_stall_prof::add(&moe_stall_prof::ROUTE_ENQUEUE_NS, (t1 - t0).as_nanos());
             moe_stall_prof::add(&moe_stall_prof::DRAIN_NS, t1.elapsed().as_nanos());
         }
         Ok(Gemma4MoeRouting {

@@ -1185,7 +1185,9 @@ mod cuda {
     }
 
     pub fn paged_attn_fp8_enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_PAGED_ATTN_FP8")
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_PAGED_ATTN_FP8",
+        )
     }
 
     pub const PAGED_PREFILL_FP8_ENV: &str = "NV_PAGED_PREFILL_FP8";
@@ -1197,7 +1199,9 @@ mod cuda {
     pub const PAGED_ATTN_FP8_RING_ENV: &str = "NV_PAGED_ATTN_FP8_RING";
 
     pub fn paged_attn_fp8_ring_enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(PAGED_ATTN_FP8_RING_ENV)
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            PAGED_ATTN_FP8_RING_ENV,
+        )
     }
 
     pub struct PagedGemma4Cache {

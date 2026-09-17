@@ -480,14 +480,8 @@ impl ServingDeltaSlice {
             offset,
             width,
             scaling,
-            a_t: a
-                .t()?
-                .contiguous()?
-                .to_dtype(candle_core::DType::F32)?,
-            b_t: b
-                .t()?
-                .contiguous()?
-                .to_dtype(candle_core::DType::F32)?,
+            a_t: a.t()?.contiguous()?.to_dtype(candle_core::DType::F32)?,
+            b_t: b.t()?.contiguous()?.to_dtype(candle_core::DType::F32)?,
         })
     }
 }
@@ -560,7 +554,7 @@ fn cuda_bf16_ptr(t: &Tensor, stream: &Arc<cudarc::driver::CudaStream>) -> Result
     let view = sl.slice(layout.start_offset()..);
     let (p, g) = view.device_ptr(stream);
     drop(g);
-    Ok(p as u64)
+    Ok(p)
 }
 
 #[cfg(feature = "cuda")]
@@ -696,25 +690,33 @@ fn build_cuda_m1_kernel_delta(
     let n_slices = a_tensors.len();
     let (n_tiles, k_tile) = nv_kernels::lora::m1_shrink_tiling(in_features);
     #[allow(deprecated)]
-    let a_ptrs_d = stream.clone_htod(&a_addrs).map_err(|e| anyhow::anyhow!(e))?;
+    let a_ptrs_d = stream
+        .clone_htod(&a_addrs)
+        .map_err(|e| anyhow::anyhow!(e))?;
     #[allow(deprecated)]
-    let b_ptrs_d = stream.clone_htod(&b_addrs).map_err(|e| anyhow::anyhow!(e))?;
+    let b_ptrs_d = stream
+        .clone_htod(&b_addrs)
+        .map_err(|e| anyhow::anyhow!(e))?;
     #[allow(deprecated)]
-    let slice_n_d = stream.clone_htod(&slice_n).map_err(|e| anyhow::anyhow!(e))?;
+    let slice_n_d = stream
+        .clone_htod(&slice_n)
+        .map_err(|e| anyhow::anyhow!(e))?;
     #[allow(deprecated)]
-    let slice_start_d = stream.clone_htod(&slice_start).map_err(|e| anyhow::anyhow!(e))?;
+    let slice_start_d = stream
+        .clone_htod(&slice_start)
+        .map_err(|e| anyhow::anyhow!(e))?;
     let mut partials = stream
         .alloc_zeros::<f32>(n_slices * n_tiles * max_rank)
         .map_err(|e| anyhow::anyhow!(e))?;
     let ro = |s: &cudarc::driver::CudaSlice<u64>| -> u64 {
         let (p, g) = s.device_ptr(&stream);
         drop(g);
-        p as u64
+        p
     };
     let roi = |s: &cudarc::driver::CudaSlice<i32>| -> u64 {
         let (p, g) = s.device_ptr(&stream);
         drop(g);
-        p as u64
+        p
     };
     let a_ptrs_ptr = ro(&a_ptrs_d);
     let b_ptrs_ptr = ro(&b_ptrs_d);
@@ -723,7 +725,7 @@ fn build_cuda_m1_kernel_delta(
     let partials_ptr = {
         let (p, g) = partials.device_ptr_mut(&stream);
         drop(g);
-        p as u64
+        p
     };
     let _ = out_features;
     Ok(Some(Arc::new(CudaM1TwoPhaseDelta {
@@ -832,7 +834,8 @@ impl nv_layers::linear::LoraDeltaHook for ServingLoraHook {
         }
         #[cfg(feature = "cuda")]
         {
-            if let Some(hook) = &self.cuda_m1_kernel_delta_that_survives_the_forked_stream_decode_capture
+            if let Some(hook) =
+                &self.cuda_m1_kernel_delta_that_survives_the_forked_stream_decode_capture
             {
                 if m == 1
                     && matches!(x2.device(), candle_core::Device::Cuda(_))
@@ -983,10 +986,20 @@ pub fn install_gemma4_serving_adapter(
                  projection has no v slice for the adapter to land on"
             ));
         }
-        plan_serving_hook(&attn.qkv_proj, &qkv_slices, adapter, &mut planned, &mut matched)?;
+        plan_serving_hook(
+            &attn.qkv_proj,
+            &qkv_slices,
+            adapter,
+            &mut planned,
+            &mut matched,
+        )?;
         plan_serving_hook(
             &attn.o_proj,
-            &[(format!("{p}.self_attn.o_proj"), 0, attn.o_proj.out_features())],
+            &[(
+                format!("{p}.self_attn.o_proj"),
+                0,
+                attn.o_proj.out_features(),
+            )],
             adapter,
             &mut planned,
             &mut matched,
@@ -1150,10 +1163,7 @@ pub fn install_laguna_serving_adapter(
             );
         }
     }
-    if w8_bypassed_attention_matched
-        && model.attn_w8_active()
-        && model.attn_w8_shape_policy()
-    {
+    if w8_bypassed_attention_matched && model.attn_w8_active() && model.attn_w8_shape_policy() {
         bail!(
             "this laguna engine booted with the attn-w8 'shape' policy \
              (NV_LAGUNA_ATTN_W8/NV_LAGUNA_ATTN_FP8 contains 'shape'): apply_attn_w8_for \

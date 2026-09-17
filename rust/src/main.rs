@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let models = models::Models::get_or_init().context("load models")?;
+    oapi::vram_plan::observe_loaded_speech_stack(&models);
     #[cfg(feature = "wgpu")]
     let chat_registry = oapi::chat_engine_wgpu::registry_from_env_with_wgpu();
     #[cfg(not(feature = "wgpu"))]
@@ -127,8 +128,6 @@ async fn main() -> anyhow::Result<()> {
         tts_talker,
         speaker_encoder: speaker_encoder.clone(),
     };
-
-    oapi::vram_plan::reconcile_boot_plans_against_nvidia_smi_once();
 
     let _ = CHAT_MODEL_IDS.set(
         chat_registry
@@ -157,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
                 post(oapi::completions::handle_completions),
             )
             .route("/v1/messages", post(oapi::messages::handle_messages))
+            .route("/v1/laguna/capture", post(oapi::laguna_capture::handle))
             .route(
                 "/v1/messages/count_tokens",
                 post(oapi::messages::handle_count_tokens),
@@ -196,43 +196,124 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
 
     let voice_profile_root = voice_profile_root_dir();
-    let voice_profiles_router = match nv_tts::VoiceProfileStore::open(&voice_profile_root) {
-        Ok(store) => {
-            let vp_state = oapi::voice_profiles::VoiceProfilesAppState::new(store)
-                .with_encoder(speaker_encoder.clone());
-            Some(
-                Router::new()
-                    .route(
-                        "/v1/voice-profiles",
-                        post(oapi::voice_profiles::handle_create)
-                            .get(oapi::voice_profiles::handle_list),
-                    )
-                    .route(
-                        "/v1/voice-profiles/{name}",
-                        get(oapi::voice_profiles::handle_get)
-                            .delete(oapi::voice_profiles::handle_delete),
-                    )
-                    .with_state(vp_state),
-            )
-        }
-        Err(err) => {
-            warn!(
-                error = %err,
-                path = %voice_profile_root.display(),
-                "voice-profiles store open failed; endpoint disabled",
-            );
-            None
-        }
+    let voice_store = Arc::new(nv_tts::VoiceStoreHandle::new(&voice_profile_root));
+    let _ = VOICE_STORE.set(voice_store.clone());
+    let voice_profiles_live = voice_store.is_live();
+    if !voice_profiles_live {
+        warn!(
+            path = %voice_profile_root.display(),
+            "voice-profile store not reachable at boot; /v1/voice-profiles answers 503 and \
+             the OpenAI voice aliases use the built-in default voice until it is",
+        );
+    }
+    let vp_state = oapi::voice_profiles::VoiceProfilesAppState::new(voice_store.clone())
+        .with_encoder(speaker_encoder.clone());
+    let voice_profiles_router = Router::new()
+        .route(
+            "/v1/voice-profiles",
+            post(oapi::voice_profiles::handle_create).get(oapi::voice_profiles::handle_list),
+        )
+        .route(
+            "/v1/voice-profiles/{name}",
+            get(oapi::voice_profiles::handle_get).delete(oapi::voice_profiles::handle_delete),
+        )
+        .with_state(vp_state);
+
+    let workspace_root = std::env::var("NV_VOICES_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            voice_profile_root
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default()
+        });
+    let st = oapi::voices::VoicesAppState {
+        store: voice_store.clone(),
+        kokoro: state.models.kokoro.clone(),
+        embedding: state.models.diar_embedding.clone(),
+        workspace_root,
+        self_base: format!("http://127.0.0.1:{}", args.port),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(7200))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
     };
+    let voices_router = Router::new()
+        .route("/voice-lab", get(oapi::voices::handle_page))
+        .route(
+            "/v1/voices/workspace/status",
+            get(oapi::voices::handle_ws_status),
+        )
+        .route(
+            "/v1/voices/workspace/config",
+            get(oapi::voices::handle_ws_config),
+        )
+        .route(
+            "/v1/voices/workspace/manifest",
+            get(oapi::voices::handle_ws_manifest),
+        )
+        .route(
+            "/v1/voices/workspace/speakers",
+            get(oapi::voices::handle_ws_speakers),
+        )
+        .route(
+            "/v1/voices/workspace/speakers/{id}",
+            post(oapi::voices::handle_ws_name_speaker),
+        )
+        .route(
+            "/v1/voices/workspace/identify",
+            post(oapi::voices::handle_ws_identify),
+        )
+        .route(
+            "/v1/voices/workspace/identify-audio",
+            post(oapi::voices::handle_ws_identify_audio),
+        )
+        .route(
+            "/v1/voices/workspace/run",
+            post(oapi::voices::handle_ws_run),
+        )
+        .route(
+            "/v1/voices/workspace/artifacts/{sha}/{kind}",
+            get(oapi::voices::handle_ws_artifact),
+        )
+        .route(
+            "/v1/voices/workspace/clip/{sha}/{index}",
+            get(oapi::voices::handle_ws_clip),
+        )
+        .route(
+            "/v1/voices",
+            get(oapi::voices::handle_list).post(oapi::voices::handle_import),
+        )
+        .route(
+            "/v1/voices/fit",
+            get(oapi::voices::handle_fit_list).post(oapi::voices::handle_fit_start),
+        )
+        .route("/v1/voices/fit/{id}", get(oapi::voices::handle_fit_get))
+        .route(
+            "/v1/voices/fit/{id}/events",
+            get(oapi::voices::handle_fit_events),
+        )
+        .route(
+            "/v1/voices/{name}",
+            get(oapi::voices::handle_get).delete(oapi::voices::handle_delete),
+        )
+        .route(
+            "/v1/voices/{name}/files/{file}",
+            get(oapi::voices::handle_file),
+        )
+        .with_state(st);
 
     let pii_router = load_pii_classifier_from_env();
     let ocr_router = oapi::ocr::router_from_env();
-    let _ = oapi::text_embeddings::warm_embedder_at_boot();
+    let _ = oapi::text_embeddings::warm_embedder_at_boot().await;
+    oapi::cold_tier::preload_if_requested().await;
+    oapi::cold_tier::spawn_idle_sweeper();
+    oapi::vram_plan::reconcile_boot_plans_against_nvidia_smi_once();
 
     let _ = READINESS.set(build_readiness(
         &state,
         chat_router.is_some(),
-        voice_profiles_router.is_some(),
+        voice_profiles_live,
         pii_router.is_some(),
     ));
     if api_key().is_none() && cors().origin == "*" {
@@ -296,26 +377,23 @@ async fn main() -> anyhow::Result<()> {
     } else {
         app
     };
-    let app = if let Some(vpr) = voice_profiles_router {
-        app.merge(vpr)
-    } else {
-        app
-    };
+    let app = app.merge(voice_profiles_router);
+    let app = app.merge(voices_router);
     let app = if let Some(pr) = pii_router {
         app.merge(pr)
     } else {
         app
     };
     let app = app.merge(ocr_router);
-    let app = app.merge(oapi::fine_tuning::router()).route(
-        "/v1/trajectory/label",
-        post(oapi::trajectory::handle_label),
-    );
+    let app = app
+        .merge(oapi::fine_tuning::router())
+        .route("/v1/trajectory/label", post(oapi::trajectory::handle_label));
     let app = app
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .layer(middleware::from_fn(auth_mw))
         .layer(middleware::from_fn(metrics_mw))
-        .layer(middleware::from_fn(cors_mw));
+        .layer(middleware::from_fn(cors_mw))
+        .layer(middleware::from_fn(speaches_plus::otel_http::trace_request));
 
     let _ = ready_tx.send(());
     if tokio::time::timeout(WARMING_HANDOFF_DRAIN, &mut warming)
@@ -357,8 +435,10 @@ async fn bind_listener(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListen
             }
         }
     }
-    Err(anyhow::Error::from(last.expect("bind attempted at least once")))
-        .with_context(|| format!("bind {addr}"))
+    Err(anyhow::Error::from(
+        last.expect("bind attempted at least once"),
+    ))
+    .with_context(|| format!("bind {addr}"))
 }
 
 fn warming_router() -> Router {
@@ -631,6 +711,7 @@ impl Drop for InFlightGuard {
     }
 }
 
+#[derive(Clone)]
 struct Subsystem {
     name: &'static str,
     configured: bool,
@@ -640,6 +721,7 @@ struct Subsystem {
 }
 
 static READINESS: OnceLock<Vec<Subsystem>> = OnceLock::new();
+static VOICE_STORE: OnceLock<Arc<nv_tts::VoiceStoreHandle>> = OnceLock::new();
 
 fn readiness_report(subs: &[Subsystem]) -> (StatusCode, serde_json::Value) {
     let down: Vec<&str> = subs
@@ -686,7 +768,16 @@ async fn readiness() -> Response {
         )
             .into_response();
     };
-    let (status, body) = readiness_report(subs);
+    let mut subs = subs.clone();
+    if let Some(handle) = VOICE_STORE.get().cloned() {
+        let live = tokio::task::spawn_blocking(move || handle.is_live())
+            .await
+            .unwrap_or(false);
+        if let Some(sub) = subs.iter_mut().find(|s| s.name == "voice_profiles") {
+            sub.live = live;
+        }
+    }
+    let (status, body) = readiness_report(&subs);
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
@@ -818,17 +909,16 @@ async fn auth_mw(req: Request, next: Next) -> Response {
     if let Some(key) = api_key() {
         let path = req.uri().path();
         let exempt = matches!(path, "/health" | "/health/ready" | "/metrics" | "/version");
-        if !exempt
-            && !oapi::request_key_ok(req.headers(), key) {
-                if path.starts_with("/v1/messages") {
-                    return oapi::messages::anthropic_error(
-                        StatusCode::UNAUTHORIZED,
-                        oapi::messages::akind::AUTH,
-                        "missing or invalid API key (send x-api-key or Authorization: Bearer)",
-                    );
-                }
-                return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response();
+        if !exempt && !oapi::request_key_ok(req.headers(), key) {
+            if path.starts_with("/v1/messages") {
+                return oapi::messages::anthropic_error(
+                    StatusCode::UNAUTHORIZED,
+                    oapi::messages::akind::AUTH,
+                    "missing or invalid API key (send x-api-key or Authorization: Bearer)",
+                );
             }
+            return (StatusCode::UNAUTHORIZED, "missing or invalid API key").into_response();
+        }
     }
     next.run(req).await
 }
@@ -945,27 +1035,41 @@ async fn warm_chat_engine(engine: Arc<dyn oapi::chat::ChatEngine>) {
 }
 
 fn load_speaker_encoder_from_env() -> Option<Arc<nv_tts::SpeakerEncoder>> {
-    let dir = std::env::var_os(oapi::audio_speech_nvtts::ENV_TALKER_DIR)?;
-    let dir = std::path::PathBuf::from(dir);
-    if !nv_tts::SpeakerEncoder::checkpoint_has_speaker_encoder(&dir) {
-        info!(
-            path = %dir.display(),
-            "TTS checkpoint has no speaker_encoder tensors (CustomVoice/VoiceDesign); \
-             voice-profile enrollment disabled -- use a Qwen3-TTS Base checkpoint to enroll"
-        );
-        return None;
-    }
-    match nv_tts::SpeakerEncoder::from_qwen3_checkpoint(&dir, &candle_core::Device::Cpu) {
+    use nv_tts::speaker_encoder::{
+        SpeakerEncoderSource, ENV_KOKORO_QWEN_ENCODER_DIR, ENV_SPEAKER_ENCODER_DIR,
+    };
+    let talker =
+        std::env::var_os(oapi::audio_speech_nvtts::ENV_TALKER_DIR).map(std::path::PathBuf::from);
+    let (external_env, external) = [ENV_SPEAKER_ENCODER_DIR, ENV_KOKORO_QWEN_ENCODER_DIR]
+        .into_iter()
+        .find_map(|k| std::env::var_os(k).map(|v| (k, std::path::PathBuf::from(v))))
+        .unzip();
+    let source = SpeakerEncoderSource::choose(talker.as_deref(), external.as_deref());
+    let path = match &source {
+        SpeakerEncoderSource::Checkpoint(p) | SpeakerEncoderSource::External(p) => p.clone(),
+        SpeakerEncoderSource::Unavailable(reason) => {
+            info!(reason = %reason, "speaker-encoder unavailable");
+            return None;
+        }
+    };
+    match source.load(&candle_core::Device::Cpu) {
         Ok(encoder) => {
             info!(
-                path = %dir.display(),
+                source = source.label(),
+                path = %path.display(),
+                external_env = external_env.unwrap_or("-"),
                 enc_dim = encoder.config().enc_dim,
-                "speaker-encoder ready (ECAPA-TDNN from TTS checkpoint)"
+                "speaker-encoder ready (ECAPA-TDNN)"
             );
             Some(Arc::new(encoder))
         }
         Err(err) => {
-            warn!(error = %err, path = %dir.display(), "speaker-encoder open failed");
+            warn!(
+                error = %err,
+                source = source.label(),
+                path = %path.display(),
+                "speaker-encoder open failed"
+            );
             None
         }
     }
@@ -1346,7 +1450,9 @@ async fn do_stt_post(
     };
     let opts = speaches_plus::stt::SttRequestOptions {
         language: opts_language,
-        initial_prompt: prompt.map(|p| p.trim().to_string()).filter(|p| !p.is_empty()),
+        initial_prompt: prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty()),
     };
     let Some(bytes) = audio_bytes else {
         return oapi::fastapi_validation_error(vec![oapi::missing_field(&["body", "file"])]);
@@ -1929,9 +2035,18 @@ mod serving_tests {
 
     #[test]
     fn stt_params_pass_through_known_language_codes_lowercased() {
-        assert_eq!(check_stt_params(Some("de"), None).unwrap().as_deref(), Some("de"));
-        assert_eq!(check_stt_params(Some("EN"), None).unwrap().as_deref(), Some("en"));
-        assert_eq!(check_stt_params(Some(" ja "), None).unwrap().as_deref(), Some("ja"));
+        assert_eq!(
+            check_stt_params(Some("de"), None).unwrap().as_deref(),
+            Some("de")
+        );
+        assert_eq!(
+            check_stt_params(Some("EN"), None).unwrap().as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            check_stt_params(Some(" ja "), None).unwrap().as_deref(),
+            Some("ja")
+        );
     }
 
     #[test]
@@ -1944,8 +2059,14 @@ mod serving_tests {
 
     #[test]
     fn stt_params_reject_nonzero_temperature() {
-        assert_eq!(check_stt_params(None, Some("0.8")).unwrap_err().0, "temperature");
-        assert_eq!(check_stt_params(None, Some("hot")).unwrap_err().0, "temperature");
+        assert_eq!(
+            check_stt_params(None, Some("0.8")).unwrap_err().0,
+            "temperature"
+        );
+        assert_eq!(
+            check_stt_params(None, Some("hot")).unwrap_err().0,
+            "temperature"
+        );
     }
 
     #[test]

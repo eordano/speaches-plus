@@ -50,7 +50,7 @@ gpu_idle_gate() {
 
 run_probe() {
   NV_QWEN38_WGPU_TEST=1 NV_CTX_TOKENS="$DEPTH" NV_LORA_AB_PAIRS="$PAIRS" \
-  NVK_LANE=${NVK_LANE:-gape} NVK_PKG=nv-specdecode NVK_FEATURES=cuda,wgpu \
+    NVK_LANE=${NVK_LANE:-gape} NVK_PKG=nv-specdecode NVK_FEATURES=cuda,wgpu \
     scripts/nvk.sh probe "$@"
 }
 

@@ -317,9 +317,18 @@ impl WhisperEngine {
 
 #[derive(Clone)]
 pub enum WhisperHandle {
-    Ct2 { inner: Arc<Ct2State>, id: String },
-    WhisperCpp { inner: Arc<CppContext>, id: String },
-    Parakeet { inner: Arc<parakeet::ParakeetTdt>, id: String },
+    Ct2 {
+        inner: Arc<Ct2State>,
+        id: String,
+    },
+    WhisperCpp {
+        inner: Arc<CppContext>,
+        id: String,
+    },
+    Parakeet {
+        inner: Arc<parakeet::ParakeetTdt>,
+        id: String,
+    },
 }
 
 impl WhisperHandle {
@@ -333,7 +342,11 @@ impl WhisperHandle {
 
     pub fn ep(&self) -> Option<&'static str> {
         match self {
-            WhisperHandle::Ct2 { .. } => Some(if cfg!(feature = "cuda") { "cuda" } else { "cpu" }),
+            WhisperHandle::Ct2 { .. } => Some(if cfg!(feature = "cuda") {
+                "cuda"
+            } else {
+                "cpu"
+            }),
             WhisperHandle::WhisperCpp { .. } => None,
             WhisperHandle::Parakeet { inner, .. } => Some(inner.ep()),
         }
@@ -657,7 +670,11 @@ fn transcribe_ct2_long(
 const CT2_START_OF_PREV_TOKEN: &str = "<|startofprev|>";
 
 fn ct2_initial_prompt_tokens(state: &Ct2State, prompt: &str) -> Result<Vec<String>> {
-    if state.tokenizer.token_to_id(CT2_START_OF_PREV_TOKEN).is_none() {
+    if state
+        .tokenizer
+        .token_to_id(CT2_START_OF_PREV_TOKEN)
+        .is_none()
+    {
         return Err(anyhow::Error::new(SttParamUnsupported {
             param: "prompt",
             message: format!(
@@ -1236,11 +1253,63 @@ fn ct2_config() -> Ct2Config {
     }
 }
 
+fn env_checkpoint_override(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var(name).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+fn first_ggml_checkpoint(dir: &Path) -> Option<PathBuf> {
+    let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("ggml-") && n.ends_with(".bin"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    hits.sort();
+    hits.into_iter().next()
+}
+
 fn ct2_model_dir(model_dir: &Path) -> Result<PathBuf> {
+    ct2_model_dir_with(
+        model_dir,
+        env_checkpoint_override(super::defaults::env::CT2_MODEL),
+    )
+}
+
+fn ct2_model_dir_with(model_dir: &Path, override_path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = override_path {
+        let dir = if p.is_file() {
+            p.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| p.clone())
+        } else {
+            p.clone()
+        };
+        if dir.join("model.bin").exists() {
+            return Ok(dir);
+        }
+        tracing::warn!(
+            path = %p.display(),
+            "CT2_MODEL does not resolve to a directory containing model.bin; \
+             falling back to the models directory"
+        );
+    }
+
     let dir = model_dir.join("whisper-ct2");
     if !dir.join("model.bin").exists() {
         anyhow::bail!(
-            "{}/model.bin not found -- run `./scripts/fetch-models.sh` from rust/",
+            "{}/model.bin not found -- set CT2_MODEL to a ct2 checkpoint, \
+             or run `./scripts/fetch-models.sh` from rust/",
             dir.display()
         );
     }
@@ -1248,18 +1317,52 @@ fn ct2_model_dir(model_dir: &Path) -> Result<PathBuf> {
 }
 
 fn whisper_cpp_model_path(model_dir: &Path) -> Result<PathBuf> {
-    for candidate in [
-        "ggml-large-v3-turbo.bin",
-        "ggml-large-v3.bin",
-        "ggml-tiny.en.bin",
-    ] {
-        let p = model_dir.join(candidate);
-        if p.exists() {
+    whisper_cpp_model_path_with(
+        model_dir,
+        env_checkpoint_override(super::defaults::env::WHISPER_MODEL),
+    )
+}
+
+fn whisper_cpp_model_path_with(
+    model_dir: &Path,
+    override_path: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let mut search: Vec<PathBuf> = Vec::new();
+    if let Some(p) = override_path {
+        if p.is_file() {
+            return Ok(p);
+        }
+        if p.is_dir() {
+            search.push(p);
+        } else {
+            tracing::warn!(
+                path = %p.display(),
+                "WHISPER_MODEL is neither a file nor a directory; \
+                 falling back to the models directory"
+            );
+        }
+    }
+    search.push(model_dir.to_path_buf());
+
+    for dir in &search {
+        for candidate in [
+            "ggml-large-v3-turbo.bin",
+            "ggml-large-v3.bin",
+            "ggml-tiny.en.bin",
+        ] {
+            let p = dir.join(candidate);
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+        if let Some(p) = first_ggml_checkpoint(dir) {
             return Ok(p);
         }
     }
+
     anyhow::bail!(
-        "no GGML whisper model in {} -- run `./scripts/fetch-models.sh` from rust/",
+        "no GGML whisper model in {} -- set WHISPER_MODEL to a .bin, \
+         or run `./scripts/fetch-models.sh` from rust/",
         model_dir.display()
     )
 }
@@ -1443,6 +1546,75 @@ mod tests {
         assert_eq!(words[0].word, "fall");
     }
 
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("sp-stt-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    #[test]
+    fn whisper_model_override_accepts_a_file_path() {
+        let d = scratch("wm-file");
+        let bin = d.join("ggml-large-v3-turbo-q8_0.bin");
+        std::fs::write(&bin, b"x").unwrap();
+        let empty = scratch("wm-file-empty");
+        let got = whisper_cpp_model_path_with(&empty, Some(bin.clone())).unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn whisper_model_override_accepts_a_directory() {
+        let d = scratch("wm-dir");
+        let bin = d.join("ggml-large-v3-turbo.bin");
+        std::fs::write(&bin, b"x").unwrap();
+        let empty = scratch("wm-dir-empty");
+        let got = whisper_cpp_model_path_with(&empty, Some(d.clone())).unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn whisper_quantised_checkpoint_found_without_exact_name() {
+        let d = scratch("wm-quant");
+        let bin = d.join("ggml-large-v3-turbo-q8_0.bin");
+        std::fs::write(&bin, b"x").unwrap();
+        let got = whisper_cpp_model_path_with(&d, None).unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn whisper_unusable_override_falls_back_to_models_dir() {
+        let d = scratch("wm-fallback");
+        let bin = d.join("ggml-large-v3.bin");
+        std::fs::write(&bin, b"x").unwrap();
+        let got =
+            whisper_cpp_model_path_with(&d, Some(std::path::PathBuf::from("/nope/missing.bin")))
+                .unwrap();
+        assert_eq!(got, bin);
+    }
+
+    #[test]
+    fn ct2_override_accepts_dir_or_model_bin() {
+        let d = scratch("ct2");
+        std::fs::write(d.join("model.bin"), b"x").unwrap();
+        let empty = scratch("ct2-empty");
+        assert_eq!(ct2_model_dir_with(&empty, Some(d.clone())).unwrap(), d);
+        assert_eq!(
+            ct2_model_dir_with(&empty, Some(d.join("model.bin"))).unwrap(),
+            d
+        );
+    }
+
+    #[test]
+    fn ct2_unusable_override_falls_back_to_models_dir() {
+        let root = scratch("ct2-fallback");
+        let conv = root.join("whisper-ct2");
+        std::fs::create_dir_all(&conv).unwrap();
+        std::fs::write(conv.join("model.bin"), b"x").unwrap();
+        let got = ct2_model_dir_with(&root, Some(std::path::PathBuf::from("/nope"))).unwrap();
+        assert_eq!(got, conv);
+    }
+
     #[test]
     fn silence_gate_returns_empty() {
         let zeros = vec![0.0f32; 16_000];
@@ -1606,8 +1778,16 @@ mod tests {
     #[test]
     fn echoed_prompt_context_is_stripped_with_interleaved_specials() {
         let mut tokens = s(&[
-            "<|startofprev|>", "ĠYesterday", "Ġmuseum", "<|startoftranscript|>", "<|en|>",
-            "<|transcribe|>", "<|0.00|>", "ĠThe", "Ġfox", "<|1.00|>",
+            "<|startofprev|>",
+            "ĠYesterday",
+            "Ġmuseum",
+            "<|startoftranscript|>",
+            "<|en|>",
+            "<|transcribe|>",
+            "<|0.00|>",
+            "ĠThe",
+            "Ġfox",
+            "<|1.00|>",
         ]);
         let mut ids: Vec<usize> = (0..tokens.len()).collect();
         let prefix = s(&["<|startofprev|>", "ĠYesterday", "Ġmuseum"]);
@@ -1744,7 +1924,13 @@ mod tests {
             let _ = transcribe_ct2_legacy(&state, &audio).expect("legacy");
         });
         let m_new = bench("new (ts+split)", &|| {
-            let _ = transcribe_ct2(&state, &audio, WhisperTask::Transcribe, &SttRequestOptions::default()).expect("new");
+            let _ = transcribe_ct2(
+                &state,
+                &audio,
+                WhisperTask::Transcribe,
+                &SttRequestOptions::default(),
+            )
+            .expect("new");
         });
 
         let delta_pct = (m_new as f64 - m_legacy as f64) / m_legacy as f64 * 100.0;
@@ -1801,7 +1987,13 @@ mod tests {
         };
 
         let legacy = transcribe_ct2_legacy(&state, &audio).expect("legacy decode");
-        let new = transcribe_ct2(&state, &audio, WhisperTask::Transcribe, &SttRequestOptions::default()).expect("new decode");
+        let new = transcribe_ct2(
+            &state,
+            &audio,
+            WhisperTask::Transcribe,
+            &SttRequestOptions::default(),
+        )
+        .expect("new decode");
 
         eprintln!("legacy  : {:?}", legacy);
         eprintln!("new.text: {:?}", new.text);

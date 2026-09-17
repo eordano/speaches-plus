@@ -108,7 +108,11 @@ pub fn append_to(dir: &Path, record: &TrajectoryRecord) -> anyhow::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join(daily_file_name_so_tmpfiles_age_rules_can_prune_old_days(record.ts)))?;
+        .open(
+            dir.join(daily_file_name_so_tmpfiles_age_rules_can_prune_old_days(
+                record.ts,
+            )),
+        )?;
     f.write_all(line.as_bytes())?;
     Ok(())
 }
@@ -209,8 +213,8 @@ pub fn label_target_exists_in_retained_trajectories(
         };
         for line in std::io::BufReader::new(f).lines() {
             let Ok(line) = line else { break };
-            let cheap_prefilter_hit = id.is_some_and(|v| line.contains(v))
-                || tag.is_some_and(|v| line.contains(v));
+            let cheap_prefilter_hit =
+                id.is_some_and(|v| line.contains(v)) || tag.is_some_and(|v| line.contains(v));
             if !cheap_prefilter_hit {
                 continue;
             }
@@ -255,8 +259,10 @@ pub async fn handle_label(
     let Some(dir) = dir_from_env() else {
         return crate::oapi::openai_error(
             axum::http::StatusCode::BAD_REQUEST,
-            format!("trajectory capture is disabled ({TRAJECTORY_DIR_ENV} unset), so there is \
-                     nothing to label"),
+            format!(
+                "trajectory capture is disabled ({TRAJECTORY_DIR_ENV} unset), so there is \
+                     nothing to label"
+            ),
             crate::oapi::kind::INVALID_REQUEST,
             None,
             Some("trajectory_capture_disabled"),
@@ -447,7 +453,9 @@ mod tests {
             Some("chatcmpl-nope"),
             Some("tag-nope")
         ));
-        assert!(!label_target_exists_in_retained_trajectories(&dir, None, None));
+        assert!(!label_target_exists_in_retained_trajectories(
+            &dir, None, None
+        ));
         assert!(!label_target_exists_in_retained_trajectories(
             &dir,
             Some("  "),

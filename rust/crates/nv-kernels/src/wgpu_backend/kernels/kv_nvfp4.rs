@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dequant::bytes_to_words;
+use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::pack_u16_even_min_one_word as pack_bf16;
 use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -72,8 +72,15 @@ pub fn nibble_word_index(elem: usize) -> (usize, u32) {
     (elem >> 3, 4 * (elem as u32 & 7))
 }
 
-pub fn k_channel_scale_index(slot: usize, n_kv: usize, kvh: usize, head_dim: usize, d: usize) -> usize {
-    let block = slot / KV_NVFP4_K_BLOCK_TOKENS_A_BLOCK_FINALIZES_THE_STEP_ITS_LAST_TOKEN_LANDS as usize;
+pub fn k_channel_scale_index(
+    slot: usize,
+    n_kv: usize,
+    kvh: usize,
+    head_dim: usize,
+    d: usize,
+) -> usize {
+    let block =
+        slot / KV_NVFP4_K_BLOCK_TOKENS_A_BLOCK_FINALIZES_THE_STEP_ITS_LAST_TOKEN_LANDS as usize;
     (block * n_kv + kvh) * head_dim + d
 }
 
@@ -195,13 +202,12 @@ pub fn cpu_dequantize_kv_nvfp4_k(
     d: usize,
 ) -> f32 {
     let e = (slot * n_kv + kvh) * head_dim + d;
-    decode_e2m1(nibble_at(payload, e))
-        * scales[k_channel_scale_index(slot, n_kv, kvh, head_dim, d)]
+    decode_e2m1(nibble_at(payload, e)) * scales[k_channel_scale_index(slot, n_kv, kvh, head_dim, d)]
 }
 
 pub fn nibble_at(payload: &[u8], elem: usize) -> u8 {
     let b = payload[elem / 2];
-    if elem % 2 == 0 {
+    if elem.is_multiple_of(2) {
         b & 0xf
     } else {
         b >> 4

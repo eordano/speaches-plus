@@ -1,8 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::wgpu_backend::device::WgpuContext;
+use crate::wgpu_backend::pack::{
+    pack_u16_odd_tail_zeroed_min_one_word as pack_u16, pack_u8_min_one_word as pack_u8,
+    unpack_u16_by_element as unpack_u16,
+};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_odd_tail_zeroed_min_one_word as pack_u16, unpack_u16_by_element as unpack_u16, pack_u8_min_one_word as pack_u8};
 
 pub const WGSL: &str = include_str!("../../../wgsl/verify_fused_norms.wgsl");
 
@@ -56,7 +59,12 @@ struct VfsParams {
 }
 
 fn check_device(ctx: &WgpuContext) -> Result<()> {
-    dispatch::require_workgroup_and_scratch(ctx, "verify_fused_norms", WORKGROUP_SIZE, SCRATCH_BYTES)
+    dispatch::require_workgroup_and_scratch(
+        ctx,
+        "verify_fused_norms",
+        WORKGROUP_SIZE,
+        SCRATCH_BYTES,
+    )
 }
 
 fn check_grid(ctx: &WgpuContext, x: usize, y: usize) -> Result<()> {

@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
-use candle_core::{DType, Device, IndexOp, Tensor, D};
 use super::linear;
 use super::preprocess::resize_plane_f32;
+use anyhow::{Context, Result};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 fn prof_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -234,7 +234,7 @@ extern "C" __global__ void sam_relpos_softmax_bf16(
         let hw = h * w;
         let n = scores.elem_count();
         anyhow::ensure!(
-            n % hw == 0,
+            n.is_multiple_of(hw),
             "sam fused: scores {n} not divisible by hw {hw}"
         );
         let rows = n / hw;

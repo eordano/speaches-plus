@@ -125,14 +125,14 @@ fn prefill_scratch_gib(dir: &Path, max_seq: usize) -> f64 {
             if m == 0 {
                 return 0.0;
             }
-            let legacy = m
-                * nv_models::qwen3_5_moe_wgpu::prefill_list_bytes_per_token_charged_by_mem_fit();
+            let legacy =
+                m * nv_models::qwen3_5_moe_wgpu::prefill_list_bytes_per_token_charged_by_mem_fit();
             let mrow = match nv_models::qwen3_5_moe::Qwen3MoeConfig::from_hf_json_file(
                 &dir.join("config.json"),
             ) {
-                Ok(cfg) => nv_models::qwen3_5_moe_wgpu::pf_mrow_scratch_bytes_upper_bound_for_mem_fit(
-                    &cfg,
-                ),
+                Ok(cfg) => {
+                    nv_models::qwen3_5_moe_wgpu::pf_mrow_scratch_bytes_upper_bound_for_mem_fit(&cfg)
+                }
                 Err(_) => 0,
             };
             (legacy + mrow) as f64 / (1u64 << 30) as f64
@@ -353,7 +353,10 @@ mod tests {
         let cfg = r#"{"model_type":"gpt_oss","num_attention_heads":64,"quantization_config":{"quant_method":"mxfp4"}}"#;
         let oss = fixture_dir("gpt-oss-scratch", Some(cfg));
         let m = nv_models::gpt_oss_wgpu::prefill_m();
-        assert!(m > 0, "default prefill_m must be non-zero for this test to mean anything");
+        assert!(
+            m > 0,
+            "default prefill_m must be non-zero for this test to mean anything"
+        );
 
         let at = |max_seq: usize| prefill_scratch_gib(&oss, max_seq);
         let one_k = at(1024);
@@ -362,12 +365,19 @@ mod tests {
             (one_k - expect).abs() < 1e-12,
             "scratch {one_k} != m*heads*max_seq*4 {expect}"
         );
-        assert!(one_k > 0.0, "the term must actually fire, not silently yield zero");
+        assert!(
+            one_k > 0.0,
+            "the term must actually fire, not silently yield zero"
+        );
         assert!(
             (at(2048) - 2.0 * one_k).abs() < 1e-12,
             "scratch must scale linearly with max_seq"
         );
-        assert_eq!(at(0), 0.0, "no max_seq known -> charge nothing rather than guess");
+        assert_eq!(
+            at(0),
+            0.0,
+            "no max_seq known -> charge nothing rather than guess"
+        );
 
         let qwen = fixture_dir(
             "qwen-moe-scratch",
@@ -399,10 +409,9 @@ mod tests {
             lm > 0,
             "default laguna prefill_m must be non-zero for this test to mean anything"
         );
-        let l_expect = (lm
-            * nv_models::laguna_wgpu::prefill_list_bytes_per_token_charged_by_mem_fit())
-            as f64
-            / (1u64 << 30) as f64;
+        let l_expect =
+            (lm * nv_models::laguna_wgpu::prefill_list_bytes_per_token_charged_by_mem_fit()) as f64
+                / (1u64 << 30) as f64;
         let l_one_k = prefill_scratch_gib(&laguna, 1024);
         assert!(
             (l_one_k - l_expect).abs() < 1e-15 && l_one_k > 0.0,

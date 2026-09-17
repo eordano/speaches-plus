@@ -77,11 +77,9 @@ pub struct Hyperparameters {
     pub alpha: Option<f64>,
 
     pub steps: Option<usize>,
-    #[serde(alias = "n_steps")]
     pub n_steps: Option<usize>,
 
     pub lr: Option<f64>,
-    #[serde(alias = "learning_rate")]
     pub learning_rate: Option<f64>,
 
     pub target: Option<Vec<String>>,
@@ -309,7 +307,7 @@ fn resolve_hp(
     };
     let dots = family == TrainerFamily::DotsQloraWindowed;
     let rank = hp.rank.unwrap_or(if dots { 16 } else { 8 }).max(1);
-    if dots && rank % 2 != 0 {
+    if dots && !rank.is_multiple_of(2) {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
@@ -749,6 +747,8 @@ fn trained_from_dots(s: dots::DotsTrainSummary) -> Trained {
 fn trained_from_laguna(s: laguna_train::LagunaTrainSummary) -> Trained {
     let metrics = match serde_json::json!({
         "trainer": "laguna_full_graph",
+        "packed_linears": s.packed_linears,
+        "grouped_moe_copies": s.grouped_moe_copies,
         "eval_loss_adapter": s.eval_loss_adapter,
         "eval_loss_base": s.eval_loss_base,
         "eval_ce_adapter": s.eval_ce_adapter,
@@ -791,7 +791,8 @@ pub const A_TARGETED_MODULE_WHOSE_LORA_B_IS_STILL_EXACTLY_ZERO_AFTER_A_TRAINING_
      modules from `target`. The adapter that was written is left on disk untouched for \
      inspection.";
 
-pub const A_NON_FINITE_GRADIENT_TURNS_THE_LORA_FACTORS_NAN_AND_THE_ZERO_B_CHECK_CANNOT_CATCH_IT: &str =
+pub const A_NON_FINITE_GRADIENT_TURNS_THE_LORA_FACTORS_NAN_AND_THE_ZERO_B_CHECK_CANNOT_CATCH_IT:
+    &str =
     "once any accumulated gradient is non-finite, AdamW writes NaN into the LoRA A/B factors and \
      every later step keeps them NaN, so the saved adapter serves NaN logits; the untrained-module \
      gate cannot catch this because a NaN B factor has NaN amax, which is not exactly zero. The \
@@ -1044,8 +1045,11 @@ fn run_training_on_a_wide_stack(train: PreparedTrain) -> anyhow::Result<Trained>
                 }
             }),
             PreparedTrain::Laguna(args) => laguna_train::run(args).map(trained_from_laguna),
-            PreparedTrain::Dots(args) => train_runner::select_device()
-                .and_then(|device| dots::run(args, &device).map(trained_from_dots)),
+            PreparedTrain::Dots(args) => {
+                dots::metal_command_batching_default();
+                train_runner::select_device()
+                    .and_then(|device| dots::run(args, &device).map(trained_from_dots))
+            }
         })
         .map_err(|e| anyhow::anyhow!("spawn training thread: {e}"))?
         .join()
@@ -1112,15 +1116,16 @@ fn run_job(prepared: PreparedJob) {
                 })
             } else {
                 let dead = if a_gradient_was_actually_asked_for {
-                    let mut dead = modules_whose_lora_b_is_still_exactly_zero(&summary.adapter_path)
-                        .unwrap_or_else(|err| {
-                            tracing::warn!(
-                                adapter = %summary.adapter_path.display(),
-                                error = %format!("{err:#}"),
-                                "could not read back the adapter to check for untrained modules"
-                            );
-                            Vec::new()
-                        });
+                    let mut dead =
+                        modules_whose_lora_b_is_still_exactly_zero(&summary.adapter_path)
+                            .unwrap_or_else(|err| {
+                                tracing::warn!(
+                                    adapter = %summary.adapter_path.display(),
+                                    error = %format!("{err:#}"),
+                                    "could not read back the adapter to check for untrained modules"
+                                );
+                                Vec::new()
+                            });
                     if let Some(spec_dir) = &summary.speculator_dir {
                         let spec_adapter = spec_dir.join("adapter_model.safetensors");
                         match modules_whose_lora_b_is_still_exactly_zero(&spec_adapter) {
@@ -1204,12 +1209,7 @@ fn finish_success_registering_and_hot_loading(
         "job success does not persist a boot default; the held-out gate owner \
          promotes via POST /v1/adapters/promote, which rolls the current symlink"
     );
-    if summary
-        .metrics
-        .get("trainer")
-        .and_then(|v| v.as_str())
-        == Some("dots_qlora_windowed")
-    {
+    if summary.metrics.get("trainer").and_then(|v| v.as_str()) == Some("dots_qlora_windowed") {
         tracing::info!(
             adapter = %ft_model,
             "a dots adapter serves through the OCR pipeline, not the chat catalog: \
@@ -1574,7 +1574,9 @@ mod tests {
         assert_eq!(hp.learning_rate, 1e-4);
         assert_eq!(
             hp.grad_layers,
-            Some(DOTS_GRAD_LAYERS_DEFAULT_IS_8_BECAUSE_THE_QLORA_SMOKE_MEASURED_ITS_FOOTPRINT_THERE)
+            Some(
+                DOTS_GRAD_LAYERS_DEFAULT_IS_8_BECAUSE_THE_QLORA_SMOKE_MEASURED_ITS_FOOTPRINT_THERE
+            )
         );
         assert_eq!(hp.b_lr_ratio, Some(1.0));
         assert_eq!(
@@ -1585,8 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn family_detection_reads_the_model_dirs_config_json_and_a_missing_one_stays_on_train_runner()
-    {
+    fn family_detection_reads_the_model_dirs_config_json_and_a_missing_one_stays_on_train_runner() {
         let root = std::env::temp_dir().join(format!("ft-family-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let qwen = root.join("qwen");
@@ -1598,7 +1599,10 @@ mod tests {
         );
         let bare = root.join("bare");
         std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(trainer_family_for_base(&bare), TrainerFamily::GemmaTrainRunner);
+        assert_eq!(
+            trainer_family_for_base(&bare),
+            TrainerFamily::GemmaTrainRunner
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1773,9 +1777,10 @@ mod tests {
             b_lr_ratio: Some(8.0),
         };
         let (status, msg) = resolve_hp(&Some(with_knobs.clone()), TrainerFamily::GemmaTrainRunner)
-            .err()
-            .expect("train_runner has no windowed depth or LoRA+ path, so accepting the knobs \
-                     would train something other than what the job record claims");
+            .expect_err(
+                "train_runner has no windowed depth or LoRA+ path, so accepting the knobs \
+                     would train something other than what the job record claims",
+            );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("grad_layers"), "{msg}");
         for one in [
@@ -1823,7 +1828,9 @@ mod tests {
                 b_lr_ratio: None,
             }),
         };
-        let (status, _) = prepare_job(&req, &None).err().expect("prepare_job must refuse");
+        let (status, _) = prepare_job(&req, &None)
+            .err()
+            .expect("prepare_job must refuse");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let req = CreateFineTuningJobRequest {
             hyperparameters: None,
@@ -2051,17 +2058,17 @@ mod tests {
             b_lr_ratio: Some(8.0),
         };
         let (status, msg) = resolve_hp(&Some(with_knobs), TrainerFamily::LagunaFullGraph)
-            .err()
-            .expect("the laguna trainer has no window or LoRA+ path, so accepting the knobs \
-                     would train something other than what the job record claims");
+            .expect_err(
+                "the laguna trainer has no window or LoRA+ path, so accepting the knobs \
+                     would train something other than what the job record claims",
+            );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("laguna full-graph"), "{msg}");
 
         for kind in ["mtp", "eagle3"] {
             let (status, msg) =
                 resolve_speculator(&Some(spec(kind)), TrainerFamily::LagunaFullGraph)
-                    .err()
-                    .expect("laguna has no MTP head and no eagle3 tap path");
+                    .expect_err("laguna has no MTP head and no eagle3 tap path");
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert!(
                 msg.contains(kind) && msg.contains("laguna"),
@@ -2178,20 +2185,17 @@ mod tests {
     fn a_speculator_kind_that_mismatches_the_trainer_family_gets_the_same_400_shape_as_the_qwen_only_knobs(
     ) {
         let (status, msg) = resolve_speculator(&Some(spec("mtp")), TrainerFamily::GemmaTrainRunner)
-            .err()
-            .expect("train_runner bases have no MTP head to co-train");
+            .expect_err("train_runner bases have no MTP head to co-train");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("mtp") && msg.contains("train_runner"), "{msg}");
         let (status, msg) =
             resolve_speculator(&Some(spec("eagle3")), TrainerFamily::Qwen3_5DenseWindowed)
-                .err()
-                .expect("the qwen family self-drafts via its MTP head, not a separate drafter");
+                .expect_err("the qwen family self-drafts via its MTP head, not a separate drafter");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("eagle3") && msg.contains("mtp"), "{msg}");
         let (status, msg) =
             resolve_speculator(&Some(spec("medusa")), TrainerFamily::Qwen3_5DenseWindowed)
-                .err()
-                .expect("unknown kinds must be refused, not silently dropped");
+                .expect_err("unknown kinds must be refused, not silently dropped");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("medusa"), "{msg}");
         for family in [
@@ -2260,8 +2264,7 @@ mod tests {
             }),
             TrainerFamily::GemmaTrainRunner,
         )
-        .err()
-        .expect("a zero lr_ratio freezes the speculator while the record claims co-training");
+        .expect_err("a zero lr_ratio freezes the speculator while the record claims co-training");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("lr_ratio"), "{msg}");
 
@@ -2272,8 +2275,9 @@ mod tests {
             }),
             TrainerFamily::Qwen3_5DenseWindowed,
         )
-        .err()
-        .expect("the mtp head loads from the base checkpoint, so a drafter_dir would be ignored");
+        .expect_err(
+            "the mtp head loads from the base checkpoint, so a drafter_dir would be ignored",
+        );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("model_mtp.safetensors"), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
@@ -2286,9 +2290,10 @@ mod tests {
             EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
         );
         std::env::remove_var(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS);
-        let (status, msg) = resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner)
-            .err()
-            .expect("no drafter_dir and no env var leaves eagle3 without weights to co-train");
+        let (status, msg) =
+            resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner).expect_err(
+                "no drafter_dir and no env var leaves eagle3 without weights to co-train",
+            );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(
             msg.contains(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS),
@@ -2308,8 +2313,9 @@ mod tests {
             }),
             TrainerFamily::GemmaTrainRunner,
         )
-        .err()
-        .expect("a drafter_dir that is not a directory must 400, mirroring the base model check");
+        .expect_err(
+            "a drafter_dir that is not a directory must 400, mirroring the base model check",
+        );
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("not a directory"), "{msg}");
 
@@ -2329,9 +2335,8 @@ mod tests {
             EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
             &missing,
         );
-        let (status, msg) = resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner)
-            .err()
-            .expect(
+        let (status, msg) =
+            resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner).expect_err(
                 "an env var the operator already set must not be silently discarded into the \
                  generic set-the-env-var 400",
             );
@@ -2652,9 +2657,7 @@ mod tests {
         );
         for arm in ["eval_loss_adapter", "eval_loss_base"] {
             assert!(
-                disk["metrics"][arm]
-                    .as_f64()
-                    .is_some_and(f64::is_finite),
+                disk["metrics"][arm].as_f64().is_some_and(f64::is_finite),
                 "the terminal record must carry the held-out eval metrics the promotion gate \
                  compares; {arm} was {:?}",
                 disk["metrics"][arm]
@@ -2748,7 +2751,10 @@ mod tests {
         let done: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
         assert_eq!(done["status"], "succeeded");
-        assert_eq!(done["metrics"]["eval_loss_adapter"], serde_json::json!(1.25));
+        assert_eq!(
+            done["metrics"]["eval_loss_adapter"],
+            serde_json::json!(1.25)
+        );
         assert_eq!(
             done["metrics"]["per_example_eval_ce_adapter"],
             serde_json::json!([1.0, 1.5]),
@@ -2801,7 +2807,9 @@ mod tests {
         .unwrap();
         assert!(
             std::process::Command::new("mkfifo")
-                .arg(&config_turned_fifo_so_the_trainer_blocks_while_the_running_record_is_inspected)
+                .arg(
+                    &config_turned_fifo_so_the_trainer_blocks_while_the_running_record_is_inspected
+                )
                 .status()
                 .expect("mkfifo runs")
                 .success(),
@@ -2824,8 +2832,7 @@ mod tests {
         let running: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
         assert_eq!(
-            running["status"],
-            "running",
+            running["status"], "running",
             "the record on disk while training is in flight must say so, or a crash mid-round \
              reads as a job that never started"
         );
@@ -2835,16 +2842,20 @@ mod tests {
             b"not json, so the released trainer fails and run_job reaches its terminal transition",
         )
         .unwrap();
-        worker.join().expect("run_job returns instead of panicking on a failed training run");
+        worker
+            .join()
+            .expect("run_job returns instead of panicking on a failed training run");
         let failed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
         assert_eq!(
-            failed["status"],
-            "failed",
+            failed["status"], "failed",
             "a failed round's on-disk record is the post-restart-forensics case this file \
              exists for"
         );
-        assert_eq!(failed["error"]["code"], serde_json::json!("training_failed"));
+        assert_eq!(
+            failed["error"]["code"],
+            serde_json::json!("training_failed")
+        );
         assert!(failed["finished_at"].is_u64(), "{failed}");
         assert_eq!(
             serde_json::to_value(get_job(&job.id).unwrap()).unwrap(),
@@ -2885,8 +2896,9 @@ mod tests {
             scaling: 2.0,
             targets: vec!["q_proj".into()],
         });
-        let link = super::super::lora_runtime::promote_to_boot_default("ft:e4b:promotetest:aaaa1111")
-            .expect("a registered adapter promotes");
+        let link =
+            super::super::lora_runtime::promote_to_boot_default("ft:e4b:promotetest:aaaa1111")
+                .expect("a registered adapter promotes");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
             std::path::absolute(&adapter_dir).unwrap(),
@@ -2901,7 +2913,10 @@ mod tests {
         let err = super::super::lora_runtime::promote_to_boot_default("ft:no:such:adapter")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("ft:no:such:adapter"), "refusal must name the adapter: {err}");
+        assert!(
+            err.contains("ft:no:such:adapter"),
+            "refusal must name the adapter: {err}"
+        );
     }
 }
 

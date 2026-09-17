@@ -2,7 +2,7 @@
   description = "speaches-plus -- Rust/Go realtime servers + Python nano-vLLM (chat / ASR / TTS / image+video)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-  inputs.nix-hug.url = "path:../nix-hug";
+  inputs.nix-hug.url = "github:eordano/nix-hug";
   inputs.nix-hug.inputs.nixpkgs.follows = "nixpkgs";
   inputs.nixpkgs-pyannote3.url = "github:NixOS/nixpkgs/nixos-24.05";
   inputs.crane.url = "github:ipetkov/crane";
@@ -21,17 +21,51 @@
         "aarch64-linux"
         "aarch64-darwin"
       ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+
+      rustSrc =
+        let
+          fs = nixpkgs.lib.fileset;
+          crateDirs = nixpkgs.lib.attrNames (
+            nixpkgs.lib.filterAttrs (_: type: type == "directory") (builtins.readDir ./rust/crates)
+          );
+          crateNonBuildTrees = fs.unions (
+            nixpkgs.lib.concatMap (
+              crate:
+              map (dir: fs.maybeMissing (./rust/crates + "/${crate}/${dir}")) [
+                "tests"
+                "benches"
+              ]
+            ) crateDirs
+          );
+          crateNotes = fs.fileFilter (
+            file: file.hasExt "md" || file.hasExt "py" || file.hasExt "html" || file.hasExt "sh"
+          ) ./rust/crates;
+          buildTimeFixtures = ./rust/crates/nv-kernels/tests/fixtures;
+        in
+        fs.toSource {
+          root = ./rust;
+          fileset = fs.difference (fs.unions [
+            ./rust/Cargo.toml
+            ./rust/Cargo.lock
+            ./rust/build.rs
+            ./rust/.cargo
+            ./rust/src
+            ./rust/crates
+            (fs.fileFilter (file: !file.hasExt "npy") ./rust/voices)
+            ./rust/static
+          ]) (fs.difference (fs.unions [ crateNonBuildTrees crateNotes ]) buildTimeFixtures);
+        };
 
       cudaCapabilities = [
         "8.9"
         "12.0"
       ];
 
-      unbreakDlinfoOverlay = final: prev: {
+      unbreakDlinfoOverlay = _final: prev: {
         python3Packages = prev.python3Packages.override {
           overrides =
-            pyFinal: pyPrev:
+            _pyFinal: pyPrev:
             {
               dlinfo = pyPrev.dlinfo.overridePythonAttrs (_: {
                 meta.broken = false;
@@ -39,7 +73,7 @@
                 doInstallCheck = false;
               });
             }
-            // nixpkgs.lib.optionalAttrs prev.stdenv.isDarwin {
+            // nixpkgs.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
               requests-futures = pyPrev.requests-futures.overridePythonAttrs (_: {
                 doCheck = false;
                 doInstallCheck = false;
@@ -63,7 +97,7 @@
 
         pythonPackagesExtensions =
           (prev.pythonPackagesExtensions or [ ])
-          ++ nixpkgs.lib.optionals prev.stdenv.isDarwin [
+          ++ nixpkgs.lib.optionals prev.stdenv.hostPlatform.isDarwin [
             (_pyFinal: pyPrev: {
 
               httpcore2 = pyPrev.httpcore2.overridePythonAttrs (_: {
@@ -94,8 +128,8 @@
       };
 
       ffmpegResignOverlay =
-        final: prev:
-        nixpkgs.lib.optionalAttrs prev.stdenv.isDarwin {
+        _final: prev:
+        nixpkgs.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
           ffmpeg-headless = prev.ffmpeg-headless.overrideAttrs (old: {
             nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ prev.darwin.sigtool ];
             postFixup = (old.postFixup or "") + ''
@@ -114,8 +148,8 @@
         };
 
       arrowCppDarwinOverlay =
-        final: prev:
-        nixpkgs.lib.optionalAttrs prev.stdenv.isDarwin {
+        _final: prev:
+        nixpkgs.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
           arrow-cpp = prev.arrow-cpp.overrideAttrs (_: {
             installCheckPhase = ''
               runHook preInstallCheck
@@ -126,7 +160,7 @@
         };
 
       cudaSetupHookNvccFixOverlay =
-        final: prev:
+        _final: prev:
         let
           fixCudaScope =
             scope:
@@ -201,7 +235,7 @@
           config = {
             allowUnfree = true;
             nvidia.acceptLicense = true;
-            cudaCapabilities = cudaCapabilities;
+            inherit cudaCapabilities;
             cudaForwardCompat = true;
           };
           overlays = [
@@ -220,7 +254,7 @@
             allowUnfree = true;
             nvidia.acceptLicense = true;
             cudaSupport = true;
-            cudaCapabilities = cudaCapabilities;
+            inherit cudaCapabilities;
             cudaForwardCompat = true;
           };
           overlays = [
@@ -364,17 +398,13 @@
           };
 
           qwen3-tts = {
-            url = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice";
-            rev = "85e237c12c027371202489a0ec509ded67b5e4b5";
-            fileTreeHash = "sha256-KKIURDkYeRgDUViVRBJwo2N02zA7T3lpRSWTEXcKFdk=";
-            envVars = [ "NV_TTS_TALKER_DIR" ];
-          };
-
-          qwen3-tts-base = {
             url = "Qwen/Qwen3-TTS-12Hz-0.6B-Base";
             rev = "5d83992436eae1d760afd27aff78a71d676296fc";
             fileTreeHash = "sha256-GKWzpwo3PApyZXPkqzI9lgjV3g+i+G21wFBxcFSvljc=";
-            envVars = [ "NV_TTS_BASE_TALKER_DIR" ];
+            envVars = [
+              "NV_TTS_TALKER_DIR"
+              "NV_TTS_BASE_TALKER_DIR"
+            ];
           };
 
           qwen3-embed = {
@@ -458,12 +488,9 @@
         qwen35-dense = [ "qwen35-dense" ];
         qwen35-dense-nvfp4 = [ "qwen35-dense-nvfp4" ];
         parakeet = [ "parakeet-tdt" ];
-        tts-only = [
-          "qwen3-tts"
-          "qwen3-tts-base"
-        ];
+        tts-only = [ "qwen3-tts" ];
         tts-clone = [
-          "qwen3-tts-base"
+          "qwen3-tts"
           "whisper-ct2"
         ];
         audio-only = [
@@ -577,14 +604,6 @@
             hash = "sha256-Hq3oTeEJHRvXwThI8vc06E3Ot/FnPP0sZUfze3ISa2o=";
           };
 
-          cutlassForCudaforge = pkgs.fetchgit {
-            url = "https://github.com/NVIDIA/cutlass.git";
-            rev = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
-            hash = "sha256-cSWVzyuDC8EidTAZzHbVz0jUNK4zx5AAwfUV6lUXTXs=";
-            leaveDotGit = true;
-            deepClone = false;
-          };
-
           ctranslate2 =
             if withCUDA then
               pkgs.ctranslate2.override {
@@ -617,7 +636,7 @@
             with cudaPackages;
             [
               cuda_cudart
-              cuda_cccl
+              cccl
               cuda_nvrtc
               libcublas
               cudnn
@@ -654,7 +673,13 @@
               pkgs.stdenv.cc.cc.lib
               pkgs.libcxx
             ]
-            ++ pkgs.lib.optionals withCUDA (cudaLibs ++ [ cudaPackages.cuda_nvcc ]);
+            ++ pkgs.lib.optionals withCUDA (
+              cudaLibs
+              ++ [
+                cudaPackages.cuda_nvcc
+                cudaPackages.nsight_compute
+              ]
+            );
 
           env = {
             LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
@@ -715,7 +740,7 @@
             fi
             export REAL_CMAKE="${pkgs.cmake}/bin/cmake"
             SPEACHES_CMAKE_SHIM_DIR="$(mktemp -d -t speaches-cmake-shim.XXXXXX)"
-            install -m 0755 "${self}/rust/scripts/cmake-install-shim.sh" "$SPEACHES_CMAKE_SHIM_DIR/cmake"
+            install -m 0755 "${./rust/scripts/cmake-install-shim.sh}" "$SPEACHES_CMAKE_SHIM_DIR/cmake"
             export PATH="$SPEACHES_CMAKE_SHIM_DIR:$PATH"
           ''
           + pkgs.lib.optionalString isLinux ''
@@ -731,8 +756,8 @@
           + pkgs.lib.optionalString withCUDA ''
             export LIBRARY_PATH="${cudaPackages.cuda_cudart}/lib/stubs''${LIBRARY_PATH:+:$LIBRARY_PATH}"
             if [ -d "$HOME/.cargo/registry/src" ]; then
-              bash "${self}/rust/scripts/patch-ct2rs-cuda.sh" >/dev/null 2>&1 || true
-              bash "${self}/rust/scripts/patch-ct2rs-cmake-min.sh" >/dev/null 2>&1 || true
+              bash "${./rust/scripts/patch-ct2rs-cuda.sh}" >/dev/null 2>&1 || true
+              bash "${./rust/scripts/patch-ct2rs-cmake-min.sh}" >/dev/null 2>&1 || true
             fi
           ''
           + pkgs.lib.optionalString (localHub && profile != null) (localHubHook system profile)
@@ -750,7 +775,7 @@
             name = "strip-comments";
             runtimeInputs = [ pkgs.python3 ];
             text = ''
-              exec python3 ${self}/scripts/strip-comments.py "$@"
+              exec python3 ${./scripts/strip-comments.py} "$@"
             '';
           };
         in
@@ -766,7 +791,6 @@
           cudaPackages ? pkgs.cudaPackages_12,
         }:
         let
-          inherit (pkgs) lib;
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
 
           ctranslate2 =
@@ -793,8 +817,15 @@
         pkgs.buildGoModule {
           pname = "speaches-plus-go";
           version = "0.0.1";
-          src = ./.;
-          modRoot = "go";
+          src = pkgs.lib.fileset.toSource {
+            root = ./go;
+            fileset = pkgs.lib.fileset.unions [
+              ./go/go.mod
+              ./go/go.sum
+              ./go/cmd
+              ./go/internal
+            ];
+          };
           vendorHash = "sha256-bqooFaAFeabBSL0Hgt+fPlAQPWdugA1Zy4iKVj+WX28=";
           subPackages = [ "cmd/server" ];
 
@@ -837,12 +868,15 @@
           withVulkan ? false,
           cudaPackages ? pkgs.cudaPackages_12,
           profile ? "full",
+          crate ? null,
         }:
         let
           inherit (pkgs) lib;
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
           modelsHub = if profile != null then mkSpeachesModelsHub system profile else null;
           profileEnv = if profile != null then mkProfileEnv system profile modelsHub else { };
+
+          cudaforgeThreadsBoundSoParallelNvccFitsInRam = "16";
 
           cutlass-44 = pkgs.fetchFromGitHub {
             owner = "NVIDIA";
@@ -910,8 +944,10 @@
             else
               base;
 
+          thirdParty = mkThirdParty pkgs;
+
           cargoVendorDir = craneLib.vendorCargoDeps {
-            src = ./rust;
+            src = rustSrc;
             overrideVendorCargoPackage =
               p: drv:
               if withCUDA && p.name == "ct2rs" then
@@ -926,19 +962,25 @@
           };
 
           commonArgs = {
-            pname = "speaches-plus";
+            pname = if crate == null then "speaches-plus" else crate;
             version = "0.0.1";
-            src = ./rust;
+            src = rustSrc;
+
+            postUnpack = ''
+              rm -rf $sourceRoot/third-party
+              cp -r --no-preserve=mode,ownership ${thirdParty} $sourceRoot/third-party
+            '';
 
             extraDummyScript = ''
               rm -rf $out/third-party
-              cp -r --no-preserve=mode,ownership ${./rust/third-party} $out/third-party
+              cp -r --no-preserve=mode,ownership ${thirdParty} $out/third-party
             '';
 
             inherit cargoVendorDir;
 
             cargoExtraArgs =
               "--locked"
+              + lib.optionalString (crate != null) " -p ${crate}"
               + lib.optionalString (features != [ ]) (" --features " + lib.concatStringsSep "," features);
 
             nativeBuildInputs =
@@ -967,7 +1009,7 @@
                 with cudaPackages;
                 [
                   cuda_cudart
-                  cuda_cccl
+                  cccl
                   cuda_nvrtc
                   libcublas
                   cudnn
@@ -990,6 +1032,8 @@
               BINDGEN_EXTRA_CLANG_ARGS = "-Wno-elaborated-enum-base";
             }
             // lib.optionalAttrs withCUDA {
+              CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16";
+              CUDAFORGE_THREADS = cudaforgeThreadsBoundSoParallelNvccFitsInRam;
               CUDA_PATH = "${cudaPackages.cudatoolkit}";
               CUDA_ARCH_LIST = lib.concatStringsSep ";" cudaCapabilities;
               CUDA_COMPUTE_CAP = builtins.replaceStrings [ "." ] [ "" ] (lib.last cudaCapabilities);
@@ -1052,22 +1096,51 @@
             doCheck = false;
 
             meta = with pkgs.lib; {
-              description = "speaches-plus realtime audio server (Rust)";
-              mainProgram = "speaches-plus";
+              description =
+                if crate == null then
+                  "speaches-plus realtime audio server (Rust)"
+                else
+                  "${crate} from the speaches-plus workspace";
+              mainProgram = if crate == null then "speaches-plus" else crate;
               license = licenses.mit;
               platforms = platforms.unix;
             };
           };
 
-          passthru = {
-            inherit profile modelsHub profileEnv;
+          cudaKernels = import ./nix/cuda-kernels.nix {
+            inherit pkgs craneLib commonArgs;
           };
+          applicationArgs = commonArgs // {
+            env =
+              commonArgs.env
+              // lib.optionalAttrs withCUDA {
+                NV_KERNELS_PREBUILT = "${cudaKernels}";
+              };
+          };
+          cargoArtifacts = craneLib.buildDepsOnly (
+            applicationArgs
+            // {
+              pname = "speaches-plus-workspace";
+              cargoExtraArgs =
+                "--locked --workspace"
+                + lib.optionalString (features != [ ]) (" --features " + lib.concatStringsSep "," features);
+              meta = { };
+            }
+          );
+          passthru = {
+            inherit
+              profile
+              modelsHub
+              profileEnv
+              cargoArtifacts
+              ;
+          }
+          // lib.optionalAttrs withCUDA { inherit cudaKernels; };
         in
         craneLib.buildPackage (
-          commonArgs
+          applicationArgs
           // {
-            inherit passthru;
-            cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+            inherit passthru cargoArtifacts;
           }
         );
 
@@ -1198,7 +1271,7 @@
         system:
         let
           pkgs3 = import nixpkgs-pyannote3 { inherit system; };
-          diarizenCkpt = (cpuPythonPackages.${system}).models.diarizen;
+          diarizenCkpt = cpuPythonPackages.${system}.models.diarizen;
           diarizenSrc = pkgs3.fetchFromGitHub {
             owner = "BUTSpeechFIT";
             repo = "DiariZen";
@@ -1249,6 +1322,82 @@
                 # rust/go backends (the ONNX sample axis is static).
                 python3 ${./rust/scripts/export-diarizen-onnx.py} --chunk-seconds 16 ${diarizenCkpt} "$out"
               '';
+        };
+
+      mkThirdParty =
+        pkgs:
+        let
+          inherit (pkgs) lib;
+          thirdParty =
+            let
+              forge = "https://git.decent.foundation";
+              crate =
+                {
+                  name,
+                  version,
+                  hash,
+                }:
+                let
+                  tarball = pkgs.fetchurl {
+                    urls = [
+                      "${forge}/api/packages/mirrors/generic/${name}/${version}/${name}-${version}.crate"
+                      "https://static.crates.io/crates/${name}/${name}-${version}.crate"
+                    ];
+                    inherit hash;
+                  };
+                  patch = ./rust/third-party/patches + "/${name}-${version}.patch";
+                in
+                ''
+                  tar -xzf ${tarball} -C $out
+                  patch -d $out/${name}-${version} -p1 < ${patch}
+                '';
+              mlx = pkgs.fetchzip {
+                urls = [
+                  "${forge}/mirrors/mlx/archive/1f8e74e3f12f31365464a6867c6579f0e9b29d85.tar.gz"
+                  "https://github.com/ml-explore/mlx/archive/1f8e74e3f12f31365464a6867c6579f0e9b29d85.tar.gz"
+                ];
+                hash = "sha256-pAQZ1RJq9Mb66qXMdZUt3znNKY+bhpxYckY708i0CmY=";
+              };
+              mlxDir = ./rust/third-party/mlx-steel-attn;
+              mlxFiles = map (l: lib.last (lib.splitString "  " l)) (
+                lib.filter (l: l != "") (lib.splitString "\n" (lib.fileContents (mlxDir + "/FILES")))
+              );
+            in
+            pkgs.runCommand "speaches-plus-third-party" { } ''
+              mkdir -p $out/mlx-steel-attn
+              ${crate {
+                name = "wgpu";
+                version = "30.0.0";
+                hash = "sha256-bY9L1E2S2lJw8DQJ26n5UtqyTxKOBdalVJJhAdG/kRQ=";
+              }}
+              ${crate {
+                name = "wgpu-hal";
+                version = "30.0.0";
+                hash = "sha256-z3ZRMtjV9Q4ZLniARkiQwT9OdFeq/o5UZugXRYbp8QE=";
+              }}
+              ${crate {
+                name = "candle-core";
+                version = "0.11.0";
+                hash = "sha256-XsskUJOw95G4nTQgw9+cbUnGCrY7pU24lr+KO69IZwY=";
+              }}
+              for f in ATTRIBUTION LICENSE FILES; do
+                cp ${mlxDir}/$f $out/mlx-steel-attn/$f
+              done
+              ${lib.concatMapStrings (f: ''
+                install -Dm644 ${mlx}/${f} $out/mlx-steel-attn/${f}
+              '') mlxFiles}
+            '';
+
+        in
+        thirdParty;
+
+      mkOcrWeb =
+        pkgs:
+        import ./nix/ocr-web.nix {
+          inherit pkgs;
+          craneLib = crane.mkLib pkgs;
+          src = rustSrc;
+          thirdParty = mkThirdParty pkgs;
         };
     in
     {
@@ -1329,7 +1478,7 @@
                 _ln ${pyModels.smartTurnV3}/smart-turn-v3.2-gpu.onnx      "$tree/smart-turn-v3.onnx"
                 _ln ${pyModels.diarizen}                                  "$tree/diarizen-large-s80-v2"
                 _ln ${pyModels.wespeaker}/voxceleb_resnet293_LM.onnx      "$tree/wespeaker-resnet293-LM.onnx"
-                ${nixpkgs.lib.optionalString pyPkgs.stdenv.isLinux ''_ln ${(mkDiarizenExporter system).onnx} "$tree/diarizen-segmentation.onnx"''}
+                ${nixpkgs.lib.optionalString pyPkgs.stdenv.hostPlatform.isLinux ''_ln ${(mkDiarizenExporter system).onnx} "$tree/diarizen-segmentation.onnx"''}
               done
               # Linux-only: ct2_bindings/_ct2.so + whisper_bindings/_whisper.so
               # don't have rpath baked in (setuptools doesn't auto-emit -Wl,-rpath
@@ -1338,7 +1487,7 @@
               # object file". On macOS this isn't needed -- dylibs encode their
               # absolute install_name and the loader finds them by id.
               ${
-                if pyPkgs.stdenv.isLinux then
+                if pyPkgs.stdenv.hostPlatform.isLinux then
                   ''
                     export LD_LIBRARY_PATH="${pyPkgs.ctranslate2}/lib:${pyPkgs.whisper-cpp}/lib:$LD_LIBRARY_PATH"
                   ''
@@ -1394,7 +1543,7 @@
                   pkgs.coreutils
                 ];
                 text = ''
-                  exec bash ${self}/rust/scripts/fetch-models.sh "$@"
+                  exec bash ${./rust/scripts/fetch-models.sh} "$@"
                 '';
               };
             in
@@ -1457,21 +1606,35 @@
         in
         {
           speaches-plus = mkPkg false "full";
+          nv-sae = mkSpeachesPlus {
+            inherit pkgs system;
+            withCUDA = false;
+            profile = null;
+            crate = "nv-sae";
+          };
+          nv-sae-cuda = mkSpeachesPlus {
+            inherit pkgs system;
+            withCUDA = true;
+            profile = null;
+            crate = "nv-sae";
+          };
+          ocr-web = mkOcrWeb pkgs;
           speaches-plus-go = mkSpeachesPlusGo {
             inherit pkgs;
             withCUDA = false;
           };
           default = mkPkg false "full";
 
-          speaches-plus-python = py.speaches-plus-python;
-          speaches-plus-python-pkg = py.speaches-plus-python-pkg;
-          hf-cache = py.hf-cache;
+          inherit (py) speaches-plus-python;
+          inherit (py) speaches-plus-python-pkg;
+          inherit (py) hf-cache;
         }
         // perProfile
         // hubs
         // nixpkgs.lib.optionalAttrs isLinux (
           {
             speaches-plus-cuda = mkPkg true "full";
+            nv-cuda-kernels = (mkPkg true null).cudaKernels;
 
             diarizen-onnx-exporter = diarizenExporter.env;
             diarizen-segmentation-onnx = diarizenExporter.onnx;

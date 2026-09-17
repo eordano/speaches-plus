@@ -623,8 +623,7 @@ mod tests {
         let s2 = decode_and_publish(&mut bm, 2, 2);
         assert_ne!(s2.block_table[0], s1.block_table[0]);
         assert_eq!(
-            bm.blocks[s1.block_table[0] as usize].hash,
-            bm.blocks[s2.block_table[0] as usize].hash,
+            bm.blocks[s1.block_table[0] as usize].hash, bm.blocks[s2.block_table[0] as usize].hash,
             "two sequences that decoded the same tokens publish the same prefix hash, which \
              only became possible once decode published anything at all"
         );

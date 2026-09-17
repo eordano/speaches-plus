@@ -167,7 +167,9 @@ pub(crate) async fn run_sampling_gemma4_moe(
     }
 
     if !generated_ids.is_empty() {
-        if let Ok(full) = crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids) {
+        if let Ok(full) =
+            crate::oapi::chat_engine::stream::decode_keeping_wire(&tokenizer, &generated_ids)
+        {
             let tail = emitter.finish(&full);
             if !tail.is_empty() {
                 let _ = tx.send(ChatEvent::TextDelta(tail)).await;

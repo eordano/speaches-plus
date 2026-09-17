@@ -78,8 +78,8 @@ mod tests {
         let src = gradient_rgb(6, 4);
         for fmt in [F::Png, F::WebP, F::Gif, F::Bmp, F::Tiff] {
             let bytes = encode(image::DynamicImage::ImageRgb8(src.clone()), fmt);
-            let got = decode_rgb8(&bytes)
-                .unwrap_or_else(|e| panic!("{fmt:?} must decode, got {e:#}"));
+            let got =
+                decode_rgb8(&bytes).unwrap_or_else(|e| panic!("{fmt:?} must decode, got {e:#}"));
             assert_eq!(got.dimensions(), (6, 4), "{fmt:?} changed dimensions");
             for (a, b) in got.pixels().zip(src.pixels()) {
                 for c in 0..3 {
@@ -106,10 +106,17 @@ mod tests {
         let r16 = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::from_fn(3, 3, |x, y| {
             image::Rgb([x as u16 * 20_000, y as u16 * 20_000, 65_535])
         });
-        let bytes = encode(image::DynamicImage::ImageRgb16(r16), image::ImageFormat::Png);
+        let bytes = encode(
+            image::DynamicImage::ImageRgb16(r16),
+            image::ImageFormat::Png,
+        );
         let got = decode_rgb8(&bytes).expect("RGB16 png");
         assert_eq!(got.dimensions(), (3, 3));
-        assert_eq!(got.get_pixel(0, 0)[2], 255, "16-bit full-scale blue must map to 255");
+        assert_eq!(
+            got.get_pixel(0, 0)[2],
+            255,
+            "16-bit full-scale blue must map to 255"
+        );
     }
 
     #[test]
@@ -121,7 +128,10 @@ mod tests {
                 image::Rgba([0, 0, 0, 128])
             }
         });
-        let bytes = encode(image::DynamicImage::ImageRgba8(rgba), image::ImageFormat::Png);
+        let bytes = encode(
+            image::DynamicImage::ImageRgba8(rgba),
+            image::ImageFormat::Png,
+        );
         let got = decode_rgb8(&bytes).expect("rgba png");
         assert_eq!(
             got.get_pixel(0, 0),
@@ -206,7 +216,10 @@ mod tests {
         let err = decode_rgb8(b"definitely not an image")
             .expect_err("junk must not decode")
             .to_string();
-        assert!(err.contains("supported: png, jpeg"), "unexpected error: {err}");
+        assert!(
+            err.contains("supported: png, jpeg"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

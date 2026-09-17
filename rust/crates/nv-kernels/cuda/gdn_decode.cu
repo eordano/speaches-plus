@@ -30,28 +30,33 @@ struct GdnGroupRecurrentStatePack {
     float* p[GDN_GROUP_LANE_POINTERS_TRAVEL_AS_A_BY_VALUE_KERNEL_PARAM_PACK_SO_A_CAPTURED_GRAPH_BAKES_THEM_EXACTLY_AS_IT_ALREADY_BAKES_THE_PER_LANE_LAUNCHES_THEY_REPLACE];
 };
 
+template<typename Weight>
 __global__ void gdn_conv_decode_silu_bf16_kernel(
     const __nv_bfloat16* __restrict__ x_new,
     __nv_bfloat16* __restrict__ conv_state,
-    const __nv_bfloat16* __restrict__ w,
+    const Weight* __restrict__ w,
+    const float* __restrict__ weight_scales,
     __nv_bfloat16* __restrict__ y,
     int C, int K
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    const __nv_bfloat16* w_row = w + (size_t)c * K;
+    const Weight* w_row = w + (size_t)c * K;
+    float scale = weight_scales ? weight_scales[c] : 1.f;
     __nv_bfloat16* s_row = conv_state + (size_t)c * (K - 1);
-    y[c] = gdn_conv_step_silu(s_row, x_new[c], w_row, K);
+    y[c] = gdn_conv_step_silu(s_row, x_new[c], w_row, K, scale);
     for (int i = 0; i < K - 2; ++i) {
         s_row[i] = s_row[i + 1];
     }
     s_row[K - 2] = x_new[c];
 }
 
+template<typename Weight>
 __global__ void gdn_conv_decode_silu_group_bf16_kernel(
     const __nv_bfloat16* __restrict__ x_new,
     GdnGroupConvStatePack conv_states,
-    const __nv_bfloat16* __restrict__ w,
+    const Weight* __restrict__ w,
+    const float* __restrict__ weight_scales,
     __nv_bfloat16* __restrict__ y,
     int C, int K, int x_lane_stride, int y_lane_stride
 ) {
@@ -60,19 +65,22 @@ __global__ void gdn_conv_decode_silu_group_bf16_kernel(
     int lane = blockIdx.y;
     const __nv_bfloat16* x_lane = x_new + (size_t)lane * x_lane_stride;
     __nv_bfloat16* y_lane = y + (size_t)lane * y_lane_stride;
-    const __nv_bfloat16* w_row = w + (size_t)c * K;
+    const Weight* w_row = w + (size_t)c * K;
+    float scale = weight_scales ? weight_scales[c] : 1.f;
     __nv_bfloat16* s_row = conv_states.p[lane] + (size_t)c * (K - 1);
-    y_lane[c] = gdn_conv_step_silu(s_row, x_lane[c], w_row, K);
+    y_lane[c] = gdn_conv_step_silu(s_row, x_lane[c], w_row, K, scale);
     for (int i = 0; i < K - 2; ++i) {
         s_row[i] = s_row[i + 1];
     }
     s_row[K - 2] = x_lane[c];
 }
 
+template<typename Weight>
 __global__ void gdn_conv_decode_chunk_silu_bf16_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
     const __nv_bfloat16* __restrict__ conv_state,
-    const __nv_bfloat16* __restrict__ w,
+    const Weight* __restrict__ w,
+    const float* __restrict__ weight_scales,
     __nv_bfloat16* __restrict__ y,
     __nv_bfloat16* __restrict__ ckpt_conv,
     int C, int K, int t
@@ -80,7 +88,8 @@ __global__ void gdn_conv_decode_chunk_silu_bf16_kernel(
     NVK_PDL_PROLOG();
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    const __nv_bfloat16* w_row = w + (size_t)c * K;
+    const Weight* w_row = w + (size_t)c * K;
+    float scale = weight_scales ? weight_scales[c] : 1.f;
     const __nv_bfloat16* s_row = conv_state + (size_t)c * (K - 1);
     __nv_bfloat16 win[GDN_CONV_MAX_K - 1];
     for (int i = 0; i < K - 1; ++i) {
@@ -88,7 +97,7 @@ __global__ void gdn_conv_decode_chunk_silu_bf16_kernel(
     }
     for (int i = 0; i < t; ++i) {
         __nv_bfloat16 xb = x_seq[(size_t)i * C + c];
-        y[(size_t)i * C + c] = gdn_conv_step_silu(win, xb, w_row, K);
+        y[(size_t)i * C + c] = gdn_conv_step_silu(win, xb, w_row, K, scale);
         for (int j = 0; j < K - 2; ++j) {
             win[j] = win[j + 1];
         }
@@ -101,10 +110,12 @@ __global__ void gdn_conv_decode_chunk_silu_bf16_kernel(
     NVK_PDL_EPILOG();
 }
 
+template<typename Weight>
 __global__ void gdn_conv_decode_chunk_silu_tree_bf16_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
     const __nv_bfloat16* __restrict__ conv_state,
-    const __nv_bfloat16* __restrict__ w,
+    const Weight* __restrict__ w,
+    const float* __restrict__ weight_scales,
     __nv_bfloat16* __restrict__ y,
     __nv_bfloat16* __restrict__ ckpt_conv,
     const int* __restrict__ parents,
@@ -112,7 +123,8 @@ __global__ void gdn_conv_decode_chunk_silu_tree_bf16_kernel(
 ) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    const __nv_bfloat16* w_row = w + (size_t)c * K;
+    const Weight* w_row = w + (size_t)c * K;
+    float scale = weight_scales ? weight_scales[c] : 1.f;
     __nv_bfloat16 win[GDN_CONV_MAX_K - 1];
     for (int i = 0; i < K - 1; ++i) {
         win[i] = conv_state[(size_t)c * (K - 1) + i];
@@ -129,7 +141,7 @@ __global__ void gdn_conv_decode_chunk_silu_tree_bf16_kernel(
             }
         }
         __nv_bfloat16 xb = x_seq[(size_t)i * C + c];
-        y[(size_t)i * C + c] = gdn_conv_step_silu(win, xb, w_row, K);
+        y[(size_t)i * C + c] = gdn_conv_step_silu(win, xb, w_row, K, scale);
         for (int j = 0; j < K - 2; ++j) {
             win[j] = win[j + 1];
         }
@@ -260,49 +272,6 @@ __device__ __forceinline__ void gdn_decode_token(
         qn, kn, red32, h, tid);
 }
 
-__global__ void gdn_decode_step_ab_fused_bf16_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const __nv_bfloat16* __restrict__ a_w,
-    const __nv_bfloat16* __restrict__ b_w,
-    const __nv_bfloat16* __restrict__ mixed,
-    const __nv_bfloat16* __restrict__ z,
-    const __nv_bfloat16* __restrict__ A_log,
-    const __nv_bfloat16* __restrict__ dt_bias,
-    const __nv_bfloat16* __restrict__ norm_w,
-    float* __restrict__ state,
-    __nv_bfloat16* __restrict__ out,
-    int hidden, int n_k, int n_v, int d_k, int d_v, float rms_eps
-) {
-    extern __shared__ float smem[];
-    float* qn = smem;
-    float* kn = smem + d_k;
-    float* red32 = smem + 2 * d_k;
-
-    int h = blockIdx.x;
-    int tid = threadIdx.x;
-
-    float sa = 0.f;
-    float sb = 0.f;
-    const __nv_bfloat16* a_row = a_w + (size_t)h * hidden;
-    const __nv_bfloat16* b_row = b_w + (size_t)h * hidden;
-    for (int i = tid; i < hidden; i += blockDim.x) {
-        float xv = __bfloat162float(x[i]);
-        sa += xv * __bfloat162float(a_row[i]);
-        sb += xv * __bfloat162float(b_row[i]);
-    }
-    float a_tot = gdn_block_sum(sa, red32);
-    float b_tot = gdn_block_sum(sb, red32);
-    float a_h = __bfloat162float(__float2bfloat16(a_tot));
-    float b_h = __bfloat162float(__float2bfloat16(b_tot));
-
-    float* s_head = state + (size_t)h * d_k * d_v;
-    gdn_decode_token_ab_scalars(
-        mixed, z, a_h, b_h,
-        A_log, dt_bias, norm_w,
-        s_head, out,
-        n_k, n_v, d_k, d_v, rms_eps,
-        qn, kn, red32, h, tid);
-}
 
 __global__ void gdn_decode_step_bf16_kernel(
     const __nv_bfloat16* __restrict__ mixed,
@@ -558,6 +527,7 @@ __global__ void gdn_decode_split_step_lanecol_kernel(
     }
 }
 
+
 template <int K_DIM, int V_DIM, int COLS, int SUBS>
 __global__ void gdn_decode_split_step_group_lanecol_kernel(
     const float* __restrict__ qn,
@@ -752,6 +722,187 @@ __global__ void gdn_decode_split_step_group_lanecol_vec4_kernel(
     for (int j = 0; j < KPS; ++j) {
         *reinterpret_cast<float4*>(
             g_state + (size_t)(sub * KPS + j) * V_DIM + v_glob) = st[j];
+    }
+}
+
+__device__ inline float gdn_block_sum_lo128_in_a_256_thread_block_matches_gdn_block_sum_at_blockdim_128_bit_for_bit(
+    float v, float* red32
+) {
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0 && warp < 4) red32[warp] = v;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float x = (threadIdx.x < 4) ? red32[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) {
+            x += __shfl_down_sync(0xffffffffu, x, off);
+        }
+        if (threadIdx.x == 0) red32[0] = x;
+    }
+    __syncthreads();
+    float total = red32[0];
+    __syncthreads();
+    return total;
+}
+
+__global__ void gdn_decode_step_one_launch_bf16_kernel(
+    const __nv_bfloat16* __restrict__ mixed,
+    const __nv_bfloat16* __restrict__ z,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ A_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    const __nv_bfloat16* __restrict__ norm_w,
+    float* __restrict__ state,
+    __nv_bfloat16* __restrict__ out,
+    int n_k, int n_v, float rms_eps
+) {
+    constexpr int K_DIM = 128;
+    constexpr int V_DIM = 128;
+    constexpr int COLS = 128;
+    constexpr int SUBS = 8;
+    constexpr int KPS = K_DIM / SUBS;
+    constexpr int COLT = COLS / 4;
+    __shared__ float qn_s[K_DIM];
+    __shared__ float kn_s[K_DIM];
+    __shared__ float red[COLS * SUBS];
+    __shared__ float red32[32];
+    __shared__ float core_s[V_DIM];
+    __shared__ float ge_s;
+    __shared__ float bt_s;
+
+    int h = blockIdx.x;
+    int tid = threadIdx.x;
+    int v_per_k = n_v / n_k;
+    int kh = h / v_per_k;
+    int key_dim = n_k * K_DIM;
+
+    float qv = 0.f;
+    float kv_in = 0.f;
+    float sq = 0.f;
+    float sk = 0.f;
+    if (tid < K_DIM) {
+        qv = __bfloat162float(mixed[(size_t)kh * K_DIM + tid]);
+        kv_in = __bfloat162float(mixed[(size_t)key_dim + kh * K_DIM + tid]);
+        sq = qv * qv;
+        sk = kv_in * kv_in;
+    }
+    __syncthreads();
+    float sq_tot = gdn_block_sum_lo128_in_a_256_thread_block_matches_gdn_block_sum_at_blockdim_128_bit_for_bit(sq, red32);
+    float sk_tot = gdn_block_sum_lo128_in_a_256_thread_block_matches_gdn_block_sum_at_blockdim_128_bit_for_bit(sk, red32);
+    float q_mul = (1.f / sqrtf(sq_tot + 1e-6f)) * (1.f / sqrtf((float)K_DIM));
+    float k_mul = 1.f / sqrtf(sk_tot + 1e-6f);
+    if (tid < K_DIM) {
+        qn_s[tid] = qv * q_mul;
+        kn_s[tid] = kv_in * k_mul;
+    }
+    if (tid == 0) {
+        float a_v = __bfloat162float(a[h]) + __bfloat162float(dt_bias[h]);
+        float sp = gdn_softplus_safe(a_v);
+        float g = -__expf(__bfloat162float(A_log[h])) * sp;
+        ge_s = expf(g);
+        bt_s = __bfloat162float(__float2bfloat16(
+            1.f / (1.f + expf(-__bfloat162float(b[h])))));
+    }
+    __syncthreads();
+
+    int col = (tid % COLT) * 4;
+    int sub = tid / COLT;
+    float* g_state = state + (size_t)h * K_DIM * V_DIM;
+    float4 st[KPS];
+#pragma unroll
+    for (int j = 0; j < KPS; ++j) {
+        st[j] = *reinterpret_cast<const float4*>(
+            g_state + (size_t)(sub * KPS + j) * V_DIM + col);
+    }
+    float ge = ge_s;
+    float bt = bt_s;
+    const __nv_bfloat16* v_row = mixed + (size_t)2 * key_dim + (size_t)h * V_DIM + col;
+
+    float kv[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int j = 0; j < KPS; ++j) {
+        float kj = kn_s[sub * KPS + j];
+        st[j].x *= ge;
+        st[j].y *= ge;
+        st[j].z *= ge;
+        st[j].w *= ge;
+        kv[0] += st[j].x * kj;
+        kv[1] += st[j].y * kj;
+        kv[2] += st[j].z * kj;
+        kv[3] += st[j].w * kj;
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) red[sub * COLS + col + i] = kv[i];
+    __syncthreads();
+#pragma unroll
+    for (int off = SUBS / 2; off > 0; off >>= 1) {
+        if (sub < off) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                red[sub * COLS + col + i] += red[(sub + off) * COLS + col + i];
+            }
+        }
+        __syncthreads();
+    }
+    float delta[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        delta[i] = (__bfloat162float(v_row[i]) - red[col + i]) * bt;
+    }
+    __syncthreads();
+    float ov[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+    for (int j = 0; j < KPS; ++j) {
+        float kj = kn_s[sub * KPS + j];
+        float qj = qn_s[sub * KPS + j];
+        st[j].x += kj * delta[0];
+        st[j].y += kj * delta[1];
+        st[j].z += kj * delta[2];
+        st[j].w += kj * delta[3];
+        ov[0] += st[j].x * qj;
+        ov[1] += st[j].y * qj;
+        ov[2] += st[j].z * qj;
+        ov[3] += st[j].w * qj;
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) red[sub * COLS + col + i] = ov[i];
+    __syncthreads();
+#pragma unroll
+    for (int off = SUBS / 2; off > 0; off >>= 1) {
+        if (sub < off) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                red[sub * COLS + col + i] += red[(sub + off) * COLS + col + i];
+            }
+        }
+        __syncthreads();
+    }
+    if (sub == 0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            core_s[col + i] = __bfloat162float(__float2bfloat16(red[col + i]));
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < KPS; ++j) {
+        *reinterpret_cast<float4*>(
+            g_state + (size_t)(sub * KPS + j) * V_DIM + col) = st[j];
+    }
+    __syncthreads();
+
+    float c = (tid < V_DIM) ? core_s[tid] : 0.f;
+    float var = gdn_block_sum_lo128_in_a_256_thread_block_matches_gdn_block_sum_at_blockdim_128_bit_for_bit(c * c, red32) / (float)V_DIM;
+    float denom = sqrtf(var + rms_eps);
+    if (tid < V_DIM) {
+        float normed = __bfloat162float(__float2bfloat16(
+            c / denom * __bfloat162float(norm_w[tid])));
+        float zv = __bfloat162float(z[(size_t)h * V_DIM + tid]);
+        float gate = __bfloat162float(__float2bfloat16(zv / (1.f + expf(-zv))));
+        out[(size_t)h * V_DIM + tid] = __float2bfloat16(normed * gate);
     }
 }
 
@@ -1200,11 +1351,13 @@ extern "C" int nv_kernels_gdn_decode_chunk_split_tree_bf16(
     return (int)cudaGetLastError();
 }
 
-extern "C" int nv_kernels_gdn_conv_decode_chunk_silu_tree_bf16(
+template<typename Weight>
+static int launch_gdn_conv_decode_chunk_silu_tree(
     void* stream,
     const uint16_t* x_seq,
     const uint16_t* conv_state,
-    const uint16_t* w,
+    const Weight* w,
+    const float* weight_scales,
     uint16_t* y,
     uint16_t* ckpt_conv,
     const int* parents,
@@ -1218,16 +1371,78 @@ extern "C" int nv_kernels_gdn_conv_decode_chunk_silu_tree_bf16(
     if (parents == nullptr) return -2;
     if (conv_dim <= 0) return 0;
     constexpr int BLOCK = 256;
-    int grid = (conv_dim + BLOCK - 1) / BLOCK;
-    gdn_conv_decode_chunk_silu_tree_bf16_kernel<<<grid, BLOCK, 0, s>>>(
+    int grid = 1 + (conv_dim - 1) / BLOCK;
+    gdn_conv_decode_chunk_silu_tree_bf16_kernel<Weight><<<grid, BLOCK, 0, s>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_seq),
         reinterpret_cast<const __nv_bfloat16*>(conv_state),
-        reinterpret_cast<const __nv_bfloat16*>(w),
+        w, weight_scales,
         reinterpret_cast<__nv_bfloat16*>(y),
         reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
         parents,
         conv_dim, k, t);
     return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_gdn_conv_decode_chunk_silu_tree_bf16(
+    void* stream,
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const uint16_t* w,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    const int* parents,
+    int conv_dim,
+    int k,
+    int t
+) {
+    return launch_gdn_conv_decode_chunk_silu_tree(stream, x_seq, conv_state, reinterpret_cast<const __nv_bfloat16*>(w), nullptr, y, ckpt_conv, parents, conv_dim, k, t);
+}
+
+extern "C" int nv_kernels_gdn_conv_decode_chunk_silu_tree_fp8_weights(
+    void* stream,
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const uint8_t* w,
+    const float* weight_scales,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    const int* parents,
+    int conv_dim,
+    int k,
+    int t
+) {
+    if (conv_dim <= 0) return 0;
+    if (k < 2 || k > GDN_CONV_MAX_K) return -2;
+    if (!stream || !x_seq || !conv_state || !w || !weight_scales || !y || !ckpt_conv || !parents) return -3;
+    return launch_gdn_conv_decode_chunk_silu_tree(stream, x_seq, conv_state, w, weight_scales, y, ckpt_conv, parents, conv_dim, k, t);
+}
+
+static int gdn_single_lane_vec4_arm_unset_until_env_or_setter_is_read = -1;
+static int gdn_single_lane_one_launch_unset_until_env_or_setter_is_read = -1;
+
+static int gdn_single_lane_vec4_arm_opt_in_env_only_because_the_2026_09_02_arm3_default_signoff_covered_the_group_launcher_not_this_one() {
+    if (gdn_single_lane_vec4_arm_unset_until_env_or_setter_is_read < 0) {
+        const char* e = getenv("NV_Q38_GDN_STEP_VEC4");
+        int v = e ? atoi(e) : 0;
+        gdn_single_lane_vec4_arm_unset_until_env_or_setter_is_read =
+            (v >= 1 && v <= 3) ? v : 0;
+    }
+    return gdn_single_lane_vec4_arm_unset_until_env_or_setter_is_read;
+}
+
+static int gdn_single_lane_one_launch_opt_in_env_nv_q38_gdn_step_one_1_replaces_prep_state_gate_with_one_kernel() {
+    if (gdn_single_lane_one_launch_unset_until_env_or_setter_is_read < 0) {
+        const char* e = getenv("NV_Q38_GDN_STEP_ONE");
+        gdn_single_lane_one_launch_unset_until_env_or_setter_is_read =
+            (e && atoi(e) == 1) ? 1 : 0;
+    }
+    return gdn_single_lane_one_launch_unset_until_env_or_setter_is_read;
+}
+
+extern "C" int nv_kernels_gdn_decode_step_single_lane_arms_set(int vec4_arm, int one_launch) {
+    gdn_single_lane_vec4_arm_unset_until_env_or_setter_is_read = vec4_arm;
+    gdn_single_lane_one_launch_unset_until_env_or_setter_is_read = one_launch;
+    return 0;
 }
 
 extern "C" int nv_kernels_gdn_decode_step_split_bf16(
@@ -1258,6 +1473,21 @@ extern "C" int nv_kernels_gdn_decode_step_split_bf16(
     if (d_k != d_v) return -1;
     if (d_k != 128 && d_k != 32) return -1;
     if (n_v / n_k > d_k) return -1;
+    if (d_k == 128
+        && gdn_single_lane_one_launch_opt_in_env_nv_q38_gdn_step_one_1_replaces_prep_state_gate_with_one_kernel() == 1) {
+        gdn_decode_step_one_launch_bf16_kernel<<<n_v, 256, 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(mixed),
+            reinterpret_cast<const __nv_bfloat16*>(z),
+            reinterpret_cast<const __nv_bfloat16*>(a),
+            reinterpret_cast<const __nv_bfloat16*>(b),
+            reinterpret_cast<const __nv_bfloat16*>(A_log),
+            reinterpret_cast<const __nv_bfloat16*>(dt_bias),
+            reinterpret_cast<const __nv_bfloat16*>(norm_w),
+            state,
+            reinterpret_cast<__nv_bfloat16*>(out),
+            n_k, n_v, rms_eps);
+        return (int)cudaGetLastError();
+    }
     size_t red_smem = 32 * sizeof(float);
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(pdl_cfg_40742, dim3((unsigned)n_k, 1u), d_k, red_smem, s);
@@ -1281,7 +1511,39 @@ extern "C" int nv_kernels_gdn_decode_step_split_bf16(
     }
     static const bool lanecol_off_env_nv_q38_gdn_step_v1 =
         getenv("NV_Q38_GDN_STEP_V1") != nullptr;
-    if (d_k == 128 && !lanecol_off_env_nv_q38_gdn_step_v1) {
+    int single_lane_vec4_arm =
+        gdn_single_lane_vec4_arm_opt_in_env_only_because_the_2026_09_02_arm3_default_signoff_covered_the_group_launcher_not_this_one();
+    if (d_k == 128 && single_lane_vec4_arm >= 1 && single_lane_vec4_arm <= 3) {
+        GdnGroupRecurrentStatePack pack;
+        for (int i = 0; i < GDN_GROUP_LANE_POINTERS_TRAVEL_AS_A_BY_VALUE_KERNEL_PARAM_PACK_SO_A_CAPTURED_GRAPH_BAKES_THEM_EXACTLY_AS_IT_ALREADY_BAKES_THE_PER_LANE_LAUNCHES_THEY_REPLACE; ++i) {
+            pack.p[i] = state;
+        }
+        if (single_lane_vec4_arm == 1) {
+            gdn_decode_split_step_group_lanecol_vec4_kernel<128, 128, 32, 8>
+                <<<dim3((unsigned)(n_v * (128 / 32)), 1u), 64, 0, s>>>(
+                    qn_scratch, kn_scratch,
+                    reinterpret_cast<const __nv_bfloat16*>(mixed),
+                    g_exp_scratch, beta_scratch, pack,
+                    reinterpret_cast<__nv_bfloat16*>(core_scratch),
+                    n_k, n_v);
+        } else if (single_lane_vec4_arm == 2) {
+            gdn_decode_split_step_group_lanecol_vec4_kernel<128, 128, 64, 8>
+                <<<dim3((unsigned)(n_v * (128 / 64)), 1u), 128, 0, s>>>(
+                    qn_scratch, kn_scratch,
+                    reinterpret_cast<const __nv_bfloat16*>(mixed),
+                    g_exp_scratch, beta_scratch, pack,
+                    reinterpret_cast<__nv_bfloat16*>(core_scratch),
+                    n_k, n_v);
+        } else {
+            gdn_decode_split_step_group_lanecol_vec4_kernel<128, 128, 128, 8>
+                <<<dim3((unsigned)n_v, 1u), 256, 0, s>>>(
+                    qn_scratch, kn_scratch,
+                    reinterpret_cast<const __nv_bfloat16*>(mixed),
+                    g_exp_scratch, beta_scratch, pack,
+                    reinterpret_cast<__nv_bfloat16*>(core_scratch),
+                    n_k, n_v);
+        }
+    } else if (d_k == 128 && !lanecol_off_env_nv_q38_gdn_step_v1) {
         gdn_decode_split_step_lanecol_kernel<128, 128, 32, 8>
             <<<n_v * (128 / 32), 256, 0, s>>>(
                 qn_scratch, kn_scratch,
@@ -1325,6 +1587,32 @@ extern "C" int nv_kernels_gdn_decode_step_split_bf16(
     return (int)cudaGetLastError();
 }
 
+
+template<typename Weight>
+static int launch_gdn_conv_decode_silu(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* conv_state,
+    const Weight* w,
+    const float* weight_scales,
+    uint16_t* y,
+    int conv_dim,
+    int k
+) {
+    cudaStream_t s = (cudaStream_t)stream;
+    if (conv_dim <= 0) return 0;
+    if (k < 2) return -2;
+    constexpr int BLOCK = 256;
+    int grid = 1 + (conv_dim - 1) / BLOCK;
+    gdn_conv_decode_silu_bf16_kernel<Weight><<<grid, BLOCK, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_new),
+        reinterpret_cast<__nv_bfloat16*>(conv_state),
+        w, weight_scales,
+        reinterpret_cast<__nv_bfloat16*>(y),
+        conv_dim, k);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int nv_kernels_gdn_conv_decode_silu_bf16(
     void* stream,
     const uint16_t* x_new,
@@ -1334,26 +1622,35 @@ extern "C" int nv_kernels_gdn_conv_decode_silu_bf16(
     int conv_dim,
     int k
 ) {
-    cudaStream_t s = (cudaStream_t)stream;
+    return launch_gdn_conv_decode_silu(stream, x_new, conv_state, reinterpret_cast<const __nv_bfloat16*>(w), nullptr, y, conv_dim, k);
+}
+
+extern "C" int nv_kernels_gdn_conv_decode_silu_fp8_weights(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* conv_state,
+    const uint8_t* w,
+    const float* weight_scales,
+    uint16_t* y,
+    int conv_dim,
+    int k
+) {
     if (conv_dim <= 0) return 0;
-    if (k < 2) return -2;
-    constexpr int BLOCK = 256;
-    int grid = (conv_dim + BLOCK - 1) / BLOCK;
-    gdn_conv_decode_silu_bf16_kernel<<<grid, BLOCK, 0, s>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_new),
-        reinterpret_cast<__nv_bfloat16*>(conv_state),
-        reinterpret_cast<const __nv_bfloat16*>(w),
-        reinterpret_cast<__nv_bfloat16*>(y),
-        conv_dim, k);
-    return (int)cudaGetLastError();
+    if (k < 2 || k > GDN_CONV_MAX_K) return -2;
+    if (!stream || !x_new || !conv_state || !w || !weight_scales || !y) return -3;
+    return launch_gdn_conv_decode_silu(stream, x_new, conv_state, w, weight_scales, y, conv_dim, k);
 }
 
 static int gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read = -1;
 
-static int gdn_group_step_vec4_arm_is_opt_in_and_zero_stays_the_shipped_lanecol_map() {
+static const int GDN_STEP_VEC4_ARM_3_IS_THE_BIT_EXACT_DEFAULT_SIGNED_OFF_2026_09_02_ENV_0_RESTORES_THE_PRE_FLIP_LANECOL_MAP = 3;
+
+static int gdn_group_step_vec4_arm_defaults_to_3_signed_off_2026_09_02_and_zero_restores_the_shipped_lanecol_map() {
     if (gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read < 0) {
         const char* e = getenv("NV_Q38_GDN_STEP_VEC4");
-        gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read = e ? atoi(e) : 0;
+        gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read =
+            e ? atoi(e)
+              : GDN_STEP_VEC4_ARM_3_IS_THE_BIT_EXACT_DEFAULT_SIGNED_OFF_2026_09_02_ENV_0_RESTORES_THE_PRE_FLIP_LANECOL_MAP;
     }
     return gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read;
 }
@@ -1424,7 +1721,7 @@ extern "C" int nv_kernels_gdn_decode_step_split_group_bf16(
         qn_scratch, kn_scratch, g_exp_scratch, beta_scratch,
         n_k, n_v, d_k, d_v, ab_lane_stride);
     }
-    int vec4_arm = gdn_group_step_vec4_arm_is_opt_in_and_zero_stays_the_shipped_lanecol_map();
+    int vec4_arm = gdn_group_step_vec4_arm_defaults_to_3_signed_off_2026_09_02_and_zero_restores_the_shipped_lanecol_map();
     dim3 lanes_dim = dim3(0u, (unsigned)lanes);
     if (vec4_arm == 1) {
         lanes_dim.x = (unsigned)(n_v * (128 / 32));
@@ -1482,11 +1779,13 @@ extern "C" int nv_kernels_gdn_decode_step_split_group_bf16(
     return (int)cudaGetLastError();
 }
 
-extern "C" int nv_kernels_gdn_conv_decode_silu_group_bf16(
+template<typename Weight>
+static int launch_gdn_conv_decode_silu_group(
     void* stream,
     const uint16_t* x_new,
     uint16_t* const* conv_states,
-    const uint16_t* w,
+    const Weight* w,
+    const float* weight_scales,
     uint16_t* y,
     int conv_dim,
     int k,
@@ -1509,14 +1808,48 @@ extern "C" int nv_kernels_gdn_conv_decode_silu_group_bf16(
         pack.p[i] = pack.p[0];
     }
     constexpr int BLOCK = 256;
-    int grid = (conv_dim + BLOCK - 1) / BLOCK;
-    gdn_conv_decode_silu_group_bf16_kernel<<<dim3((unsigned)grid, (unsigned)lanes), BLOCK, 0, s>>>(
+    int grid = 1 + (conv_dim - 1) / BLOCK;
+    gdn_conv_decode_silu_group_bf16_kernel<Weight><<<dim3((unsigned)grid, (unsigned)lanes), BLOCK, 0, s>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_new),
         pack,
-        reinterpret_cast<const __nv_bfloat16*>(w),
+        w, weight_scales,
         reinterpret_cast<__nv_bfloat16*>(y),
         conv_dim, k, x_lane_stride, y_lane_stride);
     return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_gdn_conv_decode_silu_group_bf16(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* const* conv_states,
+    const uint16_t* w,
+    uint16_t* y,
+    int conv_dim,
+    int k,
+    int lanes,
+    int x_lane_stride,
+    int y_lane_stride
+) {
+    return launch_gdn_conv_decode_silu_group(stream, x_new, conv_states, reinterpret_cast<const __nv_bfloat16*>(w), nullptr, y, conv_dim, k, lanes, x_lane_stride, y_lane_stride);
+}
+
+extern "C" int nv_kernels_gdn_conv_decode_silu_group_fp8_weights(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* const* conv_states,
+    const uint8_t* w,
+    const float* weight_scales,
+    uint16_t* y,
+    int conv_dim,
+    int k,
+    int lanes,
+    int x_lane_stride,
+    int y_lane_stride
+) {
+    if (conv_dim <= 0 || lanes <= 0) return 0;
+    if (k < 2 || k > GDN_CONV_MAX_K) return -2;
+    if (!stream || !x_new || !conv_states || !w || !weight_scales || !y) return -3;
+    return launch_gdn_conv_decode_silu_group(stream, x_new, conv_states, w, weight_scales, y, conv_dim, k, lanes, x_lane_stride, y_lane_stride);
 }
 
 extern "C" int nv_kernels_gdn_decode_step_group_bf16(
@@ -1623,50 +1956,44 @@ extern "C" int nv_kernels_gdn_decode_step_bf16(
     return (int)cudaGetLastError();
 }
 
-extern "C" int nv_kernels_gdn_decode_step_ab_fused_bf16(
+
+template<typename Weight>
+static int launch_gdn_conv_decode_chunk_silu(
     void* stream,
-    const uint16_t* x,
-    const uint16_t* a_w,
-    const uint16_t* b_w,
-    const uint16_t* mixed,
-    const uint16_t* z,
-    const uint16_t* A_log,
-    const uint16_t* dt_bias,
-    const uint16_t* norm_w,
-    float* state,
-    uint16_t* out,
-    int hidden,
-    int n_k,
-    int n_v,
-    int d_k,
-    int d_v,
-    float rms_eps
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const Weight* w,
+    const float* weight_scales,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    int conv_dim,
+    int k,
+    int t
 ) {
     cudaStream_t s = (cudaStream_t)stream;
-    if (n_v <= 0) return 0;
-    if (hidden <= 0 || n_k <= 0 || d_k <= 0 || d_v <= 0) return -2;
-    if (n_v % n_k != 0) return -2;
-    if (d_v % 32 != 0 || d_v > 1024) return -2;
-    size_t smem = (size_t)(2 * d_k + 32) * sizeof(float);
-    if (smem > 96 * 1024) return -2;
-    static DynamicSmemOptin optin_gdn_decode_step_ab_fused_bf16_kernel;
-    int orc_gdn_decode_step_ab_fused_bf16_kernel = raise_dynamic_smem_optin_never_lowering_it(
-        optin_gdn_decode_step_ab_fused_bf16_kernel,
-        (const void*)gdn_decode_step_ab_fused_bf16_kernel, smem);
-    if (orc_gdn_decode_step_ab_fused_bf16_kernel != 0)
-        return orc_gdn_decode_step_ab_fused_bf16_kernel;
-    gdn_decode_step_ab_fused_bf16_kernel<<<n_v, d_v, smem, s>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x),
-        reinterpret_cast<const __nv_bfloat16*>(a_w),
-        reinterpret_cast<const __nv_bfloat16*>(b_w),
-        reinterpret_cast<const __nv_bfloat16*>(mixed),
-        reinterpret_cast<const __nv_bfloat16*>(z),
-        reinterpret_cast<const __nv_bfloat16*>(A_log),
-        reinterpret_cast<const __nv_bfloat16*>(dt_bias),
-        reinterpret_cast<const __nv_bfloat16*>(norm_w),
-        state,
-        reinterpret_cast<__nv_bfloat16*>(out),
-        hidden, n_k, n_v, d_k, d_v, rms_eps);
+    if (k < 2 || k > GDN_CONV_MAX_K) return -2;
+    if (t < 1 || t > GDN_CHUNK_T_MAX) return -2;
+    if (conv_dim <= 0) return 0;
+    constexpr int BLOCK = 256;
+    int grid = 1 + (conv_dim - 1) / BLOCK;
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(pdl_cfg_56260, grid, BLOCK, 0, s);
+        cudaLaunchKernelEx(&pdl_cfg_56260, gdn_conv_decode_chunk_silu_bf16_kernel<Weight>,
+            reinterpret_cast<const __nv_bfloat16*>(x_seq),
+        reinterpret_cast<const __nv_bfloat16*>(conv_state),
+        w, weight_scales,
+        reinterpret_cast<__nv_bfloat16*>(y),
+        reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
+        conv_dim, k, t);
+    } else {
+        gdn_conv_decode_chunk_silu_bf16_kernel<Weight><<<grid, BLOCK, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_seq),
+        reinterpret_cast<const __nv_bfloat16*>(conv_state),
+        w, weight_scales,
+        reinterpret_cast<__nv_bfloat16*>(y),
+        reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
+        conv_dim, k, t);
+    }
     return (int)cudaGetLastError();
 }
 
@@ -1681,31 +2008,25 @@ extern "C" int nv_kernels_gdn_conv_decode_chunk_silu_bf16(
     int k,
     int t
 ) {
-    cudaStream_t s = (cudaStream_t)stream;
-    if (k < 2 || k > GDN_CONV_MAX_K) return -2;
-    if (t < 1 || t > GDN_CHUNK_T_MAX) return -2;
+    return launch_gdn_conv_decode_chunk_silu(stream, x_seq, conv_state, reinterpret_cast<const __nv_bfloat16*>(w), nullptr, y, ckpt_conv, conv_dim, k, t);
+}
+
+extern "C" int nv_kernels_gdn_conv_decode_chunk_silu_fp8_weights(
+    void* stream,
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const uint8_t* w,
+    const float* weight_scales,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    int conv_dim,
+    int k,
+    int t
+) {
     if (conv_dim <= 0) return 0;
-    constexpr int BLOCK = 256;
-    int grid = (conv_dim + BLOCK - 1) / BLOCK;
-    if (nvk_pdl_enabled()) {
-        NVK_PDL_ATTR(pdl_cfg_56260, grid, BLOCK, 0, s);
-        cudaLaunchKernelEx(&pdl_cfg_56260, gdn_conv_decode_chunk_silu_bf16_kernel,
-            reinterpret_cast<const __nv_bfloat16*>(x_seq),
-        reinterpret_cast<const __nv_bfloat16*>(conv_state),
-        reinterpret_cast<const __nv_bfloat16*>(w),
-        reinterpret_cast<__nv_bfloat16*>(y),
-        reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
-        conv_dim, k, t);
-    } else {
-        gdn_conv_decode_chunk_silu_bf16_kernel<<<grid, BLOCK, 0, s>>>(
-        reinterpret_cast<const __nv_bfloat16*>(x_seq),
-        reinterpret_cast<const __nv_bfloat16*>(conv_state),
-        reinterpret_cast<const __nv_bfloat16*>(w),
-        reinterpret_cast<__nv_bfloat16*>(y),
-        reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
-        conv_dim, k, t);
-    }
-    return (int)cudaGetLastError();
+    if (k < 2 || k > GDN_CONV_MAX_K) return -2;
+    if (!stream || !x_seq || !conv_state || !w || !weight_scales || !y || !ckpt_conv) return -3;
+    return launch_gdn_conv_decode_chunk_silu(stream, x_seq, conv_state, w, weight_scales, y, ckpt_conv, conv_dim, k, t);
 }
 
 extern "C" int nv_kernels_gdn_decode_chunk_bf16(

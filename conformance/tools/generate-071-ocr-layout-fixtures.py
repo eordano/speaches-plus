@@ -1,7 +1,8 @@
 import os
 from PIL import Image, ImageDraw, ImageFont
+from fontfind import font_file
 
-FONTS = os.environ.get("FONTS", "/usr/share/fonts/truetype/dejavu")
+FONTS = os.environ.get("FONTS") or os.path.dirname(font_file("DejaVuSans.ttf"))
 OUT = os.environ.get("OUT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rendered"))
 
 def F(name, size):

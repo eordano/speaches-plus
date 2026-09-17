@@ -277,7 +277,7 @@ pub fn vision_rope_rows_raster_order_matching_hf_rot_pos_emb(
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
     anyhow::ensure!(
-        head_dim % 4 == 0,
+        head_dim.is_multiple_of(4),
         "vision rope splits head_dim {head_dim} into row/col quarters; it must divide by 4"
     );
     let half = head_dim / 2;
@@ -961,7 +961,10 @@ mod tests {
             vec![0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15]
         );
         let row_major: Vec<u32> = (0..(gh * gw) as u32).collect();
-        assert_ne!(idx, row_major, "2x2 grouping must reorder the row-major strip");
+        assert_ne!(
+            idx, row_major,
+            "2x2 grouping must reorder the row-major strip"
+        );
     }
 
     #[test]
@@ -976,8 +979,7 @@ mod tests {
                 ((r >> 33) as f32) / (1u64 << 31) as f32 - 1.0
             })
             .collect();
-        t.pos_embed =
-            Tensor::from_vec(vals, (64, cfg.hidden_size), &Device::Cpu).unwrap();
+        t.pos_embed = Tensor::from_vec(vals, (64, cfg.hidden_size), &Device::Cpu).unwrap();
         let side = 8;
         let interp = t.interpolated_pos_embed(side, side).unwrap();
         let a: Vec<f32> = interp.flatten_all().unwrap().to_vec1().unwrap();

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use nv_tts::{
     CodecDecoderConfig, Qwen3TtsCodecDecoder, Qwen3TtsTalker, Qwen3TtsTalkerConfig,
     Qwen3TtsTokenizer,
@@ -11,10 +11,11 @@ use nv_weights::WeightLoader;
 
 const SECONDS_PER_FRAME: f64 = 1920.0 / 24_000.0;
 
-fn sync(device: &Device) {
+fn sync(device: &Device) -> Result<()> {
     if let Device::Cuda(_) = device {
-        let _ = device.synchronize();
+        device.synchronize()?;
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -37,7 +38,7 @@ fn main() -> Result<()> {
     eprintln!("device: {dev_arg}, mode: {mode}, max_n: {max_n}");
 
     let t0 = Instant::now();
-    let weights = WeightLoader::open_file(&dir.join("model.safetensors"), &device)?;
+    let weights = WeightLoader::open_file(dir.join("model.safetensors"), &device)?;
     let mut talker_cfg = Qwen3TtsTalkerConfig::from_hf_config_file(&dir.join("config.json"))?;
     if args.get(5).map(|s| s.as_str()) == Some("f32") {
         talker_cfg.dtype = DType::F32;
@@ -65,7 +66,7 @@ fn main() -> Result<()> {
         .collect();
 
     if mode == "both" || mode == "uncached" {
-        eprintln!("== uncached step_full_frame_with_speaker: per-step wall time vs context ==");
+        eprintln!("== uncached talker + uncached code predictor: per-step wall time vs context ==");
         for &n in &checkpoints {
             let prev: Vec<u32> = (0..n).map(fake_tok).collect();
             let reps = if n >= 2048 { 1 } else { 2 };
@@ -74,13 +75,13 @@ fn main() -> Result<()> {
                 let t = Instant::now();
                 let (base, _extras) =
                     talker.step_full_frame_with_speaker(&text_hidden, None, &prev, &cp, &[])?;
-                sync(&device);
+                sync(&device)?;
                 total += t.elapsed().as_secs_f64();
                 let _ = base;
             }
             let per = total / reps as f64;
             println!(
-                "uncached n={n} per_step_ms={:.1} implied_rtf={:.4}",
+                "uncached_talker uncached_cp n={n} per_step_ms={:.1} implied_audio_x={:.4}",
                 per * 1e3,
                 SECONDS_PER_FRAME / per
             );
@@ -88,17 +89,16 @@ fn main() -> Result<()> {
     }
 
     if mode == "both" || mode == "cached" {
-        eprintln!("== cached step loop: per-step wall time vs context ==");
+        eprintln!("== cached talker + uncached code predictor: per-step wall time vs context ==");
         let text_len = text_hidden.dims()[1];
         let mut cache = talker.new_kv_cache(text_len + max_n + 2)?;
-        let mut cp_cache = cp.new_kv_cache()?;
         let t = Instant::now();
-        let (_base, hidden) = talker.step_cached_with_hidden(&text_hidden, None, &mut cache)?;
+        let (base, hidden) = talker.step_cached_with_hidden(&text_hidden, None, &mut cache)?;
         let h = hidden.reshape((1usize, 1usize, talker_cfg.hidden_size))?;
-        let _extras = cp.predict_with_cache(&h, &mut cp_cache)?;
-        sync(&device);
+        let _extras = cp.predict(&h, base, &[])?;
+        sync(&device)?;
         println!(
-            "cached prefill_ms={:.1} (text_len={text_len})",
+            "cached_talker uncached_cp prefill_plus_cp_ms={:.1} (text_len={text_len})",
             t.elapsed().as_secs_f64() * 1e3
         );
 
@@ -110,14 +110,14 @@ fn main() -> Result<()> {
         while step < max_n {
             let tok = fake_tok(step);
             let tt = Instant::now();
-            let (_b, hidden) =
+            let (base, hidden) =
                 talker.step_cached_with_hidden(&text_hidden, Some(tok), &mut cache)?;
-            sync(&device);
+            sync(&device)?;
             window_talker += tt.elapsed().as_secs_f64();
             let ct = Instant::now();
             let h = hidden.reshape((1usize, 1usize, talker_cfg.hidden_size))?;
-            let _extras = cp.predict_with_cache(&h, &mut cp_cache)?;
-            sync(&device);
+            let _extras = cp.predict(&h, base, &[])?;
+            sync(&device)?;
             window_cp += ct.elapsed().as_secs_f64();
             step += 1;
             if checkpoints.contains(&step) {
@@ -125,7 +125,7 @@ fn main() -> Result<()> {
                 let per_t = window_talker / window as f64;
                 let per_c = window_cp / window as f64;
                 println!(
-                    "cached n={step} per_step_ms={:.2} talker_ms={:.2} cp_ms={:.2} implied_rtf={:.2}",
+                    "cached_talker uncached_cp n={step} per_step_ms={:.2} talker_ms={:.2} cp_ms={:.2} implied_audio_x={:.2}",
                     per * 1e3,
                     per_t * 1e3,
                     per_c * 1e3,
@@ -160,13 +160,12 @@ fn main() -> Result<()> {
         }
         let per = t.elapsed().as_secs_f64() / reps as f64;
         println!(
-            "vocoder chunk10 decode_ms={:.1} per_frame_ms={:.2} implied_rtf={:.2}",
+            "vocoder chunk10 decode_ms={:.1} per_frame_ms={:.2} implied_audio_x={:.2}",
             per * 1e3,
             per * 1e2,
             10.0 * SECONDS_PER_FRAME / per
         );
     }
 
-    let _ = Tensor::zeros(1, DType::F32, &Device::Cpu);
     Ok(())
 }

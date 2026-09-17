@@ -68,7 +68,11 @@ impl OmniThinkerConfig {
             .get("rope_scaling")
             .and_then(|r| r.get("mrope_section"))
             .and_then(|s| s.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|v| v as usize))
+                    .collect()
+            })
             .unwrap_or_default();
         if mrope_section.len() != 3 {
             anyhow::bail!(
@@ -250,7 +254,11 @@ impl OmniMoe {
         }
         let device = x_flat.device().clone();
         let in_dtype = x_flat.dtype();
-        let logits = self.gate.forward(x_flat)?.to_dtype(DType::F32)?.contiguous()?;
+        let logits = self
+            .gate
+            .forward(x_flat)?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
         let (sorted_logits, sorted_idx) = logits.sort_last_dim(false)?;
         let k = self.num_experts_per_tok;
         let top_logits = sorted_logits.narrow(1, 0, k)?.contiguous()?;
@@ -259,7 +267,10 @@ impl OmniMoe {
 
         let top_idx_host: Vec<u32> = top_idx.flatten_all()?.to_vec1::<u32>()?;
         let top_weights_host: Vec<f32> = top_weights.flatten_all()?.to_vec1::<f32>()?;
-        if let Some(&bad) = top_idx_host.iter().find(|&&e| e as usize >= self.num_experts) {
+        if let Some(&bad) = top_idx_host
+            .iter()
+            .find(|&&e| e as usize >= self.num_experts)
+        {
             anyhow::bail!(
                 "OmniMoe: routed expert id {} out of range ({} experts)",
                 bad,
@@ -397,12 +408,17 @@ impl OmniLayer {
             causal: true,
         };
         let attn_out = sdpa(&q, &k_all, &v_all, &attn_cfg)?;
-        let attn_out = attn_out.reshape((b, t, nh * hd)).map_err(|e| anyhow::anyhow!(e))?;
+        let attn_out = attn_out
+            .reshape((b, t, nh * hd))
+            .map_err(|e| anyhow::anyhow!(e))?;
         let x = (x + self.o_proj.forward(&attn_out)?).map_err(|e| anyhow::anyhow!(e))?;
 
         let normed = self.post_attn_norm.forward(&x)?;
         let normed_flat = normed.reshape((b * t, self.moe.hidden_size))?;
-        let moe_out = self.moe.forward(&normed_flat)?.reshape((b, t, self.moe.hidden_size))?;
+        let moe_out = self
+            .moe
+            .forward(&normed_flat)?
+            .reshape((b, t, self.moe.hidden_size))?;
         (x + moe_out).map_err(|e| anyhow::anyhow!(e))
     }
 }
@@ -422,7 +438,10 @@ impl OmniThinker {
         if cfg.q_dim() != cfg.num_attention_heads * cfg.head_dim {
             anyhow::bail!("OmniThinkerConfig: inconsistent q_dim");
         }
-        if !cfg.num_attention_heads.is_multiple_of(cfg.num_key_value_heads) {
+        if !cfg
+            .num_attention_heads
+            .is_multiple_of(cfg.num_key_value_heads)
+        {
             anyhow::bail!(
                 "OmniThinkerConfig: num_attention_heads {} not divisible by kv_heads {}",
                 cfg.num_attention_heads,
@@ -438,7 +457,10 @@ impl OmniThinker {
         for _ in 0..cfg.num_hidden_layers {
             layers.push(OmniLayer::new(&cfg, device)?);
         }
-        let final_norm = RmsNorm::new(Tensor::ones(cfg.hidden_size, cfg.dtype, device)?, cfg.rms_norm_eps);
+        let final_norm = RmsNorm::new(
+            Tensor::ones(cfg.hidden_size, cfg.dtype, device)?,
+            cfg.rms_norm_eps,
+        );
         let lm_head = Linear::new(
             Tensor::zeros((cfg.vocab_size, cfg.hidden_size), cfg.dtype, device)?,
             None,
@@ -474,7 +496,11 @@ impl OmniThinker {
         &self.device
     }
 
-    pub fn embed_with_splices(&self, token_ids: &[u32], splices: &[ModalitySplice]) -> Result<Tensor> {
+    pub fn embed_with_splices(
+        &self,
+        token_ids: &[u32],
+        splices: &[ModalitySplice],
+    ) -> Result<Tensor> {
         let seq = token_ids.len();
         if seq == 0 {
             anyhow::bail!("OmniThinker::embed_with_splices: empty token sequence");
@@ -531,15 +557,29 @@ impl OmniThinker {
             anyhow::bail!("OmniThinker::forward_step: batch must be 1, got {b}");
         }
         if h != self.cfg.hidden_size {
-            anyhow::bail!("OmniThinker::forward_step: hidden {} != {}", h, self.cfg.hidden_size);
+            anyhow::bail!(
+                "OmniThinker::forward_step: hidden {} != {}",
+                h,
+                self.cfg.hidden_size
+            );
         }
         if pos.len() != t {
-            anyhow::bail!("OmniThinker::forward_step: positions {} != tokens {}", pos.len(), t);
+            anyhow::bail!(
+                "OmniThinker::forward_step: positions {} != tokens {}",
+                pos.len(),
+                t
+            );
         }
 
         let mut x = x.contiguous()?;
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, pos, &self.rope, self.cfg.mrope_section, &mut cache.layers[i])?;
+            x = layer.forward(
+                &x,
+                pos,
+                &self.rope,
+                self.cfg.mrope_section,
+                &mut cache.layers[i],
+            )?;
             if let Some(ds) = deepstack {
                 if i < ds.embeds.len() {
                     let flat = x.reshape((t, self.cfg.hidden_size))?;
@@ -569,36 +609,92 @@ impl OmniThinker {
         let eps = self.cfg.rms_norm_eps;
         let mut count = 0usize;
 
-        self.embed_tokens = load_2d(weights, "thinker.model.embed_tokens.weight", (vocab, h), dtype)?;
+        self.embed_tokens = load_2d(
+            weights,
+            "thinker.model.embed_tokens.weight",
+            (vocab, h),
+            dtype,
+        )?;
         count += 1;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let p = format!("thinker.model.layers.{i}");
-            layer.input_norm =
-                RmsNorm::new(load_1d(weights, &format!("{p}.input_layernorm.weight"), h, dtype)?, eps);
-            layer.post_attn_norm = RmsNorm::new(
-                load_1d(weights, &format!("{p}.post_attention_layernorm.weight"), h, dtype)?,
+            layer.input_norm = RmsNorm::new(
+                load_1d(weights, &format!("{p}.input_layernorm.weight"), h, dtype)?,
                 eps,
             );
-            layer.q_proj =
-                Linear::new(load_2d(weights, &format!("{p}.self_attn.q_proj.weight"), (q, h), dtype)?, None)?;
-            layer.k_proj =
-                Linear::new(load_2d(weights, &format!("{p}.self_attn.k_proj.weight"), (kv, h), dtype)?, None)?;
-            layer.v_proj =
-                Linear::new(load_2d(weights, &format!("{p}.self_attn.v_proj.weight"), (kv, h), dtype)?, None)?;
-            layer.o_proj =
-                Linear::new(load_2d(weights, &format!("{p}.self_attn.o_proj.weight"), (h, q), dtype)?, None)?;
-            layer.q_norm =
-                RmsNorm::new(load_1d(weights, &format!("{p}.self_attn.q_norm.weight"), hd, dtype)?, eps);
-            layer.k_norm =
-                RmsNorm::new(load_1d(weights, &format!("{p}.self_attn.k_norm.weight"), hd, dtype)?, eps);
-            layer.moe.gate =
-                Linear::new(load_2d(weights, &format!("{p}.mlp.gate.weight"), (self.cfg.num_experts, h), dtype)?, None)?;
+            layer.post_attn_norm = RmsNorm::new(
+                load_1d(
+                    weights,
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    h,
+                    dtype,
+                )?,
+                eps,
+            );
+            layer.q_proj = Linear::new(
+                load_2d(
+                    weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    (q, h),
+                    dtype,
+                )?,
+                None,
+            )?;
+            layer.k_proj = Linear::new(
+                load_2d(
+                    weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    (kv, h),
+                    dtype,
+                )?,
+                None,
+            )?;
+            layer.v_proj = Linear::new(
+                load_2d(
+                    weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    (kv, h),
+                    dtype,
+                )?,
+                None,
+            )?;
+            layer.o_proj = Linear::new(
+                load_2d(
+                    weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    (h, q),
+                    dtype,
+                )?,
+                None,
+            )?;
+            layer.q_norm = RmsNorm::new(
+                load_1d(weights, &format!("{p}.self_attn.q_norm.weight"), hd, dtype)?,
+                eps,
+            );
+            layer.k_norm = RmsNorm::new(
+                load_1d(weights, &format!("{p}.self_attn.k_norm.weight"), hd, dtype)?,
+                eps,
+            );
+            layer.moe.gate = Linear::new(
+                load_2d(
+                    weights,
+                    &format!("{p}.mlp.gate.weight"),
+                    (self.cfg.num_experts, h),
+                    dtype,
+                )?,
+                None,
+            )?;
             count += 9;
             for (j, expert) in layer.moe.experts.iter_mut().enumerate() {
                 let ep = format!("{p}.mlp.experts.{j}");
                 let gate = Linear::new_no_pretranspose(
-                    load_2d(weights, &format!("{ep}.gate_proj.weight"), (inter, h), dtype)?,
+                    load_2d(
+                        weights,
+                        &format!("{ep}.gate_proj.weight"),
+                        (inter, h),
+                        dtype,
+                    )?,
                     None,
                 )?;
                 let up = Linear::new_no_pretranspose(
@@ -606,19 +702,33 @@ impl OmniThinker {
                     None,
                 )?;
                 let down = Linear::new_no_pretranspose(
-                    load_2d(weights, &format!("{ep}.down_proj.weight"), (h, inter), dtype)?,
+                    load_2d(
+                        weights,
+                        &format!("{ep}.down_proj.weight"),
+                        (h, inter),
+                        dtype,
+                    )?,
                     None,
                 )?;
                 *expert = Mlp::new(gate, up, down)?;
                 count += 3;
             }
             if i % 8 == 0 {
-                eprintln!("[omni-thinker] loaded layer {i}/{}", self.cfg.num_hidden_layers);
+                eprintln!(
+                    "[omni-thinker] loaded layer {i}/{}",
+                    self.cfg.num_hidden_layers
+                );
             }
         }
 
-        self.final_norm = RmsNorm::new(load_1d(weights, "thinker.model.norm.weight", h, dtype)?, eps);
-        self.lm_head = Linear::new(load_2d(weights, "thinker.lm_head.weight", (vocab, h), dtype)?, None)?;
+        self.final_norm = RmsNorm::new(
+            load_1d(weights, "thinker.model.norm.weight", h, dtype)?,
+            eps,
+        );
+        self.lm_head = Linear::new(
+            load_2d(weights, "thinker.lm_head.weight", (vocab, h), dtype)?,
+            None,
+        )?;
         count += 2;
         Ok(count)
     }
@@ -703,7 +813,9 @@ fn apply_cos_sin(x: &Tensor, cos: &Tensor, sin: &Tensor, half: usize) -> Result<
     let head_dim = *dims.last().unwrap();
     let n_heads = dims[dims.len() - 2];
     let tokens: usize = dims[..dims.len() - 2].iter().product();
-    let xf = x.to_dtype(DType::F32)?.reshape((tokens, n_heads, head_dim))?;
+    let xf = x
+        .to_dtype(DType::F32)?
+        .reshape((tokens, n_heads, head_dim))?;
     let cos = cos.unsqueeze(1)?;
     let sin = sin.unsqueeze(1)?;
     let lo = xf.narrow(2, 0, half)?;
@@ -821,7 +933,14 @@ pub fn build_mrope_positions(
         );
     }
     let next = (cur_max(&tp, &hp, &wp) + 1) as u32;
-    Ok((OmniPositions { t: tp, h: hp, w: wp }, next))
+    Ok((
+        OmniPositions {
+            t: tp,
+            h: hp,
+            w: wp,
+        },
+        next,
+    ))
 }
 
 fn splice_into(x: &Tensor, position: usize, splice: &Tensor) -> Result<Tensor> {
@@ -840,8 +959,15 @@ fn splice_into(x: &Tensor, position: usize, splice: &Tensor) -> Result<Tensor> {
     Ok(Tensor::cat(&refs, 0)?)
 }
 
-fn load_1d(weights: &nv_weights::WeightLoader, name: &str, dim: usize, dtype: DType) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+fn load_1d(
+    weights: &nv_weights::WeightLoader,
+    name: &str,
+    dim: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 1 || d[0] != dim {
         anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
@@ -855,7 +981,9 @@ fn load_2d(
     shape: (usize, usize),
     dtype: DType,
 ) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
         anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
@@ -908,11 +1036,17 @@ mod tests {
         let mut t = OmniThinker::new(cfg.clone(), &Device::Cpu).unwrap();
         let vocab = cfg.vocab_size;
         let h = cfg.hidden_size;
-        let embed: Vec<f32> = (0..vocab * h).map(|i| ((i % 13) as f32) * 0.03 - 0.2).collect();
+        let embed: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i % 13) as f32) * 0.03 - 0.2)
+            .collect();
         t.embed_tokens = Tensor::from_vec(embed, (vocab, h), &Device::Cpu).unwrap();
 
         let tokens: Vec<u32> = vec![3, 5, 7, 11, 9];
-        let x = t.embed_with_splices(&tokens, &[]).unwrap().unsqueeze(0).unwrap();
+        let x = t
+            .embed_with_splices(&tokens, &[])
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
         let mut cache = OmniKvCache::new(cfg.num_hidden_layers);
         let pos = OmniPositions::uniform(&[0, 1, 2, 3, 4]);
         let full = t.forward_step(&x, &pos, &mut cache, None).unwrap();
@@ -920,14 +1054,25 @@ mod tests {
         let mut cache2 = OmniKvCache::new(cfg.num_hidden_layers);
         let mut last = None;
         for (step, tok) in tokens.iter().enumerate() {
-            let xi = t.embed_with_splices(&[*tok], &[]).unwrap().unsqueeze(0).unwrap();
+            let xi = t
+                .embed_with_splices(&[*tok], &[])
+                .unwrap()
+                .unsqueeze(0)
+                .unwrap();
             let pi = OmniPositions::uniform(&[step as u32]);
             last = Some(t.forward_step(&xi, &pi, &mut cache2, None).unwrap());
         }
         let a: Vec<f32> = full.to_vec1().unwrap();
         let b: Vec<f32> = last.unwrap().to_vec1().unwrap();
-        let diff: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
-        assert!(diff < 1e-3, "cached decode last-token logits diverge from prefill: {diff}");
+        let diff: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            diff < 1e-3,
+            "cached decode last-token logits diverge from prefill: {diff}"
+        );
     }
 
     #[test]
@@ -939,7 +1084,13 @@ mod tests {
         let logits = Tensor::from_vec(logits_host.clone(), (2, n_exp), &device).unwrap();
         let (sorted, idx) = logits.sort_last_dim(false).unwrap();
         let top = sorted.narrow(1, 0, k).unwrap().contiguous().unwrap();
-        let top_idx: Vec<u32> = idx.narrow(1, 0, k).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        let top_idx: Vec<u32> = idx
+            .narrow(1, 0, k)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
         let w = candle_nn::ops::softmax_last_dim(&top).unwrap();
         let w_host: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
         for row in 0..2 {
@@ -1022,7 +1173,9 @@ mod tests {
             &Device::Cpu,
         )
         .unwrap();
-        let vals: Vec<f32> = (0..head_dim).map(|i| ((i as f32) * 0.3).sin() + 0.1).collect();
+        let vals: Vec<f32> = (0..head_dim)
+            .map(|i| ((i as f32) * 0.3).sin() + 0.1)
+            .collect();
         let q = Tensor::from_vec(vals.clone(), (1, 1, 1, head_dim), &Device::Cpu).unwrap();
         let pos = OmniPositions {
             t: vec![5],
@@ -1042,8 +1195,16 @@ mod tests {
             let hi = vals[half + i];
             let want_lo = lo * c - hi * s;
             let want_hi = lo * s + hi * c;
-            assert!((got[i] - want_lo).abs() < 1e-4, "lo {i}: {} vs {want_lo}", got[i]);
-            assert!((got[half + i] - want_hi).abs() < 1e-4, "hi {i}: {} vs {want_hi}", got[half + i]);
+            assert!(
+                (got[i] - want_lo).abs() < 1e-4,
+                "lo {i}: {} vs {want_lo}",
+                got[i]
+            );
+            assert!(
+                (got[half + i] - want_hi).abs() < 1e-4,
+                "hi {i}: {} vs {want_hi}",
+                got[half + i]
+            );
         }
     }
 
@@ -1088,11 +1249,17 @@ mod tests {
         let (pos, _next) = build_mrope_positions(&tokens, &ids, &[(1, 2, 2)], &[13]).unwrap();
         assert_eq!(
             pos.t,
-            vec![0, 1, 2, 2, 2, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+            vec![
+                0, 1, 2, 2, 2, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                22
+            ]
         );
         assert_eq!(
             pos.h,
-            vec![0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+            vec![
+                0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                22
+            ]
         );
     }
 
@@ -1103,7 +1270,13 @@ mod tests {
         let tokens: Vec<u32> = vec![0, 0, 0, 0, 0];
         let ones = Tensor::ones((2, cfg.hidden_size), DType::F32, &Device::Cpu).unwrap();
         let out = t
-            .embed_with_splices(&tokens, &[ModalitySplice { position: 1, embedding: ones }])
+            .embed_with_splices(
+                &tokens,
+                &[ModalitySplice {
+                    position: 1,
+                    embedding: ones,
+                }],
+            )
             .unwrap();
         let row1: Vec<f32> = out.i(1).unwrap().to_vec1().unwrap();
         let row2: Vec<f32> = out.i(2).unwrap().to_vec1().unwrap();
@@ -1121,7 +1294,13 @@ mod tests {
         let tokens: Vec<u32> = vec![0, 0, 0];
         let big = Tensor::zeros((5, cfg.hidden_size), DType::F32, &Device::Cpu).unwrap();
         let err = t
-            .embed_with_splices(&tokens, &[ModalitySplice { position: 1, embedding: big }])
+            .embed_with_splices(
+                &tokens,
+                &[ModalitySplice {
+                    position: 1,
+                    embedding: big,
+                }],
+            )
             .unwrap_err();
         assert!(err.to_string().contains("exceeds seq len"));
     }
@@ -1134,10 +1313,20 @@ mod tests {
         let h = cfg.hidden_size;
         let embed: Vec<f32> = (0..vocab * h).map(|i| ((i % 7) as f32) * 0.1).collect();
         t.embed_tokens = Tensor::from_vec(embed, (vocab, h), &Device::Cpu).unwrap();
-        let head: Vec<f32> = (0..vocab * h).map(|i| ((i % 5) as f32) * 0.2 - 0.4).collect();
-        t.lm_head = Linear::new(Tensor::from_vec(head, (vocab, h), &Device::Cpu).unwrap(), None).unwrap();
+        let head: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i % 5) as f32) * 0.2 - 0.4)
+            .collect();
+        t.lm_head = Linear::new(
+            Tensor::from_vec(head, (vocab, h), &Device::Cpu).unwrap(),
+            None,
+        )
+        .unwrap();
         let tokens: Vec<u32> = vec![1, 2, 3, 4];
-        let x = t.embed_with_splices(&tokens, &[]).unwrap().unsqueeze(0).unwrap();
+        let x = t
+            .embed_with_splices(&tokens, &[])
+            .unwrap()
+            .unsqueeze(0)
+            .unwrap();
         let pos = OmniPositions::uniform(&[0, 1, 2, 3]);
 
         let mut c1 = OmniKvCache::new(cfg.num_hidden_layers);
@@ -1153,6 +1342,9 @@ mod tests {
         let a: Vec<f32> = base.to_vec1().unwrap();
         let b: Vec<f32> = with.to_vec1().unwrap();
         let diff: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum();
-        assert!(diff > 1e-4, "deepstack injection must change logits, diff={diff}");
+        assert!(
+            diff > 1e-4,
+            "deepstack injection must change logits, diff={diff}"
+        );
     }
 }

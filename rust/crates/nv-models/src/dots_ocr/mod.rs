@@ -1,3 +1,5 @@
+#[cfg(feature = "wgpu")]
+pub mod decode_gemv_msl;
 pub mod decoder;
 #[cfg(feature = "wgpu")]
 pub mod decoder_wgpu;
@@ -5,14 +7,13 @@ pub mod decoder_wgpu;
 pub mod decoder_wgpu_graph;
 pub mod parse;
 pub mod pipeline;
+#[cfg(feature = "wgpu")]
+pub mod prefill_attn_msl;
 pub mod preprocess;
 pub mod regions;
 pub mod tiered;
 pub mod vision;
 #[cfg(feature = "wgpu")]
-pub mod decode_gemv_msl;
-#[cfg(feature = "wgpu")]
-pub mod prefill_attn_msl;
 pub mod vision_attn_msl;
 #[cfg(feature = "wgpu")]
 pub mod vision_wgpu;
@@ -24,7 +25,7 @@ pub use decoder::{
     USER_TOKEN_ID,
 };
 #[cfg(feature = "wgpu")]
-pub use decoder_wgpu_graph::{DotsDecoderWgpuGraph, DotsGraphQuant, RegionRow};
+pub use decoder_wgpu_graph::{DotsDecoderWgpuGraph, DotsGraphQuant, RegionRow, VisionRowsGpu};
 pub use parse::{parse_layout_json, LayoutElement, LayoutPage, CATEGORIES};
 pub use pipeline::{
     DotsDecoderEngine, DotsMode, DotsOcrPipeline, DotsPageResult, DotsPrecision,
@@ -33,7 +34,9 @@ pub use pipeline::{
 };
 pub use preprocess::{prepare, smart_resize, PixelBudget, PreparedImage};
 pub use regions::{plan_regions, Region, CROP_MAX_PIXELS_ENV, LAYOUT_MAX_PIXELS_ENV};
-pub use tiered::{TierPolicy, TIERED_ENV, TIERED_MIN_DOWNSCALE_ENV};
+pub use tiered::{
+    classify_sub_threshold, SubThresholdClass, TierPolicy, TIERED_ENV, TIERED_MIN_DOWNSCALE_ENV,
+};
 pub use vision::{DotsVisionConfig, DotsVisionTower};
 #[cfg(feature = "wgpu")]
 pub use vision_wgpu::{DotsVisionTowerWgpu, VisionGemmRoute};

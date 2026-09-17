@@ -1,8 +1,8 @@
 # CLAUDE.md -- context for future sessions
 
-`docs/book/01.4-STATUS.md` is the canonical what's-implemented / what's-open list;
-skim it first, never copy it here. Read `docs/book/05.7-apple-silicon-inference-architecture.md`
-before any performance or kernel work; `docs/book/08.4-PERFORMANCE.md` governs quoting numbers.
+Read `docs/book/05.7-apple-silicon-inference-architecture.md` before any
+performance or kernel work. Measured numbers live outside this repository;
+prose states the relationship a measurement evidenced, never the figure.
 
 ## Repo shape
 
@@ -59,9 +59,15 @@ before any performance or kernel work; `docs/book/08.4-PERFORMANCE.md` governs q
   Before quoting any existing `path:line`, open it. (Line numbers are still how
   you enumerate *published numbers inside documents*, per the
   performance-default rule below.)
-- Never flip a performance default. A correctness default may change only to fix a
-  demonstrated defect: keep the old path behind an env var, state the cost, and
-  list every published number measured on the old path, by document and line.
+- Default flips follow the bitwise-or-instrument law. A performance default may
+  flip only when the change reproduces the family's canonical trajectory or
+  output bitwise with its suites green; a change that reassociates stays opt-in
+  until a named corpus-level instrument (the markup-neutral CER scorecard, the
+  twelve-zeros stamp, word-diff adjudication) blesses it, and the flip's commit
+  records which instrument ruled. A correctness default may change only to fix
+  a demonstrated defect. Either way keep the old path behind an env var, state
+  the cost, and list every published number measured on the old path, by
+  document and line.
 
 ## Building: always `rust/scripts/nvk.sh`
 

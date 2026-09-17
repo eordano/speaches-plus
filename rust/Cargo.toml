@@ -2,6 +2,7 @@
 members = [".", "crates/*"]
 exclude = [
     "third-party/wgpu-hal-30.0.0",
+    "third-party/wgpu-30.0.0",
     "third-party/candle-core-0.11.0",
 ]
 resolver = "2"
@@ -39,6 +40,7 @@ nv-train = { path = "crates/nv-train" }
 nv-runner = { path = "crates/nv-runner" }
 nv-omni = { path = "crates/nv-omni" }
 nv-ocr = { path = "crates/nv-ocr" }
+nv-ocr-web = { path = "crates/nv-ocr-web" }
 nv-imgdec = { path = "crates/nv-imgdec" }
 nv-tts = { path = "crates/nv-tts" }
 nv-punkt = { path = "crates/nv-punkt" }
@@ -105,9 +107,10 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 typeshare = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "net", "test-util", "process"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tower = "0.5"
 async-trait = "0.1"
@@ -190,7 +193,7 @@ wgpu = [
 tesseract = ["leptess"]
 
 [build-dependencies]
-cc = { workspace = true }
+cc = { workspace = true, features = ["parallel"] }
 
 [dev-dependencies]
 pyo3 = { version = "0.29", features = ["auto-initialize"] }
@@ -208,5 +211,6 @@ workspace = true
 
 [patch.crates-io]
 wgpu-hal = { path = "third-party/wgpu-hal-30.0.0" }
+wgpu = { path = "third-party/wgpu-30.0.0" }
 candle-core = { path = "third-party/candle-core-0.11.0" }
 candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "4761e00bfb687cc2666e30be7726077f9e2c4456" }

@@ -38,7 +38,8 @@ pub fn default_budget_gib() -> f64 {
         Some(total) => (total as f64 / GIB) * DEFAULT_BUDGET_FRACTION,
         None => {
             tracing::warn!(
-                fallback_gib = FALLBACK_BUDGET_GIB_DELIBERATELY_SMALL_SHEDDING_RECOVERS_OOM_DOES_NOT,
+                fallback_gib =
+                    FALLBACK_BUDGET_GIB_DELIBERATELY_SMALL_SHEDDING_RECOVERS_OOM_DOES_NOT,
                 "could not read device total VRAM; falling back to a deliberately \
                  SMALL budget. Set NV_VRAM_BUDGET_GIB explicitly if this host has \
                  more to give -- an under-estimate sheds, an over-estimate OOMs."

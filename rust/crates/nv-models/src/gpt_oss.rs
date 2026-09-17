@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 
-use nv_quant::mxfp4::{Mxfp4Tensor, BLOCK_BYTES as MX_BLOCK_BYTES, BLOCK_SIZE as MX_BLOCK};
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+use nv_quant::mxfp4::BLOCK_BYTES as MX_BLOCK_BYTES;
+use nv_quant::mxfp4::{Mxfp4Tensor, BLOCK_SIZE as MX_BLOCK};
 
 pub const SWIGLU_ALPHA: f32 = 1.702;
 
@@ -267,7 +269,12 @@ pub(crate) fn bf16_val(b: u16) -> f32 {
     f32::from_bits((b as u32) << 16)
 }
 
-pub(crate) fn load_bf16(w: &nv_weights::WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub(crate) fn load_bf16(
+    w: &nv_weights::WeightLoader,
+    names: &[&str],
+    shape: &[usize],
+) -> Result<Vec<u16>> {
     for n in names {
         if w.has(n) {
             let t = w
@@ -281,11 +288,17 @@ pub(crate) fn load_bf16(w: &nv_weights::WeightLoader, names: &[&str], shape: &[u
     anyhow::bail!("none of {names:?} found")
 }
 
-pub(crate) fn load_f32_vec(w: &nv_weights::WeightLoader, name: &str, dim: usize) -> Result<Vec<f32>> {
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub(crate) fn load_f32_vec(
+    w: &nv_weights::WeightLoader,
+    name: &str,
+    dim: usize,
+) -> Result<Vec<f32>> {
     let raw = load_bf16(w, &[name], &[dim])?;
     Ok(raw.into_iter().map(bf16_val).collect())
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub(crate) fn load_lin(
     w: &nv_weights::WeightLoader,
     module: &str,
@@ -305,6 +318,7 @@ pub(crate) fn load_lin(
     })
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub(crate) fn load_mx_stack(
     w: &nv_weights::WeightLoader,
     base: &str,
@@ -348,7 +362,12 @@ pub(crate) fn load_mx_stack(
     })
 }
 
-pub(crate) fn load_layer(cfg: &GptOssConfig, w: &nv_weights::WeightLoader, idx: usize) -> Result<HostLayer> {
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+pub(crate) fn load_layer(
+    cfg: &GptOssConfig,
+    w: &nv_weights::WeightLoader,
+    idx: usize,
+) -> Result<HostLayer> {
     let p = format!("model.layers.{idx}");
     let hd = cfg.head_dim;
     let q_out = cfg.num_attention_heads * hd;

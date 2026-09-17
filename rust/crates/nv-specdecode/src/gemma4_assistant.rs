@@ -839,8 +839,8 @@ impl MoeAssistantHost {
         }
         while m.abs_end() < committed {
             let start = m.abs_end();
-            let r =
-                (committed - start).min(MOE_MIRROR_FETCH_CHUNK_ROWS_8192_BOUNDS_HOST_STAGING_TO_TENS_OF_MB);
+            let r = (committed - start)
+                .min(MOE_MIRROR_FETCH_CHUNK_ROWS_8192_BOUNDS_HOST_STAGING_TO_TENS_OF_MB);
             let (k, v) = engine.shared_kv_rows_f32_layout_len_by_n_kv_by_head_dim(
                 AssistantLayerType::Full,
                 start,

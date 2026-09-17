@@ -35,11 +35,11 @@ pub fn dots_decoder_dense_config_from_hf_json_str(s: &str) -> Result<Qwen3_5Dens
     };
     let num_hidden_layers = get_u("num_hidden_layers")?;
     let eos_token_id = match v.get("eos_token_id") {
-        Some(serde_json::Value::Array(a)) => a
-            .first()
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("empty eos_token_id list"))?
-            as u32,
+        Some(serde_json::Value::Array(a)) => {
+            a.first()
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("empty eos_token_id list"))? as u32
+        }
         Some(x) => x
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("invalid eos_token_id"))? as u32,
@@ -135,7 +135,11 @@ pub fn dots_mlx_snapshot_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var(DOTS_Q3D_MLX_DIR_ENV_FALLS_BACK_TO_THE_HUB_SNAPSHOT) {
         if !d.is_empty() {
             let p = PathBuf::from(&d);
-            anyhow::ensure!(p.is_dir(), "{} = {d} is not a directory", DOTS_Q3D_MLX_DIR_ENV_FALLS_BACK_TO_THE_HUB_SNAPSHOT);
+            anyhow::ensure!(
+                p.is_dir(),
+                "{} = {d} is not a directory",
+                DOTS_Q3D_MLX_DIR_ENV_FALLS_BACK_TO_THE_HUB_SNAPSHOT
+            );
             return Ok(p);
         }
     }
@@ -143,7 +147,12 @@ pub fn dots_mlx_snapshot_dir() -> Result<PathBuf> {
     let snaps = PathBuf::from(home)
         .join(".cache/huggingface/hub/models--mlx-community--dots.ocr-4bit/snapshots");
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&snaps)
-        .with_context(|| format!("no mlx-community/dots.ocr-4bit snapshot under {}", snaps.display()))?
+        .with_context(|| {
+            format!(
+                "no mlx-community/dots.ocr-4bit snapshot under {}",
+                snaps.display()
+            )
+        })?
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir() && p.join("model.safetensors").exists())
@@ -159,8 +168,7 @@ pub struct DotsQ3dDecoder {
     max_seq: usize,
 }
 
-pub const DOTS_Q3D_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_TRUNK: &str =
-    "NV_DOTS_LORA_DIR";
+pub const DOTS_Q3D_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_TRUNK: &str = "NV_DOTS_LORA_DIR";
 
 impl DotsQ3dDecoder {
     pub fn from_snapshot() -> Result<Self> {
@@ -289,7 +297,7 @@ impl DotsQ3dDecoder {
     }
 }
 
-const DOTS_Q3D_DECODER_IS_SEND_BECAUSE_THE_OCR_STREAM_ROUTE_HOLDS_IT_ACROSS_AWAIT: fn() = || {
+const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<DotsQ3dDecoder>();
 };

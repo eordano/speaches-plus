@@ -25,7 +25,8 @@ refuse_phase_unless_gpu_idle_because_a_ladder_can_start_mid_batch() {
 }
 
 run_arm() {
-  local arm="$1"; shift
+  local arm="$1"
+  shift
   local log="$LOG_DIR/lora-fold-ab-$STAMP-d$DEPTH-$arm.log"
   refuse_phase_unless_gpu_idle_because_a_ladder_can_start_mid_batch "arm-$arm"
   echo "=== arm=$arm depth=$DEPTH log=$log"
@@ -45,7 +46,10 @@ GATE_LOG="$LOG_DIR/lora-fold-ab-$STAMP-gates.log"
 NVK_LANE="$LANE" NVK_PKG=nv-models NVK_FEATURES=cuda,wgpu \
   "$REPO/scripts/nvk.sh" test --no-fail-fast \
   --test lora_q3d_w4a8_fold --test lora_q3d_wgpu --test q3d_mlp_w4a8 -- --test-threads=1 \
-  >"$GATE_LOG" 2>&1 || { tail -40 "$GATE_LOG"; exit 3; }
+  >"$GATE_LOG" 2>&1 || {
+  tail -40 "$GATE_LOG"
+  exit 3
+}
 grep -E "test result" "$GATE_LOG"
 
 run_arm fold_default

@@ -1,0 +1,88 @@
+diff -ruN -x .fetch-stamp a/src/backend/webgpu.rs b/src/backend/webgpu.rs
+--- a/src/backend/webgpu.rs	2006-07-24 03:21:28.000000000 +0200
++++ b/src/backend/webgpu.rs	2026-09-12 15:54:02.766438346 +0200
+@@ -82,7 +82,21 @@
+         } else if js_error.has_type::<webgpu_sys::GpuOutOfMemoryError>() {
+             crate::Error::OutOfMemory { source }
+         } else {
+-            panic!("Unexpected error");
++            let description =
++                js_sys::Reflect::get(&js_error, &wasm_bindgen::JsValue::from_str("message"))
++                    .ok()
++                    .and_then(|v| v.as_string())
++                    .unwrap_or_else(|| {
++                        if js_error.is_null() || js_error.is_undefined() {
++                            "null WebGPU error object".to_string()
++                        } else {
++                            String::from(js_sys::Object::to_string(&js_error))
++                        }
++                    });
++            crate::Error::Internal {
++                source,
++                description,
++            }
+         }
+     }
+ }
+@@ -765,7 +779,11 @@
+     }
+ }
+ 
+-const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 16] = [
++const FEATURES_MAPPING: [(wgt::Features, webgpu_sys::GpuFeatureName); 17] = [
++    (
++        wgt::Features::SUBGROUP,
++        webgpu_sys::GpuFeatureName::Subgroups,
++    ),
+     (
+         wgt::Features::DEPTH_CLIP_CONTROL,
+         webgpu_sys::GpuFeatureName::DepthClipControl,
+@@ -1064,7 +1082,12 @@
+ fn future_pop_error_scope(
+     result: Result<js_sys::JsOption<webgpu_sys::GpuError>, wasm_bindgen::JsValue>,
+ ) -> Option<crate::Error> {
+-    Some(crate::Error::from_js(result.ok()?.into_option()?.into()))
++    let err: js_sys::Object = result.ok()?.into_option()?.into();
++    let raw: &wasm_bindgen::JsValue = err.as_ref();
++    if raw.is_null() || raw.is_undefined() {
++        return None;
++    }
++    Some(crate::Error::from_js(err))
+ }
+ 
+ fn future_compilation_info(
+@@ -1329,6 +1352,10 @@
+     pub(crate) inner: webgpu_sys::GpuBuffer,
+     /// The mapped array buffer and mapped range.
+     mapping: Rc<RefCell<WebBufferMapState>>,
++    /// Destroys the GPU allocation when the last clone drops, as the native
++    /// backends do, instead of waiting for the JS garbage collector to reach
++    /// the `GPUBuffer` wrapper.
++    release: Rc<DropGuard>,
+     /// Unique identifier for this Buffer.
+     ident: crate::cmp::Identifier,
+ }
+@@ -1336,12 +1363,14 @@
+ impl WebBuffer {
+     /// Creates a new web buffer for the given Javascript object and description.
+     fn new(inner: webgpu_sys::GpuBuffer, desc: &crate::BufferDescriptor<'_>) -> Self {
++        let handle = inner.clone();
+         Self {
+             inner,
+             mapping: Rc::new(RefCell::new(WebBufferMapState {
+                 mapped_buffer: None,
+                 range: 0..desc.size,
+             })),
++            release: Rc::new(DropGuard::new(Some(Box::new(move || handle.destroy())))),
+             ident: crate::cmp::Identifier::create(),
+         }
+     }
+@@ -2976,7 +3005,7 @@
+ }
+ impl Drop for WebBuffer {
+     fn drop(&mut self) {
+-        // no-op
++        // no-op: `release` destroys the GPU allocation when the last clone drops.
+     }
+ }
+ 

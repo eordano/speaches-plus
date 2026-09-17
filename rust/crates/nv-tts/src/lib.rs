@@ -1,6 +1,7 @@
 pub mod code_predictor;
 pub mod codec_decoder;
 pub mod dense;
+pub mod kokoro;
 #[cfg(test)]
 pub(crate) mod model_gate;
 pub mod sampling;
@@ -10,8 +11,8 @@ pub mod streaming;
 pub mod talker;
 pub mod tokenizer;
 pub mod vocoder_loader;
-pub(crate) mod weight_helpers;
 pub mod voice_profile;
+pub(crate) mod weight_helpers;
 
 pub use code_predictor::{CodecDecoderConfig, Qwen3TtsCodecDecoder, NUM_EXTRA_CODEBOOKS};
 pub use codec_decoder::{
@@ -19,7 +20,10 @@ pub use codec_decoder::{
     CODEC_SAMPLE_RATE,
 };
 pub use sampling::{Sampler, SamplerConfig};
-pub use speaker_encoder::{SpeakerEncoder, SpeakerEncoderConfig, CHECKPOINT_SPEAKER_PREFIX};
+pub use speaker_encoder::{
+    qwen3_tts_base_dir, SpeakerEncoder, SpeakerEncoderConfig, SpeakerEncoderSource,
+    CHECKPOINT_SPEAKER_PREFIX, ENV_KOKORO_QWEN_ENCODER_DIR, ENV_SPEAKER_ENCODER_DIR,
+};
 pub use spk_mel::{log_mel_24k, SPK_MEL_MIN_SAMPLES, SPK_MEL_N_MELS, SPK_MEL_SAMPLE_RATE};
 pub use streaming::{TalkerLike, TtsAudioStream, TtsStream, DEFAULT_CHUNK_FRAMES};
 pub use talker::{Qwen3TtsKvCache, Qwen3TtsTalker, Qwen3TtsTalkerConfig};
@@ -28,4 +32,7 @@ pub use vocoder_loader::{
     load_from_qwen3_tts as load_vocoder_from_qwen3_tts, scan_vocoder_dir, vocoder_shard_path,
     VocoderInventory, VocoderLoadReport, DECODER_PREFIX, SPEECH_TOKENIZER_SHARD,
 };
-pub use voice_profile::{VoiceProfile, VoiceProfileStore};
+pub use voice_profile::{
+    is_store_unavailable, VoiceKind, VoiceMeta, VoiceProfile, VoiceProfileStore, VoiceStore,
+    VoiceStoreHandle, VoiceStoreUnavailable, ADAPTER_FILE, META_FILE, PACK_FILE,
+};

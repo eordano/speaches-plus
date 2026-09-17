@@ -29,7 +29,8 @@ until [ "$(mem_now)" -lt "$QUIET_MIB" ]; do
     echo "IDLE-GATE-FAIL: card busy ($(mem_now) MiB) after 900s" >&2
     exit 1
   fi
-  sleep 5 & wait $!
+  sleep 5 &
+  wait $!
 done
 BASELINE=$(mem_now)
 
@@ -52,8 +53,8 @@ for v in $DEVENV_MODEL_VARS; do
 done
 export HF_HUB_CACHE="$HOME/.cache/huggingface/hub"
 case ":$PATH:" in
-*:/run/current-system/sw/bin:*) ;;
-*) export PATH="$PATH:/run/current-system/sw/bin" ;;
+  *:/run/current-system/sw/bin:*) ;;
+  *) export PATH="$PATH:/run/current-system/sw/bin" ;;
 esac
 
 : >"$SAMPLES"
@@ -62,7 +63,11 @@ setsid env UVICORN_PORT="$PORT" RUST_LOG=info,speaches_plus=debug "$BIN" >"$LOG"
 PG=$!
 trap 'kill -TERM -- "-$PG" 2>/dev/null || true' EXIT
 
-( while kill -0 "$PG" 2>/dev/null; do mem_now >>"$SAMPLES"; sleep 0.5 & wait $!; done ) &
+(while kill -0 "$PG" 2>/dev/null; do
+  mem_now >>"$SAMPLES"
+  sleep 0.5 &
+  wait $!
+done) &
 SAMPLER=$!
 
 t=0
@@ -74,12 +79,14 @@ until curl -fsS "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; do
     kill "$SAMPLER" 2>/dev/null || true
     exit 1
   fi
-  sleep 3 & wait $!
+  sleep 3 &
+  wait $!
 done
 BOOT_ELAPSED=$(echo "$(date +%s.%N) $BOOT_T0" | awk '{printf "%.1f", $1-$2}')
 PEAK_BOOT=$(sort -n "$SAMPLES" | tail -n1)
 
-sleep 4 & wait $!
+sleep 4 &
+wait $!
 STEADY_READY=$(tail -n 6 "$SAMPLES" | median_of)
 
 MODEL_ID=""
@@ -95,23 +102,25 @@ cand = [i for i in ids if flt in i.lower()] if flt else ids
 print(cand[0] if cand else '')")
   MARK=$(grep -c '' "$SAMPLES")
   if [ -n "$MODEL_ID" ] && curl -fsS -m 300 "http://127.0.0.1:$PORT/v1/chat/completions" \
-      -H 'content-type: application/json' \
-      -d "{\"model\":\"$MODEL_ID\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Name three rivers.\"}]}" \
-      >"$OUT/$ARM.req.json" 2>>"$LOG"; then
+    -H 'content-type: application/json' \
+    -d "{\"model\":\"$MODEL_ID\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Name three rivers.\"}]}" \
+    >"$OUT/$ARM.req.json" 2>>"$LOG"; then
     REQ_OK=true
   fi
-  sleep 4 & wait $!
+  sleep 4 &
+  wait $!
   PEAK_REQ=$(tail -n +"$MARK" "$SAMPLES" | sort -n | tail -n1)
   STEADY_AFTER=$(tail -n 6 "$SAMPLES" | median_of)
 elif [ "$REQ" = "embed" ]; then
   MARK=$(grep -c '' "$SAMPLES")
   if curl -fsS -m 120 "http://127.0.0.1:$PORT/v1/embeddings" \
-      -H 'content-type: application/json' \
-      -d '{"model":"qwen3-embedding","input":"a small measurement probe"}' \
-      >"$OUT/$ARM.req.json" 2>>"$LOG"; then
+    -H 'content-type: application/json' \
+    -d '{"model":"qwen3-embedding","input":"a small measurement probe"}' \
+    >"$OUT/$ARM.req.json" 2>>"$LOG"; then
     REQ_OK=true
   fi
-  sleep 4 & wait $!
+  sleep 4 &
+  wait $!
   PEAK_REQ=$(tail -n +"$MARK" "$SAMPLES" | sort -n | tail -n1)
   STEADY_AFTER=$(tail -n 6 "$SAMPLES" | median_of)
 fi
@@ -120,14 +129,18 @@ kill -TERM -- "-$PG" 2>/dev/null || true
 trap - EXIT
 for _ in 1 2 3 4 5 6 7 8; do
   kill -0 "$PG" 2>/dev/null || break
-  sleep 5 & wait $!
+  sleep 5 &
+  wait $!
 done
 kill -KILL -- "-$PG" 2>/dev/null || true
 kill "$SAMPLER" 2>/dev/null || true
 wait "$SAMPLER" 2>/dev/null || true
 
 t0=$SECONDS
-until [ "$(mem_now)" -le $((BASELINE + 100)) ] || [ $((SECONDS - t0)) -gt 120 ]; do sleep 3 & wait $!; done
+until [ "$(mem_now)" -le $((BASELINE + 100)) ] || [ $((SECONDS - t0)) -gt 120 ]; do
+  sleep 3 &
+  wait $!
+done
 FINAL=$(mem_now)
 
 cat >"$RESULT" <<EOF

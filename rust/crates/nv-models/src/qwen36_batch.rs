@@ -115,7 +115,7 @@ impl Qwen36BatchLanes {
         let cfg = model.config();
         let hd = cfg.head_dim;
         anyhow::ensure!(
-            hd % 32 == 0 && hd <= 1024 && model.rope.cos().dtype() == DType::F32,
+            hd.is_multiple_of(32) && hd <= 1024 && model.rope.cos().dtype() == DType::F32,
             "Qwen36BatchLanes: fused qkv decode geometry contract broken (head_dim {hd})"
         );
         for (li, layer) in model.layers.iter().enumerate() {
@@ -285,7 +285,10 @@ impl Qwen36BatchLanes {
     }
 
     pub fn reset_lane(&mut self, lane: usize) -> Result<()> {
-        anyhow::ensure!(lane < self.caches.len(), "reset_lane: lane {lane} out of range");
+        anyhow::ensure!(
+            lane < self.caches.len(),
+            "reset_lane: lane {lane} out of range"
+        );
         self.invalidate_graphs_synced_because_eager_work_after_capture_faults_like_the_solo_engines_prefill()?;
         self.caches[lane].reset();
         self.lane_pos[lane] = 0;
@@ -380,7 +383,10 @@ impl Qwen36BatchLanes {
         route_moe_through_the_installed_hook_like_the_eager_serving_prefill: bool,
     ) -> Result<Tensor> {
         anyhow::ensure!(!prompt.is_empty(), "prefill_lane: empty prompt");
-        anyhow::ensure!(lane < self.caches.len(), "prefill_lane: lane {lane} out of range");
+        anyhow::ensure!(
+            lane < self.caches.len(),
+            "prefill_lane: lane {lane} out of range"
+        );
         self.invalidate_graphs_synced_because_eager_work_after_capture_faults_like_the_solo_engines_prefill()?;
         self.reset_lane(lane)?;
         let seq = prompt.len();
@@ -427,7 +433,10 @@ impl Qwen36BatchLanes {
         k_chunk: &Tensor,
         v_chunk: &Tensor,
     ) -> Result<()> {
-        anyhow::ensure!(lane < self.caches.len(), "prime_lane: lane {lane} out of range");
+        anyhow::ensure!(
+            lane < self.caches.len(),
+            "prime_lane: lane {lane} out of range"
+        );
         if self.runner.has_cached() {
             self.invalidate_graphs_synced_because_eager_work_after_capture_faults_like_the_solo_engines_prefill()?;
         }
@@ -506,12 +515,15 @@ impl Qwen36BatchLanes {
             .map(|i| i + 1)
             .unwrap();
         let b_bucket = self.plan.bucket_for(need).ok_or_else(|| {
-            anyhow::anyhow!("step_batch: {need} lanes exceed max bucket {}", self.plan.max_bucket())
+            anyhow::anyhow!(
+                "step_batch: {need} lanes exceed max bucket {}",
+                self.plan.max_bucket()
+            )
         })?;
         for (i, t) in tokens.iter().enumerate() {
             if t.is_some() {
                 anyhow::ensure!(
-                    self.lane_pos[i] + 1 <= self.caches[i].max_seq_len(),
+                    self.lane_pos[i] < self.caches[i].max_seq_len(),
                     "step_batch: lane {i} cache full at {}",
                     self.lane_pos[i]
                 );
@@ -687,9 +699,7 @@ impl Qwen36BatchLanes {
         if need_capture {
             if let Err(e) = self.runner.probe_capture() {
                 self.capture_failed = true;
-                eprintln!(
-                    "[qwen36_batch] graph capture unavailable; batching uncaptured: {e:#}"
-                );
+                eprintln!("[qwen36_batch] graph capture unavailable; batching uncaptured: {e:#}");
                 self.step_batch_eager(b_bucket)?;
                 return Ok(false);
             }
@@ -886,7 +896,10 @@ fn batch_step_body_inner(
     };
     let moe_rows = |li: usize, ffn: &LayerFfn, x: &Tensor| -> Result<Tensor> {
         let moe = ffn.as_moe().ok_or_else(|| {
-            anyhow::anyhow!("qwen36 batch: layer {li} ffn is {}, routed MoE required", ffn.label())
+            anyhow::anyhow!(
+                "qwen36 batch: layer {li} ffn is {}, routed MoE required",
+                ffn.label()
+            )
         })?;
         if !rowwise_moe || b == 1 {
             let () = ROWS_B_GROUPED_MOE_IS_THE_SOLE_NON_TWIN_ROUTE_AT_B_LE_4_ROWWISE_MOE_RESTORES_BYTE_CLASS_THERE_WHILE_AT_B8_NON_FFN_M_ROW_ROUTES_ALSO_DRIFT_PER_THE_CAD219D1F_RESCOPE;
@@ -903,15 +916,9 @@ fn batch_step_body_inner(
     let mut normed = norm_rows(&layers[0].pre_norm, &x)?;
     for (li, layer) in layers.iter().enumerate() {
         let mixed = match &layer.mixer {
-            LayerMixer::Full(attn) => batch_full_attention(
-                model,
-                attn,
-                li,
-                &normed,
-                caches,
-                b,
-                rowwise_attnproj,
-            )?,
+            LayerMixer::Full(attn) => {
+                batch_full_attention(model, attn, li, &normed, caches, b, rowwise_attnproj)?
+            }
             LayerMixer::Linear(la) => batch_gdn(la, li, &normed, caches, b)?,
         };
         let (normed_post, residual_after_attn) =
@@ -1063,9 +1070,9 @@ fn batch_gdn(
     b: usize,
 ) -> Result<Tensor> {
     let slot_of = |cache: &Qwen3MoeKvCache| -> Result<usize> {
-        cache.lin_attn_slot_for_layer(li).ok_or_else(|| {
-            anyhow::anyhow!("batch_gdn: layer {li} has no linear-attention slot")
-        })
+        cache
+            .lin_attn_slot_for_layer(li)
+            .ok_or_else(|| anyhow::anyhow!("batch_gdn: layer {li} has no linear-attention slot"))
     };
     let rowwise =
         rowwise_group_env_nv_q36_batch_rowwise_per_row_m1_twins_the_moe_group_is_the_bit_exactness_lever_because_the_rows_b_grouped_route_is_the_sole_non_twin_at_b_le_4("gdnproj")

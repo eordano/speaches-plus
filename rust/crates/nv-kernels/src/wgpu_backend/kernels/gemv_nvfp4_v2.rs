@@ -402,7 +402,13 @@ mod tests {
     #[test]
     fn every_pk_entry_point_is_present_and_pair_packs() {
         let src = source(V2Config::new(128, 4));
-        for e in [WARP_PK_ENTRY, FDEC_PK_ENTRY, FMLUT_PK_ENTRY, MROW_PK_ENTRY, MROW2_PK_ENTRY] {
+        for e in [
+            WARP_PK_ENTRY,
+            FDEC_PK_ENTRY,
+            FMLUT_PK_ENTRY,
+            MROW_PK_ENTRY,
+            MROW2_PK_ENTRY,
+        ] {
             assert!(src.contains(&format!("fn {e}(")), "missing {e}");
         }
         let pk = src

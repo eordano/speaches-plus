@@ -1,10 +1,10 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::wgpu_backend::device::WgpuContext;
-use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
 use crate::wgpu_backend::dequant::bytes_to_words;
+use crate::wgpu_backend::device::WgpuContext;
+use crate::wgpu_backend::pack::pack_u16_pairs as pack_u16;
+use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/fused_attn_chain.wgsl");
 
@@ -257,7 +257,8 @@ fn run_kv_entry(
     let scb = dispatch::storage_from_slice(ctx, "fac-kv-scales", scales);
     let up = params_uniform(ctx, n_kv, head_dim, eps, tokens, ring);
     let groups = dispatch::workgroup_count_1d(ctx, rows as u64, 1);
-    let src = compose(&wgsl_with_kv_fp8_e4m3_encode_helpers_because_the_k_v_quant_stages_call_them());
+    let src =
+        compose(&wgsl_with_kv_fp8_e4m3_encode_helpers_because_the_k_v_quant_stages_call_them());
     match tables {
         Some((cos_tbl, sin_tbl, positions)) => {
             let cb = dispatch::storage_from_slice(ctx, "fac-kv-cos", cos_tbl);

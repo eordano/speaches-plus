@@ -7,8 +7,8 @@ blocks. The single-artifact classical band is `070-ocr`; see
 
 Fixtures live directly under `conformance/fixtures/` as
 `071-ocr-layout-<name>/` like every other family. Each dir holds
-`fixture.json`, `input.png` and a `README.md`; PNGs are committed so tests are
-hermetic.
+`fixture.json`, `input.png` and a `README.md`; PNGs are gitignored and rebuilt
+by `conformance/tools/regenerate-fixtures.sh`.
 
 ## Manifest shape
 
@@ -56,6 +56,7 @@ model that emits markdown scores badly on raw CER while being correct.
 ## Regenerating
 
 `conformance/tools/generate-071-ocr-layout-fixtures.py` renders the five pages
-plus their ground-truth text into `OUT` (default: a `rendered/` scratch dir
-beside the script); the fixture directories are assembled from that output.
-Not a test-time dependency.
+plus their ground-truth text into `OUT` (default: a gitignored `rendered/`
+scratch dir beside the script; `FONTS` names the DejaVu directory, found via
+`fc-list` when unset). `conformance/tools/regenerate-fixtures.sh` copies each
+`render.case` PNG into its fixture directory. Not a test-time dependency.

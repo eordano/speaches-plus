@@ -26,7 +26,8 @@ pub const A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_T
      operand or wholly outside it, the clamp is the identity on every band the store guard admits, \
      and a fragment only ever feeds the accumulator of its own row and column.";
 
-pub const COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP: &str =
+pub const COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP:
+    &str =
     "The clamped base is multiplied by k once, before the k loop, so the inner loop addresses \
      cg_x[arow_r + kt + u*tile] where it used to address cg_x[(m0 + r*tile) * kk + kt + u*tile]. \
      The whole guard is tm + tn scalar min instructions per workgroup.";
@@ -209,7 +210,8 @@ impl CoopGemm {
         b.push_str("    let mrows = cg_p.m_rows;\n");
         b.push_str("    let nrows = cg_p.n_rows;\n");
         let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
-        let _ = COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP;
+        let _ =
+            COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP;
         for r in 0..tm {
             writeln!(
                 b,
@@ -477,8 +479,8 @@ impl WqAct {
     }
 }
 
-const E4M3_PLAIN_DECODE_ALL_INTERMEDIATES_NORMAL_BECAUSE_THIS_ADAPTER_FLUSHES_F32_DENORMALS:
-    &str = "
+const E4M3_PLAIN_DECODE_ALL_INTERMEDIATES_NORMAL_BECAUSE_THIS_ADAPTER_FLUSHES_F32_DENORMALS: &str =
+    "
 fn wq16_e4m3_plain(bits: u32) -> f32 {
     let s = select(1.0, -1.0, (bits & 128u) != 0u);
     let e = (bits >> 3u) & 15u;
@@ -554,7 +556,10 @@ fn source_wq16_act_inner(
     assert!((1..=8).contains(&sg), "sg out of range");
     assert!((1..=4).contains(&ku), "ku out of range");
     let t = g.tile;
-    assert!(t == 16, "the wq16 unpack stages one 16-code weight block per k-tile row");
+    assert!(
+        t == 16,
+        "the wq16 unpack stages one 16-code weight block per k-tile row"
+    );
     let wg = sg * SUBGROUP;
     let entry = if y_bf16 {
         entry_wq16_act_y16(fmt, act, tm, tn, sg, ku)
@@ -626,7 +631,9 @@ fn source_wq16_act_inner(
     }
     b.push('\n');
     if fmt == WqFmt::Fp8RowscalePlain || act == WqAct::Fp8Rowscale {
-        b.push_str(E4M3_PLAIN_DECODE_ALL_INTERMEDIATES_NORMAL_BECAUSE_THIS_ADAPTER_FLUSHES_F32_DENORMALS);
+        b.push_str(
+            E4M3_PLAIN_DECODE_ALL_INTERMEDIATES_NORMAL_BECAUSE_THIS_ADAPTER_FLUSHES_F32_DENORMALS,
+        );
     }
     writeln!(b, "var<workgroup> w4bs: array<f16, {}>;", cols * t * ku).unwrap();
     if act != WqAct::F16 {
@@ -839,7 +846,9 @@ fn source_wq16_act_inner(
                 b.push_str("                s = ue4m3_decode(byte_at(cg_xsf[sbi >> 2u], sbi));\n");
                 b.push_str("            }\n");
                 b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
-                b.push_str("                xas[xb + j] = f16(nvfp4_decode(nvfp4_nibble(w0, j)) * s);\n");
+                b.push_str(
+                    "                xas[xb + j] = f16(nvfp4_decode(nvfp4_nibble(w0, j)) * s);\n",
+                );
                 b.push_str("                xas[xb + j + 8u] = f16(nvfp4_decode(nvfp4_nibble(w1, j)) * s);\n");
                 b.push_str("            }\n");
             }
@@ -878,7 +887,11 @@ fn source_wq16_act_inner(
     for u in 0..ku {
         for r in 0..tm {
             for j in 0..tn {
-                writeln!(b, "        c{r}_{j} = coopMultiplyAdd(a{u}_{r}, b{u}_{j}, c{r}_{j});").unwrap();
+                writeln!(
+                    b,
+                    "        c{r}_{j} = coopMultiplyAdd(a{u}_{r}, b{u}_{j}, c{r}_{j});"
+                )
+                .unwrap();
             }
         }
     }
@@ -991,6 +1004,177 @@ pub fn tiles(m: u32, acc: u32) -> (u32, u32) {
 
 pub fn request(ab: Operand) -> CoopRequest {
     CoopGemm::new(TILE, ab).request()
+}
+
+pub fn entry_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
+    format!("gemm_coop_wa4t8_tm{tm}_tn{tn}_sg{sg}_ku{ku}")
+}
+
+pub const WQ8_AFFINE_STAGES_MATCH_THE_HOST_F16_TWIN_BIT_FOR_BIT: &str =
+    "the tile-8 in-kernel-dequant arm stages f16(f32(nibble) * scale + bias) with the mul and \
+     add rounded separately, exactly the expression mlx_affine_dequant_f16_pairs evaluates on \
+     the host, so a workgroup that stages a weight tile produces the identical f16 fragment \
+     the F16-twin arm would have loaded and the two arms' outputs are bit-comparable -- the \
+     wq16 staging's fma would differ in the last ulp and is deliberately not reused here";
+
+pub fn source_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
+    use std::fmt::Write as _;
+    let g = CoopGemm::new(8, Operand::F16);
+    assert!(tm >= 1 && tn >= 1 && tm * tn <= 64, "tile too large");
+    assert!((1..=8).contains(&sg), "sg out of range");
+    assert!((1..=4).contains(&ku), "ku out of range");
+    let t = g.tile;
+    let wg = sg * SUBGROUP;
+    let entry = entry_wq8_affine(tm, tn, sg, ku);
+    let cols = g.cols_per_workgroup(tn, sg);
+    let mut b = String::new();
+
+    writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
+    writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
+    writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
+    b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    pad0: u32,\n    gs: u32,\n};\n\n");
+    b.push_str("@group(0) @binding(0) var<storage, read> cg_w4: array<u32>;\n");
+    b.push_str("@group(0) @binding(1) var<storage, read> cg_x: array<f16>;\n");
+    b.push_str("@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;\n");
+    b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
+    b.push_str("@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n");
+    b.push_str("@group(0) @binding(5) var<storage, read> cg_sf: array<u32>;\n");
+    writeln!(
+        b,
+        "@group(0) @binding({}) var<storage, read> cg_bq: array<u32>;\n",
+        MLX_AFFINE_BIAS_SLOT_7_BECAUSE_6_IS_THE_QUANT_ACT_SCALE
+    )
+    .unwrap();
+    writeln!(b, "var<workgroup> w4bs: array<f16, {}>;", cols * t * ku).unwrap();
+
+    writeln!(b, "\n@compute @workgroup_size({wg})").unwrap();
+    writeln!(b, "fn {entry}(").unwrap();
+    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
+    b.push_str("    let sgid = lidx / 32u;\n");
+    b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
+    b.push_str("    let bm = block / cg_p.blocks_n;\n");
+    b.push_str("    let bn = block - bm * cg_p.blocks_n;\n");
+    writeln!(b, "    let m0 = bm * {}u;", g.rows_per_block(tm)).unwrap();
+    writeln!(b, "    let n0w = bn * {cols}u;").unwrap();
+    writeln!(b, "    let n0 = n0w + sgid * {}u;", t * tn).unwrap();
+    b.push_str("    let kk = cg_p.k_elems;\n");
+    b.push_str("    let ys = cg_p.y_stride;\n");
+    b.push_str("    let mrows = cg_p.m_rows;\n");
+    b.push_str("    let nrows = cg_p.n_rows;\n");
+    let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
+    for r in 0..tm {
+        writeln!(
+            b,
+            "    let arow{r} = min(m0 + {}u, mrows - {t}u) * kk;",
+            r * t
+        )
+        .unwrap();
+    }
+    b.push_str("    let row_words = kk >> 3u;\n");
+    b.push_str("    let sf_row = kk / cg_p.gs;\n");
+    for r in 0..tm {
+        for j in 0..tn {
+            writeln!(b, "    var c{r}_{j} = coopLoadT<CGC>(&cg_zero[0], {t}u);").unwrap();
+        }
+    }
+    let tiles = sg * tn;
+    writeln!(
+        b,
+        "    for (var kt = 0u; kt < kk; kt = kt + {}u) {{",
+        t * ku
+    )
+    .unwrap();
+    b.push_str("        workgroupBarrier();\n");
+    writeln!(
+        b,
+        "        for (var e = lidx; e < {}u; e = e + {wg}u) {{",
+        cols * ku
+    )
+    .unwrap();
+    writeln!(b, "            let u = e / {cols}u;").unwrap();
+    writeln!(b, "            let c = e - u * {cols}u;").unwrap();
+    b.push_str("            let gr = n0w + c;\n");
+    writeln!(b, "            let ku8 = kt + u * {t}u;").unwrap();
+    writeln!(b, "            let tile = u * {tiles}u + (c >> 3u);").unwrap();
+    b.push_str("            let row = c & 7u;\n");
+    writeln!(b, "            let tb = tile * {}u;", t * t).unwrap();
+    b.push_str("            var s = 0.0;\n");
+    b.push_str("            var bv = 0.0;\n");
+    b.push_str("            var w0 = 0u;\n");
+    b.push_str("            if (gr < nrows) {\n");
+    b.push_str("                w0 = cg_w4[gr * row_words + (ku8 >> 3u)];\n");
+    b.push_str("                let sbi = gr * sf_row + ku8 / cg_p.gs;\n");
+    b.push_str("                s = bf16_decode(cg_sf[sbi]);\n");
+    b.push_str("                bv = bf16_decode(cg_bq[sbi]);\n");
+    b.push_str("            }\n");
+    b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
+    writeln!(
+        b,
+        "                let dq = f32((w0 >> (j * 4u)) & 0xfu) * s;"
+    )
+    .unwrap();
+    writeln!(
+        b,
+        "                w4bs[tb + j * {t}u + row] = f16(dq + bv);"
+    )
+    .unwrap();
+    b.push_str("            }\n");
+    b.push_str("        }\n");
+    b.push_str("        workgroupBarrier();\n");
+    for u in 0..ku {
+        for r in 0..tm {
+            writeln!(
+                b,
+                "        let a{u}_{r} = coopLoadT<CGA>(&cg_x[arow{r} + kt + {}u], kk);",
+                u * t
+            )
+            .unwrap();
+        }
+        for j in 0..tn {
+            writeln!(
+                b,
+                "        let b{u}_{j} = coopLoadT<CGB>(&w4bs[({}u + sgid * {tn}u + {j}u) * {}u], {t}u);",
+                u * tiles,
+                t * t
+            )
+            .unwrap();
+        }
+    }
+    for u in 0..ku {
+        for r in 0..tm {
+            for j in 0..tn {
+                writeln!(
+                    b,
+                    "        c{r}_{j} = coopMultiplyAdd(a{u}_{r}, b{u}_{j}, c{r}_{j});"
+                )
+                .unwrap();
+            }
+        }
+    }
+    b.push_str("    }\n");
+    for r in 0..tm {
+        for j in 0..tn {
+            writeln!(
+                b,
+                "    let yo{r}_{j} = (m0 + {}u) * ys + n0 + {}u;",
+                r * t,
+                j * t
+            )
+            .unwrap();
+            writeln!(
+                b,
+                "    if (m0 + {}u < mrows && n0 + {}u < nrows) {{",
+                r * t,
+                j * t
+            )
+            .unwrap();
+            writeln!(b, "        coopStoreT(c{r}_{j}, &cg_y[yo{r}_{j}], ys);").unwrap();
+            b.push_str("    }\n");
+        }
+    }
+    b.push_str("}\n");
+
+    compose_enabled(&ENABLES, &b)
 }
 
 pub fn entry_ab(tm: u32, tn: u32, sg: u32, ku: u32, ab: Operand) -> String {
@@ -1163,9 +1347,12 @@ mod tests {
                 entry_wq16_act(fmt, WqAct::F16, 4, 4, 2, 2)
             );
             for act in [WqAct::Fp8Rowscale, WqAct::Nvfp4Block16] {
-                for (tm, tn, sg, ku) in
-                    [(2u32, 2u32, 2u32, 1u32), (4, 4, 2, 2), (8, 2, 2, 2), (8, 1, 1, 4)]
-                {
+                for (tm, tn, sg, ku) in [
+                    (2u32, 2u32, 2u32, 1u32),
+                    (4, 4, 2, 2),
+                    (8, 2, 2, 2),
+                    (8, 1, 1, 4),
+                ] {
                     let src = source_wq16_act(fmt, act, tm, tn, sg, ku);
                     let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
                         panic!("{fmt:?}x{act:?} tm={tm} tn={tn} sg={sg} ku={ku}: parse: {e}")
@@ -1209,7 +1396,10 @@ mod tests {
     #[test]
     fn the_a_stage_budget_counts_both_tiles_and_the_error_names_the_overflow() {
         assert_eq!(wq16_act_stage_elems(WqAct::F16, 8, 1, 1, 4), 1024);
-        assert_eq!(wq16_act_stage_elems(WqAct::Fp8Rowscale, 8, 1, 1, 4), 1024 + 8192);
+        assert_eq!(
+            wq16_act_stage_elems(WqAct::Fp8Rowscale, 8, 1, 1, 4),
+            1024 + 8192
+        );
         assert_eq!(
             wq16_act_stage_elems(WqAct::Nvfp4Block16, 4, 4, 2, 2),
             4096 + 2048
@@ -1353,7 +1543,12 @@ mod tests {
 
     #[test]
     fn splitk_source_parses_validates_and_stores_each_split_into_its_own_partial_slab() {
-        for (tm, tn, sg, s) in [(4u32, 4u32, 4u32, 4u32), (4, 4, 4, 8), (8, 2, 2, 16), (2, 4, 4, 2)] {
+        for (tm, tn, sg, s) in [
+            (4u32, 4u32, 4u32, 4u32),
+            (4, 4, 4, 8),
+            (8, 2, 2, 16),
+            (2, 4, 4, 2),
+        ] {
             let src = source_splitk(tm, tn, sg, s);
             let module = naga::front::wgsl::parse_str(&src)
                 .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: parse: {e}"));
@@ -1369,5 +1564,4 @@ mod tests {
         }
         assert_eq!(entry_splitk(4, 4, 4, 8), "gemm_coop_h8k_tm4_tn4_sg4_s8");
     }
-
 }

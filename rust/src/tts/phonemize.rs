@@ -96,3 +96,24 @@ pub fn phonemize(text: &str, lang: &str) -> Result<String> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clause_punctuation_reaches_the_phoneme_string() {
+        let data = std::env::var("ESPEAK_DATA_PATH").ok();
+        if init(data.as_deref()).is_err() {
+            eprintln!("SKIP: espeak-ng data not available");
+            return;
+        }
+        let es = phonemize("Hola, mundo. ¿Cómo estás? Bien.", "es").unwrap();
+        assert!(es.contains(", "), "{es}");
+        assert!(es.contains(". "), "{es}");
+        assert!(es.contains("? "), "{es}");
+        assert!(es.ends_with('.'), "{es}");
+        let en = phonemize("Good night, stranger.", "en-us").unwrap();
+        assert!(en.contains(", ") && en.ends_with('.'), "{en}");
+    }
+}

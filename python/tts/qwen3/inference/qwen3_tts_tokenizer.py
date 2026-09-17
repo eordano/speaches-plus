@@ -4,7 +4,6 @@ import urllib.request
 from typing import Union
 from urllib.parse import urlparse
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -80,6 +79,7 @@ class Qwen3TTSTokenizer:
         target_sr: int,
     ) -> np.ndarray:
 
+        import librosa
         if self._is_url(x):
             with urllib.request.urlopen(x) as resp:
                 audio_bytes = resp.read()
@@ -106,6 +106,7 @@ class Qwen3TTSTokenizer:
         sr: int | None,
     ) -> list[np.ndarray]:
 
+        import librosa
         target_sr = int(self.feature_extractor.sampling_rate)
 
         if isinstance(audios, (str, np.ndarray)):

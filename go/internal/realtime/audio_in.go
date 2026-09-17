@@ -88,13 +88,14 @@ func (p *sessionPipeline) processIncomingAudio(resampled audio.MonoF32) (quit bo
 	var stoppedEndMs int64
 	var stoppedSamples audio.MonoF32
 
+	if p.audioStore != nil {
+		p.audioStore.AppendMicIn(resampled)
+	}
+
 	p.bufMu.Lock()
 	p.buf16k = append(p.buf16k, resampled...)
 
 	p.audioCursor.Add(int64(len(resampled)))
-	if p.audioStore != nil {
-		p.audioStore.AppendMicIn(append(audio.MonoF32(nil), resampled...))
-	}
 	if hasNonSilenceWith(resampled, p.session.NonSilenceThreshold) {
 		p.lastAudio = time.Now()
 	}

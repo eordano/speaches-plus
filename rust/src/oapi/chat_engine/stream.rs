@@ -303,7 +303,6 @@ impl IncrementalDetok {
     }
 
     pub(crate) fn push(&mut self, id: u32) -> anyhow::Result<&str> {
-
         if let Some(text) = self.wire_text(id) {
             let w = self
                 .tokenizer
@@ -600,9 +599,8 @@ mod wire_token_tests {
     use super::*;
 
     fn real_tokenizer() -> Arc<tokenizers::Tokenizer> {
-        let dir = std::env::var("NV_CHAT_MODEL_DIR").expect(
-            "PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: NV_CHAT_MODEL_DIR unset",
-        );
+        let dir = std::env::var("NV_CHAT_MODEL_DIR")
+            .expect("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: NV_CHAT_MODEL_DIR unset");
         let path = std::path::Path::new(&dir).join("tokenizer.json");
         Arc::new(tokenizers::Tokenizer::from_file(&path).expect("tokenizer.json"))
     }
@@ -660,7 +658,8 @@ mod wire_token_tests {
         let call = "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>";
         let ids = tok.encode(call, false).expect("encode").get_ids().to_vec();
         assert!(
-            ids.iter().any(|i| tok.decode(&[*i], true).unwrap().is_empty()),
+            ids.iter()
+                .any(|i| tok.decode(&[*i], true).unwrap().is_empty()),
             "the encoding contains no special token, so this proves nothing"
         );
 
@@ -669,7 +668,10 @@ mod wire_token_tests {
         for id in &ids {
             last = d.push(*id).expect("push").to_string();
         }
-        assert_eq!(last, call, "emitter output must reproduce the call verbatim");
+        assert_eq!(
+            last, call,
+            "emitter output must reproduce the call verbatim"
+        );
 
         let parsed = crate::oapi::chat::parse_model_tool_calls(&last, None);
         assert_eq!(parsed.tool_calls.len(), 1, "parsed: {last:?}");

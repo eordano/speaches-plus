@@ -1,4 +1,6 @@
+pub mod builtin_voices;
 pub mod chunk;
+pub mod fit;
 pub mod http;
 pub mod npz;
 pub mod phonemize;
@@ -6,8 +8,9 @@ pub mod text;
 pub mod vocab;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{anyhow, Context, Result};
 use ort::ep::{self, ExecutionProvider};
@@ -18,6 +21,64 @@ use tracing::debug;
 
 use self::npz::Voice;
 use super::vad::ort_err;
+use nv_tts::kokoro::KokoroCandle;
+use nv_tts::{VoiceKind, VoiceStoreHandle, ADAPTER_FILE, PACK_FILE};
+
+pub fn load_candle_from_env() -> Option<Arc<KokoroCandle>> {
+    let weights = std::env::var_os("KOKORO_CANDLE_WEIGHTS")?;
+    let weights = PathBuf::from(weights);
+    let enc = match (
+        std::env::var_os("NV_QWEN_VOICE_ENCODER_DIR"),
+        std::env::var_os("NV_WESPEAKER_CANDLE_DIR"),
+    ) {
+        (Some(q), Some(w)) => Some((PathBuf::from(q), PathBuf::from(w))),
+        _ => None,
+    };
+    let device = candle_core::Device::cuda_if_available(0).unwrap_or(candle_core::Device::Cpu);
+    match KokoroCandle::load(
+        &weights,
+        enc.as_ref().map(|(q, w)| (q.as_path(), w.as_path())),
+        &device,
+    ) {
+        Ok(h) => {
+            debug!(path = %weights.display(), fit = enc.is_some(), "kokoro candle model loaded");
+            Some(Arc::new(h))
+        }
+        Err(e) => {
+            debug!(?e, path = %weights.display(), "kokoro candle model failed to load");
+            None
+        }
+    }
+}
+
+pub fn load_adapter_map(
+    directory: &std::path::Path,
+    device: &candle_core::Device,
+) -> Result<HashMap<String, candle_core::Tensor>> {
+    let st = directory.join("adapter.safetensors");
+    if st.is_file() {
+        return Ok(candle_core::safetensors::load(&st, device)?);
+    }
+    let voices = npz::load_voices(&directory.join(ADAPTER_FILE)).context("read adapter.npz")?;
+    let mut out = HashMap::with_capacity(voices.len());
+    for (k, v) in voices {
+        out.insert(
+            k,
+            candle_core::Tensor::from_vec(v.data, v.shape.as_slice(), device)?,
+        );
+    }
+    Ok(out)
+}
+
+#[derive(Clone)]
+struct StoreVoice {
+    directory: PathBuf,
+    modified: Option<SystemTime>,
+    pack: Voice,
+    session: Option<Arc<Mutex<Session>>>,
+
+    adapter: Option<Arc<HashMap<String, candle_core::Tensor>>>,
+}
 
 #[allow(dead_code)]
 pub const TTS_SAMPLE_RATE: usize = super::defaults::audio::TTS_SAMPLE_RATE;
@@ -27,17 +88,159 @@ pub struct KokoroHandle {
     session: Arc<Mutex<Session>>,
     voices: Arc<HashMap<String, Voice>>,
     queue: Arc<tokio::sync::Semaphore>,
+    provider: &'static str,
+    model_path: Arc<PathBuf>,
+    threads: usize,
+    store: Arc<VoiceStoreHandle>,
+    store_cache: Arc<Mutex<HashMap<String, StoreVoice>>>,
+    candle: Option<Arc<KokoroCandle>>,
 }
 
 impl KokoroHandle {
+    pub fn provider(&self) -> &'static str {
+        self.provider
+    }
+
+    pub fn candle(&self) -> Option<Arc<KokoroCandle>> {
+        self.candle.clone()
+    }
+
     pub fn has_voice(&self, name: &str) -> bool {
-        self.voices.contains_key(name)
+        self.voices.contains_key(name) || self.store_has(name)
     }
 
     pub fn voice_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.voices.keys().cloned().collect();
+        if let Ok(store) = self.store.get() {
+            if let Ok(metas) = store.list_kokoro() {
+                names.extend(metas.into_iter().map(|m| m.name));
+            }
+        }
         names.sort();
+        names.dedup();
         names
+    }
+
+    fn store_has(&self, name: &str) -> bool {
+        self.store
+            .get()
+            .ok()
+            .and_then(|s| s.get_meta(name).ok())
+            .map(|m| m.kind.is_kokoro())
+            .unwrap_or(false)
+    }
+
+    fn store_voice(&self, name: &str) -> Result<Option<StoreVoice>> {
+        let Ok(store) = self.store.get() else {
+            return Ok(None);
+        };
+        if !store.exists(name) {
+            return Ok(None);
+        }
+        let directory = store.dir_for(name);
+        let modified = std::fs::metadata(directory.join(nv_tts::META_FILE))
+            .and_then(|m| m.modified())
+            .ok();
+        {
+            let cache = self
+                .store_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(sv) = cache.get(name) {
+                if sv.modified == modified && sv.directory == directory {
+                    return Ok(Some(sv.clone()));
+                }
+            }
+        }
+        let meta: nv_tts::VoiceMeta =
+            serde_json::from_slice(&std::fs::read(directory.join(nv_tts::META_FILE))?)?;
+        if !meta.kind.is_kokoro() {
+            return Ok(None);
+        }
+        let pack = npz::parse_npy(&std::fs::read(directory.join(PACK_FILE))?)
+            .with_context(|| format!("voice {name:?}: {PACK_FILE}"))?;
+        let adapter = match (&meta.kind, &self.candle) {
+            (VoiceKind::KokoroAdapter, Some(candle)) => Some(Arc::new(
+                load_adapter_map(&directory, &candle.device)
+                    .with_context(|| format!("voice {name:?}: adapter"))?,
+            )),
+            _ => None,
+        };
+        let session = if meta.kind == VoiceKind::KokoroAdapter && adapter.is_none() {
+            let t0 = std::time::Instant::now();
+            let session = self
+                .build_adapted_session(&directory.join(ADAPTER_FILE))
+                .with_context(|| format!("voice {name:?}: {ADAPTER_FILE}"))?;
+            debug!(
+                voice = name,
+                ms = t0.elapsed().as_millis() as u64,
+                "kokoro adapted session ready"
+            );
+            Some(Arc::new(Mutex::new(session)))
+        } else {
+            None
+        };
+        let sv = StoreVoice {
+            directory,
+            modified,
+            pack,
+            session,
+            adapter,
+        };
+        let mut cache = self
+            .store_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sv.session.is_some() {
+            let limit = adapted_sessions_limit();
+            while cache.values().filter(|v| v.session.is_some()).count() >= limit {
+                let Some(victim) = cache
+                    .iter()
+                    .find(|(k, v)| v.session.is_some() && k.as_str() != name)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                cache.remove(&victim);
+            }
+        }
+        cache.insert(name.to_string(), sv.clone());
+        Ok(Some(sv))
+    }
+
+    fn build_adapted_session(&self, adapter: &Path) -> Result<Session> {
+        let overrides = npz::load_voices(adapter).context("read adapter")?;
+        if overrides.is_empty() {
+            return Err(anyhow!("adapter has no initializer entries"));
+        }
+        let builder = session_builder(self.threads)?;
+        let (mut builder, _provider) = with_requested_provider(builder)?;
+        for (init_name, value) in overrides {
+            let tensor = Tensor::<f32>::from_array((value.shape.clone(), value.data))
+                .map_err(ort_err)
+                .with_context(|| format!("initializer {init_name}"))?;
+            builder = builder
+                .with_external_initializer(&init_name, Arc::new(tensor.into_dyn()))
+                .map_err(ort_err)
+                .with_context(|| format!("override initializer {init_name}"))?;
+        }
+        builder
+            .commit_from_file(self.model_path.as_path())
+            .map_err(ort_err)
+            .with_context(|| format!("load kokoro {}", self.model_path.display()))
+    }
+
+    fn resolve_voice(&self, voice_name: &str) -> Result<(Voice, Arc<Mutex<Session>>)> {
+        if let Some(sv) = self.store_voice(voice_name)? {
+            return Ok((sv.pack, sv.session.unwrap_or_else(|| self.session.clone())));
+        }
+        let pack = self.voices.get(voice_name).ok_or_else(|| {
+            anyhow!(
+                "voice {voice_name:?} not found in voices.bin ({} voices loaded)",
+                self.voices.len()
+            )
+        })?;
+        Ok((pack.clone(), self.session.clone()))
     }
 
     pub fn queue(&self) -> Arc<tokio::sync::Semaphore> {
@@ -56,16 +259,59 @@ impl KokoroHandle {
         }
         let voice_name = voice.unwrap_or("af_heart");
         let lang = lang.unwrap_or("en-us");
-        let voice_pack = self.voices.get(voice_name).ok_or_else(|| {
-            anyhow!(
-                "voice {voice_name:?} not found in voices.bin ({} voices loaded)",
-                self.voices.len()
-            )
-        })?;
+        let (cleaned, tokens) = self.tokens_for(text, lang)?;
+        let n = tokens.len();
+        if let (Some(candle), Some(sv)) = (&self.candle, self.store_voice(voice_name)?) {
+            if let Some(adapter) = &sv.adapter {
+                let rows = sv.pack.shape.first().copied().unwrap_or(0);
+                if rows == 0 {
+                    return Err(anyhow!("voice {voice_name:?} has no style rows"));
+                }
+                let style_vec = sv.pack.row(n.min(rows - 1)).context("style row")?;
+                let mut ids: Vec<u32> = Vec::with_capacity(n + 2);
+                ids.push(0);
+                ids.extend(tokens.iter().map(|t| *t as u32));
+                ids.push(0);
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(1);
+                let audio_vec = candle.synthesize(
+                    &ids,
+                    &style_vec,
+                    speed as f64,
+                    Some(adapter.as_ref()),
+                    seed,
+                )?;
+                debug!(
+                    phonemes = cleaned.as_str(),
+                    n_tokens = n,
+                    samples = audio_vec.len(),
+                    "kokoro candle synth complete (adapter)"
+                );
+                return Ok(super::types::MonoF32At24k::new(audio_vec));
+            }
+        }
+        let (voice_pack, session) = self.resolve_voice(voice_name)?;
+        let rows = voice_pack.shape.first().copied().unwrap_or(0);
+        if rows == 0 {
+            return Err(anyhow!("voice {voice_name:?} has no style rows"));
+        }
+        let style_vec = voice_pack.row(n.min(rows - 1)).context("style row")?;
+        let audio_vec = run_kokoro(&session, &tokens, &style_vec, speed)?;
+        debug!(
+            phonemes = cleaned.as_str(),
+            n_tokens = n,
+            samples = audio_vec.len(),
+            "kokoro synth complete"
+        );
+        Ok(super::types::MonoF32At24k::new(audio_vec))
+    }
 
+    pub fn tokens_for(&self, text: &str, lang: &str) -> Result<(String, Vec<i64>)> {
         let raw =
             phonemize::phonemize(text, lang).with_context(|| format!("phonemize {text:?}"))?;
-        let cleaned = vocab::clean_phonemes(&raw);
+        let cleaned = vocab::clean_phonemes(&raw, lang);
         if cleaned.is_empty() {
             return Err(anyhow!("phonemize produced empty output for {text:?}"));
         }
@@ -80,53 +326,32 @@ impl KokoroHandle {
                 vocab::MAX_PHONEME_LENGTH
             ));
         }
-        let n = tokens.len();
+        Ok((cleaned, tokens))
+    }
 
-        let mut padded = Vec::with_capacity(n + 2);
-        padded.push(0i64);
-        padded.extend_from_slice(&tokens);
-        padded.push(0i64);
+    pub fn synth_tokens_with_style(
+        &self,
+        tokens: &[i64],
+        style: &[f32],
+        speed: f32,
+    ) -> Result<Vec<f32>> {
+        run_kokoro(&self.session, tokens, style, speed)
+    }
 
-        if voice_pack.shape.is_empty() || n >= voice_pack.shape[0] {
-            return Err(anyhow!(
-                "token count {n} >= style rows {}",
-                voice_pack.shape.first().copied().unwrap_or(0)
-            ));
-        }
-        let style_vec = voice_pack.row(n).context("style row")?;
-
-        let token_tensor = Tensor::<i64>::from_array(([1usize, n + 2], padded.into_boxed_slice()))
-            .map_err(ort_err)?;
-        let style_tensor =
-            Tensor::<f32>::from_array(([1usize, style_vec.len()], style_vec.into_boxed_slice()))
-                .map_err(ort_err)?;
-        let speed_tensor = Tensor::<f32>::from_array(([1usize], vec![speed].into_boxed_slice()))
-            .map_err(ort_err)?;
-
-        let audio_vec: Vec<f32> = {
-            let mut session = self
-                .session
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let outputs = session
-                .run(ort::inputs![
-                    "tokens" => token_tensor,
-                    "style" => style_tensor,
-                    "speed" => speed_tensor,
-                ])
-                .map_err(ort_err)?;
-            let (_, audio) = outputs["audio"]
-                .try_extract_tensor::<f32>()
-                .map_err(ort_err)?;
-            audio.to_vec()
-        };
-        debug!(
-            phonemes = cleaned.as_str(),
-            n_tokens = n,
-            samples = audio_vec.len(),
-            "kokoro synth complete"
-        );
-        Ok(super::types::MonoF32At24k::new(audio_vec))
+    pub fn stock_style_rows(&self) -> Vec<(String, Vec<f32>)> {
+        let mut out: Vec<(String, Vec<f32>)> = self
+            .voices
+            .iter()
+            .filter_map(|(name, v)| {
+                let rows = v.shape.first().copied().unwrap_or(0);
+                if rows == 0 {
+                    return None;
+                }
+                v.row(100.min(rows - 1)).ok().map(|r| (name.clone(), r))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 
@@ -163,7 +388,11 @@ fn gpu_eps() -> Vec<(&'static str, Box<dyn ExecutionProvider>)> {
 
 fn with_requested_provider(mut builder: SessionBuilder) -> Result<(SessionBuilder, &'static str)> {
     let requested = std::env::var(super::defaults::env::KOKORO_ONNX_PROVIDER)
-        .map(|v| v.trim().to_ascii_lowercase().replace("executionprovider", ""))
+        .map(|v| {
+            v.trim()
+                .to_ascii_lowercase()
+                .replace("executionprovider", "")
+        })
         .unwrap_or_default();
     if requested == "cpu" {
         return Ok((builder, "cpu"));
@@ -192,7 +421,11 @@ fn with_requested_provider(mut builder: SessionBuilder) -> Result<(SessionBuilde
         }
         match provider.register(&mut builder) {
             Ok(()) => return Ok((builder, name)),
-            Err(e) => debug!(name, ?e, "kokoro gpu provider available but failed to register"),
+            Err(e) => debug!(
+                name,
+                ?e,
+                "kokoro gpu provider available but failed to register"
+            ),
         }
     }
     Ok((builder, "cpu"))
@@ -213,21 +446,17 @@ pub fn prepared_handle(model_dir: &Path) -> Result<Option<KokoroHandle>> {
         return Ok(None);
     };
 
-    let voices = npz::load_voices(&voices_path).context("load voices")?;
+    let mut voices = npz::load_voices(&voices_path).context("load voices")?;
+    for (name, voice) in builtin_voices::load().context("builtin voices")? {
+        voices.entry(name).or_insert(voice);
+    }
     debug!(count = voices.len(), "loaded Kokoro voices");
 
     let espeak_data = espeak_data_dir();
     phonemize::init(espeak_data.as_deref()).context("init phonemizer")?;
 
     let threads = intra_threads();
-    let builder = Session::builder()
-        .map_err(ort_err)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
-        .map_err(ort_err)?
-        .with_intra_threads(threads)
-        .map_err(ort_err)?
-        .with_inter_threads(1)
-        .map_err(ort_err)?;
+    let builder = session_builder(threads)?;
     let (mut builder, provider) = with_requested_provider(builder)?;
     let session = builder
         .commit_from_file(&model_path)
@@ -240,10 +469,19 @@ pub fn prepared_handle(model_dir: &Path) -> Result<Option<KokoroHandle>> {
         "kokoro session ready"
     );
 
+    let store = Arc::new(VoiceStoreHandle::new(
+        crate::oapi::voice_profiles::voice_profile_root(),
+    ));
     let handle = KokoroHandle {
         session: Arc::new(Mutex::new(session)),
         voices: Arc::new(voices),
         queue: Arc::new(tokio::sync::Semaphore::new(1)),
+        provider,
+        model_path: Arc::new(model_path.clone()),
+        threads,
+        store,
+        store_cache: Arc::new(Mutex::new(HashMap::new())),
+        candle: load_candle_from_env(),
     };
 
     let warmup_enabled = std::env::var(super::defaults::env::KOKORO_WARMUP)
@@ -265,6 +503,59 @@ pub fn prepared_handle(model_dir: &Path) -> Result<Option<KokoroHandle>> {
     }
 
     Ok(Some(handle))
+}
+
+fn session_builder(threads: usize) -> Result<SessionBuilder> {
+    Session::builder()
+        .map_err(ort_err)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(ort_err)?
+        .with_intra_threads(threads)
+        .map_err(ort_err)?
+        .with_inter_threads(1)
+        .map_err(ort_err)
+}
+
+fn adapted_sessions_limit() -> usize {
+    std::env::var("KOKORO_ADAPTED_SESSIONS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+fn run_kokoro(
+    session: &Arc<Mutex<Session>>,
+    tokens: &[i64],
+    style: &[f32],
+    speed: f32,
+) -> Result<Vec<f32>> {
+    let n = tokens.len();
+    let mut padded = Vec::with_capacity(n + 2);
+    padded.push(0i64);
+    padded.extend_from_slice(tokens);
+    padded.push(0i64);
+    let token_tensor =
+        Tensor::<i64>::from_array(([1usize, n + 2], padded.into_boxed_slice())).map_err(ort_err)?;
+    let style_tensor =
+        Tensor::<f32>::from_array(([1usize, style.len()], style.to_vec().into_boxed_slice()))
+            .map_err(ort_err)?;
+    let speed_tensor =
+        Tensor::<f32>::from_array(([1usize], vec![speed].into_boxed_slice())).map_err(ort_err)?;
+    let mut session = session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let outputs = session
+        .run(ort::inputs![
+            "tokens" => token_tensor,
+            "style" => style_tensor,
+            "speed" => speed_tensor,
+        ])
+        .map_err(ort_err)?;
+    let (_, audio) = outputs["audio"]
+        .try_extract_tensor::<f32>()
+        .map_err(ort_err)?;
+    Ok(audio.to_vec())
 }
 
 fn first_existing(candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
@@ -296,4 +587,138 @@ fn espeak_data_dir() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    fn check_adapter_formats(device: &candle_core::Device) -> Result<()> {
+        let td = crate::voices::stages::TempDir::new("adapter-device")?;
+        let path = td.0.join("adapter.safetensors");
+        let tensor = candle_core::Tensor::from_vec(
+            vec![1f32, 2., 3., 4.],
+            (2, 2),
+            &candle_core::Device::Cpu,
+        )?;
+        let map = HashMap::from([("decoder.test.weight".to_string(), tensor)]);
+        candle_core::safetensors::save(&map, &path)?;
+        for safetensors in [true, false] {
+            if !safetensors {
+                std::fs::remove_file(&path)?;
+                npz::write_npz(
+                    &td.0.join(ADAPTER_FILE),
+                    &[(
+                        "decoder.test.weight".into(),
+                        vec![2, 2],
+                        vec![1., 2., 3., 4.],
+                    )],
+                )?;
+            }
+            let loaded = load_adapter_map(&td.0, device)?;
+            let w = &loaded["decoder.test.weight"];
+            assert!(w.device().same_device(device));
+            let result = w.matmul(&candle_core::Tensor::ones(
+                (2, 1),
+                candle_core::DType::F32,
+                device,
+            )?)?;
+            assert_eq!(result.flatten_all()?.to_vec1::<f32>()?, vec![3., 7.]);
+        }
+        Ok(())
+    }
+
+    const DEFAULT_KOKORO_WEIGHTS: &str = "models/kokoro-v1_0.safetensors";
+    const DEFAULT_ADAPTED_VOICE: &str = "voices/adapted";
+
+    fn env_or(var: &str, default: &str) -> PathBuf {
+        std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("NV_VOICES_DATA_DIR").unwrap_or_default()).join(default)
+        })
+    }
+
+    fn real_adapter(device: &candle_core::Device) -> Result<()> {
+        let weights = env_or("KOKORO_CANDLE_WEIGHTS", DEFAULT_KOKORO_WEIGHTS);
+        let directory = env_or("NV_TEST_KOKORO_VOICE_DIR", DEFAULT_ADAPTED_VOICE);
+        if !weights.is_file() || !directory.join(PACK_FILE).is_file() {
+            eprintln!(
+                "SKIP: need {} and {} (KOKORO_CANDLE_WEIGHTS, NV_TEST_KOKORO_VOICE_DIR)",
+                weights.display(),
+                directory.display()
+            );
+            return Ok(());
+        }
+        let model = nv_tts::kokoro::KokoroCandle::load(&weights, None, device)?;
+        assert!(model.device.same_device(device));
+        let pack = npz::parse_npy(&std::fs::read(directory.join(PACK_FILE))?)?;
+        let style = pack.row(0)?;
+        let mut ids = vec![0];
+        ids.extend(
+            vocab::tokenize("həlˈoʊ wˈɜːld")
+                .into_iter()
+                .map(|v| v as u32),
+        );
+        ids.push(0);
+        let base = model.synthesize(&ids, &style, 1., None, 7)?;
+        let adapter = load_adapter_map(&directory, device)?;
+        assert!(!adapter.is_empty());
+        assert!(adapter.values().all(|t| t.device().same_device(device)));
+        let adapted = model.synthesize(&ids, &style, 1., Some(&adapter), 7)?;
+        let restored = model.synthesize(&ids, &style, 1., None, 7)?;
+        assert!(!adapted.is_empty() && adapted.iter().all(|v| v.is_finite()));
+        assert!(adapted.iter().any(|v| v.abs() > 0.001));
+        assert_eq!(base.len(), restored.len());
+        assert!(base
+            .iter()
+            .zip(&restored)
+            .all(|(a, b)| (a - b).abs() < 1e-5));
+        assert!(
+            base.len() != adapted.len()
+                || base.iter().zip(&adapted).any(|(a, b)| (a - b).abs() > 1e-3)
+        );
+        let cpu_adapter = load_adapter_map(&directory, &candle_core::Device::Cpu)?;
+        let via_cpu = model.synthesize(&ids, &style, 1., Some(&cpu_adapter), 7)?;
+        assert_eq!(via_cpu.len(), adapted.len());
+        assert!(via_cpu
+            .iter()
+            .zip(&adapted)
+            .all(|(a, b)| (a - b).abs() < 1e-4));
+        eprintln!(
+            "real adapter on {:?}: {} tensors, {} samples adapted",
+            device,
+            adapter.len(),
+            adapted.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "loads the converted Kokoro weights and a fitted voice"]
+    fn voices_real_adapter_cpu() -> Result<()> {
+        real_adapter(&candle_core::Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "loads the converted Kokoro weights and a fitted voice on the GPU"]
+    fn voices_real_adapter_cuda() -> Result<()> {
+        let device = candle_core::Device::cuda_if_available(0)?;
+        if !device.is_cuda() {
+            eprintln!("SKIP: no CUDA device");
+            return Ok(());
+        }
+        real_adapter(&device)
+    }
+
+    #[test]
+    fn voices_adapter_formats_load_on_requested_cpu() -> Result<()> {
+        check_adapter_formats(&candle_core::Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn voices_adapter_formats_load_on_requested_cuda() -> Result<()> {
+        check_adapter_formats(&candle_core::Device::new_cuda(0)?)
+    }
 }

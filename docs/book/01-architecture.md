@@ -126,9 +126,8 @@ W1–W8 wire and I1–I11 state-machine invariants), **so an implementation cann
 pass by agreeing with itself** (08-build-and-testing.md). **`client/`** holds
 Python and Node e2e drivers driving the server over `aiortc`, upstream
 `speaches`'s own WebRTC stack; **`inspector/`** is a dependency-free static
-frontend over `/v1/inspect/*`, not served by the binary; `rocq/` holds Coq/Rocq
-proofs of scheduling and roofline properties; `examples/` a LoRA training
-notebook.
+frontend over `/v1/inspect/*`, not served by the binary; `examples/` a LoRA
+training notebook.
 
 ## Build and model provisioning
 

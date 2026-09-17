@@ -320,7 +320,7 @@ fn q3w_attn_decode(
     if (ad_pos[0] > 0) {
         p = u32(ad_pos[0]);
     }
-    let total = p + 1u;
+    let total = min(p + 1u, ad_p.max_seq);
     let kv = h / ad_p.group;
     let srow = h * ad_p.max_seq;
 

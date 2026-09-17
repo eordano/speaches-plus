@@ -90,15 +90,25 @@ impl Qwen3MmSpec {
         let min_pixels = pp
             .get("min_pixels")
             .and_then(|v| v.as_u64())
-            .or_else(|| size.and_then(|s| s.get("shortest_edge")).and_then(|v| v.as_u64()))
+            .or_else(|| {
+                size.and_then(|s| s.get("shortest_edge"))
+                    .and_then(|v| v.as_u64())
+            })
             .map(|v| v as usize)
-            .ok_or_else(|| anyhow::anyhow!("preprocessor_config.json: no min_pixels/shortest_edge"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("preprocessor_config.json: no min_pixels/shortest_edge")
+            })?;
         let max_pixels = pp
             .get("max_pixels")
             .and_then(|v| v.as_u64())
-            .or_else(|| size.and_then(|s| s.get("longest_edge")).and_then(|v| v.as_u64()))
+            .or_else(|| {
+                size.and_then(|s| s.get("longest_edge"))
+                    .and_then(|v| v.as_u64())
+            })
             .map(|v| v as usize)
-            .ok_or_else(|| anyhow::anyhow!("preprocessor_config.json: no max_pixels/longest_edge"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("preprocessor_config.json: no max_pixels/longest_edge")
+            })?;
         let triple = |k: &str, default: f32| -> [f32; 3] {
             match pp.get(k).and_then(|v| v.as_array()) {
                 Some(a) if a.len() == 3 => [
@@ -295,9 +305,9 @@ impl Qwen3VisionMm {
         prompt_ids: &[u32],
         embeds: &[Tensor],
     ) -> Result<Vec<nv_models::embed_row_splice::EmbedRowSplice>> {
-        let splices =
-            self.tower
-                .build_splices(prompt_ids, self.spec.image_token_id, embeds)?;
+        let splices = self
+            .tower
+            .build_splices(prompt_ids, self.spec.image_token_id, embeds)?;
         let mut out = Vec::with_capacity(splices.len());
         for sp in splices {
             let f: Vec<f32> = sp
@@ -305,7 +315,10 @@ impl Qwen3VisionMm {
                 .to_dtype(candle_core::DType::F32)?
                 .flatten_all()?
                 .to_vec1()?;
-            let rows_bf16: Vec<u16> = f.iter().map(|&x| f32_to_bf16_bits_round_nearest_even(x)).collect();
+            let rows_bf16: Vec<u16> = f
+                .iter()
+                .map(|&x| f32_to_bf16_bits_round_nearest_even(x))
+                .collect();
             out.push(nv_models::embed_row_splice::EmbedRowSplice {
                 position: sp.position,
                 rows_bf16,

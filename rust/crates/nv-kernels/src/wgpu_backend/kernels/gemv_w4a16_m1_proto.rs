@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::wgpu_backend::device::WgpuContext;
+use crate::wgpu_backend::pack::pack_u16_pairs as pack_u16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/gemv_w4a16_m1_proto.wgsl");
 

@@ -198,7 +198,19 @@ pub async fn diarization_post(State(state): State<AppState>, mut multipart: Mult
             }
         };
 
-    let label_for = build_speaker_label_map(&segments, &samples, &emb, &known_embeddings).await;
+    let speakers = match speaker_summaries(&segments, &samples, &emb).await {
+        Ok(v) => v,
+        Err(err) => {
+            return oapi::openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("speaker embeddings: {err}"),
+                oapi::kind::SERVER,
+                None,
+                Some("embed_failed"),
+            )
+        }
+    };
+    let label_for = speaker_labels(&speakers, &known_embeddings);
 
     if response_format == "rttm" {
         let file_id = audio_filename
@@ -230,17 +242,7 @@ pub async fn diarization_post(State(state): State<AppState>, mut multipart: Mult
         )
             .into_response()
     } else {
-        let body = serde_json::json!({
-            "duration": duration_s,
-            "segments": segments
-                .iter()
-                .map(|s| serde_json::json!({
-                    "start": s.t_start_ms as f64 / 1000.0,
-                    "end": s.t_end_ms as f64 / 1000.0,
-                    "speaker": label_for(s.speaker),
-                }))
-                .collect::<Vec<_>>(),
-        });
+        let body = diarization_json(duration_s, &segments, &speakers, &label_for);
         (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -250,64 +252,100 @@ pub async fn diarization_post(State(state): State<AppState>, mut multipart: Mult
     }
 }
 
-pub async fn build_speaker_label_map(
+fn diarization_json(
+    duration_s: f64,
+    segments: &[DiarSegment],
+    speakers: &[SpeakerSummary],
+    label_for: &impl Fn(u32) -> String,
+) -> serde_json::Value {
+    serde_json::json!({
+            "duration": duration_s,
+            "speakers": speakers.iter().map(|s| serde_json::json!({
+                "speaker": label_for(s.id), "seconds": s.seconds,
+                "turns": s.turns, "embedding": s.embedding,
+            })).collect::<Vec<_>>(),
+            "segments": segments
+                .iter()
+                .map(|s| serde_json::json!({
+                    "start": s.t_start_ms as f64 / 1000.0,
+                    "end": s.t_end_ms as f64 / 1000.0,
+                    "speaker": label_for(s.speaker),
+                    "confidence": s.confidence,
+                }))
+                .collect::<Vec<_>>(),
+    })
+}
+
+#[derive(Debug)]
+struct SpeakerSummary {
+    id: u32,
+    seconds: f64,
+    turns: usize,
+    embedding: Vec<f32>,
+}
+
+async fn speaker_summaries(
     segments: &[DiarSegment],
     audio: &[f32],
     emb: &Arc<EmbeddingModel>,
-    known: &[(String, Vec<f32>)],
-) -> impl Fn(u32) -> String {
-    use super::embedding::cosine_sim;
-
-    let mut per_cluster: std::collections::HashMap<u32, Vec<f32>> =
-        std::collections::HashMap::new();
+) -> anyhow::Result<Vec<SpeakerSummary>> {
+    let mut clusters: std::collections::BTreeMap<u32, (Vec<f32>, f64, usize)> = Default::default();
     for s in segments {
-        let start_idx = ((s.t_start_ms as usize) * 16_000) / 1000;
-        let end_idx = ((s.t_end_ms as usize) * 16_000) / 1000;
-        let end_idx = end_idx.min(audio.len());
-        if end_idx <= start_idx {
+        let start = ((s.t_start_ms as usize) * 16).min(audio.len());
+        let end = ((s.t_end_ms as usize) * 16).min(audio.len());
+        if end <= start {
             continue;
         }
-        per_cluster
-            .entry(s.speaker)
-            .or_insert_with(|| Vec::with_capacity(end_idx - start_idx))
-            .extend_from_slice(&audio[start_idx..end_idx]);
+        let c = clusters.entry(s.speaker).or_default();
+        c.1 += (end - start) as f64 / 16_000.0;
+        c.2 += 1;
+        let remaining = (30 * 16_000usize).saturating_sub(c.0.len());
+        c.0.extend_from_slice(&audio[start..end.min(start + remaining)]);
     }
-
-    let mut cluster_to_known: std::collections::HashMap<u32, String> =
-        std::collections::HashMap::new();
-    if !known.is_empty() {
-        for (cid, samples) in &per_cluster {
-            if samples.len() < 16_000 {
-                continue;
-            }
-            let emb_clone = emb.clone();
-            let samples_owned = samples.clone();
-            let cluster_emb =
-                match tokio::task::spawn_blocking(move || emb_clone.embed(&samples_owned)).await {
-                    Ok(Ok(v)) => v,
-                    _ => continue,
+    let emb = emb.clone();
+    tokio::task::spawn_blocking(move || {
+        clusters
+            .into_iter()
+            .map(|(id, (samples, seconds, turns))| {
+                let embedding = if samples.len() >= 16_000 {
+                    emb.embed(&samples)?
+                } else {
+                    Vec::new()
                 };
+                Ok(SpeakerSummary {
+                    id,
+                    seconds,
+                    turns,
+                    embedding,
+                })
+            })
+            .collect()
+    })
+    .await?
+}
 
-            let mut best: Option<(String, f32)> = None;
-            for (name, kv) in known {
-                let s = cosine_sim(&cluster_emb, kv);
-                match &best {
-                    None => best = Some((name.clone(), s)),
-                    Some((_, bs)) if s > *bs => best = Some((name.clone(), s)),
-                    _ => {}
-                }
-            }
-            if let Some((name, _)) = best {
-                cluster_to_known.insert(*cid, name);
-            }
+fn speaker_labels(
+    speakers: &[SpeakerSummary],
+    known: &[(String, Vec<f32>)],
+) -> impl Fn(u32) -> String {
+    let mut labels = std::collections::HashMap::new();
+    for s in speakers {
+        if s.embedding.is_empty() {
+            continue;
+        }
+        if let Some((name, _)) = known
+            .iter()
+            .map(|(name, e)| (name, super::embedding::cosine_sim(&s.embedding, e)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+        {
+            labels.insert(s.id, name.clone());
         }
     }
-
-    move |cid: u32| -> String {
-        cluster_to_known
-            .get(&cid)
+    move |id| {
+        labels
+            .get(&id)
             .cloned()
-            .unwrap_or_else(|| format!("SPEAKER_{:02}", cid))
+            .unwrap_or_else(|| format!("SPEAKER_{id:02}"))
     }
 }
 
@@ -345,4 +383,91 @@ pub fn decode_data_url_with_mime(s: &str) -> anyhow::Result<(Vec<u8>, Option<Str
         .decode(body)
         .map_err(|e| anyhow::anyhow!("base64: {e}"))?;
     Ok((bytes, mime))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::voices::{stages, Workspace};
+
+    #[tokio::test]
+    #[ignore = "requires DiariZen and WeSpeaker ONNX model paths"]
+    async fn voices_real_diarization_enters_registry() -> anyhow::Result<()> {
+        let seg = Arc::new(super::super::SegmentationModel::load(std::env::var(
+            "NV_TEST_DIAR_MODEL",
+        )?)?);
+        let emb = Arc::new(EmbeddingModel::load(std::env::var(
+            "NV_TEST_EMBEDDING_MODEL",
+        )?)?);
+        let audio = decode_any_to_16k_mono(
+            include_bytes!("../../tests/data/parakeet_fox_16k.wav"),
+            Some("audio/wav"),
+        )?;
+        let mut diarizer = Diarizer::new(seg, emb.clone(), DiarConfig::default());
+        let segments = diarizer.diarize_utterance(&audio, 0)?;
+        assert!(
+            !segments.is_empty(),
+            "real speech must produce diarized segments"
+        );
+        let speakers = speaker_summaries(&segments, &audio, &emb).await?;
+        assert!(speakers
+            .iter()
+            .any(|s| s.seconds >= 1. && s.embedding.len() == 256));
+        let body = diarization_json(
+            audio.len() as f64 / 16_000.,
+            &segments,
+            &speakers,
+            &speaker_labels(&speakers, &[]),
+        );
+        let td = stages::TempDir::new("real-diar")?;
+        let ws = Workspace::new(&td.0);
+        ws.init()?;
+        std::fs::write(
+            ws.recordings_dir().join("real.wav"),
+            include_bytes!("../../tests/data/parakeet_fox_16k.wav"),
+        )?;
+        let mut manifest = ws.load()?;
+        ws.scan(&mut manifest, false)?;
+        let sha = manifest.rows.keys().next().unwrap().clone();
+        ws.put_artifact(&mut manifest, &sha, "diar", &body)?;
+        let registry = stages::identify(&ws, &manifest, 1., &mut |_| {})?;
+        assert!(!registry.speakers.is_empty());
+        assert!(registry.speakers.iter().all(|s| !s.sources.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn voices_identify_consumes_the_engine_diarization_response() -> anyhow::Result<()> {
+        let td = stages::TempDir::new("diar-contract")?;
+        let ws = Workspace::new(&td.0);
+        ws.init()?;
+        std::fs::write(ws.recordings_dir().join("episode.wav"), b"fixture")?;
+        let mut manifest = ws.load()?;
+        ws.scan(&mut manifest, false)?;
+        let sha = manifest.rows.keys().next().unwrap().clone();
+        let segments = vec![DiarSegment {
+            speaker: 0,
+            t_start_ms: 0,
+            t_end_ms: 90_000,
+            confidence: 0.9,
+        }];
+        let speakers = vec![SpeakerSummary {
+            id: 0,
+            seconds: 90.,
+            turns: 1,
+            embedding: vec![1., 0., 0.],
+        }];
+        let labels = speaker_labels(&speakers, &[]);
+        let body = diarization_json(90., &segments, &speakers, &labels);
+        assert_eq!(
+            body["segments"][0]["speaker"],
+            body["speakers"][0]["speaker"]
+        );
+        ws.put_artifact(&mut manifest, &sha, "diar", &body)?;
+        let registry = stages::identify(&ws, &manifest, 60., &mut |_| {})?;
+        assert_eq!(registry.speakers.len(), 1);
+        assert_eq!(registry.speakers[0].seconds, 90.);
+        assert_eq!(registry.speakers[0].sources[0].label, "SPEAKER_00");
+        Ok(())
+    }
 }

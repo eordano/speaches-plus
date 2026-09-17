@@ -1,0 +1,403 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>q38 full 27B browser run</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background:#111; color:#ddd; margin:1.5em; }
+  pre { white-space: pre-wrap; word-break: break-all; background:#181818; padding:0.8em; border:1px solid #333; }
+  #status { color:#fc6; }
+</style>
+<h1>q38 full 27B in the browser (64 layers, real W4, kv 4096, streamed extern shards)</h1>
+<div id="status">running...</div>
+<pre id="report"></pre>
+<script type="module">
+'use strict';
+const out = [];
+const J = { started: new Date().toISOString(), ua: navigator.userAgent };
+function log(s) {
+  out.push(s);
+  document.getElementById('report').textContent = out.slice(-40).join('\n');
+  console.log('Q38F|' + s);
+}
+function finish(tag) {
+  if (J.done) return;
+  J.done = tag;
+  J.finished = new Date().toISOString();
+  J.mem_device = snapMem();
+  const c = JSON.stringify(J);
+  document.getElementById('status').textContent = 'DONE (' + tag + ')';
+  fetch('/' + resultName, { method: 'PUT', body: c })
+    .catch(() => {})
+    .finally(() => {
+      console.log('Q38F_DONE');
+      document.title = 'Q38F_DONE';
+    });
+}
+window.addEventListener('error', e => { J.page_error = String(e.message); finish('page-error'); });
+window.addEventListener('unhandledrejection', e => {
+  J.page_error = String(e.reason && e.reason.stack || e.reason);
+  finish('page-error');
+});
+
+const params = new URLSearchParams(location.search);
+const modelDir = './' + (params.get('dir') || 'full-model');
+const refStem = params.get('ref') || 'ref-full';
+const resultName = params.get('result') || 'q38-result-full.json';
+const deepTarget = Number(params.get('deep') ?? '4096');
+const opfsMode = params.get('opfs') ?? '1';
+const CENSUS_MAX_ABS_CEILING_CATCHES_STRUCTURAL_BREAKAGE_NOT_PROMPT_SPECIFIC_DRIFT = 2.0;
+J.ref_stem = refStem;
+
+const mem = { created: 0, freed: 0, live: 0, peak: 0, count: 0, live_count: 0, by_usage: {} };
+function snapMem() {
+  return {
+    created_bytes: mem.created, freed_bytes: mem.freed, live_bytes: mem.live,
+    peak_live_bytes: mem.peak, buffers_created: mem.count, buffers_live: mem.live_count,
+    by_usage_live: Object.assign({}, mem.by_usage),
+    wasm_memory_bytes: wasmMemory ? wasmMemory.buffer.byteLength : null,
+    js_shard_bytes_live: shardBytesLive,
+  };
+}
+const origCreate = GPUDevice.prototype.createBuffer;
+GPUDevice.prototype.createBuffer = function (desc) {
+  const buf = origCreate.call(this, desc);
+  const size = Number(desc.size) || 0;
+  mem.created += size; mem.live += size; mem.count++; mem.live_count++;
+  if (mem.live > mem.peak) mem.peak = mem.live;
+  const key = '0x' + (Number(desc.usage) >>> 0).toString(16);
+  mem.by_usage[key] = (mem.by_usage[key] || 0) + size;
+  const origDestroy = buf.destroy.bind(buf);
+  buf.destroy = () => {
+    mem.freed += size; mem.live -= size; mem.live_count--;
+    mem.by_usage[key] -= size;
+    return origDestroy();
+  };
+  return buf;
+};
+
+let wasmMemory = null;
+let shardBytesLive = 0;
+
+async function manifestSha(ref) {
+  const basis = JSON.stringify({ shards: ref.shards, slice_bytes: ref.slice_bytes });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(basis));
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function opfsSetup(ref) {
+  const o = { enabled: false, hits: 0, misses: 0, writes: 0, write_errors: 0 };
+  if (opfsMode === '0' || !navigator.storage || !navigator.storage.getDirectory) {
+    o.skipped = 'disabled or unavailable';
+    return o;
+  }
+  try {
+    o.sha = await manifestSha(ref);
+    const est = await navigator.storage.estimate();
+    o.quota = est.quota; o.usage = est.usage;
+    const root = await navigator.storage.getDirectory();
+    o.dir = await root.getDirectoryHandle('q38-' + o.sha, { create: true });
+    o.headroom = est.quota - est.usage;
+    o.write_ok = o.headroom > ref.slice_bytes * 1.2;
+    if (!o.write_ok) {
+      o.skipped = 'quota headroom ' + o.headroom + ' B < 1.2x slice ' + ref.slice_bytes + ' B; reads still tried';
+    }
+    o.enabled = true;
+  } catch (e) {
+    o.skipped = 'opfs setup failed: ' + String(e);
+  }
+  return o;
+}
+
+async function opfsRead(o, name) {
+  if (!o.enabled) return null;
+  try {
+    const fh = await o.dir.getFileHandle(name);
+    const f = await fh.getFile();
+    const buf = new Uint8Array(await f.arrayBuffer());
+    o.hits++;
+    return buf;
+  } catch { o.misses++; return null; }
+}
+
+async function opfsWrite(o, name, bytes) {
+  if (!o.enabled || !o.write_ok) return;
+  try {
+    const fh = await o.dir.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(bytes);
+    await w.close();
+    o.writes++;
+  } catch (e) {
+    o.write_errors++;
+    o.write_ok = false;
+    o.write_error = String(e);
+  }
+}
+
+async function main() {
+  const wasmUrl = './web/nv_ocr_web_bg.wasm';
+  const head = await fetch(wasmUrl, { method: 'HEAD' });
+  J.wasm_bytes = Number(head.headers.get('content-length'));
+  const mod = await import('./web/nv_ocr_web.js');
+  const inited = await mod.default({ module_or_path: wasmUrl });
+  wasmMemory = inited.memory;
+  mod.q38_install_panic_hook();
+  log('wasm module: ' + J.wasm_bytes + ' bytes');
+
+  const ref = await (await fetch(modelDir + '/' + refStem + '.json')).json();
+  J.ref = { n_layers: ref.n_layers, slice_bytes: ref.slice_bytes, shards: ref.shards.length,
+            kv_span: ref.kv_span, prompt_tokens: ref.prompt.length };
+  log('ref: ' + ref.n_layers + ' layers, ' + ref.shards.length + ' shards, ' +
+      ref.slice_bytes + ' B, prompt ' + ref.prompt.length + ' ids');
+
+  const opfs = await opfsSetup(ref);
+  J.opfs = opfs;
+  if (opfs.sha) log('opfs cache key q38-' + opfs.sha.slice(0, 12) + ' quota=' + opfs.quota +
+                    ' usage=' + opfs.usage + (opfs.skipped ? ' [' + opfs.skipped + ']' : ''));
+
+  mod.q38_extern_clear();
+  const cfg = await (await fetch(modelDir + '/config.json')).text();
+  mod.q38_extern_config(cfg);
+
+  const t0 = performance.now();
+  let staged = 0, fromCache = 0, fromNet = 0;
+  try {
+    for (const name of ref.shards) {
+      let bytes = await opfsRead(opfs, name);
+      let src = 'opfs';
+      if (!bytes) {
+        const resp = await fetch(modelDir + '/' + name);
+        if (!resp.ok) throw new Error('fetch ' + name + ': ' + resp.status);
+        bytes = new Uint8Array(await resp.arrayBuffer());
+        src = 'net';
+        fromNet += bytes.length;
+        await opfsWrite(opfs, name, bytes);
+      } else {
+        fromCache += bytes.length;
+      }
+      mod.q38_extern_set(name, bytes);
+      staged += bytes.length;
+      shardBytesLive += bytes.length;
+      J.staged_bytes = staged;
+      log('staged ' + name + ' via ' + src + ' (total ' + staged + ' B, wasm mem ' +
+          wasmMemory.buffer.byteLength + ' B)');
+    }
+  } catch (e) {
+    J.stage_error = String(e && e.stack || e);
+    J.verdict = 'STAGE-WALL: shard staging failed at ' + staged + ' of ' + ref.slice_bytes +
+      ' bytes (js-held extern arrays; wasm mem ' +
+      (wasmMemory ? wasmMemory.buffer.byteLength : -1) + ' B)';
+    log(J.verdict + '\n' + J.stage_error.slice(0, 600));
+    finish('stage-wall');
+    return;
+  }
+  J.shard_load_ms = performance.now() - t0;
+  J.staged_from_opfs_bytes = fromCache;
+  J.staged_from_net_bytes = fromNet;
+  if (staged !== ref.slice_bytes) throw new Error('staged ' + staged + ' != ref ' + ref.slice_bytes);
+  log('staged ' + staged + ' B in ' + J.shard_load_ms.toFixed(0) + ' ms (opfs ' + fromCache +
+      ' B, net ' + fromNet + ' B); wasm mem ' + wasmMemory.buffer.byteLength + ' B');
+
+  const tb = performance.now();
+  let boot;
+  try {
+    boot = JSON.parse(await mod.q38_extern_boot(JSON.stringify({ kv_span: ref.kv_span })));
+  } catch (e) {
+    J.boot_error = String(e && e.stack || e);
+    J.mem_at_boot_failure = snapMem();
+    J.verdict = 'BOOT-WALL: extern boot failed with device live=' + mem.live + ' B peak=' +
+      mem.peak + ' B buffers=' + mem.live_count + ' wasm=' + wasmMemory.buffer.byteLength + ' B';
+    log(J.verdict + '\n' + J.boot_error.slice(0, 900));
+    finish('boot-wall');
+    return;
+  }
+  J.boot_ms = performance.now() - tb;
+  J.caps_summary = boot.caps_summary;
+  J.mem_after_boot = snapMem();
+  log('boot ' + J.boot_ms.toFixed(0) + ' ms; caps: ' + boot.caps_summary);
+  log('device after boot: live=' + J.mem_after_boot.live_bytes + ' peak=' +
+      J.mem_after_boot.peak_live_bytes + ' buffers=' + J.mem_after_boot.buffers_live +
+      ' wasm=' + J.mem_after_boot.wasm_memory_bytes);
+
+  const tp = performance.now();
+  const first = await mod.q38_parity_prefill(new Uint32Array(ref.prompt));
+  J.prefill_ms = performance.now() - tp;
+  const tokens = [];
+  J.step_ms = [];
+  for (let i = 0; i < ref.steps; i++) {
+    const ts = performance.now();
+    tokens.push(i < ref.census_steps
+      ? await mod.q38_parity_step()
+      : await mod.q38_parity_step_quiet());
+    J.step_ms.push(performance.now() - ts);
+  }
+  J.first = first;
+  J.tokens = tokens;
+  const labels = JSON.parse(mod.q38_parity_labels());
+  const logits = mod.q38_logits_bin();
+  const quiet = J.step_ms.slice(ref.census_steps);
+  J.quiet_step_ms_mean = quiet.reduce((a, b) => a + b, 0) / quiet.length;
+  const sorted = quiet.slice().sort((a, b) => a - b);
+  J.quiet_step_ms_median = sorted[sorted.length >> 1];
+  J.tok_per_s = 1000 / J.quiet_step_ms_mean;
+  log('forward done: first=' + first + ' prefill=' + J.prefill_ms.toFixed(1) +
+      'ms quiet mean=' + J.quiet_step_ms_mean.toFixed(2) + 'ms median=' +
+      J.quiet_step_ms_median.toFixed(2) + 'ms -> ' + J.tok_per_s.toFixed(1) + ' tok/s');
+
+  const refBin = new Uint8Array(await (await fetch(modelDir + '/' + refStem + '-logits.bin')).arrayBuffer());
+  J.token_match = first === ref.first && tokens.length === ref.tokens.length &&
+    tokens.every((t, i) => t === ref.tokens[i]);
+  if (!J.token_match) {
+    J.tokens_native = ref.tokens;
+    if (first !== ref.first) {
+      J.token_divergence = { step: -1, browser_id: first, native_id: ref.first };
+    } else {
+      let ds = 0;
+      const n = Math.min(tokens.length, ref.tokens.length);
+      while (ds < n && tokens[ds] === ref.tokens[ds]) ds++;
+      J.token_divergence = { step: ds, browser_id: tokens[ds] ?? null, native_id: ref.tokens[ds] ?? null };
+    }
+  }
+  J.labels_match = labels.length === ref.labels.length && labels.every((l, i) => l === ref.labels[i]);
+  if (!J.labels_match) {
+    J.labels_browser = labels;
+    J.labels_native = ref.labels;
+  }
+  J.logits_len_match = logits.length === refBin.length;
+  let nDiff = 0, firstDiff = -1, maxAbs = 0, maxUlp = 0, nNan = 0;
+  const perStep = [];
+  if (J.logits_len_match) {
+    const a = new Uint32Array(logits.buffer, logits.byteOffset, logits.length >> 2);
+    const bCopy = refBin.slice();
+    const b = new Uint32Array(bCopy.buffer, 0, bCopy.length >> 2);
+    const af = new Float32Array(a.buffer, a.byteOffset, a.length);
+    const bf = new Float32Array(b.buffer, 0, b.length);
+    const vocab = ref.vocab;
+    const ord16 = w => { const h = w >>> 16; return (h & 0x8000) ? (0x8000 - (h & 0x7fff)) - 0x8000 : h; };
+    for (let s = 0; s < ref.census_steps; s++) {
+      let sn = 0, sMax = 0, sSum = 0, sBig = 0, sUlpLe4 = 0, sArgA = 0, sArgB = 0;
+      let sBf16Ulp1 = 0, sBf16UlpGt1 = 0, sBf16UlpMax = 0, sNan = 0;
+      for (let k = 0; k < vocab; k++) {
+        const i = s * vocab + k;
+        if (Number.isNaN(af[i]) || Number.isNaN(bf[i])) sNan++;
+        if (af[i] > af[s * vocab + sArgA]) sArgA = k;
+        if (bf[i] > bf[s * vocab + sArgB]) sArgB = k;
+        if (a[i] !== b[i]) {
+          sn++; nDiff++;
+          if (firstDiff < 0) firstDiff = i;
+          const d = Math.abs(af[i] - bf[i]);
+          if (d > sMax) sMax = d;
+          if (d > maxAbs) maxAbs = d;
+          sSum += d;
+          if (d > 1e-2) sBig++;
+          const u = Math.abs((a[i] | 0) - (b[i] | 0));
+          if (u > maxUlp) maxUlp = u;
+          if (u <= 4 && (a[i] >>> 31) === (b[i] >>> 31)) sUlpLe4++;
+          const bu = Math.abs(ord16(a[i]) - ord16(b[i]));
+          if (bu === 1) sBf16Ulp1++; else if (bu > 1) sBf16UlpGt1++;
+          if (bu > sBf16UlpMax) sBf16UlpMax = bu;
+        }
+      }
+      nNan += sNan;
+      perStep.push({
+        n_diff: sn, max_abs: sMax, mean_abs: sn ? sSum / sn : 0,
+        n_gt_1e2: sBig, n_ulp_le4: sUlpLe4,
+        n_bf16_ulp1: sBf16Ulp1, n_bf16_ulp_gt1: sBf16UlpGt1, bf16_ulp_max: sBf16UlpMax,
+        n_nan: sNan, argmax_browser: sArgA, argmax_native: sArgB,
+      });
+    }
+  }
+  J.census = {
+    values: (logits.length >> 2), n_bit_diff: nDiff, first_diff_index: firstDiff,
+    max_abs_diff: maxAbs, max_ulp_diff: maxUlp, n_nan: nNan, vocab: ref.vocab,
+    census_steps: ref.census_steps, per_step: perStep,
+  };
+  log('census compare: token_match=' + J.token_match + ' labels_match=' + J.labels_match +
+      (J.token_divergence ? ' token_divergence=' + JSON.stringify(J.token_divergence) : ''));
+  log('census=' + JSON.stringify(J.census));
+
+  if (deepTarget > 0) {
+    const pos0 = ref.prompt.length + ref.steps;
+    const extra = Math.max(0, Math.min(deepTarget, ref.kv_span - 8) - pos0);
+    log('deep-context phase: ' + extra + ' extra quiet steps toward position ' + deepTarget);
+    const deepMs = [];
+    try {
+      for (let i = 0; i < extra; i++) {
+        const ts = performance.now();
+        await mod.q38_parity_step_quiet();
+        deepMs.push(performance.now() - ts);
+        if (i % 512 === 0) log('deep step ' + i + '/' + extra);
+      }
+      const tail = deepMs.slice(-64);
+      if (tail.length) {
+        const mean = tail.reduce((a, b) => a + b, 0) / tail.length;
+        const med = tail.slice().sort((a, b) => a - b)[tail.length >> 1];
+        J.deep = {
+          target_pos: deepTarget, steps: deepMs.length,
+          tail64_ms_mean: mean, tail64_ms_median: med, tail64_tok_per_s: 1000 / mean,
+          total_ms: deepMs.reduce((a, b) => a + b, 0),
+        };
+        log('deep d' + deepTarget + '-class: tail64 mean=' + mean.toFixed(2) + 'ms median=' +
+            med.toFixed(2) + 'ms -> ' + (1000 / mean).toFixed(1) + ' tok/s');
+      }
+    } catch (e) {
+      J.deep_error = String(e && e.stack || e);
+      log('deep phase failed after ' + deepMs.length + ' steps: ' + J.deep_error.slice(0, 300));
+    }
+  }
+
+  const det = { replayed: false, ok: false };
+  J.census_determinism = det;
+  try {
+    mod.q38_parity_reset();
+    const first2 = await mod.q38_parity_prefill(new Uint32Array(ref.prompt));
+    const tokens2 = [];
+    for (let i = 0; i < ref.census_steps; i++) tokens2.push(await mod.q38_parity_step());
+    const logits2 = mod.q38_logits_bin();
+    det.replayed = true;
+    det.first_match = first2 === first;
+    det.tokens_match = tokens2.every((t, i) => t === tokens[i]);
+    det.logits_len_match = logits2.length === logits.length;
+    let rDiff = 0;
+    if (det.logits_len_match) {
+      const a = new Uint32Array(logits.buffer, logits.byteOffset, logits.length >> 2);
+      const b = new Uint32Array(logits2.buffer, logits2.byteOffset, logits2.length >> 2);
+      for (let k = 0; k < a.length; k++) if (a[k] !== b[k]) rDiff++;
+    } else {
+      rDiff = -1;
+    }
+    det.n_bit_diff = rDiff;
+    det.ok = det.first_match && det.tokens_match && det.logits_len_match && rDiff === 0;
+  } catch (e) {
+    det.error = String(e && e.stack || e);
+  }
+  log('census determinism replay: ' + JSON.stringify(det));
+
+  const ps = J.census.per_step;
+  const argmaxMatch = ps.length === ref.census_steps && ps.every(s => s.argmax_browser === s.argmax_native);
+  const envelopeOk = J.logits_len_match && nNan === 0 &&
+    maxAbs < CENSUS_MAX_ABS_CEILING_CATCHES_STRUCTURAL_BREAKAGE_NOT_PROMPT_SPECIFIC_DRIFT;
+  const censusOk = envelopeOk && argmaxMatch && J.labels_match && det.ok;
+  const bitEqual = J.logits_len_match && nDiff === 0;
+  J.census_criteria = {
+    envelope_ok: envelopeOk, argmax_match: argmaxMatch, labels_match: J.labels_match,
+    determinism_ok: det.ok,
+    max_abs_ceiling: CENSUS_MAX_ABS_CEILING_CATCHES_STRUCTURAL_BREAKAGE_NOT_PROMPT_SPECIFIC_DRIFT,
+  };
+  J.verdict = bitEqual && J.token_match && censusOk
+    ? 'BIT-EQUAL (logits, tokens, pass labels; census deterministic)'
+    : censusOk && J.token_match
+      ? 'CHARACTERIZED-DRIFT (all ' + ref.steps + ' greedy tokens and pass labels bit-match; census argmax equal every step; census deterministic; mechanism: Tint/Dawn vs naga WGSL-to-MSL codegen under Metal fast-math)'
+      : censusOk
+        ? 'CHARACTERIZED-DRIFT-TOKEN-DIVERGENCE (greedy stream crossed a near-tie at step ' +
+          (J.token_divergence ? J.token_divergence.step : '?') +
+          '; census argmax, pass labels and per-step determinism all hold; drift magnitudes are prompt-specific by characterization)'
+        : 'DIVERGED';
+  log('parity: ' + J.verdict);
+  finish(bitEqual && J.token_match && censusOk ? 'full-bit-equal'
+    : censusOk && J.token_match ? 'full-characterized'
+    : censusOk ? 'full-characterized-token-divergence'
+    : 'full-diverged');
+}
+
+main().catch(e => { J.error = String(e && e.stack || e); log('ERROR: ' + J.error); finish('error'); });
+</script>

@@ -32,7 +32,7 @@ echo "gpu idle gate ok: memory.used=${used}MiB"
 
 cd "$PROJECT_ROOT/rust"
 NV_QUANT_LINEAR_TRAIN_BENCH=1 \
-NVK_LANE=${NVK_LANE:-gape} NVK_PKG=nv-layers \
+  NVK_LANE=${NVK_LANE:-gape} NVK_PKG=nv-layers \
   scripts/nvk.sh probe --test quant_linear_train_bench_perfc -- \
   --ignored --nocapture 2>&1 | tee "$OUT_DIR/quant_linear_release.log"
 

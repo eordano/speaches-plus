@@ -82,7 +82,8 @@ pub fn record(s: Sample) {
 
 pub fn gpu_coverage() -> (u64, u64) {
     let g = acc().lock().unwrap_or_else(|p| p.into_inner());
-    g.values().fold((0, 0), |(gn, n), b| (gn + b.gpu_n, n + b.n))
+    g.values()
+        .fold((0, 0), |(gn, n), b| (gn + b.gpu_n, n + b.n))
 }
 
 pub fn dump(tag: &str) {

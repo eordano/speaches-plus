@@ -2,6 +2,29 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=NV_KERNELS_PREBUILT");
+    if env::var_os("CARGO_FEATURE_CUDA").is_some() {
+        if let Some(prebuilt) = env::var_os("NV_KERNELS_PREBUILT") {
+            let prebuilt = PathBuf::from(prebuilt);
+            let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+            std::fs::copy(prebuilt.join("bindings.rs"), out.join("bindings.rs"))
+                .expect("prebuilt CUDA bindings");
+            let directives = std::fs::read_to_string(prebuilt.join("link-directives"))
+                .expect("prebuilt CUDA linker directives");
+            assert!(
+                !directives.trim().is_empty(),
+                "empty prebuilt CUDA linker directives"
+            );
+            for line in directives.lines() {
+                assert!(
+                    line.starts_with("cargo:rustc-link-"),
+                    "invalid prebuilt CUDA linker directive"
+                );
+                println!("{line}");
+            }
+            return;
+        }
+    }
     println!("cargo:rerun-if-changed=build.rs");
     for watched in ["include", "cuda", "cuda_sm120", "hip", "cpp", "third_party"] {
         if Path::new(watched).exists() {
@@ -216,8 +239,27 @@ fn build_cuda(manifest_dir: &Path, out_dir: &Path) {
             .flag("--expt-relaxed-constexpr")
             .flag("--expt-extended-lambda")
             .flag("-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1");
+        let whole_program_nvcc = sm120.clone();
+        let mut whole_program_files = Vec::new();
         for src in &sm120_files {
-            sm120.file(src);
+            if matches!(
+                src.file_name().and_then(|name| name.to_str()),
+                Some("cutlass_fp4_gemm.cu" | "moe_grouped_fp4_gemm.cu")
+            ) {
+                whole_program_files.push(src);
+            } else {
+                sm120.file(src);
+            }
+        }
+        if !whole_program_files.is_empty() {
+            sm120.objects(
+                whole_program_nvcc
+                    .clone()
+                    .cuda(false)
+                    .flag("--relocatable-device-code=false")
+                    .files(whole_program_files)
+                    .compile_intermediates(),
+            );
         }
         sm120.compile("nv_kernels_sm120");
     }

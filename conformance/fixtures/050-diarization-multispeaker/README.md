@@ -42,7 +42,9 @@ DIAR_FIXTURE_KOKORO_VOICES=$K/voices.bin \
        diarization::hop_sweep::diar_build_multispeaker_fixture -- --ignored --nocapture'
 ```
 
-`DIAR_FIXTURE_OUT` overrides the output directory.
+`DIAR_FIXTURE_OUT` overrides the output directory. `audio.wav` is gitignored;
+`conformance/tools/regenerate-fixtures.sh` runs this step only when
+`DIAR_FIXTURE_KOKORO_MODEL` is set and prints the recipe otherwise.
 
 ## Consumed by
 

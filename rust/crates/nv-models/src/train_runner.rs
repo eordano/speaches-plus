@@ -2,9 +2,11 @@ use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, Var, D};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use nv_layers::linear::{Linear, LoraDeltaHook};
+use nv_layers::norm::RmsNorm;
+use nv_layers::rope::Rope;
 use nv_train::qwen38::{
     quant_resident_arm_opted_in,
-    NV_TRAIN_QUANT_RESIDENT_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM as NV_TRAIN_QUANT_RESIDENT,
+    NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM as NV_TRAIN_QUANT_RESIDENT,
 };
 use nv_train::{
     ce_mean_over_unmasked_positions,
@@ -14,8 +16,6 @@ use nv_train::{
     LoraTrainable, RawLora, TokenRow, TrainingLoraHook,
     JSONL_MAX_SEQ_IS_512_SHARED_BY_BOTH_ENDPOINT_ARMS_BECAUSE_THE_DEFAULT_QWEN_WINDOWS_GDN_GRAPH_AT_512_IS_ABOUT_14_GB as JSONL_MAX_SEQ,
 };
-use nv_layers::norm::RmsNorm;
-use nv_layers::rope::Rope;
 use nv_weights::{TensorSource, WeightLoader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -459,7 +459,8 @@ impl DenseAuxTapForward {
         let layer = &model.layers()[idx];
         let residual_attn = x.clone();
         let normed_pre_attn = layer.input_layernorm.forward_candle(x)?;
-        let attn_out = self.attention_forward_replica(model, idx, &normed_pre_attn, positions, seq)?;
+        let attn_out =
+            self.attention_forward_replica(model, idx, &normed_pre_attn, positions, seq)?;
         let attn_post = layer.post_attention_layernorm.forward_candle(&attn_out)?;
         let after_attn = attn_post.add(&residual_attn)?;
         let normed_pre_mlp = layer
@@ -566,7 +567,10 @@ impl Eagle3Cotrain {
             bail!("speculator rank must be positive");
         }
         if !(spec.lr_ratio > 0.0) {
-            bail!("speculator lr_ratio must be positive, got {}", spec.lr_ratio);
+            bail!(
+                "speculator lr_ratio must be positive, got {}",
+                spec.lr_ratio
+            );
         }
         let cfg = Eagle3TrainConfig::from_drafter_dir(&spec.drafter_dir)?;
         let hidden = dense.config().hidden_size;
@@ -852,7 +856,7 @@ fn load_base_resident_aware(path: &Path, device: &Device) -> Result<(BaseModel, 
         };
         let model = if packed {
             let src = Nvfp4DequantSource {
-                inner: &weights,
+                inner: weights,
                 device: device.clone(),
             };
             DenseTrainModel::from_loader_dtype(base_cfg, &src, device, base_dtype)
@@ -893,9 +897,9 @@ fn load_dense_resident(
              not exist on CPU"
         ),
     };
-    let runner = Arc::new(std::sync::Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
-        cuda.cuda_stream(),
-    )?));
+    let runner = Arc::new(std::sync::Mutex::new(
+        nv_quant::nvfp4::Nvfp4GemmRunner::new(cuda.cuda_stream())?,
+    ));
     let src = Nvfp4DequantSource {
         inner: weights,
         device: device.clone(),
@@ -928,9 +932,14 @@ fn load_dense_resident(
         resident_count.set(resident_count.get() + names.len());
         Ok(lin)
     };
-    let model =
-        DenseTrainModel::from_loader_dtype_resident(base_cfg, &src, device, base_dtype, Some(&ingest))
-            .with_context(|| format!("load quant-resident dense base {}", path.display()))?;
+    let model = DenseTrainModel::from_loader_dtype_resident(
+        base_cfg,
+        &src,
+        device,
+        base_dtype,
+        Some(&ingest),
+    )
+    .with_context(|| format!("load quant-resident dense base {}", path.display()))?;
     ensure!(
         resident_count.get() > 0,
         "{NV_TRAIN_QUANT_RESIDENT}=1 built zero resident modules for {}; {}",
@@ -1134,8 +1143,8 @@ fn per_row_ce_means_in_dataset_row_order(
     batch: &[TokenRow],
 ) -> Result<Vec<Tensor>> {
     let dev = model.device();
-    let solo = !model.is_dense()
-        || nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_TRAIN_SOLO");
+    let solo =
+        !model.is_dense() || nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_TRAIN_SOLO");
     if solo {
         return batch
             .iter()
@@ -1169,10 +1178,7 @@ fn batch_loss(model: &BaseModel, batch: &[TokenRow]) -> Result<Tensor> {
     total.context("empty batch")
 }
 
-fn per_row_eval_ce_in_dataset_row_order(
-    model: &BaseModel,
-    batch: &[TokenRow],
-) -> Result<Vec<f32>> {
+fn per_row_eval_ce_in_dataset_row_order(model: &BaseModel, batch: &[TokenRow]) -> Result<Vec<f32>> {
     per_row_ce_means_in_dataset_row_order(model, batch)?
         .into_iter()
         .map(|t| Ok(t.to_scalar::<f32>()?))

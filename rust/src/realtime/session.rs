@@ -78,6 +78,7 @@ pub struct Session {
     pub input_audio_format: std::sync::Mutex<String>,
     pub output_audio_format: std::sync::Mutex<String>,
     pub voice: std::sync::Mutex<Option<String>>,
+    pub output_language: std::sync::Mutex<Option<String>>,
     pub tts_speed_bits: AtomicU32,
     pub model: std::sync::Mutex<String>,
     pub transcription_model: std::sync::Mutex<Option<String>>,
@@ -449,6 +450,7 @@ impl Session {
             input_audio_format: std::sync::Mutex::new(defaults::audio_format::DEFAULT.to_string()),
             output_audio_format: std::sync::Mutex::new(defaults::audio_format::DEFAULT.to_string()),
             voice: std::sync::Mutex::new(voice_label),
+            output_language: std::sync::Mutex::new(None),
             tts_speed_bits: AtomicU32::new(1.0f32.to_bits()),
             model: std::sync::Mutex::new(model_label),
             transcription_model: std::sync::Mutex::new(transcription_model_label),
@@ -880,6 +882,12 @@ impl Session {
         if let Some(v) = staged.voice {
             *self.voice.lock().expect("voice poisoned") = v;
         }
+        if let Some(language) = staged.language {
+            *self
+                .output_language
+                .lock()
+                .expect("output_language poisoned") = language;
+        }
         if let Some(f) = staged.speed {
             self.tts_speed_bits.store(f.to_bits(), Ordering::Relaxed);
         }
@@ -937,6 +945,21 @@ impl Session {
         }))
         .await;
         info!("session.update applied");
+    }
+
+    pub fn tts_settings(&self) -> (Option<String>, &'static str) {
+        let voice = self.voice.lock().expect("voice poisoned").clone();
+        let language = self
+            .output_language
+            .lock()
+            .expect("output_language poisoned");
+        let espeak = language
+            .as_deref()
+            .map(crate::tts::http::espeak_voice_for)
+            .transpose()
+            .expect("validated output language")
+            .unwrap_or("en-us");
+        (voice, espeak)
     }
 
     pub fn tts_speed(&self) -> f32 {
@@ -1004,6 +1027,7 @@ impl Session {
             "min_speech_for_response_ms": self.min_speech_for_response_ms.load(Ordering::Relaxed),
             "sealed_buffer_retention_count": self.sealed_buffer_retention_count.load(Ordering::Relaxed),
             "speed": self.tts_speed(),
+            "language": self.output_language.lock().expect("output_language poisoned").clone(),
         });
         if let Some(obj) = sess.as_object_mut() {
             if let Some(v) = voice {
@@ -1018,7 +1042,10 @@ impl Session {
                 if let Some(l) = stt_language {
                     iat.insert("language".into(), serde_json::Value::String(l));
                 }
-                obj.insert("input_audio_transcription".into(), serde_json::Value::Object(iat));
+                obj.insert(
+                    "input_audio_transcription".into(),
+                    serde_json::Value::Object(iat),
+                );
             }
         }
 
@@ -2416,12 +2443,12 @@ async fn run_partial_transcription(
     )
     .await
     {
-            Ok(t) => t,
-            Err(err) => {
-                debug!(error = %err, "partial STT failed; dropping");
-                return;
-            }
-        };
+        Ok(t) => t,
+        Err(err) => {
+            debug!(error = %err, "partial STT failed; dropping");
+            return;
+        }
+    };
     if transcript.is_empty() {
         return;
     }
@@ -2694,6 +2721,55 @@ async fn terminate_with_error(session: Arc<Session>, code: &'static str, message
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn realtime_synthesis_uses_updated_voice_and_output_locale() {
+        let mut query = probe_query();
+        query.voice = Some("af_heart".into());
+        let session = Arc::new(Session::with_dependencies(
+            query,
+            Models::get_or_init().expect("models container"),
+            Intent::Transcription,
+            None,
+            Arc::new(crate::ids::CounterIdSource::new()),
+            inspector::default_sink(),
+        ));
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        session.attach_websocket(tx).await;
+        assert_eq!(session.tts_settings(), (Some("af_heart".into()), "en-us"));
+        session.handle_session_update(json!({"session":{
+            "voice":"em_alex", "language":"es-AR", "input_audio_transcription":{"language":"es"}
+        }}), None).await;
+        assert_eq!(session.query.voice.as_deref(), Some("af_heart"));
+        assert_eq!(session.tts_settings(), (Some("em_alex".into()), "es-419"));
+        assert_eq!(session.stt_language().as_deref(), Some("es"));
+        let mut updated = None;
+        while let Ok(event) = rx.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            if event["type"] == "session.updated" {
+                updated = Some(event["session"].clone());
+            }
+        }
+        let updated = updated.expect("session.updated must acknowledge applied settings");
+        assert_eq!(updated["language"], "es-AR");
+        assert_eq!(updated["voice"], "em_alex");
+        assert_eq!(updated["input_audio_transcription"]["language"], "es");
+        session
+            .handle_session_update(
+                json!({"session":{"voice":"ef_dora", "language":"bad"}}),
+                None,
+            )
+            .await;
+        assert_eq!(session.tts_settings(), (Some("em_alex".into()), "es-419"));
+        session
+            .handle_session_update(json!({"session":{"speed":1.0}}), None)
+            .await;
+        assert_eq!(session.tts_settings(), (Some("em_alex".into()), "es-419"));
+        session
+            .handle_session_update(json!({"session":{"voice":null,"language":null}}), None)
+            .await;
+        assert_eq!(session.tts_settings(), (None, "en-us"));
+    }
 
     #[test]
     fn client_commit_is_rejected_only_on_a_silent_buffer() {

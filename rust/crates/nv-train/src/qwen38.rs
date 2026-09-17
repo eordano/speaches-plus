@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::qwen38_gdn_chunked as chunked;
 use crate::{LoraConfig, LoraTrainable, RawLora, TrainingLoraHook};
 
 pub const THE_FROZEN_PREFIX_IS_CACHED_AS_HIDDEN_STATES_WHICH_IS_ONLY_SOUND_BECAUSE_NO_TRAINABLE_PARAMETER_LIVES_BELOW_THE_WINDOW: &str =
@@ -200,8 +201,7 @@ fn par_row_blocks(
     let mut out = vec![0f32; rows * cols];
     let failure: Mutex<Option<String>> = Mutex::new(None);
     {
-        let blocks: Vec<Mutex<&mut [f32]>> =
-            out.chunks_mut(block * cols).map(Mutex::new).collect();
+        let blocks: Vec<Mutex<&mut [f32]>> = out.chunks_mut(block * cols).map(Mutex::new).collect();
         let nblocks = blocks.len();
         let next = AtomicUsize::new(0);
         std::thread::scope(|s| {
@@ -332,8 +332,7 @@ impl HostDequantWeights {
             .loader
             .st_dtype_of(&wname)
             .ok_or_else(|| anyhow::anyhow!("{wname}: no dtype"))?;
-        if dt == nv_weights::StDtype::F8_E4M3
-            && self.loader.has(&format!("{module}.weight_scale"))
+        if dt == nv_weights::StDtype::F8_E4M3 && self.loader.has(&format!("{module}.weight_scale"))
         {
             return Ok((ModuleStorage::Fp8RowScale, shape[0], shape[1]));
         }
@@ -445,7 +444,8 @@ impl HostDequantWeights {
     }
 
     pub fn trunk_rmsnorm_gamma(&self, name: &str, dtype: DType) -> Result<Tensor> {
-        let _ = THE_TRUNK_RMSNORM_GAMMAS_ARE_STORED_AS_GAMMA_MINUS_ONE_BUT_THE_GDN_INNER_NORM_IS_NOT;
+        let _ =
+            THE_TRUNK_RMSNORM_GAMMAS_ARE_STORED_AS_GAMMA_MINUS_ONE_BUT_THE_GDN_INNER_NORM_IS_NOT;
         let raw = self.plain(name, DType::F32)?;
         Ok(raw.affine(1.0, 1.0)?.to_dtype(dtype)?)
     }
@@ -569,13 +569,11 @@ impl TrainGdn {
             src.dense_linear(&format!("{prefix}.in_proj_z"), dtype)?,
             src.dense_linear(&format!("{prefix}.in_proj_a"), dtype)?,
             src.dense_linear(&format!("{prefix}.in_proj_b"), dtype)?,
-            src.plain(&format!("{prefix}.conv1d.weight"), dtype)?.reshape((
-                cfg.conv_dim(),
-                1,
-                cfg.linear_conv_kernel_dim,
-            ))?,
+            src.plain(&format!("{prefix}.conv1d.weight"), dtype)?
+                .reshape((cfg.conv_dim(), 1, cfg.linear_conv_kernel_dim))?,
             src.plain(&format!("{prefix}.A_log"), dtype)?.reshape(n_v)?,
-            src.plain(&format!("{prefix}.dt_bias"), dtype)?.reshape(n_v)?,
+            src.plain(&format!("{prefix}.dt_bias"), dtype)?
+                .reshape(n_v)?,
             src.plain(&format!("{prefix}.norm.weight"), dtype)?
                 .reshape(cfg.linear_value_head_dim)?,
             src.dense_linear(&format!("{prefix}.out_proj"), dtype)?,
@@ -601,11 +599,19 @@ impl TrainGdn {
         Ok(candle_nn::ops::silu(&acc)?)
     }
 
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn scan_dims(&self) -> (usize, usize, usize) {
+        (
+            self.cfg.linear_num_value_heads,
+            self.cfg.linear_key_head_dim,
+            self.cfg.linear_value_head_dim,
+        )
+    }
+
+    pub fn head(&self, x: &Tensor) -> Result<GdnParts> {
         let dims = x.dims().to_vec();
         ensure!(
             dims.len() == 3,
-            "TrainGdn::forward expects [B, T, H], got {dims:?}"
+            "TrainGdn::head expects [B, T, H], got {dims:?}"
         );
         let (b, t, h) = (dims[0], dims[1], dims[2]);
         ensure!(
@@ -613,7 +619,6 @@ impl TrainGdn {
             "TrainGdn: hidden {h} != cfg {}",
             self.cfg.hidden_size
         );
-        let in_dtype = x.dtype();
         let acc = self.cfg.mamba_ssm_dtype;
         let n_k = self.cfg.linear_num_key_heads;
         let n_v = self.cfg.linear_num_value_heads;
@@ -626,6 +631,45 @@ impl TrainGdn {
         let z = self.in_proj_z.forward(x)?;
         let a = self.in_proj_a.forward(x)?;
         let b_proj = self.in_proj_b.forward(x)?;
+
+        let head_dims = crate::qwen38_gdn_head::GdnHeadDims {
+            b,
+            t,
+            conv_dim: self.cfg.conv_dim(),
+            key_dim,
+            n_v,
+            v_per_k: self.cfg.v_per_k(),
+            head_dim: d_k,
+            conv_k: self.cfg.linear_conv_kernel_dim,
+        };
+        #[cfg(feature = "cuda")]
+        if d_v == d_k
+            && acc == DType::F32
+            && crate::qwen38_gdn_head::fused_head_kernel_serves(&qkv, &head_dims)
+        {
+            let op = crate::qwen38_gdn_head::GdnHeadPackedOp::new(&self.conv1d_weight, head_dims)?;
+            let packed = qkv.contiguous()?.apply_op1(op)?;
+            let q_scaled = packed.narrow(3, 0, d_k)?;
+            let k_grp = packed.narrow(3, d_k, d_k)?;
+            let v_f = packed.narrow(3, 2 * d_k, d_v)?;
+            let beta = candle_nn::ops::sigmoid(&b_proj.to_dtype(acc)?)?;
+            let a_plus = a
+                .to_dtype(acc)?
+                .broadcast_add(&self.dt_bias.to_dtype(acc)?)?;
+            let neg_exp_alog = self.a_log.to_dtype(acc)?.exp()?.affine(-1.0, 0.0)?;
+            let g_exp = softplus(&a_plus)?.broadcast_mul(&neg_exp_alog)?.exp()?;
+            return Ok(GdnParts {
+                q_scaled,
+                k_grp,
+                v_f,
+                g_exp,
+                beta,
+                z,
+                b,
+                t,
+            });
+        }
+        let _ = &head_dims;
 
         let mixed = self.causal_depthwise_conv_silu(&qkv, b, t)?;
 
@@ -654,14 +698,35 @@ impl TrainGdn {
         let v_f = v.to_dtype(acc)?;
 
         let beta = candle_nn::ops::sigmoid(&b_proj.to_dtype(acc)?)?;
-        let a_plus = a.to_dtype(acc)?.broadcast_add(&self.dt_bias.to_dtype(acc)?)?;
+        let a_plus = a
+            .to_dtype(acc)?
+            .broadcast_add(&self.dt_bias.to_dtype(acc)?)?;
         let neg_exp_alog = self.a_log.to_dtype(acc)?.exp()?.affine(-1.0, 0.0)?;
-        let g_exp = softplus(&a_plus)?
-            .broadcast_mul(&neg_exp_alog)?
-            .exp()?;
+        let g_exp = softplus(&a_plus)?.broadcast_mul(&neg_exp_alog)?.exp()?;
 
-        let core = gdn_scan(&q_scaled, &k_grp, &v_f, &g_exp, &beta, b, t, n_v, d_k, d_v)?;
+        Ok(GdnParts {
+            q_scaled,
+            k_grp,
+            v_f,
+            g_exp,
+            beta,
+            z,
+            b,
+            t,
+        })
+    }
 
+    pub fn tail(
+        &self,
+        core: &Tensor,
+        z: &Tensor,
+        in_dtype: DType,
+        b: usize,
+        t: usize,
+    ) -> Result<Tensor> {
+        let n_v = self.cfg.linear_num_value_heads;
+        let d_v = self.cfg.linear_value_head_dim;
+        let value_dim = self.cfg.value_dim();
         let core_bf = core.to_dtype(in_dtype)?;
         let z_re = z.reshape((b, t, n_v, d_v))?;
         let normed = rmsnorm_last(&core_bf, &self.norm_weight, self.cfg.rms_eps)?;
@@ -670,6 +735,36 @@ impl TrainGdn {
         let flat = gated.reshape((b, t, value_dim))?;
         self.out_proj.forward(&flat)
     }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let in_dtype = x.dtype();
+        let p = self.head(x)?;
+        let (n_v, d_k, d_v) = self.scan_dims();
+        let core = gdn_scan(
+            &p.q_scaled,
+            &p.k_grp,
+            &p.v_f,
+            &p.g_exp,
+            &p.beta,
+            p.b,
+            p.t,
+            n_v,
+            d_k,
+            d_v,
+        )?;
+        self.tail(&core, &p.z, in_dtype, p.b, p.t)
+    }
+}
+
+pub struct GdnParts {
+    pub q_scaled: Tensor,
+    pub k_grp: Tensor,
+    pub v_f: Tensor,
+    pub g_exp: Tensor,
+    pub beta: Tensor,
+    pub z: Tensor,
+    pub b: usize,
+    pub t: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -687,17 +782,33 @@ pub fn gdn_scan(
 ) -> Result<Tensor> {
     let acc = q.dtype();
     let bn = b * n_v;
-    let fold3 = |x: &Tensor, d: usize| -> Result<Tensor> {
-        Ok(x.transpose(1, 2)?.contiguous()?.reshape((bn, t, d))?)
-    };
-    let fold2 = |x: &Tensor| -> Result<Tensor> {
-        Ok(x.transpose(1, 2)?.contiguous()?.reshape((bn, t))?)
-    };
-    let q3 = fold3(q, d_k)?;
-    let k3 = fold3(k, d_k)?;
-    let v3 = fold3(v, d_v)?;
-    let g2 = fold2(g_exp)?;
-    let be2 = fold2(beta)?;
+    let q3 = chunked::fold3(q, bn, t, d_k)?;
+    let k3 = chunked::fold3(k, bn, t, d_k)?;
+    let v3 = chunked::fold3(v, bn, t, d_v)?;
+    let g2 = chunked::fold2(g_exp, bn, t)?;
+    let be2 = chunked::fold2(beta, bn, t)?;
+
+    #[cfg(feature = "cuda")]
+    if chunked::fused_scan_kernel_serves(q, d_k, d_v) {
+        let fwd = chunked::scan_chunked_fwd(q, k, v, g_exp, beta, b, t, n_v, d_k, d_v, t)?;
+        if std::env::var("NV_Q38_GDN_SCAN_CHECK_PRINTS_THE_KERNEL_VS_CANDLE_DIVERGENCE_PER_CALL").as_deref() == Ok("1") {
+            std::env::set_var(chunked::NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP, "0");
+            let reference = gdn_scan(q, k, v, g_exp, beta, b, t, n_v, d_k, d_v);
+            std::env::remove_var(chunked::NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP);
+            let reference = reference?;
+            let diff = fwd.out.sub(&reference)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            let scale = reference.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            let gmin = g_exp.flatten_all()?.min(0)?.to_scalar::<f32>()?;
+            let gmax = g_exp.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            let bmax = beta.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+            eprintln!(
+                "[gdn-scan-check] b={b} t={t} n_v={n_v} dtype={:?} max|diff|={diff:e} max|ref|={scale:e} rel={:e} g_exp=[{gmin:e},{gmax:e}] beta_max={bmax:e}",
+                q.dtype(),
+                diff / scale.max(1e-30)
+            );
+        }
+        return Ok(fwd.out);
+    }
 
     let mut state = Tensor::zeros((bn, d_k, d_v), acc, q.device())?;
     let mut outs: Vec<Tensor> = Vec::with_capacity(t);
@@ -707,19 +818,12 @@ pub fn gdn_scan(
         let v_t = v3.narrow(1, ti, 1)?.contiguous()?;
         let g_t = g2.narrow(1, ti, 1)?.reshape((bn, 1, 1))?;
         let be_t = be2.narrow(1, ti, 1)?.reshape((bn, 1, 1))?;
-
-        let decayed = state.broadcast_mul(&g_t)?;
-        let kv_mem = k_t.matmul(&decayed)?;
-        let delta = v_t.sub(&kv_mem)?.broadcast_mul(&be_t)?;
-        let update = k_t.transpose(1, 2)?.contiguous()?.matmul(&delta)?;
-        state = decayed.add(&update)?;
-        outs.push(q_t.matmul(&state)?);
+        let (s, o) = chunked::scan_step(&state, &q_t, &k_t, &v_t, &g_t, &be_t)?;
+        state = s;
+        outs.push(o);
     }
     let out = Tensor::cat(&outs, 1)?;
-    Ok(out
-        .reshape((b, n_v, t, d_v))?
-        .transpose(1, 2)?
-        .contiguous()?)
+    chunked::unfold3(&out, b, n_v, t, d_v)
 }
 
 pub struct TrainAttn {
@@ -793,7 +897,21 @@ impl TrainAttn {
         let q_normed = self.q_norm.forward_candle(&q_value)?;
         let k_normed = self.k_norm.forward_candle(&k)?;
 
-        let (q_final, k_final) = if self.rotary_dim >= hd {
+        #[cfg(feature = "cuda")]
+        let fused_rope = if nv_layers::rope::train_rope_op_serves(&q_normed) && q_normed.dtype() == k_normed.dtype() {
+            let rd = self.rotary_dim.min(hd);
+            Some((
+                rope.apply_train_partial_scaled(&q_normed, positions, rd, hd, 1.0)?.to_dtype(in_dtype)?,
+                rope.apply_train_partial_scaled(&k_normed, positions, rd, hd, 1.0)?.to_dtype(in_dtype)?,
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let fused_rope: Option<(Tensor, Tensor)> = None;
+        let (q_final, k_final) = if let Some(pair) = fused_rope {
+            pair
+        } else if self.rotary_dim >= hd {
             let (qr, kr) = rope.apply_candle(
                 &q_normed.to_dtype(DType::F32)?,
                 &k_normed.to_dtype(DType::F32)?,
@@ -913,7 +1031,10 @@ impl TrainLayer {
                 cfg.rms_norm_eps,
             ),
             post_norm: RmsNorm::new(
-                src.trunk_rmsnorm_gamma(&format!("{prefix}.post_attention_layernorm.weight"), dtype)?,
+                src.trunk_rmsnorm_gamma(
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                    dtype,
+                )?,
                 cfg.rms_norm_eps,
             ),
             mixer,
@@ -962,6 +1083,120 @@ impl TrainLayer {
             "in_proj_qkv" | "in_proj_z" | "out_proj" => format!("{prefix}.linear_attn.{leaf}"),
             _ => format!("{prefix}.mlp.{leaf}"),
         }
+    }
+
+    pub const GDN_CHUNKED_BACKWARD_SEVERS_THE_SCAN_AT_ITS_FIVE_INPUTS_AND_RE_SEEDS_THEM_FROM_A_SECOND_SURROGATE: &'static str =
+        "the layer graph is built once with the scan replaced by a detached chunked forward \
+         behind a Var seam at its output; the first surrogate backward covers the tail \
+         (norm/gate/out_proj), the mlp, the z projection and the residuals, and yields d(core); \
+         the reverse chunk sweep turns d(core) into grads at the five scan inputs; the second \
+         surrogate re-seeds those grads into the head subgraph (conv+silu, l2norm, \
+         softplus/sigmoid gating, in_proj_qkv/a/b), so no state matrix outlives its chunk";
+
+    pub fn gdn_grads_chunked(
+        &self,
+        h_in: &Tensor,
+        grad_next: &Tensor,
+        vars: &[Var],
+        chunk: usize,
+    ) -> Result<(Vec<Option<Tensor>>, Tensor)> {
+        let _ = Self::GDN_CHUNKED_BACKWARD_SEVERS_THE_SCAN_AT_ITS_FIVE_INPUTS_AND_RE_SEEDS_THEM_FROM_A_SECOND_SURROGATE;
+        let TrainMixer::Linear(gdn) = &self.mixer else {
+            bail!("gdn_grads_chunked called on a full-attention layer")
+        };
+        let in_dtype = h_in.dtype();
+        let dev = h_in.device().clone();
+        let x_var = Var::from_tensor(&h_in.detach())?;
+        let (p, normed) = crate::train_prof::phase(&dev, "gdn_bwd_head_forward_graph", || {
+            let normed = self.pre_norm.forward_candle(x_var.as_tensor())?;
+            let p = gdn.head(&normed)?;
+            Ok((p, normed))
+        })?;
+        let _ = normed;
+        let (n_v, d_k, d_v) = gdn.scan_dims();
+        let fwd = crate::train_prof::phase(&dev, "gdn_bwd_scan_forward_checkpointed", || {
+            chunked::scan_chunked_fwd(
+                &p.q_scaled,
+                &p.k_grp,
+                &p.v_f,
+                &p.g_exp,
+                &p.beta,
+                p.b,
+                p.t,
+                n_v,
+                d_k,
+                d_v,
+                chunk,
+            )
+        })?;
+        let core_var = Var::from_tensor(&fwd.out)?;
+        let (gs_tail, d_core) = crate::train_prof::phase(&dev, "gdn_bwd_tail_mlp_forward_and_surrogate_backward", || {
+            let mixed = gdn.tail(core_var.as_tensor(), &p.z, in_dtype, p.b, p.t)?;
+            let after_mix = x_var.as_tensor().add(&mixed)?;
+            let normed_post = self.post_norm.forward_candle(&after_mix)?;
+            let ffn = self.mlp.forward(&normed_post)?;
+            let out = after_mix.add(&ffn)?;
+            let surrogate_tail = out
+                .to_dtype(DType::F32)?
+                .mul(&grad_next.detach().to_dtype(DType::F32)?)?
+                .sum_all()?;
+            let gs_tail = surrogate_tail.backward()?;
+            let d_core = gs_tail
+                .get(core_var.as_tensor())
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no grad reached the scan output seam"))?;
+            Ok((gs_tail, d_core))
+        })?;
+        let mut acc: Vec<Option<Tensor>> = vars.iter().map(|v| gs_tail.get(v).cloned()).collect();
+
+        let (dq, dk, dv, dg, dbe) = crate::train_prof::phase(&dev, "gdn_bwd_scan_input_grads", || {
+            chunked::scan_chunked_input_grads(
+                &p.q_scaled,
+                &p.k_grp,
+                &p.v_f,
+                &p.g_exp,
+                &p.beta,
+                &d_core,
+                &fwd.checkpoints,
+                p.b,
+                p.t,
+                n_v,
+                d_k,
+                d_v,
+                chunk,
+            )
+        })?;
+
+        let gs_head = crate::train_prof::phase(&dev, "gdn_bwd_head_surrogate_backward", || {
+            let surrogate_head = p
+                .q_scaled
+                .mul(&dq)?
+                .sum_all()?
+                .add(&p.k_grp.mul(&dk)?.sum_all()?)?
+                .add(&p.v_f.mul(&dv)?.sum_all()?)?
+                .add(&p.g_exp.mul(&dg)?.sum_all()?)?
+                .add(&p.beta.mul(&dbe)?.sum_all()?)?;
+            surrogate_head.backward().map_err(Into::into)
+        })?;
+        for (vi, v) in vars.iter().enumerate() {
+            if let Some(g) = gs_head.get(v) {
+                let g = g.clone();
+                acc[vi] = Some(match acc[vi].take() {
+                    Some(a) => a.add(&g.to_dtype(a.dtype())?)?,
+                    None => g,
+                });
+            }
+        }
+        let gx = match (
+            gs_tail.get(x_var.as_tensor()),
+            gs_head.get(x_var.as_tensor()),
+        ) {
+            (Some(a), Some(b)) => a.add(b)?,
+            (Some(a), None) => a.clone(),
+            (None, Some(b)) => b.clone(),
+            (None, None) => bail!("no grad reached the layer input from either surrogate"),
+        };
+        Ok((acc, gx))
     }
 }
 
@@ -1079,7 +1314,10 @@ pub fn byte_corpus(path: &Path, take_bytes: usize, vocab: usize) -> Result<Vec<u
     let raw = std::fs::read(path).with_context(|| format!("read corpus {}", path.display()))?;
     ensure!(!raw.is_empty(), "corpus {} is empty", path.display());
     let n = take_bytes.min(raw.len());
-    Ok(raw[..n].iter().map(|b| (*b as u32) % vocab as u32).collect())
+    Ok(raw[..n]
+        .iter()
+        .map(|b| (*b as u32) % vocab as u32)
+        .collect())
 }
 
 pub fn tokenized_corpus(
@@ -1189,7 +1427,10 @@ fn run_inner(
     let mut hidden: Vec<Tensor> = Vec::with_capacity(args.examples);
     for ex in &inputs {
         let rows = src.embed_rows(EMBED_TOKENS, ex, cfg.hidden_size)?;
-        hidden.push(rows.reshape((1, args.seq_len, cfg.hidden_size))?.to_dtype(dtype)?);
+        hidden.push(
+            rows.reshape((1, args.seq_len, cfg.hidden_size))?
+                .to_dtype(dtype)?,
+        );
     }
     for li in 0..window_start {
         let layer = TrainLayer::from_weights(&src, &cfg, li, dtype)
@@ -1209,7 +1450,10 @@ fn run_inner(
                 .with_context(|| format!("build trainable window layer {li}"))?,
         );
     }
-    let final_norm = RmsNorm::new(src.trunk_rmsnorm_gamma(FINAL_NORM, dtype)?, cfg.rms_norm_eps);
+    let final_norm = RmsNorm::new(
+        src.trunk_rmsnorm_gamma(FINAL_NORM, dtype)?,
+        cfg.rms_norm_eps,
+    );
     let lm_head = src.dense_linear(LM_HEAD, dtype)?;
     let window_build_seconds = t_window.elapsed().as_secs_f64();
 
@@ -1253,11 +1497,12 @@ fn run_inner(
         Ok(candle_nn::loss::cross_entropy(&logits2, &t)?)
     };
 
-    let (losses, step_seconds, all_grads_finite, head_losses, all_head_grads_finite) =
-        match (&cotrain, co) {
-            (Some(ct), Some(c)) => {
-                let ones = vec![1.0f32; args.seq_len];
-                let o = co_train_steps(
+    let (losses, step_seconds, all_grads_finite, head_losses, all_head_grads_finite) = match (
+        &cotrain, co,
+    ) {
+        (Some(ct), Some(c)) => {
+            let ones = vec![1.0f32; args.seq_len];
+            let o = co_train_steps(
                     &vars,
                     &loras,
                     &ct.vars,
@@ -1287,16 +1532,16 @@ fn run_inner(
                         Ok((trunk, head))
                     },
                 )?;
-                (
-                    o.losses,
-                    o.step_seconds,
-                    o.all_grads_finite,
-                    o.head_losses,
-                    o.all_head_grads_finite,
-                )
-            }
-            _ => {
-                let (l, s, f) = train_steps(
+            (
+                o.losses,
+                o.step_seconds,
+                o.all_grads_finite,
+                o.head_losses,
+                o.all_head_grads_finite,
+            )
+        }
+        _ => {
+            let (l, s, f) = train_steps(
                     &vars,
                     &loras,
                     args.steps,
@@ -1311,9 +1556,9 @@ fn run_inner(
                         )
                     },
                 )?;
-                (l, s, f, Vec::new(), true)
-            }
-        };
+            (l, s, f, Vec::new(), true)
+        }
+    };
 
     let (entries, min_amax, max_amax) = collect_raw_entries(&loras)?;
     let (speculator, head_modules) = match &cotrain {
@@ -1426,39 +1671,100 @@ fn window_loss_and_grads_checkpointed(
     vocab: usize,
     vars: &[Var],
 ) -> Result<(f32, Vec<Option<Tensor>>, Tensor)> {
+    let t = h0.dims()[1];
+    ensure!(
+        mask.len() == t,
+        "loss mask has {} weights for {t} target positions",
+        mask.len()
+    );
+    let unmasked = mask.iter().sum::<f32>().max(1.0);
+    let weights: Vec<f32> = mask.iter().map(|w| w / unmasked).collect();
+    window_loss_and_grads_checkpointed_rows(
+        window, final_norm, lm_head, rope, positions, h0, tgt, &weights, vocab, vars,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn window_loss_and_grads_checkpointed_rows(
+    window: &[TrainLayer],
+    final_norm: &RmsNorm,
+    lm_head: &Linear,
+    rope: &Rope,
+    positions: &Tensor,
+    h0: &Tensor,
+    tgt: &Tensor,
+    weights: &[f32],
+    vocab: usize,
+    vars: &[Var],
+) -> Result<(f32, Vec<Option<Tensor>>, Tensor)> {
+    let dev = h0.device().clone();
+    let rows = h0.dims()[0];
     let mut boundaries: Vec<Tensor> = Vec::with_capacity(window.len() + 1);
     boundaries.push(h0.detach());
-    for layer in window {
-        let out = layer
-            .forward(boundaries.last().unwrap(), rope, positions)?
-            .detach();
-        boundaries.push(out);
-    }
+    crate::train_prof::phase(&dev, "forward_window_chain", || {
+        for layer in window {
+            let out = layer
+                .forward(boundaries.last().unwrap(), rope, positions)?
+                .detach();
+            boundaries.push(out);
+        }
+        Ok(())
+    })?;
 
     let t = h0.dims()[1];
     let hv = Var::from_tensor(boundaries.last().unwrap())?;
-    let x = final_norm.forward_candle(hv.as_tensor())?;
-    let logits2 = lm_head
-        .forward(&x)?
-        .reshape((t, vocab))?
-        .to_dtype(DType::F32)?;
-    let loss = crate::ce_mean_over_unmasked_positions(&logits2, tgt, mask)?;
-    let lv = loss.to_scalar::<f32>()?;
-    let gs = loss.backward()?;
+    let (lv, gs) = crate::train_prof::phase(&dev, "head_loss_and_backward", || {
+        let x = final_norm.forward_candle(hv.as_tensor())?;
+        let logits = lm_head.forward(&x)?.reshape((rows * t, vocab))?;
+        #[cfg(feature = "cuda")]
+        let loss = if crate::qwen38_ce::fused_ce_serves(&logits) {
+            crate::qwen38_ce::ce_rows_fused(&logits, tgt, weights)?
+        } else {
+            crate::ce_weighted_over_positions(&logits.to_dtype(DType::F32)?, tgt, weights)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let loss = crate::ce_weighted_over_positions(&logits.to_dtype(DType::F32)?, tgt, weights)?;
+        let lv = loss.to_scalar::<f32>()?;
+        let gs = loss.backward()?;
+        Ok((lv, gs))
+    })?;
     let mut acc: Vec<Option<Tensor>> = vars.iter().map(|v| gs.get(v).cloned()).collect();
     let mut grad_next = gs
         .get(hv.as_tensor())
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no grad for the checkpointed head input"))?;
 
+    let chunk = chunked::chunk_tokens_from_env();
     for li in (0..window.len()).rev() {
+        if chunk > 0 && matches!(window[li].mixer, TrainMixer::Linear(_)) {
+            let (layer_acc, gx) =
+                crate::train_prof::phase(&dev, "gdn_layer_chunked_backward", || {
+                    window[li].gdn_grads_chunked(&boundaries[li], &grad_next, vars, chunk)
+                })?;
+            for (vi, g) in layer_acc.into_iter().enumerate() {
+                if let Some(g) = g {
+                    acc[vi] = Some(match acc[vi].take() {
+                        Some(a) => a.add(&g.to_dtype(a.dtype())?)?,
+                        None => g,
+                    });
+                }
+            }
+            grad_next = gx;
+            continue;
+        }
         let inp = Var::from_tensor(&boundaries[li])?;
-        let out = window[li].forward(inp.as_tensor(), rope, positions)?;
-        let surrogate = out
-            .to_dtype(DType::F32)?
-            .mul(&grad_next.detach().to_dtype(DType::F32)?)?
-            .sum_all()?;
-        let layer_gs = surrogate.backward()?;
+        let phase_name = match window[li].mixer {
+            TrainMixer::Linear(_) => "gdn_layer_recompute_and_backward",
+            _ => "attention_layer_recompute_and_backward",
+        };
+        let layer_gs = crate::train_prof::phase(&dev, phase_name, || {
+            let out = window[li].forward(inp.as_tensor(), rope, positions)?;
+            let surrogate = out
+                .to_dtype(DType::F32)?
+                .mul(&grad_next.detach().to_dtype(DType::F32)?)?
+                .sum_all()?;
+            surrogate.backward().map_err(Into::into)
+        })?;
         for (vi, v) in vars.iter().enumerate() {
             if let Some(g) = layer_gs.get(v) {
                 let g = g.clone();
@@ -1536,7 +1842,10 @@ impl WindowOptimizer {
     }
 }
 
-pub(crate) fn fold_example_grads(acc: &mut [Option<Tensor>], grads: Vec<Option<Tensor>>) -> Result<()> {
+pub(crate) fn fold_example_grads(
+    acc: &mut [Option<Tensor>],
+    grads: Vec<Option<Tensor>>,
+) -> Result<()> {
     for (vi, g) in grads.into_iter().enumerate() {
         if let Some(g) = g {
             let g = g.to_dtype(DType::F32)?;
@@ -1567,7 +1876,8 @@ pub(crate) fn average_grads_bailing_on_an_untouched_factor(
     for slot in acc.iter_mut() {
         if let Some(g) = slot.take() {
             let g = g.affine(inv, 0.0)?;
-            if !crate::grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum(&g)? {
+            if !crate::grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum(&g)?
+            {
                 finite = false;
             }
             *slot = Some(g);
@@ -1602,10 +1912,20 @@ fn train_steps(
             fold_example_grads(&mut acc, grads)?;
         }
         let inv = 1.0 / n_examples as f64;
-        if !average_grads_bailing_on_an_untouched_factor(&mut acc, loras, inv, step)? {
+        let dev = vars.first().map(|v| v.device().clone());
+        let finite = match &dev {
+            Some(d) => crate::train_prof::phase(d, "grad_average_and_finite_check", || {
+                average_grads_bailing_on_an_untouched_factor(&mut acc, loras, inv, step)
+            })?,
+            None => average_grads_bailing_on_an_untouched_factor(&mut acc, loras, inv, step)?,
+        };
+        if !finite {
             all_grads_finite = false;
         }
-        opt.step(vars, &acc)?;
+        match &dev {
+            Some(d) => crate::train_prof::phase(d, "optimizer_step", || opt.step(vars, &acc))?,
+            None => opt.step(vars, &acc)?,
+        }
         let lv = loss_sum * inv as f32;
         losses.push(lv);
         step_seconds.push(t0.elapsed().as_secs_f64());
@@ -2128,7 +2448,7 @@ fn w4a4_eval_arm_opted_in() -> bool {
     )
 }
 
-pub const NV_TRAIN_QUANT_RESIDENT_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM: &str =
+pub const NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM: &str =
     "NV_TRAIN_QUANT_RESIDENT";
 
 pub const QUANT_RESIDENT_TRAINS_THROUGH_QUANT_LINEAR_OP_AND_LEAVES_BF16_MODULES_HOST_DEQUANT: &str =
@@ -2138,8 +2458,9 @@ pub const QUANT_RESIDENT_TRAINS_THROUGH_QUANT_LINEAR_OP_AND_LEAVES_BF16_MODULES_
      QuantLinearOp: forward is the serving quantized GEMM, backward is dx-only through a device \
      dequant of the frozen base, and the LoRA delta hook carries the only trainable parameters. \
      Bf16-stored modules (and the MTP head, which loads through its own small \
-     HostDequantWeights) stay host-dequant. Unset, nothing changes: the default path is \
-     byte-identical to the pre-arm trainer.";
+     HostDequantWeights) stay host-dequant. This is the default since the 2026-09-13 ruling \
+     that training is quantized always; NV_TRAIN_QUANT_RESIDENT=0 is the host-dequant oracle \
+     the byte-identity test keeps, not a measured arm.";
 
 pub const QUANT_RESIDENT_REFUSES_AN_ALL_BF16_CHECKPOINT_BECAUSE_A_SILENT_FALLTHROUGH_WOULD_FAKE_THE_ARM: &str =
     "the refuses-loudly design: a checkpoint with no Nvfp4Packed/Fp8RowScale linear would make \
@@ -2147,9 +2468,23 @@ pub const QUANT_RESIDENT_REFUSES_AN_ALL_BF16_CHECKPOINT_BECAUSE_A_SILENT_FALLTHR
      host-dequant path is worse than no row";
 
 pub fn quant_resident_arm_opted_in() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-        NV_TRAIN_QUANT_RESIDENT_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM,
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM,
     )
+}
+
+pub const A_BF16_ONLY_CHECKPOINT_UNDER_THE_QUANTIZED_ALWAYS_DEFAULT_IS_THE_TEST_ORACLE_AND_TRAINS_HOST_DEQUANT_ONLY_AN_EXPLICIT_1_REFUSES_IT: &str =
+    "the 2026-09-13 ruling keeps bf16 only as an internal test oracle: a checkpoint with no \
+     nvfp4-packed or fp8-rowscale linear (the tiny fixtures) has nothing to keep resident, so \
+     under the default it trains on the host-dequant path and says so; NV_TRAIN_QUANT_RESIDENT=1 \
+     set by hand still refuses it, because that arm must never be a silent no-op";
+
+fn quant_resident_set_by_hand() -> bool {
+    std::env::var(
+        NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM,
+    )
+    .as_deref()
+        == Ok("1")
 }
 
 pub fn open_train_weights(base: &Path, device: &Device) -> Result<(HostDequantWeights, bool)> {
@@ -2158,6 +2493,15 @@ pub fn open_train_weights(base: &Path, device: &Device) -> Result<(HostDequantWe
         return Ok((src, false));
     }
     let _ = QUANT_RESIDENT_TRAINS_THROUGH_QUANT_LINEAR_OP_AND_LEAVES_BF16_MODULES_HOST_DEQUANT;
+    if !quant_resident_set_by_hand() && (!src.has_any_quantized_linear() || !device.is_cuda()) {
+        let _ = A_BF16_ONLY_CHECKPOINT_UNDER_THE_QUANTIZED_ALWAYS_DEFAULT_IS_THE_TEST_ORACLE_AND_TRAINS_HOST_DEQUANT_ONLY_AN_EXPLICIT_1_REFUSES_IT;
+        eprintln!(
+            "[q38-lora-train] {} holds no quantized linear or runs on {:?}: host-dequant oracle path",
+            base.display(),
+            device.location()
+        );
+        return Ok((src, false));
+    }
     ensure!(
         src.has_any_quantized_linear(),
         "NV_TRAIN_QUANT_RESIDENT=1 but {} holds no nvfp4-packed or fp8-rowscale linear -- {}",
@@ -2223,7 +2567,10 @@ pub(crate) fn logits_f32_after_head(
 ) -> Result<Tensor> {
     let t = x.dims()[1];
     let x = final_norm.forward_candle(x)?;
-    Ok(lm_head.forward(&x)?.reshape((t, vocab))?.to_dtype(DType::F32)?)
+    Ok(lm_head
+        .forward(&x)?
+        .reshape((t, vocab))?
+        .to_dtype(DType::F32)?)
 }
 
 fn detached_window_output(
@@ -2251,8 +2598,7 @@ fn per_row_holdout_ce_in_loaded_dataset_row_order(
         .map(|(h, positions, tgt, mask)| {
             let x = detached_window_output(window, rope, h, positions)?;
             let logits = logits_f32_after_head(final_norm, lm_head, &x, vocab)?;
-            Ok(crate::ce_mean_over_unmasked_positions(&logits, tgt, mask)?
-                .to_scalar::<f32>()?)
+            Ok(crate::ce_mean_over_unmasked_positions(&logits, tgt, mask)?.to_scalar::<f32>()?)
         })
         .collect()
 }
@@ -2291,9 +2637,7 @@ fn run_w4a4_eval_arm(
 ) -> Result<()> {
     let cuda = match device {
         Device::Cuda(d) => d.clone(),
-        _ => bail!(
-            "NV_Q38_EVAL_W4A4=1 needs a CUDA device: the serving W4A4 GEMM has no CPU path"
-        ),
+        _ => bail!("NV_Q38_EVAL_W4A4=1 needs a CUDA device: the serving W4A4 GEMM has no CPU path"),
     };
     let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
         cuda.cuda_stream(),
@@ -2316,8 +2660,9 @@ fn run_w4a4_eval_arm(
         );
     }
     let vocab = cfg.vocab_size;
-    let per_row_base_q =
-        per_row_holdout_ce_in_loaded_dataset_row_order(&window, final_norm, lm_head, rope, vocab, &exs)?;
+    let per_row_base_q = per_row_holdout_ce_in_loaded_dataset_row_order(
+        &window, final_norm, lm_head, rope, vocab, &exs,
+    )?;
     let base_q = crate::eval_loss_scalar_is_the_sum_of_the_per_row_ce_means_in_dataset_row_order(
         &per_row_base_q,
     )
@@ -2342,14 +2687,22 @@ fn run_w4a4_eval_arm(
          serving-forward score would fake parity",
         loras.len()
     );
-    let per_row_adapter_q =
-        per_row_holdout_ce_in_loaded_dataset_row_order(&window, final_norm, lm_head, rope, vocab, &exs)?;
+    let per_row_adapter_q = per_row_holdout_ce_in_loaded_dataset_row_order(
+        &window, final_norm, lm_head, rope, vocab, &exs,
+    )?;
     let adapter_q =
         crate::eval_loss_scalar_is_the_sum_of_the_per_row_ce_means_in_dataset_row_order(
             &per_row_adapter_q,
         )
         .unwrap_or(f32::NAN);
-    let bf16_l0 = row0_logits(bf16_window, final_norm, lm_head, rope, vocab, &bf16_eval_ex[0])?;
+    let bf16_l0 = row0_logits(
+        bf16_window,
+        final_norm,
+        lm_head,
+        rope,
+        vocab,
+        &bf16_eval_ex[0],
+    )?;
     let w4a4_l0 = row0_logits(&window, final_norm, lm_head, rope, vocab, &exs[0])?;
     let row0_diff = crate::max_abs_diff(&bf16_l0, &w4a4_l0)?;
     eprintln!(
@@ -2414,6 +2767,87 @@ pub const EVAL_ROWS_SHARE_THE_FROZEN_PREFIX_PASS_BECAUSE_NO_TRAINABLE_PARAMETER_
      inside the window; attaching a hook cannot change any hidden state entering it, and the \
      base weights never move, so scoring the window before any LoRA exists IS the detached eval.";
 
+pub const WINDOW_ROWS_PER_GRAPH_ENV_DEFAULT_4_BECAUSE_FOUR_512_ROWS_THROUGH_THE_CHECKPOINTED_CHUNKED_WALK_RUN_2_81_S_AT_29_GIB_AND_EIGHT_RUN_2_59_S_AT_51_GIB_1_RESTORES_ONE_ROW_PER_GRAPH: &str =
+    "NV_TRAIN_WINDOW_ROWS";
+
+pub const WINDOW_ROWS_PEAK_GIB_LADDER_MEASURED_ON_8X512_AT_250W_ROWS_8_51_0_ROWS_4_29_1_ROWS_2_18_0_FASTEST_FIRST: [(usize, f64); 3] =
+    [(8, 51.0), (4, 29.1), (2, 18.0)];
+
+pub const WINDOW_ROWS_HEADROOM_GIB_8_BECAUSE_THE_PEAK_LADDER_WAS_MEASURED_ON_512_TOKEN_ROWS_AND_LONGER_ROWS_OR_A_WARM_ALLOCATOR_NEED_SLACK: f64 =
+    8.0;
+
+pub fn window_rows_per_graph_adaptive(device_total_gib: f64, used_by_others_gib: f64) -> usize {
+    let budget = device_total_gib
+        - used_by_others_gib
+        - WINDOW_ROWS_HEADROOM_GIB_8_BECAUSE_THE_PEAK_LADDER_WAS_MEASURED_ON_512_TOKEN_ROWS_AND_LONGER_ROWS_OR_A_WARM_ALLOCATOR_NEED_SLACK;
+    WINDOW_ROWS_PEAK_GIB_LADDER_MEASURED_ON_8X512_AT_250W_ROWS_8_51_0_ROWS_4_29_1_ROWS_2_18_0_FASTEST_FIRST
+        .iter()
+        .find(|(_, peak)| *peak <= budget)
+        .map(|(rows, _)| *rows)
+        .unwrap_or(1)
+}
+
+fn window_rows_per_graph(device: &Device) -> usize {
+    if let Some(rows) = std::env::var(
+        WINDOW_ROWS_PER_GRAPH_ENV_DEFAULT_4_BECAUSE_FOUR_512_ROWS_THROUGH_THE_CHECKPOINTED_CHUNKED_WALK_RUN_2_81_S_AT_29_GIB_AND_EIGHT_RUN_2_59_S_AT_51_GIB_1_RESTORES_ONE_ROW_PER_GRAPH,
+    )
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    {
+        return rows.max(1);
+    }
+    #[cfg(feature = "cuda")]
+    if device.is_cuda() {
+        if let Ok((free, total)) = cudarc::driver::result::mem_get_info() {
+            let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+            let used_by_others = (gib(total)
+                - gib(free)
+                - DEVICE_USED_BY_THIS_PROCESS_GIB_AT_LOAD
+                    .lock()
+                    .map(|g| *g)
+                    .unwrap_or(0.0))
+            .max(0.0);
+            let rows = window_rows_per_graph_adaptive(gib(total), used_by_others);
+            eprintln!(
+                "[q38-lora-train] window rows per graph {rows} (device {:.1} GiB, others {:.1} GiB, this process {:.1} GiB at load, headroom {} GiB)",
+                gib(total),
+                used_by_others,
+                DEVICE_USED_BY_THIS_PROCESS_GIB_AT_LOAD.lock().map(|g| *g).unwrap_or(0.0),
+                WINDOW_ROWS_HEADROOM_GIB_8_BECAUSE_THE_PEAK_LADDER_WAS_MEASURED_ON_512_TOKEN_ROWS_AND_LONGER_ROWS_OR_A_WARM_ALLOCATOR_NEED_SLACK
+            );
+            return rows;
+        }
+    }
+    let _ = device;
+    4
+}
+
+static DEVICE_USED_BY_THIS_PROCESS_GIB_AT_LOAD: Mutex<f64> = Mutex::new(0.0);
+
+#[cfg(feature = "cuda")]
+fn note_device_use_of_this_process_between(before_free: usize) {
+    if let Ok((free_now, _)) = cudarc::driver::result::mem_get_info() {
+        let used = before_free.saturating_sub(free_now) as f64 / (1u64 << 30) as f64;
+        if let Ok(mut g) = DEVICE_USED_BY_THIS_PROCESS_GIB_AT_LOAD.lock() {
+            *g = used;
+        }
+    }
+}
+
+fn equal_length_row_groups(lengths: &[usize], rows_per_graph: usize) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, &t) in lengths.iter().enumerate() {
+        match groups
+            .last_mut()
+            .filter(|g| g.len() < rows_per_graph && lengths[g[0]] == t)
+        {
+            Some(g) => g.push(i),
+            None => groups.push(vec![i]),
+        }
+    }
+    groups
+}
+
 pub fn run_jsonl(args: &Q38JsonlArgs, device: &Device) -> Result<Q38JsonlSummary> {
     Ok(run_jsonl_inner(args, None, device)?.0)
 }
@@ -2441,6 +2875,10 @@ fn run_jsonl_inner(
     let cfg = Q38Config::from_hf_json_file(&args.base.join("config.json"))?;
     let grad_layers = args.grad_layers.clamp(1, cfg.num_hidden_layers);
     let window_start = cfg.num_hidden_layers - grad_layers;
+    #[cfg(feature = "cuda")]
+    let device_free_before_this_process_loaded = cudarc::driver::result::mem_get_info()
+        .map(|(free, _)| free)
+        .unwrap_or(0);
     let (src, resident_base) = open_train_weights(&args.base, device)?;
     let dtype = if device.is_cuda() {
         DType::BF16
@@ -2450,7 +2888,8 @@ fn run_jsonl_inner(
 
     let max_seq =
         crate::JSONL_MAX_SEQ_IS_512_SHARED_BY_BOTH_ENDPOINT_ARMS_BECAUSE_THE_DEFAULT_QWEN_WINDOWS_GDN_GRAPH_AT_512_IS_ABOUT_14_GB;
-    let train_rows = crate::load_jsonl_token_dataset(&args.data, &args.base, cfg.vocab_size, max_seq)?;
+    let train_rows =
+        crate::load_jsonl_token_dataset(&args.data, &args.base, cfg.vocab_size, max_seq)?;
     let eval_rows = match &args.eval_data {
         Some(p) => Some(crate::load_jsonl_token_dataset(
             p,
@@ -2491,7 +2930,10 @@ fn run_jsonl_inner(
                 .with_context(|| format!("build trainable window layer {li}"))?,
         );
     }
-    let final_norm = RmsNorm::new(src.trunk_rmsnorm_gamma(FINAL_NORM, dtype)?, cfg.rms_norm_eps);
+    let final_norm = RmsNorm::new(
+        src.trunk_rmsnorm_gamma(FINAL_NORM, dtype)?,
+        cfg.rms_norm_eps,
+    );
     let lm_head = src.dense_linear(LM_HEAD, dtype)?;
 
     let head_loss = |x: &Tensor, tgt: &Tensor, mask: &[f32]| -> Result<Tensor> {
@@ -2501,13 +2943,14 @@ fn run_jsonl_inner(
         let logits2 = logits.reshape((t, cfg.vocab_size))?.to_dtype(DType::F32)?;
         crate::ce_mean_over_unmasked_positions(&logits2, tgt, mask)
     };
-    let forward_loss = |h: &Tensor, positions: &Tensor, tgt: &Tensor, mask: &[f32]| -> Result<Tensor> {
-        let mut x = h.clone();
-        for layer in &window {
-            x = layer.forward(&x, &rope, positions)?;
-        }
-        head_loss(&x, tgt, mask)
-    };
+    let forward_loss =
+        |h: &Tensor, positions: &Tensor, tgt: &Tensor, mask: &[f32]| -> Result<Tensor> {
+            let mut x = h.clone();
+            for layer in &window {
+                x = layer.forward(&x, &rope, positions)?;
+            }
+            head_loss(&x, tgt, mask)
+        };
     let eval_ce_base = per_row_holdout_ce_in_loaded_dataset_row_order(
         &window,
         &final_norm,
@@ -2571,17 +3014,33 @@ fn run_jsonl_inner(
                     let (h, positions, tgt, mask) = &train_ex[i];
                     let (lv, trunk_grads, window_out_detached) = if checkpointed {
                         window_loss_and_grads_checkpointed(
-                            &window, &final_norm, &lm_head, &rope, positions, h, tgt, mask,
-                            cfg.vocab_size, &vars,
+                            &window,
+                            &final_norm,
+                            &lm_head,
+                            &rope,
+                            positions,
+                            h,
+                            tgt,
+                            mask,
+                            cfg.vocab_size,
+                            &vars,
                         )?
                     } else {
-                        let mut x = h.clone();
-                        for layer in &window {
-                            x = layer.forward(&x, &rope, positions)?;
-                        }
-                        let loss = head_loss(&x, tgt, mask)?;
+                        let dev = h.device().clone();
+                        let x = crate::train_prof::phase(&dev, "forward_window_chain", || {
+                            let mut x = h.clone();
+                            for layer in &window {
+                                x = layer.forward(&x, &rope, positions)?;
+                            }
+                            Ok(x)
+                        })?;
+                        let loss = crate::train_prof::phase(&dev, "head_loss", || {
+                            head_loss(&x, tgt, mask)
+                        })?;
                         let xd = x.detach();
-                        let (lv, grads) = loss_and_grads_from_one_backward(loss, &vars)?;
+                        let (lv, grads) = crate::train_prof::phase(&dev, "backward_all", || {
+                            loss_and_grads_from_one_backward(loss, &vars)
+                        })?;
                         (lv, grads, xd)
                     };
                     let head = ct.head_loss_and_grads(
@@ -2605,26 +3064,80 @@ fn run_jsonl_inner(
             )
         }
         _ => {
+            #[cfg(feature = "cuda")]
+            note_device_use_of_this_process_between(device_free_before_this_process_loaded);
+            let groups = {
+                let lengths: Vec<usize> = train_ex.iter().map(|(h, ..)| h.dims()[1]).collect();
+                equal_length_row_groups(&lengths, window_rows_per_graph(device))
+            };
+            eprintln!(
+                "[q38-lora-train] window graphs per step {}  rows per graph {:?}",
+                groups.len(),
+                groups.iter().map(|g| g.len()).collect::<Vec<_>>()
+            );
             let (l, _step_seconds, f) = train_steps(
                 &vars,
                 &loras,
                 args.steps,
                 args.lr,
                 args.b_lr_ratio,
-                train_ex.len(),
-                |i| {
+                groups.len(),
+                |gi| {
+                    let group = &groups[gi];
+                    if group.len() > 1 {
+                        let dev = train_ex[group[0]].0.device().clone();
+                        let rows = group.len();
+                        let t = train_ex[group[0]].0.dims()[1];
+                        let hs: Vec<&Tensor> = group.iter().map(|&i| &train_ex[i].0).collect();
+                        let tg: Vec<&Tensor> = group.iter().map(|&i| &train_ex[i].2).collect();
+                        let mut weights: Vec<f32> = Vec::with_capacity(rows * t);
+                        for &i in group {
+                            let mask = &train_ex[i].3;
+                            let unmasked: f32 = mask.iter().sum::<f32>().max(1.0);
+                            weights.extend(mask.iter().map(|w| w / (unmasked * rows as f32)));
+                        }
+                        let h = Tensor::cat(&hs, 0)?;
+                        let positions = flat_positions(rows, t, &dev)?;
+                        let tgt = Tensor::cat(&tg, 0)?;
+                        return window_loss_and_grads_checkpointed_rows(
+                            &window,
+                            &final_norm,
+                            &lm_head,
+                            &rope,
+                            &positions,
+                            &h,
+                            &tgt,
+                            &weights,
+                            cfg.vocab_size,
+                            &vars,
+                        )
+                        .map(|(lv, grads, _window_out)| (lv, grads));
+                    }
+                    let i = group[0];
                     let (h, positions, tgt, mask) = &train_ex[i];
                     if checkpointed {
                         window_loss_and_grads_checkpointed(
-                            &window, &final_norm, &lm_head, &rope, positions, h, tgt, mask,
-                            cfg.vocab_size, &vars,
+                            &window,
+                            &final_norm,
+                            &lm_head,
+                            &rope,
+                            positions,
+                            h,
+                            tgt,
+                            mask,
+                            cfg.vocab_size,
+                            &vars,
                         )
                         .map(|(lv, grads, _window_out)| (lv, grads))
                     } else {
-                        loss_and_grads_from_one_backward(
-                            forward_loss(h, positions, tgt, mask)?,
-                            &vars,
-                        )
+                        let dev = h.device().clone();
+                        let loss =
+                            crate::train_prof::phase(&dev, "forward_window_and_head_loss", || {
+                                forward_loss(h, positions, tgt, mask)
+                            })?;
+                        crate::train_prof::phase(&dev, "backward_all", || {
+                            loss_and_grads_from_one_backward(loss, &vars)
+                        })
                     }
                 },
             )?;
@@ -2734,4 +3247,26 @@ fn run_jsonl_inner(
         config_path: args.out.join("adapter_config.json"),
     };
     Ok((summary, co_summary))
+}
+
+#[cfg(test)]
+mod window_row_groups {
+    use super::equal_length_row_groups;
+
+    #[test]
+    fn equal_length_rows_share_a_graph_up_to_the_cap_and_a_length_change_starts_a_new_group() {
+        assert_eq!(
+            equal_length_row_groups(&[512, 512, 512, 512, 512, 512, 512, 512], 8),
+            vec![vec![0, 1, 2, 3, 4, 5, 6, 7]]
+        );
+        assert_eq!(
+            equal_length_row_groups(&[512, 512, 512], 2),
+            vec![vec![0, 1], vec![2]]
+        );
+        assert_eq!(
+            equal_length_row_groups(&[512, 256, 256, 512], 8),
+            vec![vec![0], vec![1, 2], vec![3]]
+        );
+        assert_eq!(equal_length_row_groups(&[7, 7], 1), vec![vec![0], vec![1]]);
+    }
 }

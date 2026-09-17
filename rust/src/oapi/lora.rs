@@ -130,8 +130,9 @@ pub fn roll_current_adapter_symlink(
     let link = current_root.join(name);
     let staged = current_root.join(format!(".{name}.staged"));
     let _ = std::fs::remove_file(&staged);
-    std::os::unix::fs::symlink(&target, &staged)
-        .map_err(|e| anyhow::anyhow!("symlink {} -> {}: {e}", staged.display(), target.display()))?;
+    std::os::unix::fs::symlink(&target, &staged).map_err(|e| {
+        anyhow::anyhow!("symlink {} -> {}: {e}", staged.display(), target.display())
+    })?;
     std::fs::rename(&staged, &link)
         .map_err(|e| anyhow::anyhow!("rename over {}: {e}", link.display()))?;
     Ok(link)
@@ -362,7 +363,11 @@ fn unloaded_lock() -> &'static std::sync::Mutex<std::collections::HashSet<String
 }
 
 pub fn deregister_adapter(id: &str) {
-    registered_lock().lock().unwrap().entries.retain(|e| e.id != id);
+    registered_lock()
+        .lock()
+        .unwrap()
+        .entries
+        .retain(|e| e.id != id);
     unloaded_lock().lock().unwrap().insert(id.to_string());
 }
 
@@ -527,7 +532,10 @@ mod rolling_symlink_tests {
 
     #[test]
     fn rolling_link_name_requires_the_ft_model_suffix_shape() {
-        assert_eq!(rolling_link_name("ft:e4b:traj:abcd1234"), Some("ft:e4b:traj"));
+        assert_eq!(
+            rolling_link_name("ft:e4b:traj:abcd1234"),
+            Some("ft:e4b:traj")
+        );
         assert_eq!(rolling_link_name("no-colons"), None);
         assert_eq!(rolling_link_name("one:colon"), None);
     }
@@ -543,7 +551,10 @@ mod rolling_symlink_tests {
 
         roll_current_adapter_symlink(&current, "ft:e4b:traj:aaaa1111", &v1).unwrap();
         let link = roll_current_adapter_symlink(&current, "ft:e4b:traj:bbbb2222", &v2).unwrap();
-        assert_eq!(std::fs::read_link(&link).unwrap(), std::path::absolute(&v2).unwrap());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::absolute(&v2).unwrap()
+        );
 
         let entries: Vec<_> = std::fs::read_dir(&current)
             .unwrap()

@@ -30,3 +30,11 @@ file-shaped `voices_dir` and call `load_voices()` instead.
 
 Function and class names match upstream Rust verbatim: `Voice`,
 `load_voices`, `parse_npy`, `Voice.row`.
+
+## Custom voices (`voices/*.npy`)
+
+Style packs can be loaded as plain `.npy` files (float32,
+`[rows, 1, 256]`). A pack may carry a single row: both backends clamp the
+token-count index to the last row, so a fitted 256-d vector (about 1 KB) is a
+complete voice. Public builds do not bundle style packs fitted to real
+speakers; provide consented voice data at runtime instead.

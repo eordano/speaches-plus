@@ -145,13 +145,15 @@ pub fn flash_rows_stage1_source_sd() -> String {
          kernel body"
     );
     let fn_pos = FLASH2_PK_MK_WGSL.find(decl.as_str()).unwrap();
-    let head = FLASH2_PK_MK_WGSL[..fn_pos].rfind("@compute").unwrap_or_else(|| {
-        panic!(
-            "mk stage1 shift-decode twin: no @compute attribute precedes \
+    let head = FLASH2_PK_MK_WGSL[..fn_pos]
+        .rfind("@compute")
+        .unwrap_or_else(|| {
+            panic!(
+                "mk stage1 shift-decode twin: no @compute attribute precedes \
              {FLASH_ROWS_STAGE1_ENTRY}; the extracted twin would not be an entry point and its \
              pipeline creation would fail at model load"
-        )
-    });
+            )
+        });
     let end = FLASH2_PK_MK_WGSL[fn_pos..].find("\n}").unwrap_or_else(|| {
         panic!(
             "mk stage1 shift-decode twin: {FLASH_ROWS_STAGE1_ENTRY} has no column-zero closing \
@@ -196,32 +198,16 @@ pub fn deep_fold_env(gqa_group: u32) -> u32 {
         return 0;
     }
     assert!(
-        gqa_group > 0 && gqa_group % n == 0,
+        gqa_group > 0 && gqa_group.is_multiple_of(n),
         "{E4B_DEEP_FOLD_ENV}={n} must divide the GQA group {gqa_group}: a workgroup may only fold \
          query heads that share one KV head"
     );
     n
 }
 
-pub const E4B_DEEP_STAGE2_LEGACY16_ENV: &str = "NV_E4B_DEEP_STAGE2_LEGACY16";
-
-pub const DEEP_STAGE2_RULE: &str = "the shared g4w_flash_splitk_stage2_pk body is hand-unrolled \
-     for exactly 16 partials, so folding `let splits` past 16 makes it merge only the first 16 \
-     of N split results -- full-attention past NV_E4B_SPLIT_DEPTH then reads a quarter of the \
-     context and sliding windows their first 128 tokens (argmax probes at pos 3050: legacy \
-     agrees with the shallow reference 6/16, this kernel 15/16); e4b_flash2_deep_source is the \
-     any-splits stage2 the deep arm dispatches instead, and NV_E4B_DEEP_STAGE2_LEGACY16=1 \
-     restores the truncating fold for measurement. Cost of the fix at deep splits 64: within \
-     run variance (12.70 vs 13.03 ms/tok at depth 122880, same-harness repeats). Numbers \
-     published from the truncating path: the DEEP_SPLIT_ARM_RULE ladder cells are the only \
-     ones left. The RECORD-BAR gemma4-E4B deep row this rule used to cite (63.4 ms/tok at \
-     122880) was WITHDRAWN by the ledger audit as an off-arm measurement, so the truncating \
-     path no longer backs any published cell -- do not restore that citation, and if a deep \
-     E4B number is needed, measure it on the arm that ships rather than reviving a retired one";
-
-pub fn deep_stage2_legacy16() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(E4B_DEEP_STAGE2_LEGACY16_ENV)
-}
+pub const DEEP_STAGE2_RULE: &str = "the shared g4w_flash_splitk_stage2_pk body merges exactly \
+     sixteen partials. Every other split count uses e4b_flash2_deep_source so the merge covers \
+     the whole context without reading another head's partials";
 
 pub const FLASH2_DEEP_ENTRY: &str = "e4b_flash2_pk_deep_rt";
 
@@ -307,43 +293,14 @@ pub fn e4b_flash2_deep_module_source(splits: u32) -> String {
     )
 }
 
-pub const FLASH2_PK_SPLIT_ANCHOR: &str = "let splits = 16u;";
-
-pub const SHALLOW_STAGE2_RULE: &str = "the shallow decode stage2 is the SAME hand-unrolled \
-     g4w_flash_splitk_stage2_pk body as the deep arm's legacy path, so the same truncation applies \
-     to it: `let splits` only moves the per-head base and the running-max scan, while ssc0..ssc15 \
-     and sixteen fma terms per output pair are fixed text. Folding it to N>16 merges the first 16 \
-     of N partials; folding it to N<16 reads the NEXT head's partials with this head's max. \
-     Measured on the truncating fold, NV_WGPU_FLASH_SPLITS moved gemma4-E4B from ppl 8.165 / top-1 \
-     0.6309 at the built-in 16 to 58.204-8815.866 / 0.076-0.305 at 1,2,4,8,32,64,128 -- an accuracy \
-     collapse a reduction order cannot produce. The shallow stage2 therefore takes \
-     e4b_flash2_deep_source, the generated any-splits merge, at every split count except the \
-     shipped 16, where the hand-unrolled body is kept bit-identical so no shipped number moves. \
-     NV_E4B_DEEP_STAGE2_LEGACY16=1 restores the truncating fold on every arm for measurement. The \
-     only published numbers taken on the truncating shallow fold are the defect ladder itself \
-     (/home/user/tmp/wf/comparator/RESULTS.md section 3.1); every shipped e4b number is at 16, which \
-     this change leaves untouched";
-
-pub fn e4b_flash2_pk_folded_truncating_to_splits(prelude: &str, splits: u32) -> String {
-    let folded = prelude.replacen(
-        FLASH2_PK_SPLIT_ANCHOR,
-        &format!("let splits = {splits}u;"),
-        1,
-    );
-    assert!(
-        splits == FLASH_SPLITS || folded != prelude,
-        "flash2 split-count anchor `{FLASH2_PK_SPLIT_ANCHOR}` missing from g4shared_flash2_pk; \
-         the folded stage2 would silently merge the wrong number of partials. {SHALLOW_STAGE2_RULE}"
-    );
-    folded
-}
+pub const SHALLOW_STAGE2_RULE: &str = "the shared hand-unrolled stage2 is valid only at the \
+     shipped sixteen splits and stays unchanged there. Every other split count uses the \
+     generated any-splits merge; changing a split-count literal cannot change the number of \
+     partials the hand-unrolled body reads";
 
 pub fn e4b_flash2_stage2_source_and_entry(prelude: &str, splits: u32) -> (String, &'static str) {
-    if splits == FLASH_SPLITS || deep_stage2_legacy16() {
-        return (
-            e4b_flash2_pk_folded_truncating_to_splits(prelude, splits),
-            FLASH2_PK_ENTRY,
-        );
+    if splits == FLASH_SPLITS {
+        return (prelude.to_owned(), FLASH2_PK_ENTRY);
     }
     (
         format!("{prelude}\n{}", e4b_flash2_deep_source(splits)),
@@ -353,11 +310,7 @@ pub fn e4b_flash2_stage2_source_and_entry(prelude: &str, splits: u32) -> (String
 
 pub fn e4b_flash2_stage2_module_source_and_entry(splits: u32) -> (String, &'static str) {
     e4b_flash2_stage2_source_and_entry(
-        &format!(
-            "{}\n{}",
-            compose(wk::flash_decode::WGSL),
-            flash2_pk_wgsl()
-        ),
+        &format!("{}\n{}", compose(wk::flash_decode::WGSL), flash2_pk_wgsl()),
         splits,
     )
 }
@@ -391,14 +344,17 @@ pub fn deep_tpw_entry(hd_max: u32, fold: u32, tpw: u32, sd: bool) -> String {
 pub fn deep_tpw_source(hd_max: u32, fold: u32, tpw: u32, sd: bool) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max <= 512,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max <= 512,
         "deep tpw stage1 hd_max {hd_max} must be a positive multiple of 32 up to 512"
     );
     assert!(
         (1..=wk::flash_decode::MAX_GQA_FOLD as u32).contains(&fold),
         "deep tpw stage1 folds {fold} query heads per workgroup"
     );
-    assert!((2..=E4B_DEEP_TPW_MAX).contains(&tpw), "deep tpw {tpw} outside 2..={E4B_DEEP_TPW_MAX}");
+    assert!(
+        (2..=E4B_DEEP_TPW_MAX).contains(&tpw),
+        "deep tpw {tpw} outside 2..={E4B_DEEP_TPW_MAX}"
+    );
     let accs = hd_max / 32;
     let entry = deep_tpw_entry(hd_max, fold, tpw, sd);
     let p = format!("df{fold}t{tpw}h{hd_max}{}", if sd { "s" } else { "e" });
@@ -407,7 +363,11 @@ pub fn deep_tpw_source(hd_max: u32, fold: u32, tpw: u32, sd: bool) -> String {
     } else {
         ("fd_k_fp8", "fd_v_fp8")
     };
-    let scale_fold = if sd { " * bitcast<f32>(0x7B800000u)" } else { "" };
+    let scale_fold = if sd {
+        " * bitcast<f32>(0x7B800000u)"
+    } else {
+        ""
+    };
     let mut b = String::with_capacity(32768);
     writeln!(b, "var<workgroup> {p}_qsh: array<f32, {}>;", hd_max * fold).unwrap();
     writeln!(b, "var<workgroup> {p}_sacc: array<f32, {}>;", hd_max * 8).unwrap();
@@ -638,8 +598,8 @@ pub const E4B_DEEP2_SPLITS_ENV: &str = "NV_E4B_DEEP2_SPLITS";
 
 pub const E4B_DEEP2_KNEE_ENV: &str = "NV_E4B_DEEP2_KNEE";
 
-const DEEP2_SPLITS_94_IS_376_WORKGROUPS_TWO_PER_SM_ON_188_SMS_AND_110_128_141_ALL_LOSE_ABOVE_IT: u32 =
-    94;
+const DEEP2_SPLITS_94_IS_376_WORKGROUPS_TWO_PER_SM_ON_188_SMS_AND_110_128_141_ALL_LOSE_ABOVE_IT:
+    u32 = 94;
 
 const DEEP2_KNEE_TOKENS_4096_IS_THE_FIRST_DEPTH_WHERE_94_BEATS_64_IN_BOTH_REPS_AND_64_WINS_EVERY_DEPTH_BELOW:
     u32 = 4096;
@@ -658,6 +618,21 @@ pub const DEEP2_BAND_RULE: &str = "the shipped deep band of 64 splits is 256 wor
 pub fn deep_depthgate() -> bool {
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call(E4B_DEEP_DEPTHGATE_ENV)
 }
+
+pub const E4B_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF:
+    bool = false;
+
+pub const E4B_DEEP_DEPTHGATE_KEYSTONE_THE_ONLY_CERTIFIED_DEFAULT_OFF_WGPU_SERVING_ARM_PER_DEEP2_BAND_RULE_AND_THE_DEEPGATE_AB_INSTRUMENT:
+    bool = E4B_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
+
+pub const E4B_DEEP_FULL_ONLY_NOT_STAGED_IT_IS_THE_SLIDING_PIN_HALF_OF_THE_DEPTHGATE_ARM_KEPT_FOR_DECOMPOSITION_MEASUREMENT:
+    bool = E4B_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
+
+pub const E4B_CUDA_PREFILL_SLIDING_NARROW_STAGED_CERTIFIED_ARGMAX_IDENTICAL_CONTROL_BOUNDED_ON_THE_OPT_IN_CUDA_SERVE_PATH_ONLY:
+    bool = E4B_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
+
+pub const E4B_CUDA_BOOT_WARM_PREFILL_STAGED_BIT_IDENTITY_GATED_TTFT_ARM_ON_THE_OPT_IN_CUDA_SERVE_PATH_ONLY:
+    bool = E4B_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
 
 pub fn deep2_splits() -> u32 {
     deep_env_u32(E4B_DEEP2_SPLITS_ENV)
@@ -774,11 +749,11 @@ pub fn flash1_mk_qtile_entry(hd_max: u32, tile: u32) -> String {
 pub fn flash1_mk_qtile_source(hd_max: u32, tile: u32) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max <= 512,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max <= 512,
         "mk qtile hd_max {hd_max} must be a positive multiple of 32 up to 512"
     );
     assert!(
-        tile >= 1 && tile <= PREFILL_QTILE_MAX && tile * hd_max <= MK_QSH_ELEMS,
+        (1..=PREFILL_QTILE_MAX).contains(&tile) && tile * hd_max <= MK_QSH_ELEMS,
         "mk qtile {tile} x hd_max {hd_max} must fit the {MK_QSH_ELEMS}-element fd_qsh_mk staging"
     );
     let accs = hd_max / 32;
@@ -855,10 +830,26 @@ pub fn flash1_mk_qtile_source(hd_max: u32, tile: u32) -> String {
     for j in 0..tile {
         writeln!(b, "                        {{").unwrap();
         writeln!(b, "                            let qo = {j}u * hd + qb;").unwrap();
-        writeln!(b, "                            var t = fd_qsh_mk[qo + 1u] * e1;").unwrap();
-        writeln!(b, "                            t = fma(fd_qsh_mk[qo], e0, t);").unwrap();
-        writeln!(b, "                            t = fma(fd_qsh_mk[qo + 2u], e2, t);").unwrap();
-        writeln!(b, "                            t = fma(fd_qsh_mk[qo + 3u], e3, t);").unwrap();
+        writeln!(
+            b,
+            "                            var t = fd_qsh_mk[qo + 1u] * e1;"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "                            t = fma(fd_qsh_mk[qo], e0, t);"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "                            t = fma(fd_qsh_mk[qo + 2u], e2, t);"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "                            t = fma(fd_qsh_mk[qo + 3u], e3, t);"
+        )
+        .unwrap();
         writeln!(b, "                            pt{j} = pt{j} + t;").unwrap();
         writeln!(b, "                        }}").unwrap();
     }
@@ -995,14 +986,18 @@ pub fn flash1_sg_supported(ctx: &WgpuContext) -> bool {
 }
 
 fn flash1_sg_enabled(ctx: &WgpuContext) -> bool {
-    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FLASH1_SG") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_FLASH1_SG",
+    ) {
         return false;
     }
     flash1_sg_supported(ctx)
 }
 
 fn flash1_hd_specialize_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FLASH1_HD")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_FLASH1_HD",
+    )
 }
 
 const LMHEAD_I8_WGSL: &str = include_str!("../../nv-kernels/wgsl/e4b_lmhead_i8.wgsl");
@@ -1622,7 +1617,9 @@ struct MkPipelines {
 }
 
 fn sg16_enabled(ctx: &WgpuContext) -> bool {
-    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_W4_SG") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_W4_SG",
+    ) {
         return false;
     }
     wk::gemv_w4a16::sg_pk_supported(ctx.subgroup_width())
@@ -1841,9 +1838,8 @@ fn sg_pk_kpre_plain_and_pk3_sources_same_output_words(
 ) -> String {
     let (plain, pk3, _) = sg_pk_kpre_entry_names(k);
     let acc = sg_pk_kpre_acc_fn_name(k);
-    let mut s = sg_pk_kpre_row_acc_source_issuing_every_w_and_scale_load_before_the_fma_chain(
-        k, grain,
-    );
+    let mut s =
+        sg_pk_kpre_row_acc_source_issuing_every_w_and_scale_load_before_the_fma_chain(k, grain);
     for (entry, tail) in [
         (
             plain,
@@ -2417,9 +2413,7 @@ const E4B_FNCB_ENTRY: &str = "e4b_sg_pk_fncb_gatemul_fold";
 const E4B_FNCC_PK_ENTRY: &str = "e4b_sg_pk_fncc_pk";
 const E4B_FNCC_PK3_ENTRY: &str = "e4b_sg_pk_fncc_pk3";
 
-fn e4f_scale_acc_step_replicating_sg_pk_inner_loop(
-    grain: wk::gemv_w4a16::ScaleGrain,
-) -> String {
+fn e4f_scale_acc_step_replicating_sg_pk_inner_loop(grain: wk::gemv_w4a16::ScaleGrain) -> String {
     use wk::gemv_w4a16::ScaleGrain;
     match grain {
         ScaleGrain::Ge32 => concat!(
@@ -3032,12 +3026,16 @@ fn lmhead_sg_wg() -> u32 {
 
 fn flash_nozi_enabled() -> bool {
     dispatch::nozi_env_enabled()
-        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FLASH_NOZI")
+        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_E4B_WGPU_FLASH_NOZI",
+        )
 }
 
 fn nozi_all_enabled() -> bool {
     dispatch::nozi_env_enabled()
-        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_NOZI_ALL")
+        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_E4B_WGPU_NOZI_ALL",
+        )
 }
 
 fn raw_nozi_pipeline(
@@ -3081,7 +3079,9 @@ fn nozi_all_pipeline(
 }
 
 fn fuse_norms_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FUSE_NORMS")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_FUSE_NORMS",
+    )
 }
 
 pub const FNCU_ENTRY_A: &str = "e4b_fncu_a";
@@ -3590,12 +3590,18 @@ fn sg_pk_deep_k_unroll2_entry_source_pairing_loads_exact_fma_order(
     s.push_str("    loop {\n");
     s.push_str("        if (v + 16u >= kv) { break; }\n");
     s.push_str("        let vb = v + 16u;\n");
-    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(grain, "a", "v"));
-    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(grain, "b", "vb"));
+    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(
+        grain, "a", "v",
+    ));
+    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(
+        grain, "b", "vb",
+    ));
     s.push_str("        v = v + 32u;\n");
     s.push_str("    }\n");
     s.push_str("    if (v < kv) {\n");
-    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(grain, "c", "v"));
+    s.push_str(&sgpu2_scale_acc_step_exact_sg_pk_iteration_order(
+        grain, "c", "v",
+    ));
     s.push_str("    }\n");
     s.push_str("    acc = acc + subgroupShuffleXor(acc, 8u);\n");
     s.push_str("    acc = acc + subgroupShuffleXor(acc, 4u);\n");
@@ -3628,7 +3634,9 @@ fn sg_pk_deep_k_unroll2_entry_source_pairing_loads_exact_fma_order(
 }
 
 fn fuse_attn_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_FUSE_ATTN")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_FUSE_ATTN",
+    )
 }
 
 fn fuse_head_argmax_enabled() -> bool {
@@ -3639,7 +3647,9 @@ pub const PREFILL_M_MAX: usize = 128;
 const PREFILL_SLAB: usize = wk::gemv_w4a16::SG_MK_MAX as usize;
 
 fn prefill_m_from_env() -> usize {
-    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_PREFILL") {
+    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_PREFILL",
+    ) {
         return 0;
     }
     std::env::var("NV_WGPU_PREFILL_M")
@@ -3651,7 +3661,9 @@ fn prefill_m_from_env() -> usize {
 }
 
 fn prefill_tail_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_PREFILL_TAIL")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_PREFILL_TAIL",
+    )
 }
 
 fn verify_m_from_env() -> Option<usize> {
@@ -3670,7 +3682,9 @@ fn mk_widen(src: &str, mk_max: usize) -> String {
 }
 
 fn mk_unroll_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_MK_UNROLL")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_MK_UNROLL",
+    )
 }
 
 fn w8_enabled() -> bool {
@@ -4367,7 +4381,8 @@ fn build_pipelines(
     let mut gemv_w4_sg_kpre3 = Vec::new();
     let mut gemv_w4_sg_gelu_kpre = Vec::new();
     if sg16 && w4_mr() == 1 && w4_kpre_enabled() {
-        let rows = sg_pk_kpre_plain_rows_16_measured_faster_than_any_rowsplit_on_the_preloaded_down_gemv();
+        let rows =
+            sg_pk_kpre_plain_rows_16_measured_faster_than_any_rowsplit_on_the_preloaded_down_gemv();
         for &k in kpre_ks {
             if k < KPRE_MIN_K_512_EXCLUDES_THE_LATENCY_FLOOR_PL_GATE_WHERE_PRELOAD_MEASURED_SLOWER {
                 continue;
@@ -4729,7 +4744,11 @@ fn build_pipelines(
             let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), generated_wgsl);
             flash1_fold_deep.push((
                 *hd,
-                mk_nozi(&format!("e4bw-flash1-dfold{deep_fold}t{tpw}-{hd}"), &src, &entry)?,
+                mk_nozi(
+                    &format!("e4bw-flash1-dfold{deep_fold}t{tpw}-{hd}"),
+                    &src,
+                    &entry,
+                )?,
             ));
         }
         eprintln!(
@@ -4852,9 +4871,7 @@ fn build_pipelines(
             let src = format!(
                 "{}\n{}",
                 wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
-                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
-                    w4_grain, hidden
-                )
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(w4_grain, hidden)
             );
             Some(mk("e4bw-gemv-w4-sg-fnca", &src, E4B_FNCA_ENTRY)?)
         } else {
@@ -4869,9 +4886,7 @@ fn build_pipelines(
                     w4_grain, hidden,
                 )
             } else {
-                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
-                    w4_grain, hidden,
-                )
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(w4_grain, hidden)
             };
             let src = format!(
                 "{}\n{}",
@@ -4916,9 +4931,7 @@ fn build_pipelines(
             let src = format!(
                 "{}\n{}",
                 wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
-                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
-                    w4_grain, hidden
-                )
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(w4_grain, hidden)
             );
             Some(mk("e4bw-gemv-w4-sg-fncc-pk", &src, E4B_FNCC_PK_ENTRY)?)
         } else {
@@ -4928,9 +4941,7 @@ fn build_pipelines(
             let src = format!(
                 "{}\n{}",
                 wk::gemv_w4a16::sg_pk_source_grain(w4_grain),
-                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(
-                    w4_grain, hidden
-                )
+                sg_pk_fnc_fold_source_replicating_fused_norm_chain_then_sg_pk_dot(w4_grain, hidden)
             );
             Some(mk("e4bw-gemv-w4-sg-fncc-pk3", &src, E4B_FNCC_PK3_ENTRY)?)
         } else {
@@ -5541,9 +5552,8 @@ impl Builder<'_> {
                                     ),
                                 )
                             } else if let Some(rs) = self.pl.gemv_w4_sg_pk_rs.clone() {
-                                let rows = sg_rowsplit_rows_per_wg().expect(
-                                    "rowsplit pipelines exist only while the env resolves",
-                                );
+                                let rows = sg_rowsplit_rows_per_wg()
+                                    .expect("rowsplit pipelines exist only while the env resolves");
                                 (rs, sg_rowsplit_grid_1d(*n, rows, self.ctx))
                             } else {
                                 (
@@ -5703,9 +5713,8 @@ impl Builder<'_> {
                                     ),
                                 )
                             } else if let Some(rs) = self.pl.gemv_w4_sg_pk3_rs.clone() {
-                                let rows = sg_rowsplit_rows_per_wg().expect(
-                                    "rowsplit pipelines exist only while the env resolves",
-                                );
+                                let rows = sg_rowsplit_rows_per_wg()
+                                    .expect("rowsplit pipelines exist only while the env resolves");
                                 (rs, sg_rowsplit_grid_1d(*n, rows, self.ctx))
                             } else {
                                 (
@@ -6254,7 +6263,8 @@ fn upload_proj(ctx: &WgpuContext, b: &mut Builder, label: &str, l: &HostLin) -> 
             q.gs
         );
         let packed = GpuTensor::upload(ctx, label, &q.packed);
-        let force_block = nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_W4_BLOCK");
+        let force_block =
+            nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_W4_BLOCK");
         let grain = b.pl.w4_grain;
         let sg_ok =
             b.sg16 && grain.accepts(q.gs) && !(w4_route_enabled() && w4_prefer_v4(l.n, l.k));
@@ -6739,11 +6749,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         match a.shared {
             Some(_) => {
                 let off = b.uni("e4bw-fncc-off", PkOffParams::default());
-                let pl = b
-                    .pl
-                    .gemv_w4_sg_fncc_pk
-                    .clone()
-                    .expect("fncc_fold checked the pk pipeline");
+                let pl =
+                    b.pl.gemv_w4_sg_fncc_pk
+                        .clone()
+                        .expect("fncc_fold checked the pk pipeline");
                 b.push(
                     pl,
                     &[
@@ -6774,11 +6783,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
                         pad0: 0,
                     },
                 );
-                let pl = b
-                    .pl
-                    .gemv_w4_sg_fncc_pk3
-                    .clone()
-                    .expect("fncc_fold checked the pk3 pipeline");
+                let pl =
+                    b.pl.gemv_w4_sg_fncc_pk3
+                        .clone()
+                        .expect("fncc_fold checked the pk3 pipeline");
                 b.push(
                     pl,
                     &[
@@ -6875,9 +6883,8 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         && b.pl.fac.is_some()
         && a.hd.is_multiple_of(4)
         && a.hd <= wk::fused_attn_chain::MAX_HEAD_DIM;
-    let fac_merged = fuse_attn
-        && a.shared.is_none()
-        && b.pl.fac.as_ref().is_some_and(|f| f.qkv.is_some());
+    let fac_merged =
+        fuse_attn && a.shared.is_none() && b.pl.fac.as_ref().is_some_and(|f| f.qkv.is_some());
     if fac_merged {
         let fac_p = b.uni(
             "e4bw-fac-p",
@@ -6901,12 +6908,11 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
                 pad1: 0,
             },
         );
-        let pl = b
-            .pl
-            .fac
-            .as_ref()
-            .and_then(|f| f.qkv.clone())
-            .expect("fac_merged checked the qkv pipeline");
+        let pl =
+            b.pl.fac
+                .as_ref()
+                .and_then(|f| f.qkv.clone())
+                .expect("fac_merged checked the qkv pipeline");
         b.push(
             pl,
             &[
@@ -7104,7 +7110,11 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
             (8, a.kv.k_scales.raw()),
             (9, a.kv.v_scales.raw()),
         ];
-        b.push(flash1_pl, &s1_binds, (n_q as u32 / fold, decode_splits(), 1));
+        b.push(
+            flash1_pl,
+            &s1_binds,
+            (n_q as u32 / fold, decode_splits(), 1),
+        );
         let flash2_pl = b.pl.flash2_pk.clone();
         let s2_binds = [
             (3, bufs.attn_pack.raw()),
@@ -7154,11 +7164,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         && a.lora_parts().is_none_or(|(_, ll)| ll.o.is_none())
         && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.o, b.pl);
     if tail_fnca {
-        let pl = b
-            .pl
-            .gemv_w4_sg_tail_fnca
-            .clone()
-            .expect("tail_fnca checked the pipeline");
+        let pl =
+            b.pl.gemv_w4_sg_tail_fnca
+                .clone()
+                .expect("tail_fnca checked the pipeline");
         b.gemv_tail_fnc(
             pl,
             a.o,
@@ -7179,11 +7188,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         && b.pl.gemv_w4_sg_tail_gate.is_some()
         && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.o, b.pl)
     {
-        let pl = b
-            .pl
-            .gemv_w4_sg_tail_gate
-            .clone()
-            .expect("the null probe checked the pipeline");
+        let pl =
+            b.pl.gemv_w4_sg_tail_gate
+                .clone()
+                .expect("the null probe checked the pipeline");
         b.gemv_tail_gate_only_null_probe(
             pl,
             a.o,
@@ -7305,11 +7313,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
                 scale: 1.0,
             },
         );
-        let pl = b
-            .pl
-            .gemv_w4_sg_fnca
-            .clone()
-            .expect("fnca_fold checked the pipeline");
+        let pl =
+            b.pl.gemv_w4_sg_fnca
+                .clone()
+                .expect("fnca_fold checked the pipeline");
         b.push(
             pl,
             &[
@@ -7328,113 +7335,111 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
             *grid,
         );
     } else {
-    match (gelu_fold_pl, a.gate_up) {
-        (
-            Some(pl),
-            GpuProj::W4 {
-                packed,
-                scales,
-                params,
-                grid,
-                variant: W4Variant::Sg16,
-                n,
-                k,
-                ..
-            },
-        ) => {
-            let off = b.uni("e4bw-gelu-fold-off", PkOffParams::default());
-            let kpre = b
-                .pl
-                .gemv_w4_sg_gelu_kpre
-                .iter()
-                .find(|(kk, _)| kk == k)
-                .map(|(_, p)| p.clone());
-            let (pl, fold_grid) = if let Some(p) = kpre {
-                (
-                    p,
-                    sg_rowsplit_grid_1d(
-                        *n,
-                        GELU_KPRE_ROWS_4_KEEPS_THE_MEASURED_ROWSPLIT_WIN_ON_THE_GATE_UP_FOLD,
-                        b.ctx,
-                    ),
-                )
-            } else if let Some(rs) = b.pl.gemv_w4_sg_gelu_rs.clone() {
-                let rows = sg_rowsplit_rows_per_wg()
-                    .expect("rowsplit pipelines exist only while the env resolves");
-                (rs, sg_rowsplit_grid_1d(*n, rows, b.ctx))
-            } else {
-                (pl, *grid)
-            };
-            b.push(
-                pl,
-                &[
-                    (1, scales.raw()),
-                    (3, bufs.act_pack.raw()),
-                    (4, params.raw()),
-                    (6, packed.raw()),
-                    (7, mlp_in),
-                    (30, &off),
-                ],
-                fold_grid,
-            );
-        }
-        _ => {
-            if m == 1 {
-                b.gemv(
-                    a.gate_up,
-                    mlp_in,
-                    GemvDst::Packed {
-                        y: bufs.gu_pack.raw(),
-                        word_off: 0,
-                    },
-                );
-            } else {
-                b.gemv_mk(
-                    a.gate_up,
-                    mlp_in,
-                    m,
-                    hidden / 2,
-                    GemvDstMk::Packed {
-                        y: bufs.gu_pack.raw(),
-                        word_off: 0,
-                        y_stride_words: inter,
-                    },
-                );
-            }
-            if let Some((pl, ll)) = a.lora_parts() {
-                if let Some(site) = &ll.gate_up {
-                    b.lora_site(pl, m, site, mlp_in, &[bufs.gu_pack.raw()]);
-                }
-            }
-            let gelu_p = b.uni(
-                "e4bw-gelu-p",
-                GeluParams {
-                    inter: inter as u32,
-                    inter_words: (inter / 2) as u32,
-                    rows: m as u32,
-                    tot_pairs: (m * inter) as u32,
+        match (gelu_fold_pl, a.gate_up) {
+            (
+                Some(pl),
+                GpuProj::W4 {
+                    packed,
+                    scales,
+                    params,
+                    grid,
+                    variant: W4Variant::Sg16,
+                    n,
+                    k,
+                    ..
                 },
-            );
-            let ggrid = b.grid_1d((inter / 2) as u64, 256);
-            let gelu_pl = if gelu_interleaved {
-                b.pl
-                    .gelu_inter
-                    .clone()
-                    .expect("interleaved gate_up rows without the interleaved gelu pipeline")
-            } else {
-                b.pl.gelu_even.clone()
-            };
-            b.push(
-                gelu_pl,
-                &[
-                    (3, bufs.gu_pack.raw()),
-                    (4, bufs.act_pack.raw()),
-                    (5, &gelu_p),
-                ],
-                (ggrid.0, m as u32, 1),
-            );
+            ) => {
+                let off = b.uni("e4bw-gelu-fold-off", PkOffParams::default());
+                let kpre =
+                    b.pl.gemv_w4_sg_gelu_kpre
+                        .iter()
+                        .find(|(kk, _)| kk == k)
+                        .map(|(_, p)| p.clone());
+                let (pl, fold_grid) = if let Some(p) = kpre {
+                    (
+                        p,
+                        sg_rowsplit_grid_1d(
+                            *n,
+                            GELU_KPRE_ROWS_4_KEEPS_THE_MEASURED_ROWSPLIT_WIN_ON_THE_GATE_UP_FOLD,
+                            b.ctx,
+                        ),
+                    )
+                } else if let Some(rs) = b.pl.gemv_w4_sg_gelu_rs.clone() {
+                    let rows = sg_rowsplit_rows_per_wg()
+                        .expect("rowsplit pipelines exist only while the env resolves");
+                    (rs, sg_rowsplit_grid_1d(*n, rows, b.ctx))
+                } else {
+                    (pl, *grid)
+                };
+                b.push(
+                    pl,
+                    &[
+                        (1, scales.raw()),
+                        (3, bufs.act_pack.raw()),
+                        (4, params.raw()),
+                        (6, packed.raw()),
+                        (7, mlp_in),
+                        (30, &off),
+                    ],
+                    fold_grid,
+                );
+            }
+            _ => {
+                if m == 1 {
+                    b.gemv(
+                        a.gate_up,
+                        mlp_in,
+                        GemvDst::Packed {
+                            y: bufs.gu_pack.raw(),
+                            word_off: 0,
+                        },
+                    );
+                } else {
+                    b.gemv_mk(
+                        a.gate_up,
+                        mlp_in,
+                        m,
+                        hidden / 2,
+                        GemvDstMk::Packed {
+                            y: bufs.gu_pack.raw(),
+                            word_off: 0,
+                            y_stride_words: inter,
+                        },
+                    );
+                }
+                if let Some((pl, ll)) = a.lora_parts() {
+                    if let Some(site) = &ll.gate_up {
+                        b.lora_site(pl, m, site, mlp_in, &[bufs.gu_pack.raw()]);
+                    }
+                }
+                let gelu_p = b.uni(
+                    "e4bw-gelu-p",
+                    GeluParams {
+                        inter: inter as u32,
+                        inter_words: (inter / 2) as u32,
+                        rows: m as u32,
+                        tot_pairs: (m * inter) as u32,
+                    },
+                );
+                let ggrid = b.grid_1d((inter / 2) as u64, 256);
+                let gelu_pl = if gelu_interleaved {
+                    b.pl.gelu_inter
+                        .clone()
+                        .expect("interleaved gate_up rows without the interleaved gelu pipeline")
+                } else {
+                    b.pl.gelu_even.clone()
+                };
+                b.push(
+                    gelu_pl,
+                    &[
+                        (3, bufs.gu_pack.raw()),
+                        (4, bufs.act_pack.raw()),
+                        (5, &gelu_p),
+                    ],
+                    (ggrid.0, m as u32, 1),
+                );
+            }
         }
-    }
     }
     if m == 1 {
         b.gemv(
@@ -7502,11 +7507,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
                 scale: 1.0,
             },
         );
-        let pl = b
-            .pl
-            .gemv_w4_sg_fncb
-            .clone()
-            .expect("fncb_fold checked the pipeline");
+        let pl =
+            b.pl.gemv_w4_sg_fncb
+                .clone()
+                .expect("fncb_fold checked the pipeline");
         b.push(
             pl,
             &[
@@ -7526,117 +7530,117 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
             *grid,
         );
     } else {
-    if fuse {
-        b.fnc_b(
-            bufs.t0.raw(),
-            mlp_res,
-            a.ln_po,
-            bufs.mid.raw(),
-            m,
-            hidden,
-            eps,
-            1.0,
-        );
-    } else {
-        b.rms(bufs.t0.raw(), a.ln_po, bufs.t1.raw(), m, hidden, eps);
-        b.resadd(x_in, bufs.t1.raw(), bufs.mid.raw(), m * hidden, 1.0);
-    }
-
-    let plgate_fold_pl = if m == 1 {
-        b.pl.gemv_w4_sg_gm.clone()
-    } else {
-        None
-    };
-    match (plgate_fold_pl, a.pl_gate_proj) {
-        (
-            Some(pl),
-            GpuProj::W4 {
-                packed,
-                scales,
-                params,
-                grid,
-                variant: W4Variant::Sg16,
-                ..
-            },
-        ) => {
-            let off = b.uni("e4bw-gm-fold-off", PkOffParams::default());
-            let gmf = b.uni(
-                "e4bw-gm-fold-p",
-                GmFoldParams {
-                    pli_word_off: (a.li * hpl / 2) as u32,
-                    ..Default::default()
-                },
+        if fuse {
+            b.fnc_b(
+                bufs.t0.raw(),
+                mlp_res,
+                a.ln_po,
+                bufs.mid.raw(),
+                m,
+                hidden,
+                eps,
+                1.0,
             );
-            let fold_grid = *grid;
-            b.push(
-                pl,
-                &[
-                    (1, scales.raw()),
-                    (3, bufs.pl_gated.raw()),
-                    (4, params.raw()),
-                    (6, packed.raw()),
-                    (7, bufs.mid.raw()),
-                    (30, &off),
-                    (9, bufs.pli.raw()),
-                    (10, &gmf),
-                ],
-                fold_grid,
-            );
+        } else {
+            b.rms(bufs.t0.raw(), a.ln_po, bufs.t1.raw(), m, hidden, eps);
+            b.resadd(x_in, bufs.t1.raw(), bufs.mid.raw(), m * hidden, 1.0);
         }
-        _ => {
-            if m == 1 {
-                b.gemv(
-                    a.pl_gate_proj,
-                    bufs.mid.raw(),
-                    GemvDst::Packed {
-                        y: bufs.pl_gate.raw(),
-                        word_off: 0,
+
+        let plgate_fold_pl = if m == 1 {
+            b.pl.gemv_w4_sg_gm.clone()
+        } else {
+            None
+        };
+        match (plgate_fold_pl, a.pl_gate_proj) {
+            (
+                Some(pl),
+                GpuProj::W4 {
+                    packed,
+                    scales,
+                    params,
+                    grid,
+                    variant: W4Variant::Sg16,
+                    ..
+                },
+            ) => {
+                let off = b.uni("e4bw-gm-fold-off", PkOffParams::default());
+                let gmf = b.uni(
+                    "e4bw-gm-fold-p",
+                    GmFoldParams {
+                        pli_word_off: (a.li * hpl / 2) as u32,
+                        ..Default::default()
                     },
                 );
-            } else {
-                b.gemv_mk(
-                    a.pl_gate_proj,
-                    bufs.mid.raw(),
-                    m,
-                    hidden / 2,
-                    GemvDstMk::Packed {
-                        y: bufs.pl_gate.raw(),
-                        word_off: 0,
-                        y_stride_words: hpl / 2,
-                    },
+                let fold_grid = *grid;
+                b.push(
+                    pl,
+                    &[
+                        (1, scales.raw()),
+                        (3, bufs.pl_gated.raw()),
+                        (4, params.raw()),
+                        (6, packed.raw()),
+                        (7, bufs.mid.raw()),
+                        (30, &off),
+                        (9, bufs.pli.raw()),
+                        (10, &gmf),
+                    ],
+                    fold_grid,
                 );
             }
-            let gm_p = b.uni(
-                "e4bw-gm-p",
-                GmParams {
-                    n_words: (m * hpl / 2) as u32,
-                    pli_word_off: (a.li * hpl / 2) as u32,
-                    tok_words: (hpl / 2) as u32,
-                    pli_stride: (cfg.ple_row / 2) as u32,
-                },
-            );
-            let gmgrid = b.grid_1d((m * hpl / 2) as u64, 256);
-            let gm_pl = if m == 1 {
-                b.pl.gatemul.clone()
-            } else {
-                b.pl.mk
-                    .as_ref()
-                    .expect("prefill gatemul pipeline")
-                    .gatemul
-                    .clone()
-            };
-            b.push(
-                gm_pl,
-                &[
-                    (0, bufs.pl_gate.raw()),
-                    (1, bufs.pli.raw()),
-                    (2, bufs.pl_gated.raw()),
-                    (3, &gm_p),
-                ],
-                gmgrid,
-            );
+            _ => {
+                if m == 1 {
+                    b.gemv(
+                        a.pl_gate_proj,
+                        bufs.mid.raw(),
+                        GemvDst::Packed {
+                            y: bufs.pl_gate.raw(),
+                            word_off: 0,
+                        },
+                    );
+                } else {
+                    b.gemv_mk(
+                        a.pl_gate_proj,
+                        bufs.mid.raw(),
+                        m,
+                        hidden / 2,
+                        GemvDstMk::Packed {
+                            y: bufs.pl_gate.raw(),
+                            word_off: 0,
+                            y_stride_words: hpl / 2,
+                        },
+                    );
+                }
+                let gm_p = b.uni(
+                    "e4bw-gm-p",
+                    GmParams {
+                        n_words: (m * hpl / 2) as u32,
+                        pli_word_off: (a.li * hpl / 2) as u32,
+                        tok_words: (hpl / 2) as u32,
+                        pli_stride: (cfg.ple_row / 2) as u32,
+                    },
+                );
+                let gmgrid = b.grid_1d((m * hpl / 2) as u64, 256);
+                let gm_pl = if m == 1 {
+                    b.pl.gatemul.clone()
+                } else {
+                    b.pl.mk
+                        .as_ref()
+                        .expect("prefill gatemul pipeline")
+                        .gatemul
+                        .clone()
+                };
+                b.push(
+                    gm_pl,
+                    &[
+                        (0, bufs.pl_gate.raw()),
+                        (1, bufs.pli.raw()),
+                        (2, bufs.pl_gated.raw()),
+                        (3, &gm_p),
+                    ],
+                    gmgrid,
+                );
+            }
         }
-    }
     }
     let tail_fncc = fuse
         && m == 1
@@ -7645,11 +7649,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         && b.pl.gemv_w4_sg_tail_fncc.is_some()
         && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.pl_proj, b.pl);
     if tail_fncc {
-        let pl = b
-            .pl
-            .gemv_w4_sg_tail_fncc
-            .clone()
-            .expect("tail_fncc checked the pipeline");
+        let pl =
+            b.pl.gemv_w4_sg_tail_fncc
+                .clone()
+                .expect("tail_fncc checked the pipeline");
         b.gemv_tail_fnc(
             pl,
             a.pl_proj,
@@ -7670,11 +7673,10 @@ fn emit_layer(b: &mut Builder, a: &LayerEmit) {
         && b.pl.gemv_w4_sg_tail_gate.is_some()
         && tail_fold_projection_takes_the_plain_sg_pk_row_map(a.pl_proj, b.pl)
     {
-        let pl = b
-            .pl
-            .gemv_w4_sg_tail_gate
-            .clone()
-            .expect("the null probe checked the pipeline");
+        let pl =
+            b.pl.gemv_w4_sg_tail_gate
+                .clone()
+                .expect("the null probe checked the pipeline");
         b.gemv_tail_gate_only_null_probe(
             pl,
             a.pl_proj,
@@ -8114,7 +8116,9 @@ fn encode_passes_staged(
 const TOK_STAGE_BYTES: u64 = 64;
 
 fn staged_read_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_STAGED_READ")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_E4B_WGPU_STAGED_READ",
+    )
 }
 
 fn spin_read_enabled() -> bool {
@@ -9324,8 +9328,7 @@ impl Gemma4E4bWgpu {
                     .iter()
                     .filter(|q| Arc::ptr_eq(&q.pipeline, p))
                     .count()
-                    + pl
-                        .flash1_fold
+                    + pl.flash1_fold
                         .iter()
                         .filter(|(fhd, _)| fhd == hd)
                         .map(|(_, fp)| {
@@ -9403,11 +9406,15 @@ impl Gemma4E4bWgpu {
             decode_hid,
             decode_hid_row_words: hidden / 2,
             vocab,
-            enc_stats: nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_WGPU_ENCODE_STATS"),
+            enc_stats: nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+                "NV_E4B_WGPU_ENCODE_STATS",
+            ),
             enc_us_sum: 0.0,
             enc_us_min: f64::INFINITY,
             enc_steps: 0,
-            preenc: nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_E4B_WGPU_PREENC"),
+            preenc: nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+                "NV_E4B_WGPU_PREENC",
+            ),
             pending_cb: None,
             deep_split_depth: deep_arm.map(|(d, _)| d).unwrap_or(0),
             deep_splits_baked: deep_arm.map(|(_, s)| s).unwrap_or_else(decode_splits),
@@ -9852,8 +9859,8 @@ impl Gemma4E4bWgpu {
         });
         let arm = self.active_arm();
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        let inpass_low_distortion = dispatch::profile_inpass_low_distortion_requested()
-            && self.ctx.ts_inside_passes;
+        let inpass_low_distortion =
+            dispatch::profile_inpass_low_distortion_requested() && self.ctx.ts_inside_passes;
         static PROF_SHAPE_BANNER_ONCE: std::sync::Once = std::sync::Once::new();
         PROF_SHAPE_BANNER_ONCE.call_once(|| {
             eprintln!(

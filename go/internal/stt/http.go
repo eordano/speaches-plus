@@ -1,6 +1,7 @@
 package stt
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,7 +65,13 @@ func (h *TranscriptionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 	if fileHdr != nil {
 		contentType = fileHdr.Header.Get("Content-Type")
 	}
-	rawBytes, err := io.ReadAll(io.LimitReader(file, fileReadLimit+1))
+	knownSize := int64(0)
+	if fileHdr != nil && fileHdr.Size > 0 && fileHdr.Size <= fileReadLimit {
+		knownSize = fileHdr.Size
+	}
+	rawBuf := bytes.NewBuffer(make([]byte, 0, knownSize+1))
+	_, err = io.Copy(rawBuf, io.LimitReader(file, fileReadLimit+1))
+	rawBytes := rawBuf.Bytes()
 	if err != nil {
 		oapi.WriteError(w, http.StatusBadRequest,
 			"read file: "+err.Error(), oapi.TypeInvalidRequest, "file", "file_read_error")

@@ -175,7 +175,6 @@ impl DotsKvCache {
         Ok(())
     }
 
-    /// (1, len, h_kv, d) on CUDA; (1, h_kv, len, d) when `bhsd()`.
     pub fn view(&self, layer: usize, len: usize) -> Result<(Tensor, Tensor)> {
         let (k, v) = &self.layers[layer];
         let seq_dim = if self.bhsd { 2 } else { 1 };
@@ -218,7 +217,20 @@ trait LinearFactory {
         in_dim: usize,
         bias: Option<&str>,
     ) -> Result<Linear>;
+
+    fn load_mlp_up_down_diagfolded_if_opted_in(
+        &self,
+        _weights: &dyn nv_weights::TensorSource,
+        _up_name: &str,
+        _down_name: &str,
+        _inter: usize,
+        _hidden: usize,
+    ) -> Option<Result<(Linear, Linear)>> {
+        None
+    }
 }
+
+pub const DOTS_NVFP4_DIAGFOLD_ENV: &str = "NV_DOTS_NVFP4_DIAGFOLD";
 
 struct Bf16Factory {
     dtype: DType,
@@ -315,6 +327,83 @@ impl LinearFactory for Nvfp4Factory {
         Linear::from_bf16_quantized_nvfp4(&w.contiguous()?, b, &self.device, self.runner.clone())
             .with_context(|| format!("quantize {name} to nvfp4"))
     }
+
+    fn load_mlp_up_down_diagfolded_if_opted_in(
+        &self,
+        weights: &dyn nv_weights::TensorSource,
+        up_name: &str,
+        down_name: &str,
+        inter: usize,
+        hidden: usize,
+    ) -> Option<Result<(Linear, Linear)>> {
+        use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
+        if !nv_quant::nvfp4::diagfold_from(std::env::var(DOTS_NVFP4_DIAGFOLD_ENV).ok().as_deref()) {
+            return None;
+        }
+        if inter < MIN_TILE
+            || hidden < MIN_TILE
+            || !inter.is_multiple_of(BLOCK_SIZE)
+            || !hidden.is_multiple_of(BLOCK_SIZE)
+        {
+            return None;
+        }
+        Some(self.load_mlp_up_down_diagfolded(weights, up_name, down_name, inter, hidden))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Nvfp4Factory {
+    fn host_f32_rows(
+        weights: &dyn nv_weights::TensorSource,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let w = weights
+            .get(name, DType::BF16)
+            .with_context(|| format!("load {name}"))?;
+        anyhow::ensure!(
+            w.dims2()? == (out_dim, in_dim),
+            "{name}: expected [{out_dim}, {in_dim}], got {:?}",
+            w.dims()
+        );
+        let flat = w
+            .to_dtype(DType::F32)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Ok(flat.chunks(in_dim).map(|c| c.to_vec()).collect())
+    }
+
+    fn quantize_folded_rows(&self, rows: Vec<Vec<f32>>, name: &str) -> Result<Linear> {
+        let out_dim = rows.len();
+        let in_dim = rows[0].len();
+        let flat: Vec<f32> = rows.into_iter().flatten().collect();
+        let t = Tensor::from_vec(flat, (out_dim, in_dim), &Device::Cpu)?;
+        Linear::from_bf16_quantized_nvfp4(&t, None, &self.device, self.runner.clone())
+            .with_context(|| format!("quantize diagfolded {name} to nvfp4"))
+    }
+
+    fn load_mlp_up_down_diagfolded(
+        &self,
+        weights: &dyn nv_weights::TensorSource,
+        up_name: &str,
+        down_name: &str,
+        inter: usize,
+        hidden: usize,
+    ) -> Result<(Linear, Linear)> {
+        let mut up = Self::host_f32_rows(weights, up_name, inter, hidden)?;
+        let mut down = Self::host_f32_rows(weights, down_name, hidden, inter)?;
+        let exps = nv_quant::nvfp4::diagfold_pow2_exponents_equalizing_column_amax(
+            &down,
+            nv_quant::nvfp4::DIAGFOLD_EXP_CLAMP_BOUNDS_THE_COMPENSATED_SIDES_SCALE_SHIFT_AWAY_FROM_UE4M3_SUBNORMALS_AND_THE_448_CEILING,
+        );
+        nv_quant::nvfp4::diagfold_scale_cols_pow2(&mut down, &exps);
+        nv_quant::nvfp4::diagfold_scale_rows_pow2_negated(&mut up, &exps);
+        let up_lin = self.quantize_folded_rows(up, up_name)?;
+        let down_lin = self.quantize_folded_rows(down, down_name)?;
+        Ok((up_lin, down_lin))
+    }
 }
 
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
@@ -330,7 +419,12 @@ fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Ten
     sdpa(q, k, v, cfg)
 }
 
-fn decode_attention_grouped(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
+fn decode_attention_grouped(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    cfg: &AttnConfig,
+) -> Result<Tensor> {
     let (_b, _one, h, d) = q.dims4()?;
     let (_bk, h_kv, s_k, dk) = k.dims4()?;
     anyhow::ensure!(
@@ -483,29 +577,41 @@ impl DotsDecoder {
                     eps,
                     DType::F32,
                 )?,
-                mlp: Mlp::new(
-                    factory.load(
+                mlp: {
+                    let gate = factory.load(
                         weights,
                         &format!("{p}.mlp.gate_proj.weight"),
                         inter,
                         hidden,
                         None,
-                    )?,
-                    factory.load(
+                    )?;
+                    let (up, down) = match factory.load_mlp_up_down_diagfolded_if_opted_in(
                         weights,
                         &format!("{p}.mlp.up_proj.weight"),
-                        inter,
-                        hidden,
-                        None,
-                    )?,
-                    factory.load(
-                        weights,
                         &format!("{p}.mlp.down_proj.weight"),
-                        hidden,
                         inter,
-                        None,
-                    )?,
-                )?,
+                        hidden,
+                    ) {
+                        Some(pair) => pair?,
+                        None => (
+                            factory.load(
+                                weights,
+                                &format!("{p}.mlp.up_proj.weight"),
+                                inter,
+                                hidden,
+                                None,
+                            )?,
+                            factory.load(
+                                weights,
+                                &format!("{p}.mlp.down_proj.weight"),
+                                hidden,
+                                inter,
+                                None,
+                            )?,
+                        ),
+                    };
+                    Mlp::new(gate, up, down)?
+                },
             });
         }
 

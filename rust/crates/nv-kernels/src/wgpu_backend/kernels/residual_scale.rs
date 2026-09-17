@@ -1,9 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::wgpu_backend::device::WgpuContext;
-use crate::wgpu_backend::{compose, dispatch, Result};
 #[cfg(test)]
 use crate::wgpu_backend::WgpuError;
+use crate::wgpu_backend::{compose, dispatch, Result};
 
 pub const WGSL: &str = include_str!("../../../wgsl/residual_scale.wgsl");
 

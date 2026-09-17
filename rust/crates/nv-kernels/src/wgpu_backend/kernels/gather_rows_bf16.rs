@@ -2,8 +2,10 @@
 
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
+use crate::wgpu_backend::pack::{
+    pack_u16_pairs as pack_words, unpack_u16_pairs_clamped as unpack_words,
+};
 use crate::wgpu_backend::{Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_pairs as pack_words, unpack_u16_pairs_clamped as unpack_words};
 
 pub const WGSL: &str = include_str!("../../../wgsl/gather_rows_bf16.wgsl");
 

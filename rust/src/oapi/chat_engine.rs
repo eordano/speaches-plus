@@ -41,11 +41,6 @@ pub use build::{
     RemoveDenied, ALLOW_UNKNOWN_MODEL_ENV,
 };
 #[cfg(feature = "cuda")]
-pub use lora_cuda::{
-    cuda_adapter_tag_that_changes_when_the_weights_change, cuda_base_dirs, select_cuda_base,
-    CudaLoraAdapterEngine,
-};
-#[cfg(feature = "cuda")]
 pub(crate) use gemma4_loop::*;
 #[cfg(feature = "cuda")]
 pub(crate) use gemma4_moe_loop::*;
@@ -54,10 +49,15 @@ pub(crate) use gpt_oss_loop::*;
 #[cfg(feature = "cuda")]
 pub(crate) use laguna_loop::*;
 #[cfg(feature = "cuda")]
+pub use lora_cuda::{
+    cuda_adapter_tag_that_changes_when_the_weights_change, cuda_base_dirs, select_cuda_base,
+    CudaLoraAdapterEngine,
+};
+#[cfg(feature = "cuda")]
 pub(crate) use omni_loop::*;
 #[cfg(feature = "cuda")]
 pub(crate) use qwen::*;
-#[cfg_attr(not(any(test, feature = "cuda")), allow(unused_imports))]
+#[cfg(feature = "cuda")]
 pub(crate) use qwen38_sched::*;
 
 #[cfg_attr(not(any(test, feature = "cuda")), allow(unused_imports))]
@@ -144,6 +144,87 @@ impl ChatEngine for EchoEngine {
 #[cfg(feature = "cuda")]
 #[async_trait::async_trait]
 impl ChatEngine for NvEngineChat {
+    async fn capture_layer(
+        &self,
+        req: crate::oapi::laguna_capture::LayerCaptureRequest,
+    ) -> anyhow::Result<crate::oapi::laguna_capture::LayerCaptureResponse> {
+        use crate::oapi::laguna_capture::{
+            CaptureRecord, LayerCaptureResponse, LAYER_CAPTURE_DEFAULT_CONTEXT,
+        };
+        let LoadedModel::Laguna(m) = &self.inner.model else {
+            anyhow::bail!("layer capture is not available on this engine: needs a Laguna model");
+        };
+        let m = m.clone();
+        let tokenizer = self.inner.tokenizer.clone();
+        let mut inputs = req.inputs;
+        for text in &req.texts {
+            let encoded = tokenizer
+                .encode(text.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            inputs.push(encoded.get_ids().to_vec());
+        }
+        anyhow::ensure!(!inputs.is_empty(), "texts or inputs required");
+        let max_context = req
+            .max_context
+            .unwrap_or(LAYER_CAPTURE_DEFAULT_CONTEXT)
+            .min(self.inner.kv_max_seq_len)
+            .min(m.config().max_position_embeddings);
+        anyhow::ensure!(
+            req.layer < m.config().num_hidden_layers,
+            "layer {} out of range for {} blocks",
+            req.layer,
+            m.config().num_hidden_layers
+        );
+        for ids in &inputs {
+            anyhow::ensure!(
+                !ids.is_empty() && ids.len() <= max_context,
+                "each input must hold 1..={max_context} tokens"
+            );
+        }
+        let permit = m.1.acquire_exclusive().await?;
+        let layer = req.layer;
+        let want_tokens = req.tokens;
+        let model_id = self.model_id().to_string();
+        let hidden_size = m.config().hidden_size;
+        let start = std::time::Instant::now();
+        let records = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CaptureRecord>> {
+            let _permit = permit;
+            let mut state = m.new_study_capture_state(layer, max_context)?;
+            let mut out = Vec::with_capacity(inputs.len());
+            for ids in inputs {
+                let (tokens, _calls, chunks) = m.study_capture_record_tokens(&ids, &mut state)?;
+                let n = ids.len();
+                let mean = tokens.mean(0)?.to_vec1::<f32>()?;
+                let last = tokens
+                    .narrow(0, n - 1, 1)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let token_states = if want_tokens {
+                    Some(tokens.to_vec2::<f32>()?)
+                } else {
+                    None
+                };
+                out.push(CaptureRecord {
+                    tokens: n,
+                    chunks,
+                    input_token_ids: ids,
+                    mean,
+                    last,
+                    token_states,
+                });
+            }
+            Ok(out)
+        })
+        .await??;
+        Ok(LayerCaptureResponse {
+            model: model_id,
+            layer,
+            hidden_size,
+            records,
+            seconds: start.elapsed().as_secs_f64(),
+        })
+    }
+
     fn model_id(&self) -> &str {
         &self.inner.model_id
     }
@@ -1994,7 +2075,16 @@ mod tests {
                 Some(DFlash)
             );
             assert_eq!(
-                resolve_drafter_arm("auto", class, auto_gate - 1, auto_gate, true, true, 0.5, 9.0),
+                resolve_drafter_arm(
+                    "auto",
+                    class,
+                    auto_gate - 1,
+                    auto_gate,
+                    true,
+                    true,
+                    0.5,
+                    9.0
+                ),
                 Some(DFlash)
             );
             assert_eq!(

@@ -78,7 +78,9 @@ fn quote_if_needed(v: &str) -> String {
 
 fn assert_bare_key(k: &str) {
     assert!(
-        !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        !k.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
         "measurement key {k:?} must be a bare [A-Za-z0-9_-]+ ident so the line stays splittable"
     );
 }
@@ -165,7 +167,10 @@ impl Measurement {
                 }
                 seen.push(r);
             }
-            let count = |v: &str| v.parse::<usize>().with_context(|| format!("{k}={v:?} is not a count"));
+            let count = |v: &str| {
+                v.parse::<usize>()
+                    .with_context(|| format!("{k}={v:?} is not a count"))
+            };
             match k.as_str() {
                 "instrument" => m.instrument = v,
                 "model" => m.model_at_rev = v,
@@ -301,7 +306,10 @@ mod tests {
     fn parse_rejects_a_line_missing_a_required_basis_field_naming_the_field() {
         let line = sample().line().replace(" warmup=200", "");
         let err = Measurement::parse(&line).unwrap_err().to_string();
-        assert!(err.contains("warmup"), "error must name the missing field: {err}");
+        assert!(
+            err.contains("warmup"),
+            "error must name the missing field: {err}"
+        );
     }
 
     #[test]

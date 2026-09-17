@@ -206,9 +206,7 @@ pub fn mrope_rope_one_row_per_token(
     let (cos, sin) = mrope_cos_sin_rows(rope, pos, section, device)?;
     let mut cfg = *rope.config();
     cfg.max_seq_len = pos.len();
-    Rope::from_precomputed_tables_one_row_per_token_so_mrope_rides_the_standard_apply(
-        cfg, cos, sin,
-    )
+    Rope::from_precomputed_tables_one_row_per_token_so_mrope_rides_the_standard_apply(cfg, cos, sin)
 }
 
 pub struct Qwen3ImageRowSplice {

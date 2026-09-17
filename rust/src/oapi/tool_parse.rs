@@ -372,5 +372,4 @@ mod tests {
         let p = parse_tool_calls("<tool_call>not a call</tool_call>", None);
         assert!(p.tool_calls.is_empty());
     }
-
 }

@@ -2,7 +2,9 @@
 set -euo pipefail
 
 MAGICK="${MAGICK:-magick}"
-FONT="${FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
+FONT="${FONT:-$(fc-list -f '%{file}\n' 2>/dev/null | grep -F -- /DejaVuSans.ttf | sort | sed -n 1p)}"
+[ -f "$FONT" ] || { echo "DejaVuSans.ttf not found; set FONT or run tools/regenerate-fixtures.sh" >&2; exit 1; }
+SEED="${SEED:-20260806}"
 OUT="${OUT:-$(cd "$(dirname "$0")/../fixtures" && pwd)}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -119,7 +121,7 @@ EOF
 name=070-ocr-photo-noise-surround
 mkdir -p "$OUT/$name"
 "$MAGICK" "$OUT/070-ocr-paragraph/input.png" -resize 150% -depth 8 "$TMP/page15.png"
-"$MAGICK" -size 128x128 xc:'gray(45%)' -attenuate 1.2 +noise Gaussian -colorspace Gray -depth 8 \
+"$MAGICK" -size 128x128 xc:'gray(45%)' -seed "$SEED" -attenuate 1.2 +noise Gaussian -colorspace Gray -depth 8 \
   "$TMP/tile.png"
 PW=$("$MAGICK" "$TMP/page15.png" -format '%w' info:)
 PH=$("$MAGICK" "$TMP/page15.png" -format '%h' info:)
@@ -172,7 +174,7 @@ name=070-ocr-noise-gauss
 mkdir -p "$OUT/$name"
 "$MAGICK" -background white -fill black -font "$FONT" -pointsize 44 \
   label:'Noise resistant text' -bordercolor white -border 40 \
-  -attenuate 0.6 +noise Gaussian -depth 8 \
+  -seed "$SEED" -attenuate 0.6 +noise Gaussian -depth 8 \
   "$OUT/$name/input.png"
 emit "$name" "$(
   cat <<EOF

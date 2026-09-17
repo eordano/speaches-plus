@@ -607,7 +607,7 @@ fn linear_bf16_into_raw(
         "moe prealloc linear: out {} < {m}x{n}",
         out.len()
     );
-    if m == 1 && gemv_env_ok() && k % 2 == 0 {
+    if m == 1 && gemv_env_ok() && k.is_multiple_of(2) {
         let (ws, wl) = w.storage_and_layout();
         anyhow::ensure!(
             wl.is_contiguous(),
@@ -726,7 +726,7 @@ impl MoePrealloc {
         let cfg = model.config();
         let hidden = cfg.hidden_size;
         let e = cfg.n_routed_experts;
-        let need_wt = |k: usize| max_b > 1 || !gemv_env_ok() || k % 2 != 0;
+        let need_wt = |k: usize| max_b > 1 || !gemv_env_ok() || !k.is_multiple_of(2);
         let eligible = |l: &nv_layers::Linear| -> bool {
             l.weight().is_some() && l.bias().is_none() && !l.has_lora()
         };
@@ -1113,7 +1113,7 @@ pub(crate) fn moe_decode_ffn(
         anyhow::ensure!(rc == 0, "moe weight gather rc={rc}");
     }
 
-    match moe_pre.as_deref_mut() {
+    match moe_pre {
         Some(mp) => mp.shared_cast(li, x_normed, 1, &mut scratch.shared_f32, &stream)?,
         None => {
             let shared_t = moe.shared_expert().forward_fused_cuda(x_normed)?;
@@ -1190,7 +1190,7 @@ pub fn graph_supported(model: &DeepseekOcrDecoder) -> std::result::Result<(), St
         return Err(format!("decoder dtype {:?} != BF16", model.dtype()));
     }
     let cfg = model.config();
-    if cfg.head_dim() % 8 != 0 || cfg.head_dim() > 256 {
+    if !cfg.head_dim().is_multiple_of(8) || cfg.head_dim() > 256 {
         return Err(format!(
             "head_dim {} unsupported by fa2 shim",
             cfg.head_dim()
@@ -1599,7 +1599,7 @@ impl DsocrDecodeGraph {
 
     pub fn step(&mut self, token: u32) -> Result<()> {
         anyhow::ensure!(
-            self.cur_len + 1 <= self.cap,
+            self.cur_len < self.cap,
             "dsocr graph step overflows capacity {}",
             self.cap
         );

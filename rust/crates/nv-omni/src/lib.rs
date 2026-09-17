@@ -6,7 +6,9 @@ pub mod thinker;
 pub mod vision;
 pub mod vocoder;
 
-pub use audio_encoder::{audio_tokens_for_mel_frames, whisper_log_mel_128, AuTConfig, AudioEncoder};
+pub use audio_encoder::{
+    audio_tokens_for_mel_frames, whisper_log_mel_128, AuTConfig, AudioEncoder,
+};
 pub use codec_vel::{LearnedVelField, LearnedVelFieldConfig};
 pub use qwen3_vision::{Qwen3VisionConfig, Qwen3VisionTower};
 pub use talker::{Talker, TalkerConfig};

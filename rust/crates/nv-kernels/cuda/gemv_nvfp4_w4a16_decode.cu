@@ -181,6 +181,447 @@ __global__ void gemv_nvfp4_w4a16_silu_gate_up_in_m1_kernel(
     if (lane == 0) y[r] = __float2bfloat16(acc * alpha);
 }
 
+constexpr int kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape = 8;
+constexpr int kV2RowsPerBlock = 2 * kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape;
+constexpr int kV2PairSlots17Per16KeepsBf16PairBanksCoprimeWith32 = 17;
+
+__device__ __forceinline__ int swizzled_scale_row_byte_base(int r, int kb_total) {
+    int k_tiles = (kb_total + 3) >> 2;
+    int m_tile = r >> 7;
+    int d2 = (r >> 5) & 3;
+    int d3 = r & 31;
+    return (m_tile * k_tiles) * 512 + d3 * 16 + d2 * 4;
+}
+
+__device__ __forceinline__ uint16_t scale_pair_bytes_for_two_adjacent_blocks(
+    const uint8_t* __restrict__ sc,
+    int row_base,
+    int v
+) {
+    return *reinterpret_cast<const uint16_t*>(sc + row_base + (v >> 1) * 512 + (v & 1) * 2);
+}
+
+__device__ __forceinline__ void fp4x32_two_block_partials_from_staged_x(
+    uint4 raw,
+    const float2* __restrict__ xf,
+    float& p0,
+    float& p1
+) {
+    unsigned e[8];
+    nibbles8_to_fp8_bytes_via_prmt_because_sm120_fp4_cvt_is_emulated(raw.x, e[0], e[1]);
+    nibbles8_to_fp8_bytes_via_prmt_because_sm120_fp4_cvt_is_emulated(raw.y, e[2], e[3]);
+    nibbles8_to_fp8_bytes_via_prmt_because_sm120_fp4_cvt_is_emulated(raw.z, e[4], e[5]);
+    nibbles8_to_fp8_bytes_via_prmt_because_sm120_fp4_cvt_is_emulated(raw.w, e[6], e[7]);
+    const __nv_fp8x2_storage_t* p2 = reinterpret_cast<const __nv_fp8x2_storage_t*>(e);
+    p0 = 0.0f;
+    p1 = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(p2[i], __NV_E4M3);
+        float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+        p0 += wf.x * xf[i].x + wf.y * xf[i].y;
+    }
+    #pragma unroll
+    for (int i = 8; i < 16; ++i) {
+        __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2(p2[i], __NV_E4M3);
+        float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+        p1 += wf.x * xf[i].x + wf.y * xf[i].y;
+    }
+}
+
+__device__ __forceinline__ void warp_rows2_dot_nvfp4_uint4_pipelined(
+    const uint8_t* __restrict__ w0,
+    const uint8_t* __restrict__ c0,
+    int r0,
+    const uint8_t* __restrict__ w1,
+    const uint8_t* __restrict__ c1,
+    int r1,
+    const __nv_bfloat162* __restrict__ xs2,
+    int K,
+    int lane,
+    float& acc0,
+    float& acc1
+) {
+    int kb_total = K >> 4;
+    int Kv = K >> 5;
+    const uint4* wa4 = reinterpret_cast<const uint4*>(w0 + (size_t)r0 * (K >> 1));
+    const uint4* wb4 = reinterpret_cast<const uint4*>(w1 + (size_t)r1 * (K >> 1));
+    int scb0 = swizzled_scale_row_byte_base(r0, kb_total);
+    int scb1 = swizzled_scale_row_byte_base(r1, kb_total);
+    acc0 = 0.0f;
+    acc1 = 0.0f;
+    int v = lane;
+    uint4 ra = (v < Kv) ? __ldcs(&wa4[v]) : make_uint4(0, 0, 0, 0);
+    uint4 rb = (v < Kv) ? __ldcs(&wb4[v]) : make_uint4(0, 0, 0, 0);
+    while (v < Kv) {
+        int vn = v + kWarp;
+        uint4 na = (vn < Kv) ? __ldcs(&wa4[vn]) : make_uint4(0, 0, 0, 0);
+        uint4 nb = (vn < Kv) ? __ldcs(&wb4[vn]) : make_uint4(0, 0, 0, 0);
+        uint16_t sp0 = scale_pair_bytes_for_two_adjacent_blocks(c0, scb0, v);
+        uint16_t sp1 = scale_pair_bytes_for_two_adjacent_blocks(c1, scb1, v);
+        const __nv_bfloat162* xp =
+            xs2 + (size_t)v * kV2PairSlots17Per16KeepsBf16PairBanksCoprimeWith32;
+        float2 xf[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            xf[i] = __bfloat1622float2(xp[i]);
+        }
+        float p0;
+        float p1;
+        fp4x32_two_block_partials_from_staged_x(ra, xf, p0, p1);
+        acc0 += decode_ue4m3_scale((uint8_t)(sp0 & 0xFF)) * p0
+              + decode_ue4m3_scale((uint8_t)(sp0 >> 8)) * p1;
+        fp4x32_two_block_partials_from_staged_x(rb, xf, p0, p1);
+        acc1 += decode_ue4m3_scale((uint8_t)(sp1 & 0xFF)) * p0
+              + decode_ue4m3_scale((uint8_t)(sp1 >> 8)) * p1;
+        v = vn;
+        ra = na;
+        rb = nb;
+    }
+}
+
+__global__ void gemv_nvfp4_w4a16_dual_m1_v2_kernel(
+    const uint8_t* __restrict__ wq_a,
+    const uint8_t* __restrict__ sc_a,
+    const uint8_t* __restrict__ wq_b,
+    const uint8_t* __restrict__ sc_b,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y_a,
+    __nv_bfloat16* __restrict__ y_b,
+    float alpha_a,
+    float alpha_b,
+    int N,
+    int K
+) {
+    extern __shared__ __nv_bfloat162 xs2[];
+    const __nv_bfloat162* xg = reinterpret_cast<const __nv_bfloat162*>(x);
+    for (int p = threadIdx.x; p < (K >> 1); p += blockDim.x) {
+        xs2[(p >> 4) * kV2PairSlots17Per16KeepsBf16PairBanksCoprimeWith32 + (p & 15)] = xg[p];
+    }
+    __syncthreads();
+
+    int lane = threadIdx.x & (kWarp - 1);
+    int warp = threadIdx.x / kWarp;
+    int total = (wq_b != nullptr) ? 2 * N : N;
+    int row0 = blockIdx.x * kV2RowsPerBlock + warp;
+    int row1 = row0 + kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape;
+    if (row0 >= total) return;
+    bool has1 = row1 < total;
+    int rowb = has1 ? row1 : row0;
+    bool s0 = row0 >= N;
+    bool s1 = rowb >= N;
+    int r0 = s0 ? row0 - N : row0;
+    int r1 = s1 ? rowb - N : rowb;
+    const uint8_t* w0 = s0 ? wq_b : wq_a;
+    const uint8_t* c0 = s0 ? sc_b : sc_a;
+    const uint8_t* w1 = s1 ? wq_b : wq_a;
+    const uint8_t* c1 = s1 ? sc_b : sc_a;
+
+    float acc0;
+    float acc1;
+    warp_rows2_dot_nvfp4_uint4_pipelined(w0, c0, r0, w1, c1, r1, xs2, K, lane, acc0, acc1);
+    #pragma unroll
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+        acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
+        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+    }
+    if (lane == 0) {
+        __nv_bfloat16 out0 = __float2bfloat16(acc0 * (s0 ? alpha_b : alpha_a));
+        if (s0) y_b[r0] = out0;
+        else y_a[r0] = out0;
+        if (has1) {
+            __nv_bfloat16 out1 = __float2bfloat16(acc1 * (s1 ? alpha_b : alpha_a));
+            if (s1) y_b[r1] = out1;
+            else y_a[r1] = out1;
+        }
+    }
+}
+
+__global__ void gemv_nvfp4_w4a16_silu_gate_up_in_m1_v2_kernel(
+    const uint8_t* __restrict__ wq,
+    const uint8_t* __restrict__ sc,
+    const __nv_bfloat16* __restrict__ gate,
+    const __nv_bfloat16* __restrict__ up,
+    __nv_bfloat16* __restrict__ y,
+    float alpha,
+    int N,
+    int K
+) {
+    extern __shared__ __nv_bfloat162 xs2[];
+    for (int p = threadIdx.x; p < (K >> 1); p += blockDim.x) {
+        int k0 = 2 * p;
+        float g0 = __bfloat162float(gate[k0]);
+        float g1 = __bfloat162float(gate[k0 + 1]);
+        float u0 = __bfloat162float(up[k0]);
+        float u1 = __bfloat162float(up[k0 + 1]);
+        float a0 = (g0 / (1.0f + expf(-g0))) * u0;
+        float a1 = (g1 / (1.0f + expf(-g1))) * u1;
+        xs2[(p >> 4) * kV2PairSlots17Per16KeepsBf16PairBanksCoprimeWith32 + (p & 15)] =
+            __floats2bfloat162_rn(a0, a1);
+    }
+    __syncthreads();
+
+    int lane = threadIdx.x & (kWarp - 1);
+    int warp = threadIdx.x / kWarp;
+    int r0 = blockIdx.x * kV2RowsPerBlock + warp;
+    int r1 = r0 + kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape;
+    if (r0 >= N) return;
+    bool has1 = r1 < N;
+    int rb = has1 ? r1 : r0;
+
+    float acc0;
+    float acc1;
+    warp_rows2_dot_nvfp4_uint4_pipelined(wq, sc, r0, wq, sc, rb, xs2, K, lane, acc0, acc1);
+    #pragma unroll
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+        acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
+        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+    }
+    if (lane == 0) {
+        y[r0] = __float2bfloat16(acc0 * alpha);
+        if (has1) y[r1] = __float2bfloat16(acc1 * alpha);
+    }
+}
+
+__device__ __forceinline__ void warp_rows2_dot_nvfp4_uint4_pipelined_x_from_l2(
+    const uint8_t* __restrict__ w0,
+    const uint8_t* __restrict__ c0,
+    int r0,
+    const uint8_t* __restrict__ w1,
+    const uint8_t* __restrict__ c1,
+    int r1,
+    const uint4* __restrict__ x4,
+    int K,
+    int lane,
+    float& acc0,
+    float& acc1
+) {
+    int kb_total = K >> 4;
+    int Kv = K >> 5;
+    const uint4* wa4 = reinterpret_cast<const uint4*>(w0 + (size_t)r0 * (K >> 1));
+    const uint4* wb4 = reinterpret_cast<const uint4*>(w1 + (size_t)r1 * (K >> 1));
+    int scb0 = swizzled_scale_row_byte_base(r0, kb_total);
+    int scb1 = swizzled_scale_row_byte_base(r1, kb_total);
+    acc0 = 0.0f;
+    acc1 = 0.0f;
+    int v = lane;
+    uint4 ra = (v < Kv) ? __ldcs(&wa4[v]) : make_uint4(0, 0, 0, 0);
+    uint4 rb = (v < Kv) ? __ldcs(&wb4[v]) : make_uint4(0, 0, 0, 0);
+    while (v < Kv) {
+        int vn = v + kWarp;
+        uint4 na = (vn < Kv) ? __ldcs(&wa4[vn]) : make_uint4(0, 0, 0, 0);
+        uint4 nb = (vn < Kv) ? __ldcs(&wb4[vn]) : make_uint4(0, 0, 0, 0);
+        uint16_t sp0 = scale_pair_bytes_for_two_adjacent_blocks(c0, scb0, v);
+        uint16_t sp1 = scale_pair_bytes_for_two_adjacent_blocks(c1, scb1, v);
+        uint4 xw[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            xw[j] = __ldg(&x4[4 * v + j]);
+        }
+        const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(xw);
+        float2 xf[16];
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            xf[i] = __bfloat1622float2(xp[i]);
+        }
+        float p0;
+        float p1;
+        fp4x32_two_block_partials_from_staged_x(ra, xf, p0, p1);
+        acc0 += decode_ue4m3_scale((uint8_t)(sp0 & 0xFF)) * p0
+              + decode_ue4m3_scale((uint8_t)(sp0 >> 8)) * p1;
+        fp4x32_two_block_partials_from_staged_x(rb, xf, p0, p1);
+        acc1 += decode_ue4m3_scale((uint8_t)(sp1 & 0xFF)) * p0
+              + decode_ue4m3_scale((uint8_t)(sp1 >> 8)) * p1;
+        v = vn;
+        ra = na;
+        rb = nb;
+    }
+}
+
+__global__ void gemv_nvfp4_w4a16_gateup_pair_silu_out_m1_v3_kernel(
+    const uint8_t* __restrict__ wq_g,
+    const uint8_t* __restrict__ sc_g,
+    const uint8_t* __restrict__ wq_u,
+    const uint8_t* __restrict__ sc_u,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ act,
+    float alpha_g,
+    float alpha_u,
+    int N,
+    int K
+) {
+    int lane = threadIdx.x & (kWarp - 1);
+    int warp = threadIdx.x / kWarp;
+    int r = blockIdx.x * kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape + warp;
+    if (r >= N) return;
+
+    float acc_g;
+    float acc_u;
+    warp_rows2_dot_nvfp4_uint4_pipelined_x_from_l2(
+        wq_g, sc_g, r, wq_u, sc_u, r,
+        reinterpret_cast<const uint4*>(x), K, lane, acc_g, acc_u);
+    #pragma unroll
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+        acc_g += __shfl_xor_sync(0xffffffffu, acc_g, o);
+        acc_u += __shfl_xor_sync(0xffffffffu, acc_u, o);
+    }
+    if (lane == 0) {
+        float g = __bfloat162float(__float2bfloat16(acc_g * alpha_g));
+        float u = __bfloat162float(__float2bfloat16(acc_u * alpha_u));
+        float a = (g / (1.0f + expf(-g))) * u;
+        act[r] = __float2bfloat16(a);
+    }
+}
+
+__global__ void gemv_nvfp4_w4a16_down_act_in_m1_v3_kernel(
+    const uint8_t* __restrict__ wq,
+    const uint8_t* __restrict__ sc,
+    const __nv_bfloat16* __restrict__ act,
+    __nv_bfloat16* __restrict__ y,
+    float alpha,
+    int N,
+    int K
+) {
+    int lane = threadIdx.x & (kWarp - 1);
+    int warp = threadIdx.x / kWarp;
+    int r0 = blockIdx.x * kV2RowsPerBlock + warp;
+    int r1 = r0 + kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape;
+    if (r0 >= N) return;
+    bool has1 = r1 < N;
+    int rb = has1 ? r1 : r0;
+
+    float acc0;
+    float acc1;
+    warp_rows2_dot_nvfp4_uint4_pipelined_x_from_l2(
+        wq, sc, r0, wq, sc, rb,
+        reinterpret_cast<const uint4*>(act), K, lane, acc0, acc1);
+    #pragma unroll
+    for (int o = kWarp / 2; o > 0; o >>= 1) {
+        acc0 += __shfl_xor_sync(0xffffffffu, acc0, o);
+        acc1 += __shfl_xor_sync(0xffffffffu, acc1, o);
+    }
+    if (lane == 0) {
+        y[r0] = __float2bfloat16(acc0 * alpha);
+        if (has1) y[r1] = __float2bfloat16(acc1 * alpha);
+    }
+}
+
+}
+
+extern "C" int nv_kernels_gemv_nvfp4_w4a16_gateup_pair_silu_out_m1_v3(
+    void* stream,
+    const uint8_t* wq_g,
+    const uint8_t* sc_g,
+    const uint8_t* wq_u,
+    const uint8_t* sc_u,
+    const uint16_t* x,
+    uint16_t* act,
+    float alpha_g,
+    float alpha_u,
+    int N,
+    int K
+) {
+    if (N <= 0 || K <= 0 || (K & 31) != 0) return -1;
+    unsigned grid = (unsigned)((N + kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape - 1)
+        / kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape);
+    gemv_nvfp4_w4a16_gateup_pair_silu_out_m1_v3_kernel<<<
+        grid, dim3(kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape * kWarp), 0,
+        (cudaStream_t)stream>>>(
+        wq_g, sc_g, wq_u, sc_u,
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<__nv_bfloat16*>(act),
+        alpha_g, alpha_u, N, K);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_gemv_nvfp4_w4a16_down_act_in_m1_v3(
+    void* stream,
+    const uint8_t* wq,
+    const uint8_t* sc,
+    const uint16_t* act,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K
+) {
+    if (N <= 0 || K <= 0 || (K & 31) != 0) return -1;
+    unsigned grid = (unsigned)((N + kV2RowsPerBlock - 1) / kV2RowsPerBlock);
+    gemv_nvfp4_w4a16_down_act_in_m1_v3_kernel<<<
+        grid, dim3(kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape * kWarp), 0,
+        (cudaStream_t)stream>>>(
+        wq, sc,
+        reinterpret_cast<const __nv_bfloat16*>(act),
+        reinterpret_cast<__nv_bfloat16*>(y),
+        alpha, N, K);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_gemv_nvfp4_w4a16_dual_m1_v2(
+    void* stream,
+    const uint8_t* wq_a,
+    const uint8_t* sc_a,
+    const uint8_t* wq_b,
+    const uint8_t* sc_b,
+    const uint16_t* x,
+    uint16_t* y_a,
+    uint16_t* y_b,
+    float alpha_a,
+    float alpha_b,
+    int N,
+    int K
+) {
+    if (N <= 0 || K <= 0 || (K & 31) != 0) return -1;
+    if ((wq_b == nullptr) != (y_b == nullptr)) return -1;
+    if ((wq_b == nullptr) != (sc_b == nullptr)) return -1;
+    size_t smem = (size_t)(K >> 5) * kV2PairSlots17Per16KeepsBf16PairBanksCoprimeWith32
+        * sizeof(__nv_bfloat162);
+    if (smem > 96 * 1024) return -1;
+    static SmemOptinHighWater optin_dual_v2;
+    int orc = raise_dynamic_smem_optin_above_48k(
+        optin_dual_v2, (const void*)gemv_nvfp4_w4a16_dual_m1_v2_kernel, smem);
+    if (orc != 0) return orc;
+    int total = (wq_b != nullptr) ? 2 * N : N;
+    unsigned grid = (unsigned)((total + kV2RowsPerBlock - 1) / kV2RowsPerBlock);
+    gemv_nvfp4_w4a16_dual_m1_v2_kernel<<<
+        grid, dim3(kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape * kWarp), smem,
+        (cudaStream_t)stream>>>(
+        wq_a, sc_a, wq_b, sc_b,
+        reinterpret_cast<const __nv_bfloat16*>(x),
+        reinterpret_cast<__nv_bfloat16*>(y_a),
+        reinterpret_cast<__nv_bfloat16*>(y_b),
+        alpha_a, alpha_b, N, K);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_gemv_nvfp4_w4a16_silu_gate_up_in_m1_v2(
+    void* stream,
+    const uint8_t* wq,
+    const uint8_t* sc,
+    const uint16_t* gate,
+    const uint16_t* up,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K
+) {
+    if (N <= 0 || K <= 0 || (K & 31) != 0) return -1;
+    size_t smem = (size_t)(K >> 5) * kV2PairSlots17Per16KeepsBf16PairBanksCoprimeWith32
+        * sizeof(__nv_bfloat162);
+    if (smem > 96 * 1024) return -1;
+    static SmemOptinHighWater optin_silu_v2;
+    int orc = raise_dynamic_smem_optin_above_48k(
+        optin_silu_v2, (const void*)gemv_nvfp4_w4a16_silu_gate_up_in_m1_v2_kernel, smem);
+    if (orc != 0) return orc;
+    unsigned grid = (unsigned)((N + kV2RowsPerBlock - 1) / kV2RowsPerBlock);
+    gemv_nvfp4_w4a16_silu_gate_up_in_m1_v2_kernel<<<
+        grid, dim3(kV2WarpsPerBlock8MirrorsTheFp8ChampionRows2Shape * kWarp), smem,
+        (cudaStream_t)stream>>>(
+        wq, sc,
+        reinterpret_cast<const __nv_bfloat16*>(gate),
+        reinterpret_cast<const __nv_bfloat16*>(up),
+        reinterpret_cast<__nv_bfloat16*>(y),
+        alpha, N, K);
+    return (int)cudaGetLastError();
 }
 
 extern "C" int nv_kernels_gemv_nvfp4_w4a16_dual_m1(

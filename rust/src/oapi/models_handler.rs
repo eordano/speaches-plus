@@ -161,7 +161,7 @@ fn build_models(models: &Arc<Models>) -> Vec<Model> {
     }
 
     out.extend(embeddings_model_entry(
-        super::text_embeddings::loaded_embedding_model_id(),
+        super::text_embeddings::served_embedding_model_id(),
     ));
     out.extend(pii_model_entry(loaded_pii_model_id()));
 

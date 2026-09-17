@@ -412,9 +412,13 @@ impl SpecDims {
             "hd {} exceeds {MAX_HEAD_DIM}",
             self.hd
         );
-        ensure!(self.hd % 2 == 0, "hd {} must be even for rope", self.hd);
         ensure!(
-            self.nh % self.nkv == 0,
+            self.hd.is_multiple_of(2),
+            "hd {} must be even for rope",
+            self.hd
+        );
+        ensure!(
+            self.nh.is_multiple_of(self.nkv),
             "nh {} not a multiple of nkv {}",
             self.nh,
             self.nkv
@@ -812,7 +816,7 @@ fn sp_pass_table<'a>(d: &SpecDims, kb: usize, r: &SpBind<'a>) -> Vec<SpPass<'a>>
 }
 
 fn groups_1d(total: usize) -> (u32, u32, u32) {
-    (((total + 63) / 64) as u32, 1, 1)
+    (total.div_ceil(64) as u32, 1, 1)
 }
 
 pub struct SpProbe {
@@ -1119,7 +1123,7 @@ impl WgpuSpecModel {
 
     pub fn decode1(&mut self, token: u32) -> Result<u32> {
         ensure!(
-            self.committed + 1 <= self.dims.max_seq,
+            self.committed < self.dims.max_seq,
             "decode1 overflow: committed={} max_seq={}",
             self.committed,
             self.dims.max_seq

@@ -99,9 +99,7 @@ pub fn adapter_rows(registry: &super::chat_engine::ChatRegistry) -> Vec<serde_js
         .collect()
 }
 
-async fn handle_list(
-    axum::extract::State(state): axum::extract::State<ChatAppState>,
-) -> Response {
+async fn handle_list(axum::extract::State(state): axum::extract::State<ChatAppState>) -> Response {
     axum::Json(serde_json::json!({
         "object": "list",
         "data": adapter_rows(&state.registry),

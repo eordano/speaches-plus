@@ -116,11 +116,10 @@ func (o *wsOutbound) WriteAudio(samples audio.MonoF32, sampleRate int) error {
 			}
 			payload = pcmBuf
 		}
-		b64 := base64.StdEncoding.EncodeToString(payload)
-		ev := map[string]string{
-			"event_id": o.eventID(),
-			"type":     string(SETResponseOutputAudioDelta),
-			"delta":    b64,
+		ev := wsAudioDeltaEvent{
+			Delta:   base64.StdEncoding.EncodeToString(payload),
+			EventID: o.eventID(),
+			Type:    string(SETResponseOutputAudioDelta),
 		}
 		body, err := jsonMarshalEvent(ev)
 		if err != nil {
@@ -157,4 +156,10 @@ func clampF32(v, lo, hi float32) float32 {
 		return hi
 	}
 	return v
+}
+
+type wsAudioDeltaEvent struct {
+	Delta   string `json:"delta"`
+	EventID string `json:"event_id"`
+	Type    string `json:"type"`
 }

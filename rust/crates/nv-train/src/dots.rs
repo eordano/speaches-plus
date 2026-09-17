@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::qwen38::{
     average_grads_bailing_on_an_untouched_factor, collect_raw_entries, flat_positions,
-    fold_example_grads, logits_f32_after_head, loss_and_grads_from_one_backward, WindowOptimizer,
+    fold_example_grads, WindowOptimizer,
 };
 use crate::{LoraConfig, LoraTrainable, TokenRow, TrainingLoraHook};
 
@@ -36,6 +36,12 @@ pub const DOTS_NORMS_LOAD_RAW_BECAUSE_THE_MLX_EXPORT_FOLDS_THE_PLUS_ONE: &str =
     "language_model.* norm gammas in the mlx export already carry the +1 that qwen \
      checkpoints store zero-centred, matching the serving loader's \
      MLX_EXPORTS_STORE_ZERO_CENTERED_NORMS_WITH_THE_PLUS_ONE_FOLDED_IN rule";
+
+pub const WINDOW_LINEARS_PRETRANSPOSE_SO_THE_FALLBACK_STOPS_PAYING_A_TRANSPOSE_PER_FORWARD: &str =
+    "the step profile priced the window forwards' Metal fallback at ~9 GB of weight transposes \
+     rematerialized per training step; Linear::new stores weight_t once at build (transient for \
+     the streamed frozen prefix, resident for the trained window) and the fallback reuses it \
+     bitwise-by-construction. Measured trade on the n25 basis: -0.2 s/step for +1.7 GB peak.";
 
 pub const DOTS_AFFINE_GROUP_SIZE: usize = 64;
 pub const DOTS_LM_PREFIX: &str = "language_model.model";
@@ -148,7 +154,10 @@ impl DotsW4Weights {
 
     fn raw_u32(&self, name: &str) -> Result<Vec<u32>> {
         let bytes = self.loader.raw_bytes(name)?;
-        ensure!(bytes.len() % 4 == 0, "{name}: byte length not a u32 multiple");
+        ensure!(
+            bytes.len() % 4 == 0,
+            "{name}: byte length not a u32 multiple"
+        );
         Ok(bytes
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -221,7 +230,8 @@ impl DotsW4Weights {
         } else {
             None
         };
-        Ok(Linear::new_no_pretranspose(w, bias)?)
+        let _ = WINDOW_LINEARS_PRETRANSPOSE_SO_THE_FALLBACK_STOPS_PAYING_A_TRANSPOSE_PER_FORWARD;
+        Linear::new(w, bias)
     }
 
     pub fn embed_rows_f32(&self, ids: &[u32], hidden: usize) -> Result<Vec<f32>> {
@@ -237,8 +247,12 @@ impl DotsW4Weights {
             hidden / 8
         );
         let wbytes = self.loader.raw_bytes(&wname)?;
-        let sbytes = self.loader.raw_bytes(&format!("{DOTS_EMBED_MODULE}.scales"))?;
-        let bbytes = self.loader.raw_bytes(&format!("{DOTS_EMBED_MODULE}.biases"))?;
+        let sbytes = self
+            .loader
+            .raw_bytes(&format!("{DOTS_EMBED_MODULE}.scales"))?;
+        let bbytes = self
+            .loader
+            .raw_bytes(&format!("{DOTS_EMBED_MODULE}.biases"))?;
         let words_per_row = hidden / 8;
         let groups = hidden / DOTS_AFFINE_GROUP_SIZE;
         let bf = |bytes: &[u8], i: usize| -> f32 {
@@ -275,6 +289,188 @@ impl DotsW4Weights {
             .to_dtype(dtype)?
             .to_device(&self.device)?)
     }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn w4_raw(
+        &self,
+        module: &str,
+        n: usize,
+        k: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+        let wname = format!("{module}.weight");
+        let shape = self
+            .loader
+            .shape_of(&wname)
+            .ok_or_else(|| anyhow::anyhow!("{wname}: missing"))?;
+        ensure!(
+            shape == [n, k / 8],
+            "{wname}: shape {shape:?} != [{n}, {}]",
+            k / 8
+        );
+        let words = self.raw_u32(&wname)?;
+        let scales = self.raw_bf16_f32(&format!("{module}.scales"))?;
+        let biases = self.raw_bf16_f32(&format!("{module}.biases"))?;
+        ensure!(
+            scales.len() == biases.len() && scales.len() == n * (k / DOTS_AFFINE_GROUP_SIZE),
+            "{module}: scales/biases length {} != {} rows x {} groups",
+            scales.len(),
+            n,
+            k / DOTS_AFFINE_GROUP_SIZE
+        );
+        Ok((words, scales, biases))
+    }
+
+    pub fn dense_pretransposed(
+        &self,
+        module: &str,
+        n: usize,
+        k: usize,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        Ok(
+            Tensor::from_vec(self.dense_f32(module, n, k)?, (n, k), &Device::Cpu)?
+                .t()?
+                .contiguous()?
+                .to_dtype(dtype)?
+                .to_device(&self.device)?,
+        )
+    }
+}
+
+pub const DOTS_HEAD_W_DELETES_A_933MB_STRIDED_TRANSPOSE_COPY_PER_HEAD_CHUNK: &str =
+    "nv_layers::Linear's Metal fallback materializes weight.t().contiguous() on every forward, \
+     so the chunked head CE re-transposed the [151936,1536] fp32 lm_head once per chunk (12x \
+     per step on the n25 basis). NV_DOTS_HEAD_W picks the resident layout: unset/'view' holds \
+     the untransposed [151936,1536] tensor and runs the forward GEMM through a transposed view \
+     (no copy ever, and the backward dx GEMM then sees a contiguous rhs, the faster mlx layout \
+     at the 151936-k shape); 1 holds one resident [1536,151936] pretransposed tensor, feeding \
+     identical bytes to the identical GEMM layout the per-call copy fed, so it is bitwise by \
+     construction; 0 restores the per-call Linear path. All three arms reproduce the canonical \
+     20-step trajectory, the 28 eval CEs and the adapter delta-amax bit-for-bit on the n25 \
+     basis, so the no-copy contiguous-dx arm ships as the default";
+
+pub enum DotsHeadWeight {
+    TransposeEveryCall(Linear),
+    Pretransposed(Tensor),
+    TransposedView(Tensor),
+    #[cfg(feature = "metal")]
+    W4Fused(std::sync::Arc<crate::dots_w4head::DotsW4Head>),
+}
+
+impl DotsHeadWeight {
+    pub fn from_weights(src: &DotsW4Weights, cfg: &DotsConfig, dtype: DType) -> Result<Self> {
+        let _ = DOTS_HEAD_W_DELETES_A_933MB_STRIDED_TRANSPOSE_COPY_PER_HEAD_CHUNK;
+        let (n, k) = (cfg.vocab_size, cfg.hidden_size);
+        if crate::w4head_requested_via_env() {
+            #[cfg(feature = "metal")]
+            {
+                let (words, scales, biases) = src.w4_raw(DOTS_LM_HEAD_MODULE, n, k)?;
+                return Ok(Self::W4Fused(crate::dots_w4head::DotsW4Head::from_raw(
+                    words,
+                    scales,
+                    biases,
+                    n,
+                    k,
+                    src.device(),
+                )?));
+            }
+            #[cfg(not(feature = "metal"))]
+            anyhow::bail!(
+                "NV_DOTS_QLORA_W4HEAD=1 needs the metal feature: the fused W4 head is an MSL path"
+            );
+        }
+        match std::env::var("NV_DOTS_HEAD_W").as_deref() {
+            Ok("0") => Ok(Self::TransposeEveryCall(src.dense_linear(
+                DOTS_LM_HEAD_MODULE,
+                n,
+                k,
+                false,
+                dtype,
+            )?)),
+            Ok("1") => Ok(Self::Pretransposed(src.dense_pretransposed(
+                DOTS_LM_HEAD_MODULE,
+                n,
+                k,
+                dtype,
+            )?)),
+            _ => Ok(Self::TransposedView(
+                Tensor::from_vec(
+                    src.dense_f32(DOTS_LM_HEAD_MODULE, n, k)?,
+                    (n, k),
+                    &Device::Cpu,
+                )?
+                .to_dtype(dtype)?
+                .to_device(src.device())?,
+            )),
+        }
+    }
+
+    fn matmul_2d(&self, x: &Tensor, dims: &[usize], k: usize, n: usize) -> Result<Tensor> {
+        ensure!(
+            *dims.last().unwrap() == k,
+            "head input last dim {} != hidden {k}",
+            dims.last().unwrap()
+        );
+        let leading: usize = dims[..dims.len() - 1].iter().product();
+        let x2 = x.reshape((leading, k))?;
+        let out2 = match self {
+            Self::Pretransposed(w_t) => x2.matmul(w_t)?,
+            Self::TransposedView(w) => x2.matmul(&w.t()?)?,
+            Self::TransposeEveryCall(_) => unreachable!("Linear owns its own forward"),
+            #[cfg(feature = "metal")]
+            Self::W4Fused(h) => crate::dots_w4head::logits_f32(h, &x2.contiguous()?)?,
+        };
+        let mut out_dims = dims[..dims.len() - 1].to_vec();
+        out_dims.push(n);
+        Ok(out2.reshape(out_dims)?)
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::TransposeEveryCall(lin) => lin.forward(x),
+            Self::Pretransposed(w_t) => {
+                let (k, n) = (w_t.dims()[0], w_t.dims()[1]);
+                self.matmul_2d(x, x.dims(), k, n)
+            }
+            Self::TransposedView(w) => {
+                let (n, k) = (w.dims()[0], w.dims()[1]);
+                self.matmul_2d(x, x.dims(), k, n)
+            }
+            #[cfg(feature = "metal")]
+            Self::W4Fused(h) => self.matmul_2d(x, x.dims(), h.k, h.n),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn w4_fused(&self) -> Option<&std::sync::Arc<crate::dots_w4head::DotsW4Head>> {
+        match self {
+            Self::W4Fused(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "metal")]
+fn rope_fused_qk(
+    rope: &Rope,
+    q: &Tensor,
+    k: &Tensor,
+    positions: &Tensor,
+) -> Result<Option<(Tensor, Tensor)>> {
+    crate::dots_rope::fused_qk(rope, q, k, positions)
+}
+
+#[cfg(not(feature = "metal"))]
+fn rope_fused_qk(
+    _rope: &Rope,
+    _q: &Tensor,
+    _k: &Tensor,
+    _positions: &Tensor,
+) -> Result<Option<(Tensor, Tensor)>> {
+    Ok(None)
 }
 
 pub struct DotsTrainAttn {
@@ -318,10 +514,7 @@ impl DotsTrainAttn {
         let in_dtype = x.dtype();
         let hd = self.head_dim;
 
-        let q = self
-            .q_proj
-            .forward(x)?
-            .reshape((b, t, self.n_heads, hd))?;
+        let q = self.q_proj.forward(x)?.reshape((b, t, self.n_heads, hd))?;
         let k = self
             .k_proj
             .forward(x)?
@@ -331,11 +524,14 @@ impl DotsTrainAttn {
             .forward(x)?
             .reshape((b, t, self.n_kv_heads, hd))?;
 
-        let (qr, kr) = rope.apply_candle(
-            &q.to_dtype(DType::F32)?,
-            &k.to_dtype(DType::F32)?,
-            positions,
-        )?;
+        let (qr, kr) = match rope_fused_qk(rope, &q, &k, positions)? {
+            Some(pair) => pair,
+            None => rope.apply_candle(
+                &q.to_dtype(DType::F32)?,
+                &k.to_dtype(DType::F32)?,
+                positions,
+            )?,
+        };
         let attn_out = nv_layers::attn::sdpa(
             &qr.to_dtype(in_dtype)?,
             &kr.to_dtype(in_dtype)?,
@@ -377,7 +573,8 @@ impl DotsTrainMlp {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&candle_nn::ops::silu(&gate)?.mul(&up)?)
+        self.down_proj
+            .forward(&candle_nn::ops::silu(&gate)?.mul(&up)?)
     }
 }
 
@@ -442,7 +639,13 @@ impl DotsTrainLayer {
 
 pub fn dots_default_targets() -> Vec<String> {
     [
-        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -504,7 +707,11 @@ pub fn load_dump_dir(dir: &Path, hidden: usize) -> Result<Vec<DotsSample>> {
         .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
         .collect();
     paths.sort();
-    ensure!(!paths.is_empty(), "no .safetensors samples in {}", dir.display());
+    ensure!(
+        !paths.is_empty(),
+        "no .safetensors samples in {}",
+        dir.display()
+    );
     let mut out = Vec::with_capacity(paths.len());
     for p in &paths {
         let t = candle_core::safetensors::load(p, &Device::Cpu)
@@ -576,6 +783,260 @@ fn embed_spliced_shifted(
     Ok((h, positions, tgt, mask))
 }
 
+pub const DOTS_BUCKET_PADDED_TOKEN_BUDGET_CAPS_ACTIVATION_PEAK_WHILE_CUTTING_PER_LAUNCH_OVERHEAD:
+    usize = 512;
+
+struct DotsBucket {
+    h: Tensor,
+    positions: Tensor,
+    tgt: Tensor,
+    row_mean_weights: Tensor,
+    rows: usize,
+    padded_t: usize,
+}
+
+fn pack_length_sorted_buckets(exs: &[Ex], device: &Device) -> Result<Vec<DotsBucket>> {
+    let mut order: Vec<usize> = (0..exs.len()).collect();
+    order.sort_by_key(|&i| (usize::MAX - exs[i].0.dims()[1], i));
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for &i in &order {
+        match groups.last_mut() {
+            Some(g)
+                if (g.len() + 1) * exs[g[0]].0.dims()[1]
+                    <= DOTS_BUCKET_PADDED_TOKEN_BUDGET_CAPS_ACTIVATION_PEAK_WHILE_CUTTING_PER_LAUNCH_OVERHEAD =>
+            {
+                g.push(i)
+            }
+            _ => groups.push(vec![i]),
+        }
+    }
+    groups
+        .iter()
+        .map(|g| build_bucket(exs, g, device))
+        .collect()
+}
+
+fn build_bucket(exs: &[Ex], idxs: &[usize], device: &Device) -> Result<DotsBucket> {
+    let tp = exs[idxs[0]].0.dims()[1];
+    let mut hs: Vec<Tensor> = Vec::with_capacity(idxs.len());
+    let mut tgt_ids: Vec<u32> = Vec::with_capacity(idxs.len() * tp);
+    let mut weights: Vec<f32> = Vec::with_capacity(idxs.len() * tp);
+    for &i in idxs {
+        let (h, _, tgt, mask) = &exs[i];
+        let t = h.dims()[1];
+        ensure!(
+            t <= tp,
+            "bucket rows must be length-sorted: {t} > padded {tp}"
+        );
+        hs.push(if t < tp {
+            let pad = Tensor::zeros((1, tp - t, h.dims()[2]), h.dtype(), h.device())?;
+            Tensor::cat(&[h, &pad], 1)?
+        } else {
+            h.clone()
+        });
+        let mut ids = tgt.to_vec1::<u32>()?;
+        ids.resize(tp, 0);
+        tgt_ids.extend(ids);
+        let unmasked: f32 = mask.iter().sum();
+        ensure!(
+            unmasked > 0.0,
+            "example {i}: every target position is masked"
+        );
+        weights.extend(mask.iter().map(|w| w / unmasked));
+        weights.extend(std::iter::repeat_n(0.0f32, tp - t));
+    }
+    Ok(DotsBucket {
+        h: Tensor::cat(&hs, 0)?,
+        positions: flat_positions(idxs.len(), tp, device)?,
+        tgt: Tensor::from_vec(tgt_ids, idxs.len() * tp, device)?,
+        row_mean_weights: Tensor::from_vec(weights, idxs.len() * tp, device)?,
+        rows: idxs.len(),
+        padded_t: tp,
+    })
+}
+
+pub const DOTS_HEAD_CE_ROW_CHUNK_KEEPS_ONE_VOCAB_LOGITS_SLICE_LIVE_AT_A_TIME: usize = 256;
+
+pub fn head_ce_chunk_rows_overridable_for_reladdering_because_chunking_reassociates_the_loss_sum(
+) -> usize {
+    std::env::var("NV_DOTS_HEAD_CE_CHUNK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&c: &usize| c > 0)
+        .unwrap_or(DOTS_HEAD_CE_ROW_CHUNK_KEEPS_ONE_VOCAB_LOGITS_SLICE_LIVE_AT_A_TIME)
+}
+
+#[cfg(feature = "metal")]
+fn w4_fused_chunk_partial(
+    lm_head: &DotsHeadWeight,
+    xc: &Tensor,
+    tgt_c: &Tensor,
+    w_c: &Tensor,
+) -> Result<Option<Tensor>> {
+    match lm_head.w4_fused() {
+        Some(h) => Ok(Some(
+            crate::dots_w4head::fused_ce_rows(h, &xc.contiguous()?, tgt_c, w_c)?.sum_all()?,
+        )),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+fn w4_fused_chunk_partial(
+    _lm_head: &DotsHeadWeight,
+    _xc: &Tensor,
+    _tgt_c: &Tensor,
+    _w_c: &Tensor,
+) -> Result<Option<Tensor>> {
+    Ok(None)
+}
+
+fn bucket_head_loss_and_boundary_grad(
+    final_norm: &RmsNorm,
+    lm_head: &DotsHeadWeight,
+    vocab: usize,
+    b: &DotsBucket,
+    hv: &Var,
+) -> Result<(f32, Tensor)> {
+    let n = b.rows * b.padded_t;
+    let hidden = hv.as_tensor().dims()[2];
+    let flat = hv.as_tensor().reshape((n, hidden))?;
+    let mut loss_sum: Option<Tensor> = None;
+    let mut grad_head: Option<Tensor> = None;
+    let mut start = 0usize;
+    let chunk =
+        head_ce_chunk_rows_overridable_for_reladdering_because_chunking_reassociates_the_loss_sum();
+    while start < n {
+        let len = chunk.min(n - start);
+        let xc = final_norm.forward_candle(&flat.narrow(0, start, len)?)?;
+        let tgt_c = b.tgt.narrow(0, start, len)?;
+        let w_c = b.row_mean_weights.narrow(0, start, len)?;
+        let partial = match w4_fused_chunk_partial(lm_head, &xc, &tgt_c, &w_c)? {
+            Some(p) => p,
+            None => {
+                let logits = lm_head
+                    .forward(&xc)?
+                    .reshape((len, vocab))?
+                    .to_dtype(DType::F32)?;
+                let logp = candle_nn::ops::log_softmax(&logits, candle_core::D::Minus1)?;
+                let picked = logp.gather(&tgt_c.unsqueeze(1)?, 1)?.squeeze(1)?;
+                picked.mul(&w_c)?.sum_all()?.neg()?
+            }
+        };
+        let gs = partial.backward()?;
+        let g = gs
+            .get(hv.as_tensor())
+            .ok_or_else(|| anyhow::anyhow!("no grad for the chunked head boundary"))?;
+        grad_head = Some(match grad_head.take() {
+            Some(a) => a.add(g)?,
+            None => g.clone(),
+        });
+        loss_sum = Some(match loss_sum.take() {
+            Some(a) => a.add(&partial.detach())?,
+            None => partial.detach(),
+        });
+        start += len;
+    }
+    let lv = loss_sum
+        .ok_or_else(|| anyhow::anyhow!("empty bucket has no head loss"))?
+        .to_scalar::<f32>()?;
+    let grad = grad_head.expect("chunk loop ran at least once so the boundary grad exists");
+    Ok((lv, grad))
+}
+
+pub const DOTS_LIVE_BUCKET_GRAPH_DELETES_THE_CHECKPOINT_REFORWARD_AND_REASSOCIATES_GRADS: &str =
+    "the qlora step profile priced the per-layer checkpoint re-forward at 1.08 s/step (26 \
+     percent), so the default bucket backward keeps the whole grad-layer graph live through one \
+     forward and runs one surrogate backward from the head boundary; the chunked head CE still \
+     sees a detached boundary Var, so the head phase is unchanged, but layer grads flow through \
+     one autograd pass instead of eight isolated surrogate backwards and may reassociate \
+     (non-bitwise vs the checkpointed path). NV_DOTS_QLORA_CHECKPOINT=1 restores the \
+     re-forwarding per-layer backward and its lower activation footprint";
+
+fn bucket_loss_and_grads_live_graph(
+    window: &[DotsTrainLayer],
+    final_norm: &RmsNorm,
+    lm_head: &DotsHeadWeight,
+    rope: &Rope,
+    vocab: usize,
+    b: &DotsBucket,
+    vars: &[Var],
+) -> Result<(f32, Vec<Option<Tensor>>)> {
+    let mut x = b.h.detach();
+    for layer in window {
+        x = layer.forward(&x, rope, &b.positions)?;
+    }
+    let hv = Var::from_tensor(&x.detach())?;
+    let (lv, grad_boundary) =
+        bucket_head_loss_and_boundary_grad(final_norm, lm_head, vocab, b, &hv)?;
+    let surrogate = x
+        .to_dtype(DType::F32)?
+        .mul(&grad_boundary.detach().to_dtype(DType::F32)?)?
+        .sum_all()?;
+    let gs = surrogate.backward()?;
+    Ok((lv, vars.iter().map(|v| gs.get(v).cloned()).collect()))
+}
+
+fn bucket_loss_and_grads_checkpointed(
+    window: &[DotsTrainLayer],
+    final_norm: &RmsNorm,
+    lm_head: &DotsHeadWeight,
+    rope: &Rope,
+    vocab: usize,
+    b: &DotsBucket,
+    vars: &[Var],
+) -> Result<(f32, Vec<Option<Tensor>>)> {
+    let mut boundaries: Vec<Tensor> = Vec::with_capacity(window.len() + 1);
+    boundaries.push(b.h.detach());
+    for layer in window {
+        let out = layer
+            .forward(boundaries.last().unwrap(), rope, &b.positions)?
+            .detach();
+        boundaries.push(out);
+    }
+    let hv = Var::from_tensor(boundaries.last().unwrap())?;
+    let (lv, mut grad_next) =
+        bucket_head_loss_and_boundary_grad(final_norm, lm_head, vocab, b, &hv)?;
+    let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
+    for li in (0..window.len()).rev() {
+        let inp = Var::from_tensor(&boundaries[li])?;
+        let out = window[li].forward(inp.as_tensor(), rope, &b.positions)?;
+        let surrogate = out
+            .to_dtype(DType::F32)?
+            .mul(&grad_next.detach().to_dtype(DType::F32)?)?
+            .sum_all()?;
+        let layer_gs = surrogate.backward()?;
+        for (vi, v) in vars.iter().enumerate() {
+            if let Some(g) = layer_gs.get(v) {
+                let g = g.clone();
+                acc[vi] = Some(match acc[vi].take() {
+                    Some(a) => a.add(&g.to_dtype(a.dtype())?)?,
+                    None => g,
+                });
+            }
+        }
+        grad_next = layer_gs
+            .get(inp.as_tensor())
+            .cloned()
+            .with_context(|| format!("no grad for checkpointed window layer {li} input"))?;
+    }
+    Ok((lv, acc))
+}
+
+fn dots_logits_f32_after_head(
+    final_norm: &RmsNorm,
+    lm_head: &DotsHeadWeight,
+    x: &Tensor,
+    vocab: usize,
+) -> Result<Tensor> {
+    let t = x.dims()[1];
+    let x = final_norm.forward_candle(x)?;
+    Ok(lm_head
+        .forward(&x)?
+        .reshape((t, vocab))?
+        .to_dtype(DType::F32)?)
+}
+
 fn detached_window_output(
     window: &[DotsTrainLayer],
     rope: &Rope,
@@ -592,7 +1053,7 @@ fn detached_window_output(
 fn per_row_ce(
     window: &[DotsTrainLayer],
     final_norm: &RmsNorm,
-    lm_head: &Linear,
+    lm_head: &DotsHeadWeight,
     rope: &Rope,
     vocab: usize,
     exs: &[Ex],
@@ -600,7 +1061,7 @@ fn per_row_ce(
     exs.iter()
         .map(|(h, positions, tgt, mask)| {
             let x = detached_window_output(window, rope, h, positions)?;
-            let logits = logits_f32_after_head(final_norm, lm_head, &x, vocab)?;
+            let logits = dots_logits_f32_after_head(final_norm, lm_head, &x, vocab)?;
             Ok(crate::ce_mean_over_unmasked_positions(&logits, tgt, mask)?.to_scalar::<f32>()?)
         })
         .collect()
@@ -613,7 +1074,8 @@ fn dots_train_steps(
     lr: f64,
     b_lr_ratio: f64,
     n_examples: usize,
-    mut loss_and_grads_for_example: impl FnMut(usize) -> Result<(f32, Vec<Option<Tensor>>)>,
+    n_units: usize,
+    mut loss_sum_and_grads_for_unit: impl FnMut(usize) -> Result<(f32, Vec<Option<Tensor>>)>,
 ) -> Result<(Vec<f32>, Vec<f64>, bool)> {
     let mut losses: Vec<f32> = Vec::with_capacity(steps);
     let mut step_seconds: Vec<f64> = Vec::with_capacity(steps);
@@ -629,10 +1091,10 @@ fn dots_train_steps(
         let t0 = std::time::Instant::now();
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut loss_sum = 0f32;
-        for i in 0..n_examples {
-            let (lv, grads) = loss_and_grads_for_example(i)?;
+        for i in 0..n_units {
+            let (lv, grads) = loss_sum_and_grads_for_unit(i)?;
             if !lv.is_finite() {
-                eprintln!("[dots-lora-train] step {step} example {i}: FORWARD loss non-finite");
+                eprintln!("[dots-lora-train] step {step} unit {i}: FORWARD loss non-finite");
             }
             if fence_examples_on_metal {
                 for (vi, g) in grads.iter().enumerate() {
@@ -650,7 +1112,7 @@ fn dots_train_steps(
                             None => ("?", "?"),
                         };
                         eprintln!(
-                            "[dots-lora-train] step {step} example {i}: finite loss {lv:.6} \
+                            "[dots-lora-train] step {step} unit {i}: finite loss {lv:.6} \
                              but grad var {vi} ({name} lora_{half}) is non-finite"
                         );
                     }
@@ -746,8 +1208,59 @@ pub const METAL_PER_EXAMPLE_GRAD_READBACK_IS_AN_OPT_IN_ATTRIBUTION_PROBE: &str =
      It was the fence and the instrument that localized the strided-reduce bug; with the kernel \
      fixed it is a ~2 percent diagnostic, off by default.";
 
+pub const METAL_PER_OP_ENCODER_OVERHEAD_DOMINATES_THE_STEP_SO_DOTS_BATCHES_FOUR_OPS_PER_COMMAND_BUFFER:
+    &str =
+    "the qlora 4-bit step profile brackets ~80 percent of the step as candle-Metal per-op \
+     encoder plus fence overhead, not arithmetic, and the command-batching ladder \
+     (CANDLE_METAL_COMPUTE_PER_BUFFER 500/50/10/4/2/1) is loss-bit-identical at every rung \
+     with its knee at 4: 4.16 -> 3.6 s/step on the n25 basis. The dots entrypoints default \
+     the env to 4 before metal device creation (the backend reads it once, at Commands::new); \
+     a caller-set value always wins.";
+
+pub const FUSION_LEVERS_ARE_BITWISE_SO_THE_DOTS_ENTRYPOINTS_DEFAULT_THEM_ON: &str =
+    "the R3 census found the step's largest hidden cost was a host position round-trip \
+     draining the whole Metal queue 96x/step; the four levers (resident rope positions, \
+     fused rope kernel with exact rounding and GradStore order, transposed lora factor \
+     views, resident attn mask/scale caches) each reproduce the canonical trajectory \
+     bit-identically alone and composed, so they default on at the dots entrypoints with \
+     caller-set values winning; the composed arm's command-batching knee moved from 4 to 8. \
+     Composed default on the n25 basis: 1.47 s/step at 16.5 GB peak (was 1.98 at 14.2); \
+     NV_DOTS_QLORA_CHECKPOINT=1 stays the low-memory escape and each lever env unwinds \
+     individually.";
+
+pub const THE_CER_BLESSING_FLIPPED_THE_REASSOCIATING_ARMS_ON_BYTE_IDENTICAL_OCR_OUTPUT: &str =
+    "the named corpus instrument ran on adapters trained under each arm (identical serving \
+     path, only the adapter differing): OCR hypotheses byte-identical on every held-out and \
+     every train row, markup-neutral CER 0.0 both arms, so the w4 fused head and grouped-GQA \
+     attention default on and the canonical trajectory re-pins to the composed arm's (still \
+     deterministic to every digit across reps). The pre-blessing bit-exact path remains one \
+     env away (NV_DOTS_QLORA_W4HEAD=0 NV_ATTN_GQA_GROUPED=0 reproduces 1.47 s/step and the \
+     prior canonical exactly).";
+
+pub fn metal_command_batching_default() {
+    let _ = METAL_PER_OP_ENCODER_OVERHEAD_DOMINATES_THE_STEP_SO_DOTS_BATCHES_FOUR_OPS_PER_COMMAND_BUFFER;
+    let _ = FUSION_LEVERS_ARE_BITWISE_SO_THE_DOTS_ENTRYPOINTS_DEFAULT_THEM_ON;
+    let _ = THE_CER_BLESSING_FLIPPED_THE_REASSOCIATING_ARMS_ON_BYTE_IDENTICAL_OCR_OUTPUT;
+    for (key, val) in [
+        ("CANDLE_METAL_COMPUTE_PER_BUFFER", "8"),
+        ("NV_ROPE_POS_RESIDENT", "1"),
+        ("NV_DOTS_ROPE_FUSED", "1"),
+        ("NV_DOTS_LORA_TVIEW", "1"),
+        ("NV_ATTN_RESIDENT", "1"),
+        ("NV_ATTN_GQA_GROUPED", "1"),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, val);
+        }
+    }
+}
+
 pub fn run(args: &DotsTrainArgs, device: &Device) -> Result<DotsTrainSummary> {
-    let _ = METAL_NON_FINITE_GRADS_WERE_A_RANK5_STRIDED_REDUCE_OOB_NOT_A_RACE_SO_THE_WALK_RUNS_UNSYNCED;
+    if device.is_metal() && std::env::var_os("NV_DOTS_QLORA_W4HEAD").is_none() {
+        std::env::set_var("NV_DOTS_QLORA_W4HEAD", "1");
+    }
+    let _ =
+        METAL_NON_FINITE_GRADS_WERE_A_RANK5_STRIDED_REDUCE_OOB_NOT_A_RACE_SO_THE_WALK_RUNS_UNSYNCED;
     let cfg = DotsConfig::from_hf_json_file(&args.base.join("config.json"))?;
     ensure!(
         args.grad_layers >= 1 && args.grad_layers <= cfg.num_hidden_layers,
@@ -808,16 +1321,17 @@ pub fn run(args: &DotsTrainArgs, device: &Device) -> Result<DotsTrainSummary> {
         src.norm_gamma(DOTS_FINAL_NORM, args.dtype)?,
         cfg.rms_norm_eps,
     );
-    let lm_head = src.dense_linear(
-        DOTS_LM_HEAD_MODULE,
-        cfg.vocab_size,
-        cfg.hidden_size,
-        false,
-        args.dtype,
-    )?;
+    let lm_head = DotsHeadWeight::from_weights(&src, &cfg, args.dtype)?;
     let window_build_seconds = t_window.elapsed().as_secs_f64();
 
-    let eval_ce_base = per_row_ce(&window, &final_norm, &lm_head, &rope, cfg.vocab_size, &eval_exs)?;
+    let eval_ce_base = per_row_ce(
+        &window,
+        &final_norm,
+        &lm_head,
+        &rope,
+        cfg.vocab_size,
+        &eval_exs,
+    )?;
 
     let lcfg = LoraConfig {
         r: args.rank,
@@ -826,6 +1340,9 @@ pub fn run(args: &DotsTrainArgs, device: &Device) -> Result<DotsTrainSummary> {
     };
     let (loras, vars) = attach_dots_window_loras(&window, &args.targets, lcfg, args.seed, device)?;
 
+    let buckets = pack_length_sorted_buckets(&exs, device)?;
+    let _ = DOTS_LIVE_BUCKET_GRAPH_DELETES_THE_CHECKPOINT_REFORWARD_AND_REASSOCIATES_GRADS;
+    let checkpointed = std::env::var("NV_DOTS_QLORA_CHECKPOINT").as_deref() == Ok("1");
     let (losses, step_seconds, all_grads_finite) = dots_train_steps(
         &vars,
         &loras,
@@ -833,20 +1350,40 @@ pub fn run(args: &DotsTrainArgs, device: &Device) -> Result<DotsTrainSummary> {
         args.lr,
         args.b_lr_ratio,
         exs.len(),
+        buckets.len(),
         |i| {
-            let (h, positions, tgt, mask) = &exs[i];
-            let mut x = h.detach();
-            for layer in &window {
-                x = layer.forward(&x, &rope, positions)?;
+            if checkpointed {
+                bucket_loss_and_grads_checkpointed(
+                    &window,
+                    &final_norm,
+                    &lm_head,
+                    &rope,
+                    cfg.vocab_size,
+                    &buckets[i],
+                    &vars,
+                )
+            } else {
+                bucket_loss_and_grads_live_graph(
+                    &window,
+                    &final_norm,
+                    &lm_head,
+                    &rope,
+                    cfg.vocab_size,
+                    &buckets[i],
+                    &vars,
+                )
             }
-            let logits = logits_f32_after_head(&final_norm, &lm_head, &x, cfg.vocab_size)?;
-            let loss = crate::ce_mean_over_unmasked_positions(&logits, tgt, mask)?;
-            loss_and_grads_from_one_backward(loss, &vars)
         },
     )?;
 
-    let eval_ce_adapter =
-        per_row_ce(&window, &final_norm, &lm_head, &rope, cfg.vocab_size, &eval_exs)?;
+    let eval_ce_adapter = per_row_ce(
+        &window,
+        &final_norm,
+        &lm_head,
+        &rope,
+        cfg.vocab_size,
+        &eval_exs,
+    )?;
 
     let (entries, min_amax, max_amax) = collect_raw_entries(&loras)?;
     crate::save_peft_raw(
@@ -886,7 +1423,10 @@ pub fn write_dump_sample(
     vision_start: usize,
     completion_start: usize,
 ) -> Result<()> {
-    ensure!(rows.len() % hidden == 0, "rows length not a hidden multiple");
+    ensure!(
+        rows.len().is_multiple_of(hidden),
+        "rows length not a hidden multiple"
+    );
     let n_vis = rows.len() / hidden;
     ensure!(
         ids.len() >= 2 && vision_start + n_vis < completion_start && completion_start < ids.len(),

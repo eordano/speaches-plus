@@ -335,7 +335,10 @@ pub fn diag_write(env: &str, line: &str) {
 }
 
 fn pipeline_log(label: &str, entry: &str) {
-    diag_write("NV_WGPU_PIPELINE_LOG", &format!("[pipeline] {label}:{entry}"));
+    diag_write(
+        "NV_WGPU_PIPELINE_LOG",
+        &format!("[pipeline] {label}:{entry}"),
+    );
 }
 
 pub const RECLAIM_POLL_ENV: &str = "NV_WGPU_RECLAIM_POLL";
@@ -374,9 +377,8 @@ pub fn buffer_census(ctx: &WgpuContext) -> String {
         e.0 += 1;
         e.1 += a.size;
     }
-    let mut rows: Vec<(String, usize, u64)> =
-        by.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    let mut rows: Vec<(String, usize, u64)> = by.into_iter().map(|(k, (n, b))| (k, n, b)).collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.2));
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -437,8 +439,8 @@ pub fn unchecked_shaders_opted_in() -> bool {
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call(UNCHECKED_SHADERS_ENV)
 }
 
-static UNCHECKED_SHADERS_ARM_ANNOUNCED_ONCE_SO_A_LOG_PROVES_THE_ARM_ENGAGED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static UNCHECKED_SHADERS_ARM_ANNOUNCED_ONCE_SO_A_LOG_PROVES_THE_ARM_ENGAGED:
+    std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn announce_unchecked_shaders_once() {
     if !UNCHECKED_SHADERS_ARM_ANNOUNCED_ONCE_SO_A_LOG_PROVES_THE_ARM_ENGAGED
@@ -452,11 +454,102 @@ fn announce_unchecked_shaders_once() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+pub const WASM_INJECTS_ENABLE_SUBGROUPS_AT_THE_MODULE_CHOKE_POINT_BECAUSE_TINT_REQUIRES_THE_DIRECTIVE:
+    &str =
+    "Tint rejects any module carrying subgroup builtins without a module-level 'enable \
+     subgroups;', naga rejects the directive at parse, and browser pipeline errors are \
+     fire-and-forget (pop_scope drops on wasm) so a rejected module silently no-ops every \
+     dispatch; injecting here covers every module -- including the ad-hoc gemv/gemm affine \
+     sources that never pass through a model's Sources struct -- and only in the wasm build, \
+     so native sources stay byte-identical";
+
+#[cfg(target_arch = "wasm32")]
+pub const WASM_REWRITES_NONFINITE_CONST_BITCASTS_BECAUSE_TINT_REJECTS_CONST_EVAL_TO_NAN: &str =
+    "WGSL makes a const-expression evaluating to a non-finite value a shader-creation error and \
+     Tint enforces it ('value nan cannot be represented as f32') while naga accepts the same \
+     source, so the wasm build routes every known non-finite const bitcast spelling through a \
+     runtime helper whose user-function call can never be const-evaluated; same bits, same \
+     values, native sources untouched";
+
+#[cfg(target_arch = "wasm32")]
+const WASM_NONFINITE_BITCAST_SPELLINGS: [(&str, &str); 5] = [
+    ("bitcast<f32>(F32_QNAN)", "nvw_nonfinite(0x7fc00000u)"),
+    ("bitcast<f32>(0x7fc00000u)", "nvw_nonfinite(0x7fc00000u)"),
+    ("bitcast<f32>(F32_INF)", "nvw_nonfinite(0x7f800000u)"),
+    ("bitcast<f32>(0x7f800000u)", "nvw_nonfinite(0x7f800000u)"),
+    ("bitcast<f32>(0xff800000u)", "nvw_nonfinite(0xff800000u)"),
+];
+
+#[cfg(target_arch = "wasm32")]
+pub const WASM_REWRITES_THE_NEG_MAX_LITERAL_TO_ITS_EXACT_HEX_TWIN_TINT_REJECTS_THE_ROUNDING: &str =
+    "the decimal spelling 3.4028235e38 exceeds f32::MAX by rounding and Tint rejects an \
+     abstract-float literal outside the finite range while naga rounds it to f32::MAX; the hex \
+     literal 0x1.fffffep+127 IS f32::MAX exactly, so the rewrite is bit-identical to what naga \
+     compiles natively";
+
+#[cfg(target_arch = "wasm32")]
+const WASM_F32_MAX_LITERAL_REWRITE: (&str, &str) = ("3.4028235e38", "0x1.fffffep+127");
+
+#[cfg(target_arch = "wasm32")]
+pub const WASM_TURNS_OFF_TINT_SUBGROUP_UNIFORMITY_TO_MATCH_NAGA_WHICH_DOES_NOT_ANALYZE_IT: &str =
+    "Tint's subgroup_uniformity diagnostic rejects subgroup builtins reached through \
+     reconverged non-uniform control flow that every shipped native kernel already executes \
+     correctly on Metal; diagnostic(off, subgroup_uniformity) downgrades exactly that analysis \
+     and an unrecognized rule name only warns, so the directive is safe to inject wherever the \
+     enable directive goes";
+
+#[cfg(target_arch = "wasm32")]
+const WASM_NONFINITE_HELPER: &str =
+    "\nfn nvw_nonfinite(bits: u32) -> f32 {\n    var b = bits;\n    return bitcast<f32>(b);\n}\n";
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_sg_injected<'a>(ctx: &WgpuContext, source: &'a str) -> std::borrow::Cow<'a, str> {
+    let _ =
+        WASM_INJECTS_ENABLE_SUBGROUPS_AT_THE_MODULE_CHOKE_POINT_BECAUSE_TINT_REQUIRES_THE_DIRECTIVE;
+    let _ = WASM_REWRITES_NONFINITE_CONST_BITCASTS_BECAUSE_TINT_REJECTS_CONST_EVAL_TO_NAN;
+    let _ = WASM_REWRITES_THE_NEG_MAX_LITERAL_TO_ITS_EXACT_HEX_TWIN_TINT_REJECTS_THE_ROUNDING;
+    let _ = WASM_TURNS_OFF_TINT_SUBGROUP_UNIFORMITY_TO_MATCH_NAGA_WHICH_DOES_NOT_ANALYZE_IT;
+    let nonfinite = WASM_NONFINITE_BITCAST_SPELLINGS
+        .iter()
+        .any(|(from, _)| source.contains(from));
+    let overmax = source.contains(WASM_F32_MAX_LITERAL_REWRITE.0);
+    let sg_used = ctx.caps.subgroup && source.contains("subgroup");
+    if !nonfinite && !overmax && !sg_used {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut s = source.to_string();
+    if nonfinite {
+        for (from, to) in WASM_NONFINITE_BITCAST_SPELLINGS {
+            s = s.replace(from, to);
+        }
+        s.push_str(WASM_NONFINITE_HELPER);
+    }
+    if overmax {
+        s = s.replace(
+            WASM_F32_MAX_LITERAL_REWRITE.0,
+            WASM_F32_MAX_LITERAL_REWRITE.1,
+        );
+    }
+    if sg_used {
+        let directives = "enable subgroups;\ndiagnostic(off, subgroup_uniformity);\n";
+        s = match s.strip_prefix("enable subgroups;\n") {
+            Some(rest) => format!("{directives}{rest}"),
+            None => format!("{directives}{s}"),
+        };
+    }
+    std::borrow::Cow::Owned(s)
+}
+
 pub fn create_module_honoring_unchecked_optin(
     ctx: &WgpuContext,
     label: &str,
     source: &str,
 ) -> wgpu::ShaderModule {
+    #[cfg(target_arch = "wasm32")]
+    let source = wasm_sg_injected(ctx, source);
+    #[cfg(target_arch = "wasm32")]
+    let source: &str = &source;
     let desc = wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -537,7 +630,7 @@ pub fn compute_pipeline_opts(
             },
             cache: None,
         });
-    if let Some(err) = pollster::block_on(scope.pop()) {
+    if let Some(err) = pop_scope(scope) {
         return Err(WgpuError::ShaderCompile(format!("{label}::{entry}: {err}")));
     }
     Ok(pipeline)
@@ -604,7 +697,7 @@ pub fn dispatch(
         pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
     }
     ctx.queue.submit([enc.finish()]);
-    if let Some(err) = pollster::block_on(scope.pop()) {
+    if let Some(err) = pop_scope(scope) {
         return Err(WgpuError::ShaderCompile(format!("dispatch: {err}")));
     }
     Ok(())
@@ -1088,12 +1181,56 @@ pub fn profile_inpass_low_distortion_requested() -> bool {
 
 pub const SUBMIT_CHUNK_ENV: &str = "NV_WGPU_SUBMIT_CHUNK";
 
+pub const SUBMIT_CHUNK_UNSET_RESOLVES_TO_32_SIGNED_OFF_2026_09_02_SAFE_EVERYWHERE_MEASURED_GAINS_GPT_OSS_G4MOE_ONLY_EQ_0_RESTORES_THE_SINGLE_END_OF_STEP_SUBMIT: usize = 32;
+
 pub fn submit_chunk_overlapping_encode_with_execution() -> Option<usize> {
-    std::env::var(SUBMIT_CHUNK_ENV)
-        .ok()?
-        .parse::<usize>()
-        .ok()
-        .filter(|k| *k > 0)
+    match std::env::var(SUBMIT_CHUNK_ENV) {
+        Err(std::env::VarError::NotPresent) => {
+            Some(SUBMIT_CHUNK_UNSET_RESOLVES_TO_32_SIGNED_OFF_2026_09_02_SAFE_EVERYWHERE_MEASURED_GAINS_GPT_OSS_G4MOE_ONLY_EQ_0_RESTORES_THE_SINGLE_END_OF_STEP_SUBMIT)
+        }
+        Err(std::env::VarError::NotUnicode(_)) => None,
+        Ok(v) => v.parse::<usize>().ok().filter(|k| *k > 0),
+    }
+}
+
+#[cfg(test)]
+mod submit_chunk_default_tests {
+    use super::{
+        submit_chunk_overlapping_encode_with_execution, SUBMIT_CHUNK_ENV,
+        SUBMIT_CHUNK_UNSET_RESOLVES_TO_32_SIGNED_OFF_2026_09_02_SAFE_EVERYWHERE_MEASURED_GAINS_GPT_OSS_G4MOE_ONLY_EQ_0_RESTORES_THE_SINGLE_END_OF_STEP_SUBMIT as DEFAULT_CHUNK,
+    };
+
+    #[test]
+    fn unset_resolves_to_32_eq_0_restores_the_single_submit_and_explicit_values_keep_their_meaning()
+    {
+        std::env::remove_var(SUBMIT_CHUNK_ENV);
+        assert_eq!(DEFAULT_CHUNK, 32);
+        assert_eq!(
+            submit_chunk_overlapping_encode_with_execution(),
+            Some(DEFAULT_CHUNK),
+            "unset must resolve to the signed-off chunked default, closing the harness-uniformity \
+             hazard where wgpu rows silently inherited different chunking"
+        );
+        std::env::set_var(SUBMIT_CHUNK_ENV, "0");
+        assert_eq!(
+            submit_chunk_overlapping_encode_with_execution(),
+            None,
+            "explicit =0 is the kept escape back to the old single end-of-step submit"
+        );
+        std::env::set_var(SUBMIT_CHUNK_ENV, "13");
+        assert_eq!(submit_chunk_overlapping_encode_with_execution(), Some(13));
+        std::env::set_var(SUBMIT_CHUNK_ENV, "512");
+        assert_eq!(submit_chunk_overlapping_encode_with_execution(), Some(512));
+        std::env::set_var(SUBMIT_CHUNK_ENV, "not-a-number");
+        assert_eq!(
+            submit_chunk_overlapping_encode_with_execution(),
+            None,
+            "an explicitly set unparsable value keeps its pre-flip single-submit meaning"
+        );
+        std::env::set_var(SUBMIT_CHUNK_ENV, "");
+        assert_eq!(submit_chunk_overlapping_encode_with_execution(), None);
+        std::env::remove_var(SUBMIT_CHUNK_ENV);
+    }
 }
 
 pub fn submit_pass_list<'a, I>(ctx: &WgpuContext, passes: I)
@@ -1345,7 +1482,7 @@ impl<'a> Chain<'a> {
         }
         self.passes.clear();
         self.labels.clear();
-        if let Some(err) = pollster::block_on(scope.pop()) {
+        if let Some(err) = pop_scope(scope) {
             return Err(WgpuError::ShaderCompile(format!("chain submit: {err}")));
         }
         Ok(())
@@ -1439,7 +1576,7 @@ impl Recorded {
             ctx.queue.submit([enc.finish()]);
         }
         if let Some(scope) = scope {
-            if let Some(err) = pollster::block_on(scope.pop()) {
+            if let Some(err) = pop_scope(scope) {
                 return Err(WgpuError::ShaderCompile(format!("recorded replay: {err}")));
             }
             self.validated = true;
@@ -1476,7 +1613,7 @@ impl Recorded {
         }
         ctx.queue.submit([enc.finish()]);
         if let Some(scope) = scope {
-            if let Some(err) = pollster::block_on(scope.pop()) {
+            if let Some(err) = pop_scope(scope) {
                 return Err(WgpuError::ShaderCompile(format!(
                     "recorded replay_n: {err}"
                 )));
@@ -1517,10 +1654,189 @@ pub fn read_back_at<T: bytemuck::Pod>(
     offset: usize,
     len: usize,
 ) -> Result<Vec<T>> {
+    read_back_begin::<T>(ctx, buffer, offset, len)?.blocking(ctx)
+}
+
+pub const POP_BLOCKS_ON_NATIVE_AND_POPS_ASYNC_ON_WASM_LOGGING_NV_GPU_ERR_TO_THE_CONSOLE: &str =
+    "pollster cannot park the browser event loop, so the wasm arm issues the pop synchronously \
+     (error scopes are a thread-local LIFO stack -- a deferred pop interleaves with later \
+     pushes and panics wgpu) and spawns the resulting future, logging any captured error as an \
+     NV_GPU_ERR| console.error line; without this a rejected pipeline is created as an invalid \
+     object whose dispatches silently no-op, exactly the garbage-forward failure the q38 \
+     browser parity gate caught";
+
+pub fn pop_scope(scope: wgpu::ErrorScopeGuard) -> Option<wgpu::Error> {
+    let _ = POP_BLOCKS_ON_NATIVE_AND_POPS_ASYNC_ON_WASM_LOGGING_NV_GPU_ERR_TO_THE_CONSOLE;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        pollster::block_on(scope.pop())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let popped = scope.pop();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(e) = popped.await {
+                let msg = wasm_bindgen::JsValue::from_str(&format!("NV_GPU_ERR|{e}"));
+                if let Ok(console) = js_sys::Reflect::get(
+                    &js_sys::global(),
+                    &wasm_bindgen::JsValue::from_str("console"),
+                ) {
+                    if let Ok(error) =
+                        js_sys::Reflect::get(&console, &wasm_bindgen::JsValue::from_str("error"))
+                    {
+                        let f: js_sys::Function = error.into();
+                        let _ = f.call1(&console, &msg);
+                    }
+                }
+            }
+        });
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadbackArm {
+    Blocking,
+    Pumped,
+}
+
+pub const BLOCKING_ARM_FUTURES_FINISH_ON_THE_FIRST_POLL_SO_A_NOOP_WAKER_DRIVES_THEM: &str =
+    "with ReadbackArm::Blocking every await resolves synchronously (the readback blocks inside \
+     the future), so one poll with a noop waker completes the whole future and the native \
+     entry points stay plain fns over the shared async bodies";
+
+pub fn drive_blocking<F: std::future::Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(v) => v,
+        std::task::Poll::Pending => unreachable!(
+            "{}",
+            BLOCKING_ARM_FUTURES_FINISH_ON_THE_FIRST_POLL_SO_A_NOOP_WAKER_DRIVES_THEM
+        ),
+    }
+}
+
+struct MapState {
+    result: Option<std::result::Result<(), wgpu::BufferAsyncError>>,
+    waker: Option<std::task::Waker>,
+}
+
+pub struct PendingReadback {
+    staging: Option<wgpu::Buffer>,
+    shared: std::sync::Arc<std::sync::Mutex<MapState>>,
+}
+
+pub const PUMP_SELF_WAKES_ON_NATIVE_BECAUSE_MAP_CALLBACKS_FIRE_ONLY_INSIDE_DEVICE_POLL: &str =
+    "on native no one else drives the device, so the pump future calls \
+     device.poll(PollType::Poll) and re-wakes itself every poll until the map callback lands; \
+     on wasm the browser resolves the map and a self-wake would spin the microtask queue and \
+     starve the very event loop that delivers it, so the wasm arm parks on the callback's wake \
+     alone";
+
+fn lock_map(
+    shared: &std::sync::Arc<std::sync::Mutex<MapState>>,
+) -> std::sync::MutexGuard<'_, MapState> {
+    shared.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn take_mapped<T: bytemuck::Pod>(staging: &wgpu::Buffer) -> Result<Vec<T>> {
+    let slice = staging.slice(..);
+    let view = slice
+        .get_mapped_range()
+        .map_err(|e| WgpuError::Readback(format!("mapped range: {e}")))?;
+    let out = bytemuck::cast_slice::<u8, T>(&view).to_vec();
+    drop(view);
+    staging.unmap();
+    Ok(out)
+}
+
+const BLOCKING_LOOPS_THE_POLL_BECAUSE_A_SIBLING_THREADS_POLL_CAN_CONSUME_THE_COMPLETION: &str =
+    "under parallel native threads another thread's device poll may process this buffer's map \
+     completion just after our poll returns empty-handed, so one poll_blocking is a race: loop \
+     until the callback result lands, bounded so a genuinely dead device still errors instead \
+     of hanging";
+
+impl PendingReadback {
+    pub fn blocking<T: bytemuck::Pod>(self, ctx: &WgpuContext) -> Result<Vec<T>> {
+        let _ = BLOCKING_LOOPS_THE_POLL_BECAUSE_A_SIBLING_THREADS_POLL_CAN_CONSUME_THE_COMPLETION;
+        let Some(staging) = self.staging else {
+            return Ok(Vec::new());
+        };
+        let mut result = None;
+        for _ in 0..4096 {
+            ctx.poll_blocking()?;
+            result = lock_map(&self.shared).result.take();
+            if result.is_some() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        result
+            .ok_or_else(|| {
+                WgpuError::Readback(
+                    "map callback never fired across a bounded blocking poll loop".to_string(),
+                )
+            })?
+            .map_err(|e| WgpuError::Readback(format!("map: {e}")))?;
+        take_mapped(&staging)
+    }
+
+    pub async fn pumped<T: bytemuck::Pod>(self, ctx: &WgpuContext) -> Result<Vec<T>> {
+        let _ = PUMP_SELF_WAKES_ON_NATIVE_BECAUSE_MAP_CALLBACKS_FIRE_ONLY_INSIDE_DEVICE_POLL;
+        let Some(staging) = self.staging else {
+            return Ok(Vec::new());
+        };
+        let shared = self.shared.clone();
+        std::future::poll_fn(move |cx| {
+            if let Some(r) = lock_map(&shared).result.take() {
+                return std::task::Poll::Ready(r);
+            }
+            lock_map(&shared).waker = Some(cx.waker().clone());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = ctx.device.poll(wgpu::PollType::Poll);
+                if let Some(r) = lock_map(&shared).result.take() {
+                    return std::task::Poll::Ready(r);
+                }
+                cx.waker().wake_by_ref();
+            }
+            std::task::Poll::Pending
+        })
+        .await
+        .map_err(|e| WgpuError::Readback(format!("map: {e}")))?;
+        take_mapped(&staging)
+    }
+
+    pub async fn resolve<T: bytemuck::Pod>(
+        self,
+        ctx: &WgpuContext,
+        arm: ReadbackArm,
+    ) -> Result<Vec<T>> {
+        match arm {
+            ReadbackArm::Blocking => self.blocking(ctx),
+            ReadbackArm::Pumped => self.pumped(ctx).await,
+        }
+    }
+}
+
+pub fn read_back_begin<T: bytemuck::Pod>(
+    ctx: &WgpuContext,
+    buffer: &wgpu::Buffer,
+    offset: usize,
+    len: usize,
+) -> Result<PendingReadback> {
     let elem = std::mem::size_of::<T>() as u64;
     let bytes = len as u64 * elem;
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(MapState {
+        result: None,
+        waker: None,
+    }));
     if bytes == 0 {
-        return Ok(Vec::new());
+        return Ok(PendingReadback {
+            staging: None,
+            shared,
+        });
     }
     let start = offset as u64 * elem;
     if !start.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
@@ -1541,7 +1857,7 @@ pub fn read_back_at<T: bytemuck::Pod>(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    if let Some(err) = pollster::block_on(scope.pop()) {
+    if let Some(err) = pop_scope(scope) {
         return Err(WgpuError::Readback(format!(
             "the {bytes}-byte readback staging buffer could not be allocated, so every later use \
              of it reports an invalid buffer: {err}\n{}",
@@ -1551,22 +1867,41 @@ pub fn read_back_at<T: bytemuck::Pod>(
     let mut enc = ctx.device.create_command_encoder(&Default::default());
     enc.copy_buffer_to_buffer(buffer, start, &staging, 0, bytes);
     ctx.queue.submit([enc.finish()]);
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
+    let cb = shared.clone();
+    staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+        let mut st = lock_map(&cb);
+        st.result = Some(r);
+        if let Some(w) = st.waker.take() {
+            w.wake();
+        }
     });
-    ctx.poll_blocking()?;
-    rx.recv()
-        .map_err(|e| WgpuError::Readback(format!("map callback: {e}")))?
-        .map_err(|e| WgpuError::Readback(format!("map: {e}")))?;
-    let view = slice
-        .get_mapped_range()
-        .map_err(|e| WgpuError::Readback(format!("mapped range: {e}")))?;
-    let out = bytemuck::cast_slice::<u8, T>(&view).to_vec();
-    drop(view);
-    staging.unmap();
-    Ok(out)
+    Ok(PendingReadback {
+        staging: Some(staging),
+        shared,
+    })
+}
+
+pub async fn read_back_arm<T: bytemuck::Pod>(
+    ctx: &WgpuContext,
+    buffer: &wgpu::Buffer,
+    len: usize,
+    arm: ReadbackArm,
+) -> Result<Vec<T>> {
+    read_back_begin::<T>(ctx, buffer, 0, len)?
+        .resolve(ctx, arm)
+        .await
+}
+
+pub async fn read_back_at_arm<T: bytemuck::Pod>(
+    ctx: &WgpuContext,
+    buffer: &wgpu::Buffer,
+    offset: usize,
+    len: usize,
+    arm: ReadbackArm,
+) -> Result<Vec<T>> {
+    read_back_begin::<T>(ctx, buffer, offset, len)?
+        .resolve(ctx, arm)
+        .await
 }
 
 pub fn workgroup_count_1d(

@@ -108,8 +108,13 @@ impl LagunaLora {
             }
 
             let op = format!("{p}.self_attn.o_proj");
-            let (o, n) =
-                build_lora_site(adapter, rank, ls.q_rows, &[(op.as_str(), hidden)], &[hidden])?;
+            let (o, n) = build_lora_site(
+                adapter,
+                rank,
+                ls.q_rows,
+                &[(op.as_str(), hidden)],
+                &[hidden],
+            )?;
             matched += n;
             layer.o = o;
             wanted.insert(op);

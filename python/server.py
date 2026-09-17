@@ -499,6 +499,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="speaches-plus-python", lifespan=lifespan)
 app.include_router(inspect_api.router)
 
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(_request, exc: HTTPException):
     detail = exc.detail

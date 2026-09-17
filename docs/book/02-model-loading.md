@@ -52,7 +52,7 @@ two models loaded "serve whatever we have" is not a defensible reading of a
 typo. Even single-engine, the warning spells out the cost: the response echoes
 the *served* id, so a client typo becomes indistinguishable from a hit. The
 default — off — is OpenAI's behaviour, and once an adapter registry exists this
-arm becomes a correctness bug (01.4-STATUS.md).
+arm becomes a correctness bug (the private status ledger).
 
 Canonicalisation exists because the id a user sees and the path an operator
 configures are different strings. `model_ids.rs` maps a Nix store path

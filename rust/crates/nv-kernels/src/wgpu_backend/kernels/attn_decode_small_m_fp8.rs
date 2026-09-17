@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dequant::bytes_to_words;
+use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
 pub const WGSL: &str = include_str!("../../../wgsl/attn_decode_small_m_fp8.wgsl");

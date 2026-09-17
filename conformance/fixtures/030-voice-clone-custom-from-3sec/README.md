@@ -5,8 +5,8 @@ Voice profile created from a 3-second reference WAV.
 ## Input artifact
 
 `reference_440hz_3s_16k_mono.wav` — a 440 Hz sine wave, 3 seconds, mono,
-16 kHz, 16-bit PCM. Regenerate with `./generate_reference_wav.py` (it's
-deterministic; the file is checked in for offline use).
+16 kHz, 16-bit PCM, amplitude 0.5. Gitignored; regenerated deterministically by
+`conformance/tools/generate-audio.py` (run via `tools/regenerate-fixtures.sh`).
 
 ## What it asserts
 

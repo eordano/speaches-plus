@@ -117,13 +117,39 @@ pub const SAME_ROW_BOXES_WITHIN_TWO_CELLS_MERGE_OR_A_BOX_EDGE_SPLITS_A_LINE_AND_
      121 entries, and one split edge clipped a digit out of a price; two boxes sharing half \
      their vertical extent within two cells of each other are one line of text.";
 
+pub const SCOUT_INK_BRIDGE_ENV: &str = "NV_DOTS_SCOUT_INK_BRIDGE";
+
+pub const INK_BRIDGE_MAX_GAP_8_CELLS_A_GUTTER_IS_WHITE_AT_EVERY_SAMPLE: usize = 8;
+
+pub const SUB_THRESHOLD_INK_IN_A_SAME_ROW_GAP_IS_A_SPLIT_LINE_NOT_A_GUTTER: &str =
+    "stride-4 sampling leaves the cells beside a word space under the two-sample inky \
+     threshold, so a wrapped entry can split into a two-line left component and a one-line \
+     tail whose crop then starts mid-word and stitches as a displaced paragraph after its \
+     own entry ('TO LET: cast iron peat stove with / Box 103.' then 'ue kit. 29 pounds or \
+     near offer.' -- nine of the gazette's 121 entries carried the artifact, the entire \
+     seam class of its ncer). The gap of such a split still holds sampled ink, the clipped \
+     glyph slivers themselves, while a column gutter is white at every sample: on a page \
+     already accepted for classical crops, same-row boxes therefore also merge across gaps \
+     of up to eight cells when any sample landed in the gap band, which rejoins all nine \
+     split entries and zero gutters on the measured scale corpus. The bridge runs strictly \
+     AFTER the acceptance guards and never feeds classify_sub_threshold, because bridged \
+     boxes move the box-count and median-height statistics those verdicts read (the uw49 \
+     screen's median crosses the 64 px line under bridged merges) and no routing decision \
+     may move with it. NV_DOTS_SCOUT_INK_BRIDGE=0 restores the two-cell-only law.";
+
+fn ink_bridge_enabled() -> bool {
+    std::env::var(SCOUT_INK_BRIDGE_ENV)
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
+}
+
 pub const CLASSICAL_GRID_TARGET_512_CELLS_KEEPS_CC_UNDER_A_MILLISECOND: usize = 512;
 pub const CLASSICAL_INKY_CELL_MIN_SAMPLES_2_REJECTS_LONE_SPECKLES: usize = 2;
 pub const CLASSICAL_MIN_BLOCK_CELLS_4_DROPS_DUST: usize = 4;
 pub const CLASSICAL_DARK_PAGE_INK_FRACTION_CEILING_0_25: f64 = 0.25;
 
-pub const CLASSICAL_MIN_MEDIAN_BOX_HEIGHT_64PX_SMALL_GLYPH_PAGES_SPLIT_AT_THEIR_OWN_WHITESPACE: usize =
-    64;
+pub const CLASSICAL_MIN_MEDIAN_BOX_HEIGHT_64PX_SMALL_GLYPH_PAGES_SPLIT_AT_THEIR_OWN_WHITESPACE:
+    usize = 64;
 
 pub const CLASSICAL_BUSY_PAGE_MIN_BOXES_96_SITS_BETWEEN_THE_5K_SCREENS_52_FRAGMENTS_AND_THE_GAZETTES_130_ENTRIES: usize =
     96;
@@ -146,9 +172,40 @@ pub const A_DARK_THEME_IS_A_LIGHT_PAGE_INVERTED_SO_BRIGHT_POINTS_BECOME_THE_INK:
      greys sit at luma 25-66, the text at ~222), and only when the bright fraction also \
      exceeds the ceiling does the scout refuse and leave the page to the model.";
 
+pub const DARK_THEMED_MEANS_MOSTLY_DARK_WITH_READABLE_BRIGHT_INK_AND_A_PHOTO_IS_NEITHER: &str =
+    "the detector reuses the scout's own two ink reads: a page whose dark-luma fraction \
+     exceeds the 0.25 ceiling is inverted or photographic, and it is a dark THEME exactly \
+     when the bright-ink re-read stays under the same ceiling (light-on-dark text is sparse \
+     bright points over dark ground, a photograph is dense in both reads and refuses). This \
+     is the same verdict scout_components already reaches internally; exposing it lets the \
+     serving router invert the page before the tower, where inversion measured recall \
+     0.667 -> 0.944 and 41 -> 7 s on the 4K dark theme. The corpus and every light fixture \
+     must answer false -- the twelve zeros are not available as collateral.";
+
+pub fn page_is_dark_themed(img: &RgbImage) -> bool {
+    let _ = DARK_THEMED_MEANS_MOSTLY_DARK_WITH_READABLE_BRIGHT_INK_AND_A_PHOTO_IS_NEITHER;
+    let ink = sample_ink(img);
+    if ink.sampled == 0
+        || ink.xs.len() as f64 / ink.sampled as f64 <= CLASSICAL_DARK_PAGE_INK_FRACTION_CEILING_0_25
+    {
+        return false;
+    }
+    let bright = super::preprocess::sample_bright_ink(img);
+    bright.sampled > 0
+        && bright.xs.len() as f64 / bright.sampled as f64
+            <= CLASSICAL_DARK_PAGE_INK_FRACTION_CEILING_0_25
+}
+
+struct ScoutBoxes {
+    boxes: Vec<([usize; 4], usize)>,
+    cell: usize,
+    counts: Vec<u16>,
+    grid_w: usize,
+}
+
 enum ScoutRead {
     Unreadable,
-    Boxes(Vec<([usize; 4], usize)>, usize),
+    Boxes(ScoutBoxes),
 }
 
 fn scout_components(img: &RgbImage) -> ScoutRead {
@@ -159,13 +216,14 @@ fn scout_components(img: &RgbImage) -> ScoutRead {
     if ink.xs.len() as f64 / ink.sampled as f64 > CLASSICAL_DARK_PAGE_INK_FRACTION_CEILING_0_25 {
         let _ = A_DARK_THEME_IS_A_LIGHT_PAGE_INVERTED_SO_BRIGHT_POINTS_BECOME_THE_INK;
         ink = super::preprocess::sample_bright_ink(img);
-        if ink.xs.len() as f64 / ink.sampled as f64
-            > CLASSICAL_DARK_PAGE_INK_FRACTION_CEILING_0_25
+        if ink.xs.len() as f64 / ink.sampled as f64 > CLASSICAL_DARK_PAGE_INK_FRACTION_CEILING_0_25
         {
             return ScoutRead::Unreadable;
         }
     }
-    let cell = (img.w.max(img.h)).div_ceil(CLASSICAL_GRID_TARGET_512_CELLS_KEEPS_CC_UNDER_A_MILLISECOND).max(8);
+    let cell = (img.w.max(img.h))
+        .div_ceil(CLASSICAL_GRID_TARGET_512_CELLS_KEEPS_CC_UNDER_A_MILLISECOND)
+        .max(8);
     let gw = img.w.div_ceil(cell);
     let gh = img.h.div_ceil(cell);
     let mut counts = vec![0u16; gw * gh];
@@ -227,22 +285,18 @@ fn scout_components(img: &RgbImage) -> ScoutRead {
         }
     }
     let _ = SAME_ROW_BOXES_WITHIN_TWO_CELLS_MERGE_OR_A_BOX_EDGE_SPLITS_A_LINE_AND_CLIPS_GLYPHS;
-    let mut boxes = boxes;
     let mut merged_any = true;
     while merged_any {
         merged_any = false;
         'outer: for i in 0..boxes.len() {
             for j in (i + 1)..boxes.len() {
                 let (a, b) = (boxes[i].0, boxes[j].0);
-                let v_overlap =
-                    (a[3].min(b[3]) + 1).saturating_sub(a[1].max(b[1]));
+                let v_overlap = (a[3].min(b[3]) + 1).saturating_sub(a[1].max(b[1]));
                 let min_h = (a[3] - a[1]).min(b[3] - b[1]) + 1;
                 let h_gap = if a[2] < b[0] {
                     b[0] - a[2]
-                } else if b[2] < a[0] {
-                    a[0] - b[2]
                 } else {
-                    0
+                    a[0].saturating_sub(b[2])
                 };
                 if 2 * v_overlap >= min_h && h_gap <= 2 {
                     let cells = boxes[i].1 + boxes[j].1;
@@ -260,7 +314,61 @@ fn scout_components(img: &RgbImage) -> ScoutRead {
             }
         }
     }
-    ScoutRead::Boxes(boxes, cell)
+    ScoutRead::Boxes(ScoutBoxes {
+        boxes,
+        cell,
+        counts,
+        grid_w: gw,
+    })
+}
+
+fn bridge_split_lines(sb: &mut ScoutBoxes) {
+    let _ = SUB_THRESHOLD_INK_IN_A_SAME_ROW_GAP_IS_A_SPLIT_LINE_NOT_A_GUTTER;
+    let gw = sb.grid_w;
+    let boxes = &mut sb.boxes;
+    let mut merged_any = true;
+    while merged_any {
+        merged_any = false;
+        'outer: for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                let (a, b) = (boxes[i].0, boxes[j].0);
+                let v_overlap = (a[3].min(b[3]) + 1).saturating_sub(a[1].max(b[1]));
+                let min_h = (a[3] - a[1]).min(b[3] - b[1]) + 1;
+                if 2 * v_overlap < min_h {
+                    continue;
+                }
+                let h_gap = if a[2] < b[0] {
+                    b[0] - a[2]
+                } else {
+                    a[0].saturating_sub(b[2])
+                };
+                let gap_inked = h_gap > 2
+                    && h_gap <= INK_BRIDGE_MAX_GAP_8_CELLS_A_GUTTER_IS_WHITE_AT_EVERY_SAMPLE
+                    && {
+                        let (gx0, gx1) = if a[2] < b[0] {
+                            (a[2] + 1, b[0])
+                        } else {
+                            (b[2] + 1, a[0])
+                        };
+                        (a[1].max(b[1])..=a[3].min(b[3]))
+                            .any(|y| sb.counts[y * gw + gx0..y * gw + gx1].iter().any(|&c| c > 0))
+                    };
+                if h_gap <= 2 || gap_inked {
+                    let cells = boxes[i].1 + boxes[j].1;
+                    let (b2, _) = boxes.remove(j);
+                    boxes[i].0 = [
+                        a[0].min(b2[0]),
+                        a[1].min(b2[1]),
+                        a[2].max(b2[2]),
+                        a[3].max(b2[3]),
+                    ];
+                    boxes[i].1 = cells;
+                    merged_any = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
 }
 
 fn median_box_height_px(boxes: &[([usize; 4], usize)], cell: usize) -> usize {
@@ -274,19 +382,23 @@ fn median_box_height_px(boxes: &[([usize; 4], usize)], cell: usize) -> usize {
 
 pub fn classical_scout(img: &RgbImage) -> Option<LayoutPage> {
     let _ = CLASSICAL_SCOUT_EXISTS_BECAUSE_MODEL_T0_COST_IS_DECODE_LENGTH_NOT_RESOLUTION;
-    let ScoutRead::Boxes(boxes, cell) = scout_components(img) else {
+    let ScoutRead::Boxes(mut sb) = scout_components(img) else {
         return None;
     };
-    if !boxes.is_empty()
-        && boxes.len() < CLASSICAL_BUSY_PAGE_MIN_BOXES_96_SITS_BETWEEN_THE_5K_SCREENS_52_FRAGMENTS_AND_THE_GAZETTES_130_ENTRIES
+    if !sb.boxes.is_empty()
+        && sb.boxes.len() < CLASSICAL_BUSY_PAGE_MIN_BOXES_96_SITS_BETWEEN_THE_5K_SCREENS_52_FRAGMENTS_AND_THE_GAZETTES_130_ENTRIES
     {
         let _ = SMALL_GLYPH_PAGES_GO_TO_THE_MODEL_SCOUT_BECAUSE_CC_FRAGMENTS_UI_TEXT;
-        if median_box_height_px(&boxes, cell)
+        if median_box_height_px(&sb.boxes, sb.cell)
             < CLASSICAL_MIN_MEDIAN_BOX_HEIGHT_64PX_SMALL_GLYPH_PAGES_SPLIT_AT_THEIR_OWN_WHITESPACE
         {
             return None;
         }
     }
+    if ink_bridge_enabled() {
+        bridge_split_lines(&mut sb);
+    }
+    let ScoutBoxes { boxes, cell, .. } = sb;
     let elements = boxes
         .into_iter()
         .map(|(bb, _)| LayoutElement {
@@ -313,11 +425,12 @@ pub enum SubThresholdClass {
     Undecided,
 }
 
-pub const SCREENLIKE_MEDIAN_COMPONENT_UNDER_0_04_OF_PAGE_HEIGHT_SEPARATES_UI_FROM_RENDERED_LINES: f64 =
-    0.04;
+pub const SCREENLIKE_MEDIAN_COMPONENT_UNDER_0_04_OF_PAGE_HEIGHT_SEPARATES_UI_FROM_RENDERED_LINES:
+    f64 = 0.04;
 pub const SCREENLIKE_MIN_COMPONENTS_4_A_STRIP_OR_A_BANNER_IS_NOT_A_DESKTOP: usize = 4;
 
-pub const SUB_THRESHOLD_SCREENS_DETOUR_TO_TILING_BECAUSE_NATIVE_READING_DROPS_A_THIRD_OF_THE_UI: &str =
+pub const SUB_THRESHOLD_SCREENS_DETOUR_TO_TILING_BECAUSE_NATIVE_READING_DROPS_A_THIRD_OF_THE_UI:
+    &str =
     "below the tier threshold a 1080p screenshot reads word recall 0.75 native single-pass, \
      0.92 downscaled and 0.97 tiled (ncer 0.06 tiled against 0.34 downscaled), so \
      screen-like sub-threshold pages detour to the tiling composition instead. Screen-like \
@@ -328,14 +441,26 @@ pub const SUB_THRESHOLD_SCREENS_DETOUR_TO_TILING_BECAUSE_NATIVE_READING_DROPS_A_
      from the detour, because the twelve zeros are not available as collateral. \
      NV_DOTS_SCREEN_DETOUR=0 pins sub-threshold inputs to the plain single pass.";
 
+pub const SCREENLIKE_REQUIRES_LANDSCAPE_BECAUSE_SPARSE_PORTRAIT_RENDERS_SHARE_THE_LINE_FRACTION:
+    &str = "the 071 invoice render measures the same 0.02 median line fraction as a desktop \
+     screenshot -- sparse rendered lines and UI text are indistinguishable by relative \
+     component height alone -- but every such render is portrait while desktops are \
+     landscape, and the landscape corpus strips clear the fraction test at 0.3 of their \
+     height. A portrait phone screenshot therefore misses the detour and stays on the \
+     single pass; that miss is the recorded price of never detouring a document render.";
+
 pub fn classify_sub_threshold(img: &RgbImage) -> SubThresholdClass {
-    let ScoutRead::Boxes(boxes, cell) = scout_components(img) else {
-        return SubThresholdClass::Undecided;
-    };
-    if boxes.len() < SCREENLIKE_MIN_COMPONENTS_4_A_STRIP_OR_A_BANNER_IS_NOT_A_DESKTOP {
+    let _ = SCREENLIKE_REQUIRES_LANDSCAPE_BECAUSE_SPARSE_PORTRAIT_RENDERS_SHARE_THE_LINE_FRACTION;
+    if img.w <= img.h {
         return SubThresholdClass::Undecided;
     }
-    let frac = median_box_height_px(&boxes, cell) as f64 / img.h as f64;
+    let ScoutRead::Boxes(sb) = scout_components(img) else {
+        return SubThresholdClass::Undecided;
+    };
+    if sb.boxes.len() < SCREENLIKE_MIN_COMPONENTS_4_A_STRIP_OR_A_BANNER_IS_NOT_A_DESKTOP {
+        return SubThresholdClass::Undecided;
+    }
+    let frac = median_box_height_px(&sb.boxes, sb.cell) as f64 / img.h as f64;
     if frac < SCREENLIKE_MEDIAN_COMPONENT_UNDER_0_04_OF_PAGE_HEIGHT_SEPARATES_UI_FROM_RENDERED_LINES
     {
         SubThresholdClass::ScreenLike
@@ -364,9 +489,15 @@ mod tests {
                 "{raw:?} must restore the pre-flip single-pass path"
             );
         }
-        assert_eq!(TierPolicy::parse(Some("auto"), TierPolicy::Off).unwrap(), TierPolicy::Auto);
+        assert_eq!(
+            TierPolicy::parse(Some("auto"), TierPolicy::Off).unwrap(),
+            TierPolicy::Auto
+        );
         for raw in [Some("1"), Some("always")] {
-            assert_eq!(TierPolicy::parse(raw, TierPolicy::Off).unwrap(), TierPolicy::Always);
+            assert_eq!(
+                TierPolicy::parse(raw, TierPolicy::Off).unwrap(),
+                TierPolicy::Always
+            );
         }
         let err = TierPolicy::parse(Some("yes"), TierPolicy::Off).unwrap_err();
         assert!(err.to_string().contains(TIERED_ENV), "{err}");
@@ -477,7 +608,69 @@ mod tests {
 
         let solid = RgbImage::filled(400, 400, [20, 20, 20]);
         let page = classical_scout(&solid).expect("a solid dark page has no bright ink");
-        assert!(page.elements.is_empty(), "no text, no boxes: {:?}", page.elements);
+        assert!(
+            page.elements.is_empty(),
+            "no text, no boxes: {:?}",
+            page.elements
+        );
+    }
+
+    fn split_line_page(with_trickle: bool) -> RgbImage {
+        RgbImage::from_fn(800, 600, move |x, y| {
+            let line1_left = (96..400).contains(&x) && (96..160).contains(&y);
+            let line2 = (96..240).contains(&x) && (176..240).contains(&y);
+            let line1_tail = (432..640).contains(&x) && (96..160).contains(&y);
+            let trickle = with_trickle && x == 412 && y == 100;
+            if line1_left || line2 || line1_tail || trickle {
+                [0, 0, 0]
+            } else {
+                [255, 255, 255]
+            }
+        })
+    }
+
+    #[test]
+    fn a_split_wrapped_line_rejoins_across_a_sub_threshold_ink_gap() {
+        let page = classical_scout(&split_line_page(true)).expect("light page must scout");
+        assert_eq!(
+            page.elements.len(),
+            1,
+            "the sampled glyph sliver in the gap band proves the gap is inside a line, so \
+             the tail must rejoin its entry: {:?}",
+            page.elements
+        );
+        let b = page.elements[0].bbox.unwrap();
+        assert!(
+            b[0] <= 96.0 && b[2] >= 632.0 && b[3] >= 232.0,
+            "the merged box must cover both lines and the tail: {b:?}"
+        );
+    }
+
+    #[test]
+    fn a_white_gutter_of_the_same_width_stays_split() {
+        let page = classical_scout(&split_line_page(false)).expect("light page must scout");
+        assert_eq!(
+            page.elements.len(),
+            2,
+            "a gap that is white at every sample is a gutter, never a split line: {:?}",
+            page.elements
+        );
+    }
+
+    #[test]
+    fn the_bridge_is_a_refinement_after_the_guards_and_the_raw_read_keeps_the_split() {
+        let img = split_line_page(true);
+        let ScoutRead::Boxes(mut sb) = scout_components(&img) else {
+            panic!("light page must scout");
+        };
+        assert_eq!(
+            sb.boxes.len(),
+            2,
+            "the raw read that feeds the routing guards must keep the two-cell-only law: {:?}",
+            sb.boxes
+        );
+        bridge_split_lines(&mut sb);
+        assert_eq!(sb.boxes.len(), 1, "the bridge must rejoin: {:?}", sb.boxes);
     }
 
     #[test]

@@ -331,6 +331,8 @@ fn main() -> Result<()> {
         let img = decode_rgb(&images[0].1)?;
         let prep = Arc::new(nv_models::deepseek_ocr::preprocess::prepare(&img, mode)?);
         let feats = Arc::new(pipeline.vision().encode_prepared(&prep)?);
+        #[cfg(not(feature = "cuda"))]
+        let _retained_microbench_features = feats;
         device.synchronize()?;
         let views = prep.tiles.len() + 1;
 

@@ -21,6 +21,7 @@ pub mod trace;
 pub mod tts;
 pub mod types;
 pub mod vad;
+pub mod voices;
 
 use std::sync::Arc;
 
@@ -52,3 +53,5 @@ pub struct RealtimeQuery {
     #[serde(default)]
     pub speech_model: Option<String>,
 }
+
+pub mod otel_http;

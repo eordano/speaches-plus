@@ -61,9 +61,15 @@ impl VisionWeightFmt {
         match self {
             Self::F16 => "f16",
             Self::Nvfp4Block16 => "nvfp4",
-            Self::MlxW4 { gs: 32, twin: false } => "w4g32",
+            Self::MlxW4 {
+                gs: 32,
+                twin: false,
+            } => "w4g32",
             Self::MlxW4 { gs: 32, twin: true } => "w4g32-twin",
-            Self::MlxW4 { gs: 64, twin: false } => "w4g64",
+            Self::MlxW4 {
+                gs: 64,
+                twin: false,
+            } => "w4g64",
             Self::MlxW4 { gs: 64, twin: true } => "w4g64-twin",
             Self::MlxW4 { .. } => "w4",
         }
@@ -74,8 +80,14 @@ impl VisionWeightFmt {
         let _ = DOTS_VISION_MLX_W4_ARM_SERVES_PACKED_NIBBLES_THROUGH_A_PER_USE_DEQUANT_BECAUSE_THE_COOP_GEMM_IS_COMPUTE_BOUND_AT_THESE_M;
         match std::env::var(DOTS_VISION_WGPU_WQ_ENV).ok().as_deref() {
             Some("nvfp4") => Self::Nvfp4Block16,
-            Some("w4g32") => Self::MlxW4 { gs: 32, twin: false },
-            Some("w4g64") => Self::MlxW4 { gs: 64, twin: false },
+            Some("w4g32") => Self::MlxW4 {
+                gs: 32,
+                twin: false,
+            },
+            Some("w4g64") => Self::MlxW4 {
+                gs: 64,
+                twin: false,
+            },
             Some("w4g32-twin") => Self::MlxW4 { gs: 32, twin: true },
             Some("w4g64-twin") => Self::MlxW4 { gs: 64, twin: true },
             _ => Self::F16,
@@ -100,6 +112,16 @@ pub const DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WER
      byte-identical. NV_DOTS_VISION_WGPU_MERGER=host restores the host merger bit-for-bit. The \
      gpu route requires post_norm because it reads the f16 post-trunk-norm buffer; a tower \
      without one keeps the host merger.";
+
+enum BatchTrunkOut {
+    Host(Vec<f32>),
+    Gpu(Vec<super::decoder_wgpu_graph::VisionRowsGpu>),
+}
+
+enum TrunkOut {
+    Host(Vec<f32>),
+    Gpu(super::decoder_wgpu_graph::VisionRowsGpu),
+}
 
 pub fn merger_gpu_arm() -> bool {
     let _ = DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WERE_THE_WHOLE_RESIDUAL_AND_THE_TOKEN_GATE_HELD;
@@ -171,7 +193,6 @@ impl AttnArm {
     }
 }
 
-
 pub const DOTS_VISION_WGPU_SCALAR_ROUTE_IS_A_CORRECTNESS_FALLBACK_NOT_A_SERVING_PATH: &str =
     "An adapter without EXPERIMENTAL_COOPERATIVE_MATRIX falls back to dv_gemm_f16_scalar, one \
      invocation per output element. It is correct and it is orders off a tiled GEMM; it exists so \
@@ -238,8 +259,8 @@ pub struct PhaseLog {
 impl PhaseLog {
     pub fn from_env() -> Self {
         let _ = DOTS_VISION_PHASE_TIMING_IS_DRAIN_DISTORTED_BECAUSE_ATTRIBUTING_A_QUEUED_PASS_TO_A_PHASE_COSTS_A_DEVICE_WAIT_AT_EVERY_BOUNDARY;
-        let on = std::env::var(DOTS_VISION_WGPU_PHASES_ENV)
-            .is_ok_and(|v| !v.is_empty() && v != "0");
+        let on =
+            std::env::var(DOTS_VISION_WGPU_PHASES_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
         Self {
             at: on.then(std::time::Instant::now),
             rows: Vec::new(),
@@ -333,6 +354,8 @@ fn splitk_arm() -> Option<u32> {
     }
 }
 
+pub const DOTS_VISION_SPLITK_KERNEL_IS_GENERATED_FOR_THE_8X8X8_TILE_ONLY_SO_A_WIDER_TILE_ADAPTER_TAKES_THE_PLAIN_COOP_ARM: u32 = 8;
+
 pub const DOTS_VISION_SPLITK_FITTED_PLAN_IS_TM8_BECAUSE_THE_S16_LADDER_READS_15_59_TFLOPS_THERE_AGAINST_THE_SQUARE_PLANS_11_9: CoopPlan =
     CoopPlan { tm: 8, tn: 4, sg: 4, ku: 1 };
 
@@ -346,10 +369,32 @@ pub const DOTS_VISION_STEEL_GEMM_DEFAULTS_ON_WHERE_THE_BUILT_PASSTHROUGH_PIPELIN
 
 pub const DOTS_VISION_STEEL_GEMM_FITTED: (u32, u32, u32, u32, u32) = (64, 64, 32, 2, 2);
 
-fn steel_gemm_cfg() -> Option<(u32, u32, u32, u32, u32)> {
+pub const DOTS_VISENC_SHAPE_MAP_ENV: &str = "NV_DOTS_VISENC_SHAPE_MAP";
+
+pub const DOTS_VISENC_SHAPE_MAP_SERVES_THE_PER_SHAPE_CHAMPIONS_WHERE_NO_CFG_ENV_PINS: &str =
+    "With the cfg envs unset the tower answers steel_gemm_cfg_for(rows, n) per projection and \
+     steel_attn_cfg_for(n) per attention dispatch (serial forwards and each pack group alike), \
+     serving the crop-shape champion maps everywhere the whole-page crowns are grid-starved; \
+     every map arm is the certified bitwise class (bq moves only workgroup ownership at bk16, \
+     gemm tiles remap the same ascending-k MMA chain, fused epilogues follow their cfg through \
+     pick_resadd/pick_gsilu). NV_DOTS_VISENC_SHAPE_MAP=0 restores the fixed champions \
+     everywhere, and a set NV_DOTS_VISION_STEEL_GEMM / NV_DOTS_VISION_STEEL_ATTN_CFG keeps its \
+     exact pin meaning over the map, so every ladder and bracket instrument keeps its row \
+     meaning.";
+
+fn shape_map_on() -> bool {
+    let _ = DOTS_VISENC_SHAPE_MAP_SERVES_THE_PER_SHAPE_CHAMPIONS_WHERE_NO_CFG_ENV_PINS;
+    std::env::var(DOTS_VISENC_SHAPE_MAP_ENV).ok().as_deref() != Some("0")
+}
+
+pub fn steel_gemm_cfg_serving(rows: usize, n: usize) -> Option<(u32, u32, u32, u32, u32)> {
     let _ = DOTS_VISION_STEEL_GEMM_DEFAULTS_ON_WHERE_THE_BUILT_PASSTHROUGH_PIPELINE_PROBE_PASSES_BECAUSE_ZERO_OF_5222400_MERGED_FEATURES_MOVED;
     let Ok(v) = std::env::var(DOTS_VISION_STEEL_GEMM_ENV) else {
-        return Some(DOTS_VISION_STEEL_GEMM_FITTED);
+        return Some(if shape_map_on() {
+            super::vision_attn_msl::steel_gemm_cfg_for(rows, n)
+        } else {
+            DOTS_VISION_STEEL_GEMM_FITTED
+        });
     };
     let t = v.trim();
     if t.is_empty() || t == "0" || t == "off" {
@@ -365,7 +410,122 @@ fn steel_gemm_cfg() -> Option<(u32, u32, u32, u32, u32)> {
     }
 }
 
+pub const DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV: &str = "NV_DOTS_VISION_STEEL_GEMM_SWIZZLE";
+
+pub const STEEL_GEMM_SWIZZLE_REMAPS_TILE_OWNERSHIP_ONLY_SO_EVERY_SETTING_IS_BIT_IDENTICAL: &str =
+    "swizzle_log remaps which threadgroup owns which (m,n) tile so consecutively scheduled \
+     threadgroups share a B column block (the vendored gemm.h guard drops the overshoot rows); \
+     no tile's k order changes, so every setting is bit-identical to swizzle 0 by construction \
+     (measured: 0 of 5222400 merged bits at sl 0/1/2). The dispatch pays (gx << sl, gy/2^sl). \
+     The default stays 0 because the whole-forward wall at 13600 patches reads a wash (-0.0 to \
+     -0.2 pct): the SLC already serves the cross-workgroup B re-reads on this adapter, the same \
+     mechanism that nulled the v3ct column-tiled weights arm.";
+
+pub const DOTS_VISION_STEEL_FUSE_ENV: &str = "NV_DOTS_VISION_STEEL_FUSE";
+
+pub const DOTS_VISION_STEEL_FUSE_FOLDS_THE_ELEMENTWISE_CRUMBS_INTO_THE_PRODUCER_GEMM_STORE_BECAUSE_THE_CRUMB_PASSES_ARE_PURE_RE_READ_TRAFFIC: &str =
+    "The deleted-work bracket prices the trunk crumbs at silu 45 ms, residual 41 ms on the \
+     invoice page -- elementwise consumers that re-read the f32 accumulator bits the steel GEMM \
+     just stored. resadd serves the two residual producers (attn out proj, mlp down proj): the \
+     epilogue reads the residual stream x, adds the accumulator in the WGSL operand order, and \
+     the GEMM's one store writes x back, deleting the proj_y/ff_y store, its re-read, and the \
+     whole dv_add_f32 pass. gsilu serves fc3: the epilogue reads the fc1 gate output, applies \
+     g / (1 + exp(-g)) * acc in f32, and the store rounds to f16 into act exactly where the \
+     WGSL f16() cast sat, deleting the up_y f32 store, both silu operand reads, and the \
+     dv_silu_mul_f16 pass. Both are bitwise by the argument in STEEL_GEMM_FUSED_EPILOGUES_\
+     KEEP_THE_MMA_CHAIN..., gated by 0-bit trunk-feature equality against the shipped chain. \
+     The route engages only where the shipped steel route would (F16 weights, no bias, k-block \
+     divisibility, a BUILT fused pipeline) and only at the fitted champion cfg; every other \
+     projection keeps the shipped path, and any NV_DOTS_VISION_ABLATE arm forces the shipped \
+     pass structure so the bracket's rows keep their meaning. DEFAULT ON, bitwise class: 0 of \
+     5,222,400 invoice merged-feature bits moved on every arm, the 42-layer residual-stream \
+     census is 0-word at every layer, the batched crop path is 0-bit, and the corpus stamp \
+     reads twelve zeros EXACT / mean CER 0.0700 EXACT / 1504 tokens at mean 2515.3-2515.4 ms \
+     against the 2528-2532 pre-flip band (invoice tower 4.053 -> 4.019 s; ladder res -12 ms, \
+     silu -22 ms, additive). NV_DOTS_VISION_STEEL_FUSE=0 restores the shipped standalone \
+     passes; =res and =silu serve one side.";
+
+fn steel_fuse_from_env() -> (bool, bool) {
+    let _ = DOTS_VISION_STEEL_FUSE_FOLDS_THE_ELEMENTWISE_CRUMBS_INTO_THE_PRODUCER_GEMM_STORE_BECAUSE_THE_CRUMB_PASSES_ARE_PURE_RE_READ_TRAFFIC;
+    if std::env::var(DOTS_VISION_ABLATE_ENV).is_ok() {
+        return (false, false);
+    }
+    match std::env::var(DOTS_VISION_STEEL_FUSE_ENV).ok().as_deref() {
+        None => (true, true),
+        Some("0") | Some("") | Some("off") => (false, false),
+        Some("res") => (true, false),
+        Some("silu") => (false, true),
+        Some(_) => (true, true),
+    }
+}
+
+pub const DOTS_VISION_STEEL_ATTN_CFG_ENV: &str = "NV_DOTS_VISION_STEEL_ATTN_CFG";
+
+pub const STEEL_ATTN_CFG_IS_OPT_IN_AND_LISTED_ONLY_SO_EVERY_SERVED_TILE_CARRIES_THE_COMPILE_TIME_SMEM_AND_TQ_ASSERTS: &str =
+    "NV_DOTS_VISION_STEEL_ATTN_CFG=bq,bk,wm,wn pins another instantiation of the vendored steel \
+     attention for the single-image tower forward; the value must appear in the ladder list \
+     (STEEL_ATTN_CFGS_...) so the compile-time workgroup-limit and TQ==1 asserts cover it -- an \
+     unlisted tuple is refused loudly rather than served unasserted. Unset serves the shipped \
+     default. bq and wm*wn move only which workgroup owns a query row; bk moves the online-softmax \
+     block boundary and therefore reassociates -- bk arms are tolerance class and gate on tokens, \
+     never on bits. The batched crop path always serves the default tile.";
+
+pub fn steel_attn_cfg_serving(n: usize) -> Result<super::vision_attn_msl::SteelAttnCfg> {
+    if std::env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV).is_ok() {
+        return steel_attn_cfg_from_env();
+    }
+    Ok(if shape_map_on() {
+        super::vision_attn_msl::steel_attn_cfg_for(n as u32)
+    } else {
+        super::vision_attn_msl::STEEL_ATTN_DEFAULT_CFG
+    })
+}
+
+fn steel_attn_cfg_from_env() -> Result<super::vision_attn_msl::SteelAttnCfg> {
+    let _ = STEEL_ATTN_CFG_IS_OPT_IN_AND_LISTED_ONLY_SO_EVERY_SERVED_TILE_CARRIES_THE_COMPILE_TIME_SMEM_AND_TQ_ASSERTS;
+    let Ok(v) = std::env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV) else {
+        return Ok(super::vision_attn_msl::STEEL_ATTN_DEFAULT_CFG);
+    };
+    let t = v.trim();
+    if t.is_empty() || t == "0" {
+        return Ok(super::vision_attn_msl::STEEL_ATTN_DEFAULT_CFG);
+    }
+    let parts: Vec<u32> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let [bq, bk, wm, wn] = parts.as_slice() else {
+        anyhow::bail!("{DOTS_VISION_STEEL_ATTN_CFG_ENV}={v} is not bq,bk,wm,wn");
+    };
+    let cfg = (*bq, *bk, *wm, *wn);
+    anyhow::ensure!(
+        super::vision_attn_msl::STEEL_ATTN_TILE_LADDER_CROWNS_THE_SHIPPED_TILE_EVERY_OTHER_ARM_LOSES_OR_WASHES_AT_13600_PATCHES
+            .contains(&cfg),
+        "{DOTS_VISION_STEEL_ATTN_CFG_ENV}={v} is not in the asserted ladder list"
+    );
+    Ok(cfg)
+}
+
 pub const DOTS_VISION_ABLATE_ENV: &str = "NV_DOTS_VISION_ABLATE";
+
+pub const DOTS_VISENC_PACK_ENV: &str = "NV_DOTS_VISENC_PACK";
+
+pub const DOTS_VISENC_PACK_ROWS_ENV: &str = "NV_DOTS_VISENC_PACK_ROWS";
+
+pub const DOTS_VISENC_PACK_ROWS_DEFAULT_16384_HOLDS_TRANSIENTS_AT_THE_PROVEN_WHOLE_PAGE_CLASS:
+    usize = 16384;
+
+fn visenc_pack_rows() -> Option<usize> {
+    match std::env::var(DOTS_VISENC_PACK_ENV).ok().as_deref() {
+        Some("0") => None,
+        _ => Some(
+            std::env::var(DOTS_VISENC_PACK_ROWS_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|r| *r > 0)
+                .unwrap_or(
+                    DOTS_VISENC_PACK_ROWS_DEFAULT_16384_HOLDS_TRANSIENTS_AT_THE_PROVEN_WHOLE_PAGE_CLASS,
+                ),
+        ),
+    }
+}
 
 pub const VISION_ABLATION_DELETES_WORK_BECAUSE_THE_DRAINED_PHASE_TABLE_CARRIES_A_1_36X_DISTORTION_AND_A_DISTORTED_INSTRUMENT_HAS_INVERTED_A_PHASE_MAP: &str =
     "The drained phase table waits for device idle at every boundary, so its rows are upper \
@@ -461,7 +621,11 @@ pub fn coop_source_acc(tile: u32, tm: u32, tn: u32, sg: u32, ku: u32, acc: CoopA
     )
     .unwrap();
     b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
-    writeln!(b, "@group(0) @binding(4) var<storage, read> cg_zero: array<{cw}>;\n").unwrap();
+    writeln!(
+        b,
+        "@group(0) @binding(4) var<storage, read> cg_zero: array<{cw}>;\n"
+    )
+    .unwrap();
     writeln!(b, "@compute @workgroup_size({wg})").unwrap();
     writeln!(b, "fn {entry}(").unwrap();
     b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
@@ -474,17 +638,32 @@ pub fn coop_source_acc(tile: u32, tm: u32, tn: u32, sg: u32, ku: u32, acc: CoopA
     b.push_str("    let kk = cg_p.k_elems;\n    let ys = cg_p.y_stride;\n");
     b.push_str("    let mrows = cg_p.m_rows;\n    let nrows = cg_p.n_rows;\n");
     for r in 0..tm {
-        writeln!(b, "    let arow{r} = min(m0 + {}u, mrows - {t}u) * kk;", r * t).unwrap();
+        writeln!(
+            b,
+            "    let arow{r} = min(m0 + {}u, mrows - {t}u) * kk;",
+            r * t
+        )
+        .unwrap();
     }
     for j in 0..tn {
-        writeln!(b, "    let bcol{j} = min(n0 + {}u, nrows - {t}u) * kk;", j * t).unwrap();
+        writeln!(
+            b,
+            "    let bcol{j} = min(n0 + {}u, nrows - {t}u) * kk;",
+            j * t
+        )
+        .unwrap();
     }
     for r in 0..tm {
         for j in 0..tn {
             writeln!(b, "    var c{r}_{j} = coopLoadT<CGC>(&cg_zero[0], {t}u);").unwrap();
         }
     }
-    writeln!(b, "    for (var kt = 0u; kt < kk; kt = kt + {}u) {{", t * ku).unwrap();
+    writeln!(
+        b,
+        "    for (var kt = 0u; kt < kk; kt = kt + {}u) {{",
+        t * ku
+    )
+    .unwrap();
     for u in 0..ku {
         for r in 0..tm {
             writeln!(
@@ -567,6 +746,10 @@ pub const DOTS_VISION_COOP_PLAN_IS_A_SQUARE_FRAGMENT_TILE_BECAUSE_TM_PLUS_TN_OPE
         ku: 1,
     };
 
+pub const DOTS_VISION_COOP_PLAN_HALVES_ITS_WIDER_SIDE_UNTIL_THE_ACCUMULATOR_FITS_BECAUSE_A_16_WIDE_TILE_QUADRUPLES_THE_DWORDS_AN_8_WIDE_PLAN_WAS_FITTED_ON: &str =
+    "the tm8_tn4 plan was fitted on an 8-wide cooperative tile at 64 accumulator dwords per lane; a \
+     16-wide tile holds four times the dwords per fragment, so the same plan asks 256 of a 128 budget \
+     and the wider side halves until it fits instead of refusing the adapter";
 pub const DOTS_VISION_COOP_PLAN_FITTED_TM8_TN4_SG4_IS_THE_DEFAULT_WHEREVER_THE_OUTPUT_IS_WIDER_THAN_ONE_COLUMN_BAND: CoopPlan =
     CoopPlan {
         tm: 8,
@@ -615,7 +798,8 @@ pub const DOTS_VISION_COOP_PLAN_TM8_TN4_IS_FASTER_ON_EVERY_SHAPE_BUT_ATTN_CTX_WH
      A blanket flip is not the win: it is the win minus a 0.91x regression on 29 percent of the \
      tower.";
 
-pub const DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES: u32 = 4;
+pub const DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES:
+    u32 = 4;
 
 pub const DOTS_VISION_COOP_COLUMN_BAND_SHRINKS_TO_FIT_N_BECAUSE_SUBGROUPS_PAST_COLUMN_N_STILL_WALK_THE_WHOLE_K_LOOP: &str =
     "A workgroup covers tile*tn*sg columns whatever n is, and the subgroups whose band starts past \
@@ -702,8 +886,7 @@ pub const FA_NEEDV_ELEMS_IS_FOUR_BECAUSE_FOUR_U32_IS_EXACTLY_THE_16_BYTE_COOP_LO
 
 const _: () = assert!(
     (FA_NEEDV_ELEMS_IS_FOUR_BECAUSE_FOUR_U32_IS_EXACTLY_THE_16_BYTE_COOP_LOAD_ALIGNMENT_QUANTUM * 4)
-        % 16
-        == 0,
+        .is_multiple_of(16),
     "fa_needv must be a whole number of 16-byte units or the probability tile it precedes is coop-loaded from a truncated address"
 );
 
@@ -772,18 +955,18 @@ impl FlashPlan {
         let _ = DOTS_VISION_FLASH_IS_MEASURED_SLOWER_THAN_THE_SLAB_ON_AN_8X8_FRAGMENT_ADAPTER_AND_THE_WORKGROUP_BUDGET_IS_NOT_WHY;
         let t = tile;
         anyhow::ensure!(
-            t > 0 && self.bm % t == 0 && self.bn % t == 0 && hd % t == 0,
+            t > 0 && self.bm.is_multiple_of(t) && self.bn.is_multiple_of(t) && hd.is_multiple_of(t),
             "flash plan {}: bm, bn and head_dim {hd} must all be multiples of the {t}-wide fragment",
             self.name()
         );
         anyhow::ensure!(
-            (1..=8).contains(&self.sg) && self.scs >= 1 && self.sg % self.scs == 0,
+            (1..=8).contains(&self.sg) && self.scs >= 1 && self.sg.is_multiple_of(self.scs),
             "flash plan {}: sg must be 1..8 and the score column split must divide it",
             self.name()
         );
         let wg = self.sg * (coop::SUBGROUP as usize);
         anyhow::ensure!(
-            wg % self.bm == 0,
+            wg.is_multiple_of(self.bm),
             "flash plan {}: a {wg}-invocation workgroup must cover {} rows an equal number of \
              lanes each",
             self.name(),
@@ -794,7 +977,7 @@ impl FlashPlan {
         let ht = hd / t;
         let srs = self.sg / self.scs;
         anyhow::ensure!(
-            rm % srs == 0 && cn % self.scs == 0 && ht % self.sg == 0,
+            rm.is_multiple_of(srs) && cn.is_multiple_of(self.scs) && ht.is_multiple_of(self.sg),
             "flash plan {}: the {rm}x{cn} score tile grid and the {ht} head-dim tiles must divide \
              across {} subgroups",
             self.name(),
@@ -802,7 +985,7 @@ impl FlashPlan {
         );
         let nchunk = hd.div_ceil(self.bn).max(1);
         anyhow::ensure!(
-            rm % nchunk == 0,
+            rm.is_multiple_of(nchunk),
             "flash plan {}: {}",
             self.name(),
             DOTS_VISION_FLASH_STAGES_THE_RESCALE_THROUGH_THE_SCORE_TILE_BECAUSE_IT_IS_DEAD_BY_THEN
@@ -865,12 +1048,7 @@ impl FlashGeometry {
     }
 
     pub fn entry(&self) -> String {
-        format!(
-            "dv_flash_t{}_hd{}_{}",
-            self.tile,
-            self.hd,
-            self.plan.name()
-        )
+        format!("dv_flash_t{}_hd{}_{}", self.tile, self.hd, self.plan.name())
     }
 
     pub fn source(&self) -> String {
@@ -943,7 +1121,11 @@ impl FlashGeometry {
         b.push_str("        let j0 = kb * bnw;\n");
         for i in 0..srm {
             for j in 0..scn {
-                writeln!(b, "        var c{i}_{j} = coopLoadT<FQC>(&fa_zero[0], {t}u);").unwrap();
+                writeln!(
+                    b,
+                    "        var c{i}_{j} = coopLoadT<FQC>(&fa_zero[0], {t}u);"
+                )
+                .unwrap();
             }
         }
         writeln!(b, "        for (var kt = 0u; kt < hdw; kt = kt + {t}u) {{").unwrap();
@@ -1006,7 +1188,9 @@ impl FlashGeometry {
         b.push_str("        var zsum = 0.0;\n");
         writeln!(b, "        for (var c = sub; c < bnw; c = c + {lr}u) {{").unwrap();
         b.push_str("            var pv = 0.0;\n");
-        b.push_str("            if (j0 + c < fa_p.n) { pv = exp(fa_s[sbase + c] * fa_p.scale - mnew); }\n");
+        b.push_str(
+            "            if (j0 + c < fa_p.n) { pv = exp(fa_s[sbase + c] * fa_p.scale - mnew); }\n",
+        );
         b.push_str("            fa_pr[sbase + c] = f16(pv);\n");
         b.push_str("            zsum = zsum + pv;\n        }\n");
         b.push_str("        workgroupBarrier();\n");
@@ -1036,8 +1220,11 @@ impl FlashGeometry {
                     let off = (i - ch * self.tpc) * t;
                     writeln!(b, "            let rv{i}_{j} = o{i}_{j};").unwrap();
                     writeln!(b, "            let ro{i}_{j} = {off}u * hdw + ocol{j};").unwrap();
-                    writeln!(b, "            coopStoreT(rv{i}_{j}, &fa_s[ro{i}_{j}], hdw);")
-                        .unwrap();
+                    writeln!(
+                        b,
+                        "            coopStoreT(rv{i}_{j}, &fa_s[ro{i}_{j}], hdw);"
+                    )
+                    .unwrap();
                 }
             }
             b.push_str("            workgroupBarrier();\n");
@@ -1202,7 +1389,11 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
             .unwrap();
         }
         for s in [16u32, 8, 4, 2, 1] {
-            writeln!(b, "        sv{i} = sv{i} + subgroupShuffleXor(sv{i}, {s}u);").unwrap();
+            writeln!(
+                b,
+                "        sv{i} = sv{i} + subgroupShuffleXor(sv{i}, {s}u);"
+            )
+            .unwrap();
         }
     }
     for c in 0..4 {
@@ -1214,7 +1405,11 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
         writeln!(b, "        let ex{i} = exp(sv{i} - nm{i});").unwrap();
         writeln!(b, "        zv{i} = fma(zv{i}, rs{i}, ex{i});").unwrap();
         for c in 0..4 {
-            writeln!(b, "        av{i}_{c} = fma(av{i}_{c}, rs{i}, ex{i} * vv{c});").unwrap();
+            writeln!(
+                b,
+                "        av{i}_{c} = fma(av{i}_{c}, rs{i}, ex{i} * vv{c});"
+            )
+            .unwrap();
         }
         writeln!(b, "        mv{i} = nm{i};").unwrap();
     }
@@ -1406,15 +1601,24 @@ pub const MLX_W4_QUANTIZE_REQUANTIZES_AGAINST_THE_BF16_ROUNDED_SCALE_AND_BIAS_BE
      produce. A group whose values are all equal gets scale 0 and rides entirely on the bias.";
 
 pub fn mlx_w4_quantize_rows(w: &[f32], n: usize, k: usize, gs: usize) -> MlxW4Rows {
-    assert!(k.is_multiple_of(gs) && gs.is_multiple_of(8), "mlx w4 wants k {k} divisible by gs {gs} divisible by 8");
-    assert_eq!(w.len(), n * k, "mlx w4 quantize wants an n*k row-major weight");
+    assert!(
+        k.is_multiple_of(gs) && gs.is_multiple_of(8),
+        "mlx w4 wants k {k} divisible by gs {gs} divisible by 8"
+    );
+    assert_eq!(
+        w.len(),
+        n * k,
+        "mlx w4 quantize wants an n*k row-major weight"
+    );
     let _ = MLX_W4_QUANTIZE_REQUANTIZES_AGAINST_THE_BF16_ROUNDED_SCALE_AND_BIAS_BECAUSE_THOSE_ARE_THE_VALUES_THE_DEQUANT_WILL_USE;
     let groups = k / gs;
     let words_per_row = k / 8;
     let mut words = vec![0u32; n * words_per_row];
     let mut scales = vec![0u16; n * groups];
     let mut biases = vec![0u16; n * groups];
-    let lanes = std::thread::available_parallelism().map_or(4, |p| p.get()).min(12);
+    let lanes = std::thread::available_parallelism()
+        .map_or(4, |p| p.get())
+        .min(12);
     let rows_per_chunk = n.div_ceil(lanes).max(1);
     let mut chunk_starts = Vec::new();
     let mut r0 = 0usize;
@@ -1426,7 +1630,11 @@ pub fn mlx_w4_quantize_rows(w: &[f32], n: usize, k: usize, gs: usize) -> MlxW4Ro
         for ((wc, sc_c), (bc, &row0)) in words
             .chunks_mut(rows_per_chunk * words_per_row)
             .zip(scales.chunks_mut(rows_per_chunk * groups))
-            .zip(biases.chunks_mut(rows_per_chunk * groups).zip(chunk_starts.iter()))
+            .zip(
+                biases
+                    .chunks_mut(rows_per_chunk * groups)
+                    .zip(chunk_starts.iter()),
+            )
         {
             sc.spawn(move || {
                 for (ri, wrow) in wc.chunks_mut(words_per_row).enumerate() {
@@ -1462,9 +1670,19 @@ pub fn mlx_w4_quantize_rows(w: &[f32], n: usize, k: usize, gs: usize) -> MlxW4Ro
 }
 
 pub fn mlx_w4_dequant_f16_bits_padded(q: &MlxW4Rows, k_pad: usize) -> Vec<u16> {
-    let scales: Vec<f32> = q.scales_bf16.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-    let biases: Vec<f32> = q.biases_bf16.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
-    let deq = nv_quant::mlx_affine::dequantize_mlx_affine_linear(&q.words, &scales, &biases, q.n, q.k, q.gs);
+    let scales: Vec<f32> = q
+        .scales_bf16
+        .iter()
+        .map(|&b| f32::from_bits((b as u32) << 16))
+        .collect();
+    let biases: Vec<f32> = q
+        .biases_bf16
+        .iter()
+        .map(|&b| f32::from_bits((b as u32) << 16))
+        .collect();
+    let deq = nv_quant::mlx_affine::dequantize_mlx_affine_linear(
+        &q.words, &scales, &biases, q.n, q.k, q.gs,
+    );
     f16_bits_padded(&deq, q.n, q.k, k_pad)
 }
 
@@ -1982,7 +2200,7 @@ pub struct VisionGemm {
     ctx: &'static WgpuContext,
     route: VisionGemmRoute,
     coop_zero: wgpu::Buffer,
-    coop_zero16: wgpu::Buffer,
+    _coop_zero16: wgpu::Buffer,
     pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
     uniforms: Mutex<
         HashMap<
@@ -1996,6 +2214,7 @@ pub struct VisionGemm {
     splitk_scratch: Mutex<Option<(usize, Arc<wgpu::Buffer>)>>,
     submits: std::sync::atomic::AtomicU64,
     dispatched: std::sync::atomic::AtomicU64,
+    fused_steel: std::sync::atomic::AtomicU64,
 }
 
 impl VisionGemm {
@@ -2017,7 +2236,7 @@ impl VisionGemm {
             ctx,
             route,
             coop_zero,
-            coop_zero16,
+            _coop_zero16: coop_zero16,
             pipelines: Mutex::new(HashMap::new()),
             uniforms: Mutex::new(HashMap::new()),
             queued: Mutex::new(Vec::new()),
@@ -2026,6 +2245,7 @@ impl VisionGemm {
             splitk_scratch: Mutex::new(None),
             submits: std::sync::atomic::AtomicU64::new(0),
             dispatched: std::sync::atomic::AtomicU64::new(0),
+            fused_steel: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -2034,6 +2254,10 @@ impl VisionGemm {
             self.submits.load(std::sync::atomic::Ordering::Relaxed),
             self.dispatched.load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    pub fn fused_steel_passes(&self) -> u64 {
+        self.fused_steel.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn route(&self) -> VisionGemmRoute {
@@ -2089,13 +2313,11 @@ impl VisionGemm {
         let square = DOTS_VISION_COOP_PLAN_IS_A_SQUARE_FRAGMENT_TILE_BECAUSE_TM_PLUS_TN_OPERAND_LOADS_FEED_TM_TIMES_TN_MULTIPLY_ADDS;
         let fitted = DOTS_VISION_COOP_PLAN_FITTED_TM8_TN4_SG4_IS_THE_DEFAULT_WHEREVER_THE_OUTPUT_IS_WIDER_THAN_ONE_COLUMN_BAND;
         let wider_than_one_band = n_pad > g.cols_per_workgroup(fitted.tn, fitted.sg) as usize;
-        let mut p = listed.unwrap_or(
-            match std::env::var(DOTS_VISION_PLAN_ENV).ok().as_deref() {
-                Some("square") => square,
-                _ if wider_than_one_band => fitted,
-                _ => square,
-            },
-        );
+        let mut p = listed.unwrap_or(match std::env::var(DOTS_VISION_PLAN_ENV).ok().as_deref() {
+            Some("square") => square,
+            _ if wider_than_one_band => fitted,
+            _ => square,
+        });
         p.tm = p.tm.clamp(1, m_pad.div_ceil(tile).max(1) as u32);
         p.tn = p.tn.max(1);
         p.sg = p.sg.max(1);
@@ -2109,6 +2331,14 @@ impl VisionGemm {
         let k_tiles = (k_pad / tile.max(1)) as u32;
         if p.ku == 0 || k_tiles == 0 || !k_tiles.is_multiple_of(p.ku) {
             p.ku = 1;
+        }
+        let _ = DOTS_VISION_COOP_PLAN_HALVES_ITS_WIDER_SIDE_UNTIL_THE_ACCUMULATOR_FITS_BECAUSE_A_16_WIDE_TILE_QUADRUPLES_THE_DWORDS_AN_8_WIDE_PLAN_WAS_FITTED_ON;
+        while !(g.acc_fits_a_register_file(p.tm, p.tn) && p.tm * p.tn <= 64) && p.tm * p.tn > 1 {
+            if p.tm >= p.tn {
+                p.tm /= 2;
+            } else {
+                p.tn /= 2;
+            }
         }
         anyhow::ensure!(
             g.acc_fits_a_register_file(p.tm, p.tn) && p.tm * p.tn <= 64,
@@ -2246,23 +2476,167 @@ impl VisionGemm {
         let Some(pipeline) = pls.pick(cfg) else {
             return Ok(false);
         };
-        let p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, y_stride, cfg);
+        let _ = STEEL_GEMM_SWIZZLE_REMAPS_TILE_OWNERSHIP_ONLY_SO_EVERY_SETTING_IS_BIT_IDENTICAL;
+        let sl: u32 = std::env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            .min(3);
+        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, y_stride, cfg);
+        p.swizzle_log = sl as i32;
         let pb = self.uniform_wide("dv-steel-gemm-p", &p);
-        let bind = self.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dv-steel-gemm"),
-            layout: &pls.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: x.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: y.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: pb.as_entire_binding() },
-            ],
-        });
-        self.record_prebuilt(
-            pipeline,
-            bind,
-            super::vision_attn_msl::steel_gemm_grid(rows, n, cfg),
-        )?;
+        let bind = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dv-steel-gemm"),
+                layout: &pls.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pb.as_entire_binding(),
+                    },
+                ],
+            });
+        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
+        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_steel_resadd(
+        &self,
+        w: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        xacc: &wgpu::Buffer,
+        rows: usize,
+        n: usize,
+        k_pad: usize,
+        cfg: (u32, u32, u32, u32, u32),
+    ) -> Result<bool> {
+        if !k_pad.is_multiple_of(cfg.2 as usize) {
+            return Ok(false);
+        }
+        let Ok(pls) = super::vision_attn_msl::steel_gemm_fused_pipelines(self.ctx) else {
+            return Ok(false);
+        };
+        let Some(pipeline) = pls.pick_resadd(cfg) else {
+            return Ok(false);
+        };
+        let sl: u32 = std::env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            .min(3);
+        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, n, cfg);
+        p.swizzle_log = sl as i32;
+        let pb = self.uniform_wide("dv-steel-gemm-p", &p);
+        let bind = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dv-steel-gemm-resadd"),
+                layout: &pls.resadd_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: xacc.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pb.as_entire_binding(),
+                    },
+                ],
+            });
+        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
+        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))?;
+        self.fused_steel
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_steel_gsilu(
+        &self,
+        w: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        gate: &wgpu::Buffer,
+        act: &wgpu::Buffer,
+        rows: usize,
+        n: usize,
+        k_pad: usize,
+        cfg: (u32, u32, u32, u32, u32),
+    ) -> Result<bool> {
+        if !k_pad.is_multiple_of(cfg.2 as usize) {
+            return Ok(false);
+        }
+        let Ok(pls) = super::vision_attn_msl::steel_gemm_fused_pipelines(self.ctx) else {
+            return Ok(false);
+        };
+        let Some(pipeline) = pls.pick_gsilu(cfg) else {
+            return Ok(false);
+        };
+        let sl: u32 = std::env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            .min(3);
+        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, n, cfg);
+        p.swizzle_log = sl as i32;
+        let pb = self.uniform_wide("dv-steel-gemm-p", &p);
+        let bind = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dv-steel-gemm-gsilu"),
+                layout: &pls.gsilu_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: w.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: act.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pb.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: gate.as_entire_binding(),
+                    },
+                ],
+            });
+        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
+        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))?;
+        self.fused_steel
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
@@ -2302,7 +2676,7 @@ impl VisionGemm {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.dispatched
             .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        if let Some(err) = pollster::block_on(scope.pop()) {
+        if let Some(err) = dispatch::pop_scope(scope) {
             anyhow::bail!("dots vision submit of {} passes: {err}", batch.len());
         }
         Ok(())
@@ -2316,7 +2690,14 @@ impl VisionGemm {
         dispatch::workgroup_count_1d(self.ctx, rows as u64, 1)
     }
 
-    fn rows_params(&self, rows: usize, cols: usize, cols_pad: usize, scalar: f32, groups_x: u32) -> RowsP {
+    fn rows_params(
+        &self,
+        rows: usize,
+        cols: usize,
+        cols_pad: usize,
+        scalar: f32,
+        groups_x: u32,
+    ) -> RowsP {
         self.rows_params_z(rows, cols, cols_pad, scalar, groups_x, 0)
     }
 
@@ -2431,7 +2812,13 @@ impl VisionGemm {
             "nv_models_dots_vision_coop_acc",
             &coop_entry_acc(t, tm, tn, sg, ku, acc),
             || coop_source_acc(t, tm, tn, sg, ku, acc),
-            &[(0, w, w_off), (1, x, 0), (2, y, y_off), (3, &pb, 0), (4, zero, 0)],
+            &[
+                (0, w, w_off),
+                (1, x, 0),
+                (2, y, y_off),
+                (3, &pb, 0),
+                (4, zero, 0),
+            ],
             groups,
         )
     }
@@ -2513,7 +2900,7 @@ impl VisionGemm {
         repeats: usize,
     ) -> Result<f64> {
         anyhow::ensure!(
-            m_rows % 4 == 0 && hd % 4 == 0,
+            m_rows.is_multiple_of(4) && hd.is_multiple_of(4),
             "an M-row flash groups four query rows per vec4 and four head dims per lane, so M={m_rows} and head_dim={hd} must both be multiples of four"
         );
         let _ = DOTS_VISION_GEMM_LADDER_OPERANDS_ARE_DEVICE_ZEROS_BECAUSE_A_COOPERATIVE_MATRIX_RATE_IS_NOT_DATA_DEPENDENT;
@@ -2622,7 +3009,9 @@ impl VisionGemm {
         let mut plan = self.resolve_plan(g, n, k_pad, m_pad)?;
         if !listed {
             plan = DOTS_VISION_SPLITK_FITTED_PLAN_IS_TM8_BECAUSE_THE_S16_LADDER_READS_15_59_TFLOPS_THERE_AGAINST_THE_SQUARE_PLANS_11_9;
-            plan.tm = plan.tm.clamp(1, (m_pad.div_ceil(g.tile as usize)).max(1) as u32);
+            plan.tm = plan
+                .tm
+                .clamp(1, (m_pad.div_ceil(g.tile as usize)).max(1) as u32);
         }
         let (bm, bn) = g.grid(m_pad as u32, n as u32, plan.tm, plan.tn, plan.sg);
         let blocks_mn = bm * bn;
@@ -2701,7 +3090,9 @@ impl VisionGemm {
             VisionGemmRoute::Coop(g) => {
                 g.check_shape(m_pad as u32, n as u32, k_pad as u32)
                     .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
-                if label == "attn_ctx" {
+                if label == "attn_ctx"
+                    && g.tile == DOTS_VISION_SPLITK_KERNEL_IS_GENERATED_FOR_THE_8X8X8_TILE_ONLY_SO_A_WIDER_TILE_ADAPTER_TAKES_THE_PLAIN_COOP_ARM
+                {
                     if let Some(s) = splitk_arm() {
                         return self.gemm_splitk(
                             &g, s, w, w_off, x, x_off, y, y_off, m_pad, n, k_pad, y_stride,
@@ -2710,7 +3101,7 @@ impl VisionGemm {
                 }
                 let plan = self
                     .resolve_plan(&g, n, k_pad, m_pad)
-                    .with_context(|| format!("{label}"))?;
+                    .with_context(|| label.to_string())?;
                 let (bm, bn) = g.grid(m_pad as u32, n as u32, plan.tm, plan.tn, plan.sg);
                 let groups = dispatch::workgroup_count_1d(self.ctx, (bm as u64) * (bn as u64), 1);
                 let p = coop::CoopGemmParams {
@@ -2792,8 +3183,10 @@ impl VisionGemm {
             .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
         let mut plan = self
             .resolve_plan(&g, n, k_pad, m_pad)
-            .with_context(|| format!("{label}"))?;
-        if plan.ku > DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES {
+            .with_context(|| label.to_string())?;
+        if plan.ku
+            > DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES
+        {
             plan.ku = DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES;
         }
         anyhow::ensure!(
@@ -2910,7 +3303,7 @@ impl VisionGemm {
     ) -> Result<()> {
         match &lin.w {
             WgpuLinW::F16(w) => {
-                let steel = match steel_gemm_cfg() {
+                let steel = match steel_gemm_cfg_serving(rows, lin.n) {
                     Some(cfg) => self.gemm_steel(w, x, y, rows, lin.n, lin.k_pad, lin.n, cfg)?,
                     None => false,
                 };
@@ -3035,12 +3428,7 @@ impl VisionGemm {
         )
     }
 
-    fn gelu_erf_f16(
-        &self,
-        x: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        count: usize,
-    ) -> Result<()> {
+    fn gelu_erf_f16(&self, x: &wgpu::Buffer, y: &wgpu::Buffer, count: usize) -> Result<()> {
         let groups = self.elementwise_groups(count);
         let p = self.rows_params(count, 1, 1, 0.0, groups.0);
         let pb = self.uniform("dv-gelu-p", &p);
@@ -3144,18 +3532,13 @@ pub fn probe_gemm_f16(
     anyhow::ensure!(x.len() == m * k, "probe x is {} not {m}x{k}", x.len());
     let mut wp = vec![0f32; n_pad * k];
     wp[..n * k].copy_from_slice(w);
-    let wb = dispatch::storage_from_slice(
-        g.ctx,
-        "dv-probe-w",
-        &f16_bits_padded(&wp, n_pad, k, k_pad),
-    );
+    let wb =
+        dispatch::storage_from_slice(g.ctx, "dv-probe-w", &f16_bits_padded(&wp, n_pad, k, k_pad));
     let xb = g.f16_buf("dv-probe-x", g.coop_x_rows(m_pad) * k_pad);
     let xsrc = g.upload_f32("dv-probe-xsrc", x);
     g.cast_pad(&xsrc, &xb, m, k, k_pad)?;
     let yb = g.f32_buf("dv-probe-y", m_pad * n_pad);
-    g.gemm(
-        "probe", &wb, 0, &xb, 0, &yb, 0, m_pad, n_pad, k_pad, n_pad,
-    )?;
+    g.gemm("probe", &wb, 0, &xb, 0, &yb, 0, m_pad, n_pad, k_pad, n_pad)?;
     let all = g.read_f32(&yb, m_pad * n_pad)?;
     let mut out = vec![0f32; m * n];
     for r in 0..m {
@@ -3193,7 +3576,17 @@ pub fn probe_gemm_w4a16(
     g.cast_pad(&xsrc, &xb, m, k, k_pad)?;
     let yb = g.f32_buf("dv-probe-y4", m_pad * n_pad);
     g.gemm_w4a16(
-        "probe_w4a16", &wb, &sb, &xb, 0, &yb, 0, m_pad, n_pad, k_pad, n_pad,
+        "probe_w4a16",
+        &wb,
+        &sb,
+        &xb,
+        0,
+        &yb,
+        0,
+        m_pad,
+        n_pad,
+        k_pad,
+        n_pad,
     )?;
     let all = g.read_f32(&yb, m_pad * n_pad)?;
     let mut out = vec![0f32; m * n];
@@ -3303,12 +3696,31 @@ pub struct DotsVisionTowerWgpu {
     post_trunk_norm: Option<wgpu::Buffer>,
     merger: WgpuMerger,
     w4_scratch: Option<wgpu::Buffer>,
+    visenc_packs: std::sync::atomic::AtomicU64,
 }
+
+pub const MLX_PATCHIFIER_CONV_IS_CHANNELS_LAST_AND_PERMUTES_TO_THE_REDNOTE_ROW_ORDER: &str =
+    "the mlx-community dots.ocr-4bit export stores patch_embed.patchifier.proj.weight as \
+     [out, 14, 14, 3] where the rednote master stores [out, 3, 14, 14]; the patch rows this \
+     GEMM consumes are flattened channels-first, so a 4-d weight whose middle dims match and \
+     whose last dim differs is channels-last and permutes to [out, c, h, w] before \
+     flattening -- every other tower tensor is bitwise identical across the two snapshots";
 
 fn host_rows(weights: &WeightLoader, name: &str, expect: &[usize]) -> Result<Vec<f32>> {
     let t = weights
         .get(name, DType::F32)
         .with_context(|| format!("load {name}"))?;
+    let t = if t.dims().len() == 4 && expect.len() == 2 {
+        let _ = MLX_PATCHIFIER_CONV_IS_CHANNELS_LAST_AND_PERMUTES_TO_THE_REDNOTE_ROW_ORDER;
+        let d = t.dims().to_vec();
+        if d[1] == d[2] && d[3] != d[2] {
+            t.permute((0, 3, 1, 2))?.contiguous()?
+        } else {
+            t
+        }
+    } else {
+        t
+    };
     let t = if t.dims().len() > 2 && expect.len() == 2 {
         let rows = t.dim(0)?;
         let cols: usize = t.dims()[1..].iter().product();
@@ -3325,7 +3737,11 @@ fn host_rows(weights: &WeightLoader, name: &str, expect: &[usize]) -> Result<Vec
 }
 
 impl DotsVisionTowerWgpu {
-    pub fn from_loader(weights: &WeightLoader, prefix: &str, cfg: DotsVisionConfig) -> Result<Self> {
+    pub fn from_loader(
+        weights: &WeightLoader,
+        prefix: &str,
+        cfg: DotsVisionConfig,
+    ) -> Result<Self> {
         let ctx =
             WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu adapter unavailable: {e}"))?;
         let route = VisionGemmRoute::from_env_and_adapter(ctx);
@@ -3382,13 +3798,9 @@ impl DotsVisionTowerWgpu {
                         scales: dispatch::storage_from_slice(ctx, name, &scales),
                     }
                 }
-                VisionWeightFmt::MlxW4 { gs, .. } if !k.is_multiple_of(gs) => {
-                    WgpuLinW::F16(dispatch::storage_from_slice(
-                        ctx,
-                        name,
-                        &f16_bits_padded(&w, n, k, k_pad),
-                    ))
-                }
+                VisionWeightFmt::MlxW4 { gs, .. } if !k.is_multiple_of(gs) => WgpuLinW::F16(
+                    dispatch::storage_from_slice(ctx, name, &f16_bits_padded(&w, n, k, k_pad)),
+                ),
                 VisionWeightFmt::MlxW4 { gs, twin } => {
                     let q = mlx_w4_quantize_rows(&w, n, k, gs);
                     if twin {
@@ -3399,7 +3811,9 @@ impl DotsVisionTowerWgpu {
                         ))
                     } else {
                         let widen = |v: &[u16]| -> Vec<f32> {
-                            v.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect()
+                            v.iter()
+                                .map(|&b| f32::from_bits((b as u32) << 16))
+                                .collect()
                         };
                         WgpuLinW::MlxW4 {
                             words: dispatch::storage_from_slice(ctx, name, &q.words),
@@ -3531,6 +3945,7 @@ impl DotsVisionTowerWgpu {
             post_trunk_norm,
             merger,
             w4_scratch,
+            visenc_packs: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -3590,9 +4005,49 @@ impl DotsVisionTowerWgpu {
             .project(lin, x, y, rows, m_pad, self.w4_scratch.as_ref())
     }
 
+    fn proj_fused_resadd(
+        &self,
+        lin: &WgpuLin,
+        x: &wgpu::Buffer,
+        xacc: &wgpu::Buffer,
+        rows: usize,
+    ) -> Result<bool> {
+        let WgpuLinW::F16(w) = &lin.w else {
+            return Ok(false);
+        };
+        if lin.bias.is_some() {
+            return Ok(false);
+        }
+        let Some(cfg) = steel_gemm_cfg_serving(rows, lin.n) else {
+            return Ok(false);
+        };
+        self.g
+            .gemm_steel_resadd(w, x, xacc, rows, lin.n, lin.k_pad, cfg)
+    }
+
+    fn proj_fused_gsilu(
+        &self,
+        lin: &WgpuLin,
+        x: &wgpu::Buffer,
+        gate: &wgpu::Buffer,
+        act: &wgpu::Buffer,
+        rows: usize,
+    ) -> Result<bool> {
+        let WgpuLinW::F16(w) = &lin.w else {
+            return Ok(false);
+        };
+        if lin.bias.is_some() {
+            return Ok(false);
+        }
+        let Some(cfg) = steel_gemm_cfg_serving(rows, lin.n) else {
+            return Ok(false);
+        };
+        self.g
+            .gemm_steel_gsilu(w, x, gate, act, rows, lin.n, lin.k_pad, cfg)
+    }
+
     fn install_fitted_plans_when_asked(&self, n_pad: usize) {
-        if std::env::var(DOTS_VISION_WGPU_FITTED_PLANS_ENV)
-            .is_ok_and(|v| !v.is_empty() && v != "0")
+        if std::env::var(DOTS_VISION_WGPU_FITTED_PLANS_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
         {
             self.apply_m5_fitted_plans(n_pad, true);
         }
@@ -3603,7 +4058,12 @@ impl DotsVisionTowerWgpu {
         self.g.set_plan(
             self.cfg.head_dim(),
             n_pad,
-            on.then_some(CoopPlan { tm: 8, tn: 2, sg: 2, ku: 1 }),
+            on.then_some(CoopPlan {
+                tm: 8,
+                tn: 2,
+                sg: 2,
+                ku: 1,
+            }),
         );
     }
 
@@ -3613,9 +4073,13 @@ impl DotsVisionTowerWgpu {
         grid_h: usize,
         grid_w: usize,
     ) -> Result<Vec<f32>> {
-        Ok(self
-            .forward_patches_traced(patches, grid_h, grid_w, false)?
-            .0)
+        match self
+            .forward_patches_traced(patches, grid_h, grid_w, false, false)?
+            .0
+        {
+            TrunkOut::Host(v) => Ok(v),
+            TrunkOut::Gpu(_) => unreachable!("resident=false never returns a gpu trunk"),
+        }
     }
 
     pub fn forward_patches_with_layer_trace(
@@ -3624,7 +4088,37 @@ impl DotsVisionTowerWgpu {
         grid_h: usize,
         grid_w: usize,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
-        self.forward_patches_traced(patches, grid_h, grid_w, true)
+        let (out, trace) = self.forward_patches_traced(patches, grid_h, grid_w, true, false)?;
+        match out {
+            TrunkOut::Host(v) => Ok((v, trace)),
+            TrunkOut::Gpu(_) => unreachable!("resident=false never returns a gpu trunk"),
+        }
+    }
+
+    pub const ENCODE_RESIDENT_SERVES_ONLY_THE_GPU_MERGER_ARM_BECAUSE_ONLY_ITS_TRUNK_NEVER_TOUCHES_THE_HOST:
+        &'static str =
+        "encode_resident returns the merged features as bf16-packed words still on the shared wgpu \
+         device (the graph decoder's splice copies straight from them); every other arm -- host \
+         merger, missing post-norm, an ablation env -- computes on the host mid-merger, so the \
+         caller falls back to encode() and the shipped host handoff before any tower pass runs.";
+
+    pub fn encode_resident(
+        &self,
+        prep: &PreparedImage,
+    ) -> Result<Option<super::decoder_wgpu_graph::VisionRowsGpu>> {
+        let _ = Self::ENCODE_RESIDENT_SERVES_ONLY_THE_GPU_MERGER_ARM_BECAUSE_ONLY_ITS_TRUNK_NEVER_TOUCHES_THE_HOST;
+        if !merger_gpu_arm()
+            || self.post_trunk_norm.is_none()
+            || std::env::var(DOTS_VISION_ABLATE_ENV).is_ok()
+        {
+            return Ok(None);
+        }
+        let (out, _) =
+            self.forward_patches_traced(&prep.patches, prep.grid_h, prep.grid_w, false, true)?;
+        Ok(match out {
+            TrunkOut::Gpu(v) => Some(v),
+            TrunkOut::Host(_) => None,
+        })
     }
 
     fn forward_patches_traced(
@@ -3633,7 +4127,8 @@ impl DotsVisionTowerWgpu {
         grid_h: usize,
         grid_w: usize,
         trace: bool,
-    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        resident: bool,
+    ) -> Result<(TrunkOut, Vec<Vec<f32>>)> {
         let mut phases = PhaseLog::from_env();
         let started = std::time::Instant::now();
         let out = self.forward_patches_traced_holding_every_transient(
@@ -3641,6 +4136,7 @@ impl DotsVisionTowerWgpu {
             grid_h,
             grid_w,
             trace,
+            resident,
             &mut phases,
         );
         self.g
@@ -3655,8 +4151,9 @@ impl DotsVisionTowerWgpu {
         grid_h: usize,
         grid_w: usize,
         trace: bool,
+        resident: bool,
         ph: &mut PhaseLog,
-    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+    ) -> Result<(TrunkOut, Vec<Vec<f32>>)> {
         let n = grid_h * grid_w;
         anyhow::ensure!(
             patches.len() == n * PATCH_DIM,
@@ -3702,12 +4199,14 @@ impl DotsVisionTowerWgpu {
 
         let mut arm = AttnArm::from_env();
         let _ = DOTS_VISION_STEEL_IS_THE_DEFAULT_WHERE_PASSTHROUGH_GRANTS_AND_ZMERGE_SERVES_EVERY_OTHER_ADAPTER;
+        let steel_cfg = steel_attn_cfg_serving(n)?;
         if std::env::var(DOTS_VISION_WGPU_ATTN_ENV).is_err()
             && hd == super::vision_attn_msl::HEAD_DIM as usize
-            && super::vision_attn_msl::steel_pipelines(
+            && super::vision_attn_msl::steel_pipelines_serving(
                 g.ctx,
-                n.is_multiple_of(super::vision_attn_msl::STEEL_BQ as usize),
-                n.is_multiple_of(super::vision_attn_msl::STEEL_BK as usize),
+                steel_cfg,
+                n.is_multiple_of(steel_cfg.0 as usize),
+                n.is_multiple_of(steel_cfg.1 as usize),
             )
             .is_ok()
         {
@@ -3778,13 +4277,14 @@ impl DotsVisionTowerWgpu {
                 "the steel attention kernel is instantiated at head_dim {}, not {hd}",
                 super::vision_attn_msl::HEAD_DIM
             );
-            let pls = super::vision_attn_msl::steel_pipelines(
+            let pls = super::vision_attn_msl::steel_pipelines_serving(
                 g.ctx,
-                n.is_multiple_of(super::vision_attn_msl::STEEL_BQ as usize),
-                n.is_multiple_of(super::vision_attn_msl::STEEL_BK as usize),
+                steel_cfg,
+                n.is_multiple_of(steel_cfg.0 as usize),
+                n.is_multiple_of(steel_cfg.1 as usize),
             )?;
-            let bq = super::vision_attn_msl::STEEL_BQ as usize;
-            let bk = super::vision_attn_msl::STEEL_BK as usize;
+            let bq = steel_cfg.0 as usize;
+            let bk = steel_cfg.1 as usize;
             let p = super::vision_attn_msl::SteelAttnParams {
                 b: 1,
                 h: heads as i32,
@@ -3812,26 +4312,51 @@ impl DotsVisionTowerWgpu {
                 label: Some("dv-steel-attn"),
                 layout: &pls.layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: qh.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: kh.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: vt.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: attn_x.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: pb.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: mp.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: dummy.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 7, resource: dummy.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: qh.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: kh.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: vt.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: attn_x.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: pb.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: mp.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: dummy.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: dummy.as_entire_binding(),
+                    },
                 ],
             });
             Some((
                 pls.pipeline.clone(),
                 bind,
-                super::vision_attn_msl::steel_grid(heads as u32, n as u32),
+                super::vision_attn_msl::steel_grid_cfg(steel_cfg, heads as u32, n as u32),
             ))
         } else {
             None
         };
 
         let mut layer_trace = Vec::new();
+        let fuse = steel_fuse_from_env();
         ph.mark(g, "transient_alloc")?;
 
         for blk in self.blocks.iter() {
@@ -3839,7 +4364,7 @@ impl DotsVisionTowerWgpu {
                 g.rmsnorm_to_f16(&x, &blk.norm1, &xn, n, dim, eps)?;
             }
             ph.mark(g, "rmsnorm")?;
-            if !vis_ablated("proj") {
+            if !(vis_ablated("proj") || vis_ablated("proj_qkv")) {
                 self.proj(&blk.qkv, &xn, &qkv_y, n, n_pad)?;
             }
             ph.mark(g, "qkv_project")?;
@@ -3866,7 +4391,9 @@ impl DotsVisionTowerWgpu {
             ph.mark(g, "rope_split")?;
 
             if let Some((pl, bind, grid)) = &msl {
-                g.record_prebuilt(pl.clone(), bind.clone(), *grid)?;
+                if !vis_ablated("msl_attention") {
+                    g.record_prebuilt(pl.clone(), bind.clone(), *grid)?;
+                }
                 ph.mark(g, "msl_attention")?;
             } else if let Some(geom) = &flash {
                 g.flash_attention(geom, &qh, &kh, &vt, &attn_x, n, n_pad, heads, scale)?;
@@ -3903,21 +4430,15 @@ impl DotsVisionTowerWgpu {
                         let groups = g.row_groups(real);
                         if vis_ablated("softmax") {
                         } else if arm == AttnArm::ZMerge {
-                            let p = g.rows_params_z(
-                                real,
-                                n,
-                                n_pad,
-                                scale,
-                                groups.0,
-                                h * n_pad + m0,
-                            );
+                            let p =
+                                g.rows_params_z(real, n, n_pad, scale, groups.0, h * n_pad + m0);
                             let pb = g.uniform("dv-softmaxz-p", &p);
                             g.record_src(
                                 "nv_models_dots_vision_softmax_z",
                                 SOFTMAX_Z_SRC,
                                 "dv_softmax_rows_deferred_norm",
                                 &[(0, &scores, 0), (1, &probs, 0), (2, &pb, 0), (3, &zinv, 0)],
-                            groups,
+                                groups,
                             )?;
                         } else {
                             let p = g.rows_params(real, n, n_pad, scale, groups.0);
@@ -3974,11 +4495,15 @@ impl DotsVisionTowerWgpu {
                 ph.mark(g, "attn_merge")?;
             }
 
-            if !vis_ablated("proj") {
-                self.proj(&blk.proj, &attn_x, &proj_y, n, n_pad)?;
+            let mut fused_res_attn = false;
+            if !(vis_ablated("proj") || vis_ablated("proj_out")) {
+                fused_res_attn = fuse.0 && self.proj_fused_resadd(&blk.proj, &attn_x, &x, n)?;
+                if !fused_res_attn {
+                    self.proj(&blk.proj, &attn_x, &proj_y, n, n_pad)?;
+                }
             }
             ph.mark(g, "attn_out_project")?;
-            if !vis_ablated("residual_add") {
+            if !fused_res_attn && !(vis_ablated("residual_add") || vis_ablated("residual_attn")) {
                 g.add_into(&x, &proj_y, n * dim)?;
             }
             ph.mark(g, "residual_add")?;
@@ -3987,12 +4512,16 @@ impl DotsVisionTowerWgpu {
                 g.rmsnorm_to_f16(&x, &blk.norm2, &xn, n, dim, eps)?;
             }
             ph.mark(g, "rmsnorm")?;
-            if !vis_ablated("proj") {
+            let mut fused_silu = false;
+            if !(vis_ablated("proj") || vis_ablated("proj_gateup")) {
                 self.proj(&blk.fc1, &xn, &gate_y, n, n_pad)?;
-                self.proj(&blk.fc3, &xn, &up_y, n, n_pad)?;
+                fused_silu = fuse.1 && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, n)?;
+                if !fused_silu {
+                    self.proj(&blk.fc3, &xn, &up_y, n, n_pad)?;
+                }
             }
             ph.mark(g, "mlp_gate_up_project")?;
-            if !vis_ablated("silu") {
+            if !fused_silu && !vis_ablated("silu") {
                 let groups = g.elementwise_groups(n * inter);
                 let p = g.rows_params(n * inter, 1, 1, 0.0, groups.0);
                 let pb = g.uniform("dv-silu-p", &p);
@@ -4005,11 +4534,15 @@ impl DotsVisionTowerWgpu {
                 )?;
             }
             ph.mark(g, "silu_mul")?;
-            if !vis_ablated("proj") {
-                self.proj(&blk.fc2, &act, &ff_y, n, n_pad)?;
+            let mut fused_res_mlp = false;
+            if !(vis_ablated("proj") || vis_ablated("proj_down")) {
+                fused_res_mlp = fuse.0 && self.proj_fused_resadd(&blk.fc2, &act, &x, n)?;
+                if !fused_res_mlp {
+                    self.proj(&blk.fc2, &act, &ff_y, n, n_pad)?;
+                }
             }
             ph.mark(g, "mlp_down_project")?;
-            if !vis_ablated("residual_add") {
+            if !fused_res_mlp && !(vis_ablated("residual_add") || vis_ablated("residual_mlp")) {
                 g.add_into(&x, &ff_y, n * dim)?;
             }
             ph.mark(g, "residual_add")?;
@@ -4019,23 +4552,45 @@ impl DotsVisionTowerWgpu {
             }
         }
 
-        let merged_zeros =
-            || vec![0f32; (n / (MERGE_SIZE * MERGE_SIZE)) * self.merger.fc2.n];
+        let merged_zeros = || vec![0f32; (n / (MERGE_SIZE * MERGE_SIZE)) * self.merger.fc2.n];
         if vis_ablated("trunk_readback") {
             g.flush()?;
             g.drain()?;
-            return Ok((merged_zeros(), layer_trace));
+            return Ok((TrunkOut::Host(merged_zeros()), layer_trace));
         }
         if let (Some(norm), true) = (&self.post_trunk_norm, merger_gpu_arm()) {
             g.rmsnorm_to_f16(&x, norm, &xn, n, dim, eps)?;
             if vis_ablated("merger") {
                 g.flush()?;
                 g.drain()?;
-                return Ok((merged_zeros(), layer_trace));
+                return Ok((TrunkOut::Host(merged_zeros()), layer_trace));
+            }
+            if resident {
+                let (y, rows) = self.merger_forward_gpu_y(&xn, n)?;
+                let cols = self.merger.fc2.n;
+                anyhow::ensure!(
+                    cols.is_multiple_of(2),
+                    "merged rows are {cols} wide, bf16 pair packing needs an even width"
+                );
+                g.flush()?;
+                let buf = super::decoder_wgpu_graph::pack_f32_rows_to_bf16_words(
+                    g.ctx,
+                    &y,
+                    rows * cols / 2,
+                )?;
+                ph.mark(g, "merger")?;
+                return Ok((
+                    TrunkOut::Gpu(super::decoder_wgpu_graph::VisionRowsGpu {
+                        buf,
+                        rows,
+                        hidden: cols,
+                    }),
+                    layer_trace,
+                ));
             }
             let merged = self.merger_forward_gpu(&xn, n)?;
             ph.mark(g, "merger")?;
-            return Ok((merged, layer_trace));
+            return Ok((TrunkOut::Host(merged), layer_trace));
         }
         let trunk = match &self.post_trunk_norm {
             Some(norm) => {
@@ -4046,14 +4601,757 @@ impl DotsVisionTowerWgpu {
         };
         ph.mark(g, "trunk_readback")?;
         if vis_ablated("merger") {
-            return Ok((merged_zeros(), layer_trace));
+            return Ok((TrunkOut::Host(merged_zeros()), layer_trace));
         }
         let merged = self.merger_forward(&trunk, n)?;
         ph.mark(g, "merger")?;
-        Ok((merged, layer_trace))
+        Ok((TrunkOut::Host(merged), layer_trace))
+    }
+
+    pub const SAME_BUCKET_CROPS_BATCH_THROUGH_ONE_TOWER_PASS_BECAUSE_THE_PER_CALL_COST_IS_FIXED:
+        &'static str =
+        "a 90-130-vision-token crop costs ~49 ms to encode of which under 1 ms is compute -- \
+         the rest is per-call upload, transient allocation, dispatch stream and readback \
+         sync -- so B same-grid crops ride one forward: per-token passes run once at B x n \
+         rows, the vendored steel kernel batches by its own tid.z stride walk (grid z = B, \
+         batch stride = the per-image slab block), and the rope-split and nothing else \
+         dispatches per image through binding offsets. The batch serves only the steel arm \
+         with the gpu merger; every other configuration answers None and callers fall back \
+         to per-crop encodes.";
+
+    pub const MIXED_GRID_PACKS_SHARE_ONE_TRUNK_BECAUSE_EVERY_TRUNK_PASS_IS_ROW_INDEPENDENT_AND_ATTENTION_STAYS_PER_CROP:
+        &'static str =
+        "a page's crop encodes today run one tower forward per same-grid bucket plus one per \
+         bucket miss, and every trunk pass -- the GEMMs, norms, epilogues and the merger -- \
+         is row-independent, so crops of DIFFERENT grids can concatenate their patch rows \
+         through one trunk at the full-grid GEMM rate while attention and the rope split \
+         keep dispatching per crop group at exactly the per-bucket parameters: the pack is \
+         addressing-only regrouping, the encode_batch bitwise class. DEFAULT ON: \
+         NV_DOTS_VISENC_PACK=0 restores the per-bucket plan byte-for-byte; \
+         NV_DOTS_VISENC_PACK_ROWS caps a pack's patch rows to bound the f32 transients \
+         (qkv/gate/up at rows x 4224) near the proven whole-page class. The pack still \
+         refuses under the attn/steel-cfg/ablate instrument envs so their rows keep \
+         their per-bucket meaning.";
+
+    fn batch_prelude(&self, preps: &[&PreparedImage]) -> Result<Option<(Vec<f32>, usize, usize)>> {
+        let bsz = preps.len();
+        if bsz < 2 {
+            return Ok(None);
+        }
+        let (gh, gw) = (preps[0].grid_h, preps[0].grid_w);
+        if preps.iter().any(|p| p.grid_h != gh || p.grid_w != gw) {
+            return Ok(None);
+        }
+        let n = gh * gw;
+        let hd = self.cfg.head_dim();
+        if std::env::var(DOTS_VISION_WGPU_ATTN_ENV).is_ok()
+            || hd != super::vision_attn_msl::HEAD_DIM as usize
+            || super::vision_attn_msl::steel_pipelines(
+                self.g.ctx,
+                n.is_multiple_of(super::vision_attn_msl::STEEL_BQ as usize),
+                n.is_multiple_of(super::vision_attn_msl::STEEL_BK as usize),
+            )
+            .is_err()
+            || self.post_trunk_norm.is_none()
+            || !merger_gpu_arm()
+        {
+            return Ok(None);
+        }
+        let mut patches = Vec::with_capacity(bsz * n * PATCH_DIM);
+        for p in preps {
+            anyhow::ensure!(
+                p.patches.len() == n * PATCH_DIM,
+                "encode_batch: a prepared image holds {} values, want {n} x {PATCH_DIM}",
+                p.patches.len()
+            );
+            patches.extend_from_slice(&p.patches);
+        }
+        Ok(Some((patches, gh, gw)))
+    }
+
+    pub fn encode_batch(&self, preps: &[&PreparedImage]) -> Result<Option<Vec<Vec<f32>>>> {
+        let _ =
+            Self::SAME_BUCKET_CROPS_BATCH_THROUGH_ONE_TOWER_PASS_BECAUSE_THE_PER_CALL_COST_IS_FIXED;
+        let Some((patches, gh, gw)) = self.batch_prelude(preps)? else {
+            return Ok(None);
+        };
+        let bsz = preps.len();
+        let merged = match self.forward_patches_batch(&patches, gh, gw, bsz, false)? {
+            BatchTrunkOut::Host(v) => v,
+            BatchTrunkOut::Gpu(_) => unreachable!("resident=false never returns gpu crops"),
+        };
+        anyhow::ensure!(
+            merged.len().is_multiple_of(bsz),
+            "batched merger produced {} values across {bsz} images",
+            merged.len()
+        );
+        let per = merged.len() / bsz;
+        Ok(Some(merged.chunks(per).map(<[f32]>::to_vec).collect()))
+    }
+
+    pub fn encode_pack_resident(
+        &self,
+        preps: &[PreparedImage],
+    ) -> Result<Option<Vec<super::decoder_wgpu_graph::VisionRowsGpu>>> {
+        let _ = Self::MIXED_GRID_PACKS_SHARE_ONE_TRUNK_BECAUSE_EVERY_TRUNK_PASS_IS_ROW_INDEPENDENT_AND_ATTENTION_STAYS_PER_CROP;
+        let Some(cap) = visenc_pack_rows() else {
+            return Ok(None);
+        };
+        if preps.len() < 2
+            || std::env::var(DOTS_VISION_ABLATE_ENV).is_ok()
+            || std::env::var(DOTS_VISION_WGPU_ATTN_ENV).is_ok()
+            || std::env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV).is_ok()
+            || self.cfg.head_dim() != super::vision_attn_msl::HEAD_DIM as usize
+            || self.post_trunk_norm.is_none()
+            || !merger_gpu_arm()
+        {
+            return Ok(None);
+        }
+        for p in preps {
+            let n = p.grid_h * p.grid_w;
+            anyhow::ensure!(
+                p.patches.len() == n * PATCH_DIM,
+                "encode_pack: a prepared image holds {} values, want {n} x {PATCH_DIM}",
+                p.patches.len()
+            );
+            let cfg = steel_attn_cfg_serving(n)?;
+            if super::vision_attn_msl::steel_pipelines_serving(
+                self.g.ctx,
+                cfg,
+                n.is_multiple_of(cfg.0 as usize),
+                n.is_multiple_of(cfg.1 as usize),
+            )
+            .is_err()
+            {
+                return Ok(None);
+            }
+        }
+        let mut grids: Vec<(usize, usize)> = Vec::new();
+        for p in preps {
+            if !grids.contains(&(p.grid_h, p.grid_w)) {
+                grids.push((p.grid_h, p.grid_w));
+            }
+        }
+        let ordered: Vec<usize> = grids
+            .iter()
+            .flat_map(|g| {
+                preps
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, p)| (p.grid_h, p.grid_w) == *g)
+                    .map(|(i, _)| i)
+            })
+            .collect();
+        let mut out: Vec<Option<super::decoder_wgpu_graph::VisionRowsGpu>> =
+            (0..preps.len()).map(|_| None).collect();
+        let mut pack: Vec<usize> = Vec::new();
+        let mut pack_rows = 0usize;
+        let flush_pack = |pack: &mut Vec<usize>,
+                          pack_rows: &mut usize,
+                          out: &mut Vec<Option<super::decoder_wgpu_graph::VisionRowsGpu>>|
+         -> Result<()> {
+            if pack.is_empty() {
+                return Ok(());
+            }
+            let crops: Vec<&PreparedImage> = pack.iter().map(|&i| &preps[i]).collect();
+            let rows = self.forward_patches_pack(&crops)?;
+            self.visenc_packs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for (i, r) in pack.drain(..).zip(rows) {
+                out[i] = Some(r);
+            }
+            *pack_rows = 0;
+            Ok(())
+        };
+        for &i in &ordered {
+            let n = preps[i].num_patches();
+            if !pack.is_empty() && pack_rows + n > cap {
+                flush_pack(&mut pack, &mut pack_rows, &mut out)?;
+            }
+            pack.push(i);
+            pack_rows += n;
+        }
+        flush_pack(&mut pack, &mut pack_rows, &mut out)?;
+        Ok(Some(
+            out.into_iter()
+                .map(|r| r.expect("every crop packed"))
+                .collect(),
+        ))
+    }
+
+    pub fn visenc_packs(&self) -> u64 {
+        self.visenc_packs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn forward_patches_pack(
+        &self,
+        crops: &[&PreparedImage],
+    ) -> Result<Vec<super::decoder_wgpu_graph::VisionRowsGpu>> {
+        let out = self.forward_patches_pack_holding_every_transient(crops);
+        self.g
+            .reclaim_dropped_device_buffers_because_wgpu_frees_only_on_poll_and_page_two_otherwise_runs_against_page_ones_residency();
+        out
+    }
+
+    fn forward_patches_pack_holding_every_transient(
+        &self,
+        crops: &[&PreparedImage],
+    ) -> Result<Vec<super::decoder_wgpu_graph::VisionRowsGpu>> {
+        struct PackGroup {
+            gh: usize,
+            gw: usize,
+            n: usize,
+            n_pad: usize,
+            count: usize,
+            row_start: usize,
+        }
+        let g = &self.g;
+        let tile = g.tile();
+        let dim = self.cfg.embed_dim;
+        let heads = self.cfg.num_attention_heads;
+        let hd = self.cfg.head_dim();
+        let inter = self.cfg.intermediate_size;
+        let eps = self.cfg.rms_norm_eps as f32;
+        anyhow::ensure!(
+            hd.is_multiple_of(tile),
+            "head_dim {hd} is not a multiple of the {tile}-wide GEMM tile"
+        );
+        let mut groups: Vec<PackGroup> = Vec::new();
+        let mut nt = 0usize;
+        for p in crops {
+            let n = p.grid_h * p.grid_w;
+            match groups.last_mut() {
+                Some(last) if (last.gh, last.gw) == (p.grid_h, p.grid_w) => last.count += 1,
+                _ => groups.push(PackGroup {
+                    gh: p.grid_h,
+                    gw: p.grid_w,
+                    n,
+                    n_pad: pad_to(n, tile),
+                    count: 1,
+                    row_start: nt,
+                }),
+            }
+            nt += n;
+        }
+        let nt_pad = pad_to(nt, tile);
+        let x_rows = g.coop_x_rows(nt_pad);
+        let mut patches = Vec::with_capacity(nt * PATCH_DIM);
+        for p in crops {
+            patches.extend_from_slice(&p.patches);
+        }
+        let patches_pad = pad_to(PATCH_DIM, tile);
+        let patch_x = g.f16_buf("dv-p-patch-x", x_rows * patches_pad);
+        let src = g.upload_f32("dv-p-patch-src", &patches);
+        g.cast_pad(&src, &patch_x, nt, PATCH_DIM, patches_pad)?;
+        let x = g.f32_buf("dv-p-x", nt_pad * dim);
+        self.proj(&self.patch_proj, &patch_x, &x, nt, nt_pad)?;
+        g.rmsnorm_f32_inplace(&x, &self.patch_norm, nt, dim, eps)?;
+        let xn = g.f16_buf("dv-p-xn", x_rows * dim);
+
+        let slack = DOTS_VISION_FLASH_READS_PAST_A_HEADS_SLAB_ON_THE_RAGGED_LAST_BLOCK_SO_THE_QKV_BUFFERS_CARRY_SLACK;
+        let qkv_y = g.f32_buf("dv-p-qkv", nt_pad * dim * 3);
+        let attn_x = g.f16_buf("dv-p-attn-x", x_rows * dim);
+        let proj_y = g.f32_buf("dv-p-proj", nt_pad * dim);
+        let gate_y = g.f32_buf("dv-p-gate", nt_pad * inter);
+        let up_y = g.f32_buf("dv-p-up", nt_pad * inter);
+        let act = g.f16_buf("dv-p-act", x_rows * inter);
+        let ff_y = g.f32_buf("dv-p-ff", nt_pad * dim);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        struct GroupPlan {
+            pipeline: Arc<wgpu::ComputePipeline>,
+            bind: wgpu::BindGroup,
+            grid: (u32, u32, u32),
+            cos_b: wgpu::Buffer,
+            sin_b: wgpu::Buffer,
+            split_pb: Arc<wgpu::Buffer>,
+            split_groups: (u32, u32, u32),
+            qh: wgpu::Buffer,
+            kh: wgpu::Buffer,
+            vt: wgpu::Buffer,
+            img_block: usize,
+            row_start: usize,
+            n: usize,
+            count: usize,
+        }
+        let mp = dispatch::uniform_from(g.ctx, "dv-p-steel-mp", &[0i64; 3]);
+        let dummy = g.f32_buf("dv-p-steel-dummy", 1);
+        let mut plans: Vec<GroupPlan> = Vec::with_capacity(groups.len());
+        for grp in &groups {
+            let n = grp.n;
+            let n_pad = grp.n_pad;
+            let img_block = heads * n_pad * hd;
+            let (cos, sin) = vision_rope_tables(grp.gh, grp.gw, hd, &Device::Cpu)?;
+            let cos_b = g.upload_f32("dv-p-cos", &cos.flatten_all()?.to_vec1::<f32>()?);
+            let sin_b = g.upload_f32("dv-p-sin", &sin.flatten_all()?.to_vec1::<f32>()?);
+            let qh = g.f16_buf("dv-p-qh", grp.count * img_block + slack);
+            let kh = g.f16_buf("dv-p-kh", grp.count * img_block + slack);
+            let vt = g.f16_buf("dv-p-vt", grp.count * img_block + slack);
+            let cfg = steel_attn_cfg_serving(n)?;
+            let (bq, bk) = (cfg.0 as usize, cfg.1 as usize);
+            let pls = super::vision_attn_msl::steel_pipelines_serving(
+                g.ctx,
+                cfg,
+                n.is_multiple_of(bq),
+                n.is_multiple_of(bk),
+            )?;
+            let p = super::vision_attn_msl::SteelAttnParams {
+                b: grp.count as i32,
+                h: heads as i32,
+                d: hd as i32,
+                q_l: n as i32,
+                k_l: n as i32,
+                gqa_factor: 1,
+                scale,
+                nq: n.div_ceil(bq) as i32,
+                nk: n.div_ceil(bk) as i32,
+                nq_aligned: (n / bq) as i32,
+                nk_aligned: (n / bk) as i32,
+                q_l_rem: (n - (n / bq) * bq) as i32,
+                k_l_rem: (n - (n / bk) * bk) as i32,
+                q_l_off: 0,
+                q_strides: [img_block as i64, (n_pad * hd) as i64, hd as i64],
+                k_strides: [img_block as i64, (n_pad * hd) as i64, hd as i64],
+                v_strides: [img_block as i64, (n_pad * hd) as i64, hd as i64],
+                o_strides: [(n * dim) as i64, hd as i64, dim as i64],
+            };
+            let pb = dispatch::uniform_from(g.ctx, "dv-p-steel-p", &p);
+            let o_off = (grp.row_start * dim * 2) as u64;
+            anyhow::ensure!(
+                o_off.is_multiple_of(256),
+                "pack attention output offset {o_off} is not 256-byte aligned"
+            );
+            let bind = g.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("dv-p-steel-attn"),
+                layout: &pls.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: qh.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: kh.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: vt.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &attn_x,
+                            offset: o_off,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: pb.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: mp.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: dummy.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: dummy.as_entire_binding(),
+                    },
+                ],
+            });
+            let single_grid = super::vision_attn_msl::steel_grid_cfg(cfg, heads as u32, n as u32);
+            let split_groups = g.elementwise_groups(n * heads * hd);
+            let split_pb = g.uniform(
+                "dv-p-split-p",
+                &SplitP {
+                    rows: n as u32,
+                    rows_pad: n_pad as u32,
+                    heads: heads as u32,
+                    head_dim: hd as u32,
+                    groups_x: split_groups.0,
+                    pad0: 1,
+                    pad1: 0,
+                    pad2: 0,
+                },
+            );
+            plans.push(GroupPlan {
+                pipeline: pls.pipeline.clone(),
+                bind,
+                grid: (single_grid.0, single_grid.1, grp.count as u32),
+                cos_b,
+                sin_b,
+                split_pb,
+                split_groups,
+                qh,
+                kh,
+                vt,
+                img_block,
+                row_start: grp.row_start,
+                n,
+                count: grp.count,
+            });
+        }
+
+        let fuse = steel_fuse_from_env();
+        for blk in self.blocks.iter() {
+            g.rmsnorm_to_f16(&x, &blk.norm1, &xn, nt, dim, eps)?;
+            self.proj(&blk.qkv, &xn, &qkv_y, nt, nt_pad)?;
+            for pl in &plans {
+                for i in 0..pl.count {
+                    let qkv_off = ((pl.row_start + i * pl.n) * dim * 3 * 4) as u64;
+                    let slab_off = (i * pl.img_block * 2) as u64;
+                    g.record_src(
+                        "nv_models_dots_vision_split",
+                        QKV_ROPE_SPLIT_SRC,
+                        "dv_qkv_rope_split",
+                        &[
+                            (0, &qkv_y, qkv_off),
+                            (1, &pl.cos_b, 0),
+                            (2, &pl.sin_b, 0),
+                            (3, &pl.qh, slab_off),
+                            (4, &pl.kh, slab_off),
+                            (5, &pl.vt, slab_off),
+                            (6, &pl.split_pb, 0),
+                        ],
+                        pl.split_groups,
+                    )?;
+                }
+                g.record_prebuilt(pl.pipeline.clone(), pl.bind.clone(), pl.grid)?;
+            }
+            if !(fuse.0 && self.proj_fused_resadd(&blk.proj, &attn_x, &x, nt)?) {
+                self.proj(&blk.proj, &attn_x, &proj_y, nt, nt_pad)?;
+                g.add_into(&x, &proj_y, nt * dim)?;
+            }
+            g.rmsnorm_to_f16(&x, &blk.norm2, &xn, nt, dim, eps)?;
+            self.proj(&blk.fc1, &xn, &gate_y, nt, nt_pad)?;
+            if !(fuse.1 && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, nt)?) {
+                self.proj(&blk.fc3, &xn, &up_y, nt, nt_pad)?;
+                let groups = g.elementwise_groups(nt * inter);
+                let sp = g.rows_params(nt * inter, 1, 1, 0.0, groups.0);
+                let spb = g.uniform("dv-p-silu-p", &sp);
+                g.record_src(
+                    "nv_models_dots_vision_silu",
+                    SILU_MUL_SRC,
+                    "dv_silu_mul_f16",
+                    &[(0, &gate_y, 0), (1, &up_y, 0), (2, &act, 0), (3, &spb, 0)],
+                    groups,
+                )?;
+            }
+            if !(fuse.0 && self.proj_fused_resadd(&blk.fc2, &act, &x, nt)?) {
+                self.proj(&blk.fc2, &act, &ff_y, nt, nt_pad)?;
+                g.add_into(&x, &ff_y, nt * dim)?;
+            }
+        }
+
+        let norm = self
+            .post_trunk_norm
+            .as_ref()
+            .expect("encode_pack gates on post_trunk_norm");
+        g.rmsnorm_to_f16(&x, norm, &xn, nt, dim, eps)?;
+        let (y, rows) = self.merger_forward_gpu_y(&xn, nt)?;
+        let cols = self.merger.fc2.n;
+        anyhow::ensure!(
+            rows == nt / (MERGE_SIZE * MERGE_SIZE),
+            "packed merger produced {rows} rows across {nt} patches"
+        );
+        anyhow::ensure!(
+            cols.is_multiple_of(2),
+            "merged rows are {cols} wide, bf16 pair packing needs an even width"
+        );
+        g.flush()?;
+        let mut row_start = 0usize;
+        let mut outs = Vec::with_capacity(crops.len());
+        for p in crops {
+            let per = p.num_patches() / (MERGE_SIZE * MERGE_SIZE);
+            let words = per * cols / 2;
+            outs.push(super::decoder_wgpu_graph::VisionRowsGpu {
+                buf: super::decoder_wgpu_graph::pack_f32_rows_to_bf16_words_at(
+                    g.ctx,
+                    &y,
+                    row_start * cols / 2,
+                    words,
+                )?,
+                rows: per,
+                hidden: cols,
+            });
+            row_start += per;
+        }
+        Ok(outs)
+    }
+
+    pub fn encode_batch_resident(
+        &self,
+        preps: &[&PreparedImage],
+    ) -> Result<Option<Vec<super::decoder_wgpu_graph::VisionRowsGpu>>> {
+        let _ = Self::ENCODE_RESIDENT_SERVES_ONLY_THE_GPU_MERGER_ARM_BECAUSE_ONLY_ITS_TRUNK_NEVER_TOUCHES_THE_HOST;
+        if std::env::var(DOTS_VISION_ABLATE_ENV).is_ok() {
+            return Ok(None);
+        }
+        let Some((patches, gh, gw)) = self.batch_prelude(preps)? else {
+            return Ok(None);
+        };
+        let bsz = preps.len();
+        match self.forward_patches_batch(&patches, gh, gw, bsz, true)? {
+            BatchTrunkOut::Gpu(crops) => Ok(Some(crops)),
+            BatchTrunkOut::Host(_) => Ok(None),
+        }
+    }
+
+    fn forward_patches_batch(
+        &self,
+        patches: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        bsz: usize,
+        resident: bool,
+    ) -> Result<BatchTrunkOut> {
+        let out = self
+            .forward_patches_batch_holding_every_transient(patches, grid_h, grid_w, bsz, resident);
+        self.g
+            .reclaim_dropped_device_buffers_because_wgpu_frees_only_on_poll_and_page_two_otherwise_runs_against_page_ones_residency();
+        out
+    }
+
+    fn forward_patches_batch_holding_every_transient(
+        &self,
+        patches: &[f32],
+        grid_h: usize,
+        grid_w: usize,
+        bsz: usize,
+        resident: bool,
+    ) -> Result<BatchTrunkOut> {
+        let n = grid_h * grid_w;
+        let nt = bsz * n;
+        let g = &self.g;
+        let tile = g.tile();
+        let dim = self.cfg.embed_dim;
+        let heads = self.cfg.num_attention_heads;
+        let hd = self.cfg.head_dim();
+        let inter = self.cfg.intermediate_size;
+        let eps = self.cfg.rms_norm_eps as f32;
+        let n_pad = pad_to(n, tile);
+        let nt_pad = pad_to(nt, tile);
+        anyhow::ensure!(
+            hd.is_multiple_of(tile),
+            "head_dim {hd} is not a multiple of the {tile}-wide GEMM tile"
+        );
+        let patches_pad = pad_to(PATCH_DIM, tile);
+        let x_rows = g.coop_x_rows(nt_pad);
+        let patch_x = g.f16_buf("dv-b-patch-x", x_rows * patches_pad);
+        let src = g.upload_f32("dv-b-patch-src", patches);
+        g.cast_pad(&src, &patch_x, nt, PATCH_DIM, patches_pad)?;
+        let x = g.f32_buf("dv-b-x", nt_pad * dim);
+        self.proj(&self.patch_proj, &patch_x, &x, nt, nt_pad)?;
+        g.rmsnorm_f32_inplace(&x, &self.patch_norm, nt, dim, eps)?;
+        let xn = g.f16_buf("dv-b-xn", x_rows * dim);
+
+        let (cos, sin) = vision_rope_tables(grid_h, grid_w, hd, &Device::Cpu)?;
+        let cos_b = g.upload_f32("dv-b-cos", &cos.flatten_all()?.to_vec1::<f32>()?);
+        let sin_b = g.upload_f32("dv-b-sin", &sin.flatten_all()?.to_vec1::<f32>()?);
+
+        let slack = DOTS_VISION_FLASH_READS_PAST_A_HEADS_SLAB_ON_THE_RAGGED_LAST_BLOCK_SO_THE_QKV_BUFFERS_CARRY_SLACK;
+        let img_block = heads * n_pad * hd;
+        let qkv_y = g.f32_buf("dv-b-qkv", nt_pad * dim * 3);
+        let qh = g.f16_buf("dv-b-qh", bsz * img_block + slack);
+        let kh = g.f16_buf("dv-b-kh", bsz * img_block + slack);
+        let vt = g.f16_buf("dv-b-vt", bsz * img_block + slack);
+        let attn_x = g.f16_buf("dv-b-attn-x", x_rows * dim);
+        let proj_y = g.f32_buf("dv-b-proj", nt_pad * dim);
+        let gate_y = g.f32_buf("dv-b-gate", nt_pad * inter);
+        let up_y = g.f32_buf("dv-b-up", nt_pad * inter);
+        let act = g.f16_buf("dv-b-act", x_rows * inter);
+        let ff_y = g.f32_buf("dv-b-ff", nt_pad * dim);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+
+        let bq = super::vision_attn_msl::STEEL_BQ as usize;
+        let bk = super::vision_attn_msl::STEEL_BK as usize;
+        let pls = super::vision_attn_msl::steel_pipelines(
+            g.ctx,
+            n.is_multiple_of(bq),
+            n.is_multiple_of(bk),
+        )?;
+        let p = super::vision_attn_msl::SteelAttnParams {
+            b: bsz as i32,
+            h: heads as i32,
+            d: hd as i32,
+            q_l: n as i32,
+            k_l: n as i32,
+            gqa_factor: 1,
+            scale,
+            nq: n.div_ceil(bq) as i32,
+            nk: n.div_ceil(bk) as i32,
+            nq_aligned: (n / bq) as i32,
+            nk_aligned: (n / bk) as i32,
+            q_l_rem: (n - (n / bq) * bq) as i32,
+            k_l_rem: (n - (n / bk) * bk) as i32,
+            q_l_off: 0,
+            q_strides: [img_block as i64, (n_pad * hd) as i64, hd as i64],
+            k_strides: [img_block as i64, (n_pad * hd) as i64, hd as i64],
+            v_strides: [img_block as i64, (n_pad * hd) as i64, hd as i64],
+            o_strides: [(n * dim) as i64, hd as i64, dim as i64],
+        };
+        let pb = dispatch::uniform_from(g.ctx, "dv-b-steel-p", &p);
+        let mp = dispatch::uniform_from(g.ctx, "dv-b-steel-mp", &[0i64; 3]);
+        let dummy = g.f32_buf("dv-b-steel-dummy", 1);
+        let bind = g.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("dv-b-steel-attn"),
+            layout: &pls.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: qh.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: kh.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: vt.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: attn_x.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: pb.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: mp.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: dummy.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: dummy.as_entire_binding(),
+                },
+            ],
+        });
+        let single_grid = super::vision_attn_msl::steel_grid(heads as u32, n as u32);
+        let grid = (single_grid.0, single_grid.1, bsz as u32);
+
+        let split_groups = g.elementwise_groups(n * heads * hd);
+        let split_pb = g.uniform(
+            "dv-b-split-p",
+            &SplitP {
+                rows: n as u32,
+                rows_pad: n_pad as u32,
+                heads: heads as u32,
+                head_dim: hd as u32,
+                groups_x: split_groups.0,
+                pad0: 1,
+                pad1: 0,
+                pad2: 0,
+            },
+        );
+
+        let fuse = steel_fuse_from_env();
+        for blk in self.blocks.iter() {
+            g.rmsnorm_to_f16(&x, &blk.norm1, &xn, nt, dim, eps)?;
+            self.proj(&blk.qkv, &xn, &qkv_y, nt, nt_pad)?;
+            for i in 0..bsz {
+                let qkv_off = (i * n * dim * 3 * 4) as u64;
+                let slab_off = (i * img_block * 2) as u64;
+                g.record_src(
+                    "nv_models_dots_vision_split",
+                    QKV_ROPE_SPLIT_SRC,
+                    "dv_qkv_rope_split",
+                    &[
+                        (0, &qkv_y, qkv_off),
+                        (1, &cos_b, 0),
+                        (2, &sin_b, 0),
+                        (3, &qh, slab_off),
+                        (4, &kh, slab_off),
+                        (5, &vt, slab_off),
+                        (6, &split_pb, 0),
+                    ],
+                    split_groups,
+                )?;
+            }
+            g.record_prebuilt(pls.pipeline.clone(), bind.clone(), grid)?;
+            if !(fuse.0 && self.proj_fused_resadd(&blk.proj, &attn_x, &x, nt)?) {
+                self.proj(&blk.proj, &attn_x, &proj_y, nt, nt_pad)?;
+                g.add_into(&x, &proj_y, nt * dim)?;
+            }
+            g.rmsnorm_to_f16(&x, &blk.norm2, &xn, nt, dim, eps)?;
+            self.proj(&blk.fc1, &xn, &gate_y, nt, nt_pad)?;
+            if !(fuse.1 && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, nt)?) {
+                self.proj(&blk.fc3, &xn, &up_y, nt, nt_pad)?;
+                let groups = g.elementwise_groups(nt * inter);
+                let sp = g.rows_params(nt * inter, 1, 1, 0.0, groups.0);
+                let spb = g.uniform("dv-b-silu-p", &sp);
+                g.record_src(
+                    "nv_models_dots_vision_silu",
+                    SILU_MUL_SRC,
+                    "dv_silu_mul_f16",
+                    &[(0, &gate_y, 0), (1, &up_y, 0), (2, &act, 0), (3, &spb, 0)],
+                    groups,
+                )?;
+            }
+            if !(fuse.0 && self.proj_fused_resadd(&blk.fc2, &act, &x, nt)?) {
+                self.proj(&blk.fc2, &act, &ff_y, nt, nt_pad)?;
+                g.add_into(&x, &ff_y, nt * dim)?;
+            }
+        }
+
+        let norm = self
+            .post_trunk_norm
+            .as_ref()
+            .expect("encode_batch gates on post_trunk_norm");
+        g.rmsnorm_to_f16(&x, norm, &xn, nt, dim, eps)?;
+        if resident {
+            let (y, rows) = self.merger_forward_gpu_y(&xn, nt)?;
+            let cols = self.merger.fc2.n;
+            anyhow::ensure!(
+                rows.is_multiple_of(bsz),
+                "batched merger produced {rows} rows across {bsz} images"
+            );
+            anyhow::ensure!(
+                cols.is_multiple_of(2),
+                "merged rows are {cols} wide, bf16 pair packing needs an even width"
+            );
+            let per = rows / bsz;
+            let words = per * cols / 2;
+            g.flush()?;
+            let crops = (0..bsz)
+                .map(|i| {
+                    Ok(super::decoder_wgpu_graph::VisionRowsGpu {
+                        buf: super::decoder_wgpu_graph::pack_f32_rows_to_bf16_words_at(
+                            g.ctx,
+                            &y,
+                            i * words,
+                            words,
+                        )?,
+                        rows: per,
+                        hidden: cols,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(BatchTrunkOut::Gpu(crops));
+        }
+        self.merger_forward_gpu(&xn, nt).map(BatchTrunkOut::Host)
     }
 
     fn merger_forward_gpu(&self, xn: &wgpu::Buffer, n: usize) -> Result<Vec<f32>> {
+        let (y, rows) = self.merger_forward_gpu_y(xn, n)?;
+        let g = &self.g;
+        if vis_ablated("merger_readback") {
+            g.flush()?;
+            g.drain()?;
+            return Ok(vec![0f32; rows * self.merger.fc2.n]);
+        }
+        g.read_f32(&y, rows * self.merger.fc2.n)
+    }
+
+    fn merger_forward_gpu_y(&self, xn: &wgpu::Buffer, n: usize) -> Result<(wgpu::Buffer, usize)> {
         let _ = DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WERE_THE_WHOLE_RESIDUAL_AND_THE_TOKEN_GATE_HELD;
         let m = &self.merger;
         let g = &self.g;
@@ -4081,7 +5379,7 @@ impl DotsVisionTowerWgpu {
         g.gelu_erf_f16(&h, &x2, rows * m.fc0.n)?;
         let y = g.f32_buf("dv-merger-y", rows_pad * m.fc2.n);
         self.proj(&m.fc2, &x2, &y, rows, rows_pad)?;
-        g.read_f32(&y, rows * m.fc2.n)
+        Ok((y, rows))
     }
 
     fn merger_forward(&self, trunk: &[f32], n: usize) -> Result<Vec<f32>> {

@@ -9,7 +9,6 @@ from transformers.utils import logging
 from .configuration_qwen3_tts import (Qwen3TTSSpeakerEncoderConfig)
 
 logger = logging.get_logger(__name__)
-from librosa.filters import mel as librosa_mel_fn
 
 class Res2NetBlock(torch.nn.Module):
     def __init__(self, in_channels, out_channels, scale=8, kernel_size=3, dilation=1):
@@ -260,6 +259,7 @@ def mel_spectrogram(
     center: bool = False,
 ) -> torch.Tensor:
 
+    from librosa.filters import mel as librosa_mel_fn
     if torch.min(y) < -1.0:
         print(f"[WARNING] Min value of input waveform signal is {torch.min(y)}")
     if torch.max(y) > 1.0:

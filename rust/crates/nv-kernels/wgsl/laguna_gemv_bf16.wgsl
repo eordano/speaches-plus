@@ -75,7 +75,7 @@ struct LgeParams {
     x_slot_stride_words: u32,
     y_slot_stride_words: u32,
     alpha: f32,
-    pad0: u32,
+    x_slot_div: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -102,7 +102,7 @@ fn lgw_gemv_bf16_experts(
     let row = pair * 2u + half;
     let live = row < lge_p.n_rows;
     let wbase = select(0u, e * lge_p.w_e_stride_words + row * lge_p.w_row_words, live);
-    let xbase = slot * lge_p.x_slot_stride_words;
+    let xbase = (slot / max(lge_p.x_slot_div, 1u)) * lge_p.x_slot_stride_words;
     let kw = select(0u, lge_p.k_words, live);
 
     var acc = 0.0;
@@ -121,7 +121,11 @@ fn lgw_gemv_bf16_experts(
         workgroupBarrier();
     }
 
-    if (tid == 0u) {
+    if (lge_p.out_f32 == 1u) {
+        if (lane == 0u && live) {
+            lge_y[slot * lge_p.y_slot_stride_words + row] = bitcast<u32>(lge_red[tid] * lge_p.alpha);
+        }
+    } else if (tid == 0u) {
         let lo = lge_red[0] * lge_p.alpha;
         var hi = 0.0;
         if (row + 1u < lge_p.n_rows) {

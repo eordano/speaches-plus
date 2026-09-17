@@ -5,8 +5,7 @@ pub const GIB: f64 = (1u64 << 30) as f64;
 
 pub const VRAM_PLAN_ENV_0_DEMOTES_THE_BOOT_REFUSAL_TO_A_WARNING: &str = "NV_VRAM_PLAN";
 pub const VRAM_PLAN_TOLERANCE_ENV: &str = "NV_VRAM_PLAN_TOLERANCE_GIB";
-pub const VRAM_PLAN_STRICT_ENV_1_MAKES_THE_POST_BOOT_RECONCILE_FATAL: &str =
-    "NV_VRAM_PLAN_STRICT";
+pub const VRAM_PLAN_STRICT_ENV_1_MAKES_THE_POST_BOOT_RECONCILE_FATAL: &str = "NV_VRAM_PLAN_STRICT";
 pub const VRAM_PLAN_AUX_ENV_RESERVES_HEADROOM_FOR_SPEECH_AND_OCR_ENGINES: &str =
     "NV_VRAM_PLAN_AUX_GIB";
 
@@ -74,7 +73,12 @@ pub fn kv_binding_from(
     if let (Some(env), Some(n)) = (per_engine_env, parse(per_engine_raw)) {
         return Some((n, env));
     }
-    parse(global_raw).map(|n| (n, KV_MAX_SEQ_LEN_GLOBAL_ENV_THE_DEFAULT_EVERY_ENGINE_INHERITS))
+    parse(global_raw).map(|n| {
+        (
+            n,
+            KV_MAX_SEQ_LEN_GLOBAL_ENV_THE_DEFAULT_EVERY_ENGINE_INHERITS,
+        )
+    })
 }
 
 pub fn q38_batch_lane_kv_from(kv_max: usize, raw: Option<&str>) -> usize {
@@ -104,13 +108,11 @@ pub const PRIOR_ENGINES_ITEM_LABEL_STRIPPED_ON_RECORD_SO_EACH_ENGINE_COUNTS_ONCE
 
 pub const AUX_SPEECH_STACK_STEADY_MIB_MEASURED_LEDGER_ARM_AUX_WHISPER_CT2: u64 = 2638;
 pub const AUX_EMBEDDING_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS: u64 = 1196;
-pub const AUX_TTS_TALKER_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS: u64 = 1816;
 pub const AUX_DOTS_OCR_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB: u64 = 7068;
 pub const AUX_DEEPSEEK_OCR2_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB: u64 =
     7882;
 
-pub const GEMMA4_STEADY_OVERHEAD_MIB_MEASURED_LEDGER_44684_MINUS_HEADERS_MINUS_I8_HEAD: u64 =
-    12219;
+pub const GEMMA4_STEADY_OVERHEAD_MIB_MEASURED_LEDGER_44684_MINUS_HEADERS_MINUS_I8_HEAD: u64 = 12219;
 pub const GEMMA4_STEADY_OVERHEAD_MIB_UNDER_ATTN_NVFP4_MEASURED_LEDGER_28588_ARM: u64 = 7745;
 pub const NVFP4_RESIDENT_NUMERATOR_9_BYTES_PER_32_BF16_BYTES_4BIT_PLUS_FP8_SCALE_PER_16: u64 = 9;
 pub const NVFP4_RESIDENT_DENOMINATOR_32: u64 = 32;
@@ -123,6 +125,7 @@ pub struct PlanItem {
     pub label: String,
     pub bytes: u64,
     pub basis: String,
+    pub unmeasured: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -201,6 +204,16 @@ impl VramPlan {
             label: label.into(),
             bytes,
             basis: basis.into(),
+            unmeasured: false,
+        });
+    }
+
+    fn push_unmeasured(&mut self, label: &str, bytes: u64, basis: impl Into<String>) {
+        self.items.push(PlanItem {
+            label: label.into(),
+            bytes,
+            basis: basis.into(),
+            unmeasured: true,
         });
     }
 
@@ -228,18 +241,29 @@ impl VramPlan {
             .max(8);
         for i in &self.items {
             out.push_str(&format!(
-                "  {:<width$}  {:>9.3} GiB  {}\n",
+                "  {:<width$}  {:>9.3} GiB  {}{}\n",
                 i.label,
                 i.bytes as f64 / GIB,
+                if i.unmeasured {
+                    "UNMEASURED CURRENT RESIDENCY: "
+                } else {
+                    ""
+                },
                 i.basis,
                 width = width
             ));
         }
         let total = self.planned_total_bytes();
         let verdict = if self.fits() {
-            format!("headroom {:.3} GiB", (self.budget_bytes - total) as f64 / GIB)
+            format!(
+                "headroom {:.3} GiB",
+                (self.budget_bytes - total) as f64 / GIB
+            )
         } else {
-            format!("OVER by {:.3} GiB", (total - self.budget_bytes) as f64 / GIB)
+            format!(
+                "OVER by {:.3} GiB",
+                (total - self.budget_bytes) as f64 / GIB
+            )
         };
         out.push_str(&format!(
             "  {:<width$}  {:>9.3} GiB  budget {:.2} GiB -> {}\n",
@@ -249,6 +273,9 @@ impl VramPlan {
             verdict,
             width = width
         ));
+        if self.items.iter().any(|i| i.unmeasured) {
+            out.push_str("  INCOMPLETE ESTIMATE: declared headroom is not a bound on unmeasured components\n");
+        }
         out
     }
 
@@ -536,10 +563,73 @@ pub fn kv_concurrent_cap() -> usize {
     )
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn qwen_lazy_kv_slots(
+    batch_on: bool,
+    mtp_selected: bool,
+    solo_via_lanes: bool,
+    kv_slots: usize,
+) -> usize {
+    if batch_on && solo_via_lanes && !mtp_selected {
+        0
+    } else {
+        kv_slots
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedSpeechProvider {
+    pub component: &'static str,
+    pub provider: &'static str,
+}
+
+static LOADED_SPEECH_PROVIDERS: OnceLock<Vec<LoadedSpeechProvider>> = OnceLock::new();
+
+pub fn observe_loaded_speech_stack(models: &crate::models::Models) {
+    let mut providers = Vec::new();
+    if let Some(stt) = models.whisper_opt() {
+        let component = match stt {
+            crate::stt::WhisperHandle::Ct2 { .. } => "whisper-ct2",
+            crate::stt::WhisperHandle::WhisperCpp { .. } => "whisper.cpp",
+            crate::stt::WhisperHandle::Parakeet { .. } => "parakeet-encoder",
+        };
+        providers.push(LoadedSpeechProvider {
+            component,
+            provider: stt.ep().unwrap_or("unreported"),
+        });
+        if matches!(stt, crate::stt::WhisperHandle::Parakeet { .. }) {
+            providers.push(LoadedSpeechProvider {
+                component: "parakeet-nemo/joint",
+                provider: "unreported",
+            });
+        }
+    }
+    if let Some(kokoro) = models.kokoro.as_ref() {
+        providers.push(LoadedSpeechProvider {
+            component: "kokoro",
+            provider: kokoro.provider(),
+        });
+    }
+    if let Some(seg) = models.diar_segmentation.as_ref() {
+        providers.push(LoadedSpeechProvider {
+            component: "diar-segmentation",
+            provider: seg.provider(),
+        });
+    }
+    if let Some(embedding) = models.diar_embedding.as_ref() {
+        providers.push(LoadedSpeechProvider {
+            component: "diar-embedding",
+            provider: embedding.provider(),
+        });
+    }
+    let _ = LOADED_SPEECH_PROVIDERS.set(providers);
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AuxEnv {
     pub aux_override_gib: Option<f64>,
     pub speech_stack: bool,
+    pub loaded_speech: Option<Vec<LoadedSpeechProvider>>,
     pub embedding: bool,
     pub tts_talker: bool,
     pub dots_ocr: bool,
@@ -548,6 +638,27 @@ pub struct AuxEnv {
 }
 
 impl AuxEnv {
+    fn speech_is_cpu_only(&self) -> bool {
+        self.loaded_speech.as_ref().is_some_and(|providers| {
+            providers.iter().all(|p| {
+                p.provider.eq_ignore_ascii_case("cpu")
+                    || p.provider.eq_ignore_ascii_case("CPUExecutionProvider")
+            })
+        })
+    }
+
+    fn speech_provider_basis(&self) -> String {
+        match &self.loaded_speech {
+            None => "loaded providers unreported".into(),
+            Some(providers) if providers.is_empty() => "no speech handles loaded".into(),
+            Some(providers) => providers
+                .iter()
+                .map(|p| format!("{}={}", p.component, p.provider))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }
+    }
+
     pub fn from_env() -> Self {
         Self {
             aux_override_gib: std::env::var(
@@ -556,7 +667,9 @@ impl AuxEnv {
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0),
-            speech_stack: std::env::var_os("SPEACHES_PLUS_MODELS").is_some(),
+            speech_stack: LOADED_SPEECH_PROVIDERS.get().is_some()
+                || std::env::var_os("SPEACHES_PLUS_MODELS").is_some(),
+            loaded_speech: LOADED_SPEECH_PROVIDERS.get().cloned(),
             embedding: std::env::var_os("NV_EMBEDDING_MODEL_DIR").is_some(),
             tts_talker: std::env::var_os("NV_TTS_TALKER_DIR").is_some(),
             dots_ocr: std::env::var_os("NV_OCR_DOTS_DIR").is_some(),
@@ -575,36 +688,44 @@ pub fn push_aux_items(plan: &mut VramPlan, aux: &AuxEnv) {
             "aux-engines-reserved",
             (gib * GIB) as u64,
             format!(
-                "{} overrides the measured aux itemization",
+                "{} supplies an operator reservation, not measured itemization",
                 VRAM_PLAN_AUX_ENV_RESERVES_HEADROOM_FOR_SPEECH_AND_OCR_ENGINES
             ),
         );
         return;
     }
     if aux.speech_stack {
-        plan.push(
-            "aux-speech-stack",
-            AUX_SPEECH_STACK_STEADY_MIB_MEASURED_LEDGER_ARM_AUX_WHISPER_CT2 * MIB,
-            "VRAM-LEDGER arm aux-whisper-ct2 measured steady 2638 MiB (whisper ct2 CUDA + its \
-             context; kokoro/diarizen/wespeaker/silero/pii ran CPU under that ORT build)",
-        );
+        let providers = aux.speech_provider_basis();
+        if aux.speech_is_cpu_only() {
+            plan.push(
+                "aux-speech-stack",
+                0,
+                format!("CPU-only or absent loaded speech handles; {providers}"),
+            );
+        } else {
+            plan.push_unmeasured(
+                "aux-speech-stack",
+                AUX_SPEECH_STACK_STEADY_MIB_MEASURED_LEDGER_ARM_AUX_WHISPER_CT2 * MIB,
+                format!("legacy Whisper-CT2 reserve 2638 MiB; current provider mix/arenas unmeasured; {providers}"),
+            );
+        }
     }
     if aux.embedding {
-        plan.push(
+        plan.push_unmeasured(
             "aux-qwen3-embedding",
             AUX_EMBEDDING_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS * MIB,
-            "ckpt-ratio share of VRAM-LEDGER arm aux-embed-tts measured steady 3012 MiB",
+            "legacy checkpoint-ratio reserve 1196 MiB; current embedding device/residency unmeasured",
         );
     }
     if aux.tts_talker {
         plan.push(
             "aux-qwen3-tts-talker",
-            AUX_TTS_TALKER_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS * MIB,
-            "ckpt-ratio share of VRAM-LEDGER arm aux-embed-tts measured steady 3012 MiB",
+            0,
+            "Qwen3TtsAudioSpeech::from_dirs_with uses Device::Cpu for talker, code predictor and vocoder",
         );
     }
     if aux.dots_ocr {
-        plan.push(
+        plan.push_unmeasured(
             "aux-dots-ocr",
             AUX_DOTS_OCR_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB * MIB,
             "ckpt-ratio share of VRAM-LEDGER OCR-pair net 14.6 GiB (aux arm minus split arms \
@@ -612,21 +733,21 @@ pub fn push_aux_items(plan: &mut VramPlan, aux: &AuxEnv) {
         );
     }
     if aux.deepseek_ocr {
-        plan.push(
+        plan.push_unmeasured(
             "aux-deepseek-ocr-2",
-            AUX_DEEPSEEK_OCR2_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB
-                * MIB,
+            AUX_DEEPSEEK_OCR2_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB * MIB,
             "ckpt-ratio share of VRAM-LEDGER OCR-pair net 14.6 GiB (aux arm minus split arms \
              plus shared context)",
         );
     }
     if let Some(mib) = aux.diar_gpu_limit_mib {
-        plan.push(
-            "aux-diarization-ort-arena",
-            mib * MIB,
-            "DIAR_GPU_MEM_LIMIT_MB caps the diarization ORT CUDA arena on hosts whose \
-             onnxruntime carries the CUDA EP (the dev host's dylib does not)",
-        );
+        if !aux.speech_is_cpu_only() {
+            plan.push_unmeasured(
+                "aux-diarization-ort-arena",
+                mib.saturating_mul(MIB),
+                "DIAR_GPU_MEM_LIMIT_MB is a per-session arena limit, not aggregate residency; this single-limit reserve does not bound Parakeet/diar sessions or Kokoro",
+            );
+        }
     }
 }
 
@@ -706,6 +827,32 @@ pub fn recorded_planned_total_bytes() -> u64 {
         .sum()
 }
 
+fn recorded_unmeasured_items() -> Vec<String> {
+    boot_plans()
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|(_, plan)| plan.items.iter())
+        .filter(|item| item.unmeasured)
+        .map(|item| item.label.clone())
+        .collect()
+}
+
+fn reconcile_verdict(
+    planned: u64,
+    measured: u64,
+    tolerance: u64,
+    incomplete: bool,
+) -> &'static str {
+    if measured > planned.saturating_add(tolerance) {
+        "EXCEEDS PLAN"
+    } else if incomplete {
+        "WITHIN DECLARED BYTES; INCOMPLETE ESTIMATE"
+    } else {
+        "WITHIN PLAN"
+    }
+}
+
 pub fn process_vram_bytes_via_nvidia_smi() -> Option<u64> {
     let out = std::process::Command::new("nvidia-smi")
         .args([
@@ -745,26 +892,42 @@ pub fn reconcile_boot_plans_against_nvidia_smi_once() {
         RECONCILE_TOLERANCE_GIB_DEFAULT_COVERS_ALLOCATOR_ROUNDING_AND_GRAPH_POOLS,
     ) * GIB) as u64;
     let within = measured <= planned.saturating_add(tol);
+    let unmeasured = recorded_unmeasured_items();
     let line = format!(
-        "vram plan reconcile: planned {:.2} GiB, nvidia-smi measured {:.2} GiB, tolerance {:.2} GiB -> {}",
+        "vram plan reconcile: planned {:.2} GiB, nvidia-smi measured {:.2} GiB, tolerance {:.2} GiB -> {}; unmeasured={:?}; sample after synchronous startup, asynchronous warmup/later growth not bounded",
         planned as f64 / GIB,
         measured as f64 / GIB,
         tol as f64 / GIB,
-        if within { "WITHIN PLAN" } else { "EXCEEDS PLAN" }
+        reconcile_verdict(planned, measured, tol, !unmeasured.is_empty()),
+        unmeasured
     );
     eprintln!("{line}");
     if within {
-        tracing::info!("{line}");
+        if unmeasured.is_empty() {
+            tracing::info!("{line}");
+        } else {
+            tracing::warn!("{line}");
+        }
         return;
     }
     tracing::error!(
-        "{line}; a component allocated outside its declared plan entry -- fix the plan formula \
-         or the component, this is the boot-time no-steady-state-allocation assertion"
+        "{line}; measured residency exceeds declared estimates/reservations; component attribution remains unresolved"
     );
     if std::env::var(VRAM_PLAN_STRICT_ENV_1_MAKES_THE_POST_BOOT_RECONCILE_FATAL).as_deref()
         == Ok("1")
     {
         panic!("{line}; NV_VRAM_PLAN_STRICT=1 makes this fatal");
+    }
+}
+
+pub const VERIFY_LMHEAD_INT8_SHIPS_ON_SIGNED_OFF_2026_09_02_V2_NORMX_MK_PLUS_GEMV_I8_PRENORMED_MK_AT_K_GE_4096_48_OF_48_TEACHER_FORCED_AGREEMENT_AND_ZERO_RESTORES_THE_BF16_VERIFY_HEAD: bool =
+    true;
+
+pub fn verify_lmhead_int8_from(raw: Option<&str>) -> bool {
+    match raw {
+        Some("0") => false,
+        Some(_) => true,
+        None => VERIFY_LMHEAD_INT8_SHIPS_ON_SIGNED_OFF_2026_09_02_V2_NORMX_MK_PLUS_GEMV_I8_PRENORMED_MK_AT_K_GE_4096_48_OF_48_TEACHER_FORCED_AGREEMENT_AND_ZERO_RESTORES_THE_BF16_VERIFY_HEAD,
     }
 }
 
@@ -781,6 +944,363 @@ mod family {
         Qwen35Dense,
         Qwen35Moe { grouped_graph: bool },
         Unmodeled(&'static str),
+        Laguna,
+    }
+
+    pub const LAGUNA_PLAN_IS_ADVISORY_ONLY_HANDOFF_PREFLIGHTS_BOTH_CACHES_AGAINST_LIVE_FREE_MEMORY: bool = false;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LagunaSpecServeShape {
+        pub full_layers: u64,
+        pub sliding_layers: u64,
+        pub moe_layers: u64,
+        pub kv_heads: u64,
+        pub head_dim: u64,
+        pub max_query_heads: u64,
+        pub window: u64,
+        pub chunk: u64,
+        pub capacity: u64,
+        pub num_experts: u64,
+        pub hidden: u64,
+        pub moe_intermediate: u64,
+    }
+
+    impl LagunaSpecServeShape {
+        pub fn from_config_json(raw_cfg: &str, capacity: u64, chunk: u64) -> anyhow::Result<Self> {
+            let v: serde_json::Value = serde_json::from_str(raw_cfg)?;
+            let field = |name: &str| -> anyhow::Result<u64> {
+                v.get(name)
+                    .and_then(|x| x.as_u64())
+                    .ok_or_else(|| anyhow::anyhow!("laguna config lacks {name}"))
+            };
+            let layer_types: Vec<&str> = v
+                .get("layer_types")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+                .unwrap_or_default();
+            let layers = field("num_hidden_layers")?;
+            anyhow::ensure!(
+                layer_types.len() as u64 == layers,
+                "laguna layer_types must list every layer"
+            );
+            let sliding_layers = layer_types
+                .iter()
+                .filter(|t| **t == "sliding_attention")
+                .count() as u64;
+            anyhow::ensure!(
+                field("num_key_value_heads")? > 0,
+                "Laguna ledger requires positive KV heads"
+            );
+            let model_config = nv_models::laguna::LagunaConfig::from_hf_json_str(raw_cfg)?;
+            let moe_layers = (0..model_config.num_hidden_layers)
+                .filter(|idx| model_config.is_moe_layer(*idx))
+                .count() as u64;
+            let max_query_heads = v
+                .get("num_attention_heads_per_layer")
+                .and_then(|x| x.as_array())
+                .and_then(|a| a.iter().filter_map(|h| h.as_u64()).max())
+                .unwrap_or(0)
+                .max(field("num_attention_heads")?);
+            anyhow::ensure!(
+                capacity > 0
+                    && capacity <= 262144
+                    && matches!(chunk, 256 | 512 | 1024 | 2048 | 4096 | 8192),
+                "Laguna ledger requires capacity 1..=262144 and supported chunk"
+            );
+            anyhow::ensure!(
+                layer_types
+                    .iter()
+                    .all(|t| matches!(*t, "full_attention" | "sliding_attention")),
+                "Laguna ledger requires valid layer types"
+            );
+            Ok(Self {
+                full_layers: layers - sliding_layers,
+                sliding_layers,
+                moe_layers,
+                kv_heads: field("num_key_value_heads")?,
+                head_dim: field("head_dim")?,
+                max_query_heads,
+                window: field("sliding_window")?.max(1),
+                chunk,
+                capacity,
+                num_experts: field("num_experts")?,
+                hidden: field("hidden_size")?,
+                moe_intermediate: field("moe_intermediate_size")?,
+            })
+        }
+
+        pub fn sliding_slots(&self) -> anyhow::Result<u64> {
+            Ok(self.capacity.min(laguna_sum(&[self.window, self.chunk])?))
+        }
+
+        pub fn bf16_cache_bytes(&self) -> anyhow::Result<u64> {
+            laguna_product(&[
+                4,
+                self.kv_heads,
+                self.head_dim,
+                laguna_sum(&[
+                    laguna_product(&[self.full_layers, self.capacity])?,
+                    laguna_product(&[self.sliding_layers, self.sliding_slots()?])?,
+                ])?,
+            ])
+        }
+
+        pub fn fp8_cache_bytes(&self) -> anyhow::Result<u64> {
+            let full = laguna_product(&[
+                self.full_layers,
+                self.capacity,
+                laguna_sum(&[
+                    laguna_product(&[2, self.kv_heads, self.head_dim])?,
+                    laguna_product(&[8, self.kv_heads])?,
+                ])?,
+            ])?;
+            let sliding = laguna_product(&[
+                4,
+                self.sliding_layers,
+                self.sliding_slots()?,
+                self.kv_heads,
+                self.head_dim,
+            ])?;
+            let scores_scratch_upper_bound =
+                laguna_product(&[4, self.max_query_heads, self.capacity])?;
+            laguna_sum(&[full, sliding, scores_scratch_upper_bound])
+        }
+
+        pub fn verify_fa2_dequant_scratch_bytes(&self) -> anyhow::Result<u64> {
+            laguna_product(&[4, self.capacity, self.kv_heads, self.head_dim])
+        }
+
+        pub fn grouped_expert_copy_bytes(&self, fold_shared: bool) -> anyhow::Result<u64> {
+            let elements = laguna_product(&[self.hidden, self.moe_intermediate])?;
+            anyhow::ensure!(
+                self.hidden.is_multiple_of(16) && self.moe_intermediate.is_multiple_of(16),
+                "Laguna packed expert geometry is not block16 aligned"
+            );
+            let scale_bytes = |rows: u64, cols: u64| -> anyhow::Result<u64> {
+                laguna_product(&[
+                    laguna_sum(&[rows, 127])? / 128,
+                    128,
+                    laguna_sum(&[cols / 16, 3])? / 4,
+                    4,
+                ])
+            };
+            let gate = laguna_sum(&[
+                elements / 2,
+                scale_bytes(self.moe_intermediate, self.hidden)?,
+            ])?;
+            let down = laguna_sum(&[
+                elements / 2,
+                scale_bytes(self.hidden, self.moe_intermediate)?,
+            ])?;
+            let per_expert = laguna_sum(&[laguna_product(&[2, gate])?, down, 5 * 4])?;
+            laguna_product(&[
+                self.moe_layers,
+                laguna_sum(&[self.num_experts, u64::from(fold_shared)])?,
+                per_expert,
+            ])
+        }
+    }
+
+    fn laguna_sum(values: &[u64]) -> anyhow::Result<u64> {
+        values
+            .iter()
+            .try_fold(0u64, |a, b| a.checked_add(*b))
+            .ok_or_else(|| anyhow::anyhow!("Laguna ledger addition overflow"))
+    }
+
+    fn laguna_product(values: &[u64]) -> anyhow::Result<u64> {
+        values
+            .iter()
+            .try_fold(1u64, |a, b| a.checked_mul(*b))
+            .ok_or_else(|| anyhow::anyhow!("Laguna ledger multiplication overflow"))
+    }
+
+    pub fn laguna_draft_ctx_ring_bytes(draft_cfg: &str) -> anyhow::Result<u64> {
+        let v: serde_json::Value = serde_json::from_str(draft_cfg)?;
+        let n = |name: &str| {
+            v.get(name)
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| anyhow::anyhow!("Laguna draft config lacks {name}"))
+        };
+        let block = v
+            .get("dflash_config")
+            .and_then(|c| c.get("block_size"))
+            .and_then(|n| n.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("Laguna draft config lacks block_size"))?;
+        let window = n("sliding_window")?.max(1);
+        let row = laguna_product(&[n("num_key_value_heads")?, n("head_dim")?, 2])?;
+        laguna_sum(&[
+            laguna_product(&[
+                n("num_hidden_layers")?,
+                2,
+                laguna_sum(&[window, block])?,
+                row,
+            ])?,
+            laguna_product(&[window, row])?,
+        ])
+    }
+
+    pub fn laguna_retained_verify_shapes(
+        requested: u64,
+        block: u64,
+        adapt: bool,
+    ) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            requested > 0 && block > 1,
+            "Laguna verifier requires positive K and block_size > 1"
+        );
+        let k = requested.min(block - 1);
+        Ok(if adapt { k } else { 1 })
+    }
+
+    fn laguna_env_usize(name: &str) -> Option<usize> {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    }
+
+    fn laguna_spec_capacity(raw_cfg: &str) -> anyhow::Result<u64> {
+        let v: serde_json::Value = serde_json::from_str(raw_cfg)?;
+        let model_max = v
+            .get("max_position_embeddings")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as usize;
+        let bound = kv_env_binding(per_engine_kv_env_for_family("laguna")).map(|(n, _)| n);
+        let kv_max = crate::oapi::chat_engine::kv_max_seq_len_resolved(bound, model_max);
+        Ok(crate::oapi::chat_engine::spec_serve_max_seq(
+            laguna_env_usize("NV_LAGUNA_SPEC_MAX_SEQ"),
+            kv_max,
+        ) as u64)
+    }
+
+    fn plan_laguna(
+        model_dir: &Path,
+        raw_cfg: &str,
+        budget_bytes: u64,
+        boot_shape: BootPlanShape,
+    ) -> anyhow::Result<BootPlan> {
+        let batch_selected = std::env::var("NV_LAGUNA_BATCH")
+            .map(|v| !v.trim().is_empty() && v.trim() != "0")
+            .unwrap_or(false);
+        let spec_b2 = nv_models::laguna_serve::batch_m2_spec_enabled_from_env();
+        if spec_b2 {
+            nv_models::laguna_serve::validate_m2_spec_selection()?;
+        }
+        let prepared_b2 = spec_b2 || nv_models::laguna_serve::batch_m2_graph_enabled_from_env();
+        if prepared_b2 {
+            nv_models::laguna_serve::validate_m2_graph_selection()?;
+        }
+        if boot_shape != BootPlanShape::Full
+            || (batch_selected && !prepared_b2)
+            || std::env::var_os("NV_LAGUNA_HOST_KV").is_some()
+            || std::env::var_os("NV_LAGUNA_RING_ATTN").is_some()
+            || std::env::var_os("NV_LAGUNA_FP8_BF16_FULL").is_some()
+            || std::env::var_os("NV_LAGUNA_HOST_MOE").is_some()
+            || !crate::oapi::chat_engine::laguna_serve_spec_enabled()
+        {
+            let mut boot = plan_unmodeled(model_dir, "laguna", budget_bytes)?;
+            boot.plan.push("laguna-topology-unmodeled", 0,
+                "Laguna retained-cache ledger covers only the full solo worker with compacting CUDA caches and resident grouped experts; this selected topology needs its own plan");
+            return Ok(boot);
+        }
+        let mut plan = new_process_plan(
+            model_dir,
+            "laguna",
+            budget_bytes,
+            LAGUNA_PLAN_IS_ADVISORY_ONLY_HANDOFF_PREFLIGHTS_BOTH_CACHES_AGAINST_LIVE_FREE_MEMORY,
+        );
+        match checkpoint_tensor_bytes(model_dir) {
+            Ok(t) => plan.push("weights-resident", sum_where(&t, |_| true), format!("source safetensors bytes, {} tensors; transformed residents/temporary loader allocations remain within separately estimated slack, not exact allocation tracking", t.len())),
+            Err(e) => plan.push("weights-resident", 0, format!("header parse failed: {e:#}")),
+        }
+        let chunk = laguna_env_usize("NV_LAGUNA_PREFILL_CHUNK").unwrap_or(1024) as u64;
+        let capacity = laguna_spec_capacity(raw_cfg)?;
+        let shape = LagunaSpecServeShape::from_config_json(raw_cfg, capacity, chunk)?;
+        let fold_shared = nv_layers::moe_grouped::folded_shared_enabled();
+        plan.push("experts-grouped-copy", shape.grouped_expert_copy_bytes(fold_shared)?,
+            format!("NVFP4 grouped-copy estimate: {} MoE layers x ({} routed + {} shared) experts; packed bytes, padded block16 scales and five f32 coefficients per expert; retained per-expert weights charged separately", shape.moe_layers, shape.num_experts, u8::from(fold_shared)));
+        let spec = std::env::var("NV_LAGUNA_SERVE_SPEC")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        if !spec {
+            plan.push("kv-per-request", 0, "NV_LAGUNA_SERVE_SPEC=0: each request allocates its own full-capacity cache on the eager path; not modeled");
+        } else {
+            let handoff = std::env::var("NV_LAGUNA_PREFILL_BF16_HANDOFF").as_deref() == Ok("1");
+            let fp8 = handoff || std::env::var_os("NV_LAGUNA_FP8_KV").is_some();
+            let ring = format!(
+                "cap {} full x {} layers, ring {} x {} sliding layers, chunk {}",
+                shape.capacity,
+                shape.full_layers,
+                shape.sliding_slots()?,
+                shape.sliding_layers,
+                shape.chunk
+            );
+            if prepared_b2 {
+                plan.push("kv-destinations-e4m3-b2", laguna_product(&[2, shape.fp8_cache_bytes()?])?,
+                    format!("two independent FixedOne full-capacity caches; e4m3 K/V + f32 scales, bf16 sliding rings and legacy f32 scores scratch; shared BF16 source and draft separately charged when selected; {ring}"));
+                let prefill = if handoff {
+                    "one shared BF16 prefill runner"
+                } else {
+                    "two direct-FP8 prefill runners"
+                };
+                plan.push("b2-graph-pools", 0, format!("retained physical masks 01/10/11; M1/M2 plain or M1/M2/M3/M6 fixed-K2 graphs, per-lane M1/M3 XQA, {prefill} and grouped workspaces are covered only by estimated graph/transient slack, not exact allocation tracking"));
+            } else if fp8 {
+                plan.push("kv-destination-e4m3", shape.fp8_cache_bytes()?, format!("LagunaKvCacheFp8: e4m3 K/V + f32 scales on full layers, bf16 sliding ring, f32 scores scratch; {ring}"));
+            } else {
+                plan.push(
+                    "kv-destination-bf16",
+                    shape.bf16_cache_bytes()?,
+                    format!("LagunaKvCache bf16; {ring}"),
+                );
+            }
+            if handoff {
+                plan.push("kv-handoff-source-bf16", shape.bf16_cache_bytes()?, format!("NV_LAGUNA_PREFILL_BF16_HANDOFF=1 retains one full-capacity bf16 prefill source, shared by the two destinations in B2; {ring}"));
+            }
+            let draft = std::env::var("NV_LAGUNA_SERVE_DRAFT")
+                .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                .unwrap_or(true);
+            let draft_dir = crate::oapi::chat_engine::laguna_dflash_dir();
+            if let (true, Some(dir)) = (draft, draft_dir) {
+                match checkpoint_tensor_bytes(&dir) {
+                    Ok(t) => plan.push("draft-weights", sum_where(&t, |_| true), format!("DFlash source checkpoint bytes (conservative source-storage accounting, not proof of resident packed format), {} tensors, {}", t.len(), dir.display())),
+                    Err(e) => plan.push("draft-weights", 0, format!("draft header parse failed: {e:#}")),
+                }
+                let draft_cfg = std::fs::read_to_string(dir.join("config.json"))?;
+                plan.push("draft-ctx-ring", laguna_product(&[if spec_b2 { 2 } else { 1 }, laguna_draft_ctx_ring_bytes(&draft_cfg)?])?,
+                    "DflashCtxRing bf16 K/V (window + block) per draft layer plus window scratch, per physical speculative lane");
+                if spec_b2 {
+                    plan.push("b2-spec-context-commit-staging", laguna_sum(&[laguna_product(&[2, 5, 3, shape.hidden, 2])?, 2 * 3 * 4])?, "five retained three-row BF16 auxiliary inputs and I32 positions per physical lane; commit graph pools remain inside the graph reserve estimate");
+                    plan.push("b2-spec-outputs-and-sliding", laguna_sum(&[laguna_product(&[6, shape.hidden, 5, 2])?, laguna_product(&[8, serde_json::from_str::<serde_json::Value>(raw_cfg)?.get("vocab_size").and_then(|v| v.as_u64()).ok_or_else(|| anyhow::anyhow!("Laguna config lacks vocab_size"))?, 4])?, 2 * 798_816])?, "six F32 verification logit rows plus two retained plain-owner rows, five BF16 auxiliary tap blocks and two M3 sliding scratch/fan-in buffers; XQA scratch and graph pools remain estimated");
+                }
+                if fp8 && !spec_b2 && std::env::var("NV_LAGUNA_VERIFY_SPLIT").as_deref() != Ok("1")
+                {
+                    let draft_value: serde_json::Value = serde_json::from_str(&draft_cfg)?;
+                    let block = draft_value
+                        .get("dflash_config")
+                        .and_then(|v| v.get("block_size"))
+                        .and_then(|v| v.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("Laguna draft config lacks block_size"))?;
+                    let requested = laguna_env_usize("NV_DFLASH_K").unwrap_or(4) as u64;
+                    let retained_verify_shapes = laguna_retained_verify_shapes(
+                        requested,
+                        block,
+                        nv_models::laguna_dflash::dflash_adapt_enabled()
+                            || nv_models::laguna_dflash::lookup_draft_enabled(),
+                    )?;
+                    plan.push("verify-fa2-dequant-scratch",
+                        laguna_product(&[retained_verify_shapes, shape.verify_fa2_dequant_scratch_bytes()?])?,
+                        format!("FP8 non-split LagunaVerifyGraph retains BF16 K/V scratch per shape even with XQA; up to {retained_verify_shapes} shapes from effective K/adaptation/lookup, separate from graph/transient slack"));
+                }
+            }
+        }
+        common_slack(&mut plan);
+        Ok(BootPlan {
+            plan,
+            kv_max_seq_len: 0,
+            batch_bucket_sizes: None,
+            batch_lane_kv: None,
+        })
     }
 
     #[derive(Clone, Debug)]
@@ -856,15 +1376,13 @@ mod family {
     }
 
     fn gemma4_drafter_plan() -> Option<DrafterPlan> {
-        let no_spec = crate::oapi::chat_engine::nv_no_spec(
-            std::env::var("NV_NO_SPEC").ok().as_deref(),
-        );
+        let no_spec =
+            crate::oapi::chat_engine::nv_no_spec(std::env::var("NV_NO_SPEC").ok().as_deref());
         if no_spec {
             return None;
         }
-        let kind = crate::oapi::chat_engine::nv_drafter_kind(
-            std::env::var("NV_DRAFTER").ok().as_deref(),
-        );
+        let kind =
+            crate::oapi::chat_engine::nv_drafter_kind(std::env::var("NV_DRAFTER").ok().as_deref());
         let want_eagle3 = kind != "dflash";
         let want_dflash = matches!(kind, "dflash" | "auto" | "route");
         let mut weights = 0u64;
@@ -923,13 +1441,28 @@ mod family {
     fn gemma4_attn_proj_planned_nvfp4() -> bool {
         matches!(
             std::env::var("NV_ATTN_PROJ_QUANT").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes") | Some("all") | Some("nvfp4")
-                | Some("fp4") | Some("qkv+o")
+            Some("1")
+                | Some("on")
+                | Some("true")
+                | Some("yes")
+                | Some("all")
+                | Some("nvfp4")
+                | Some("fp4")
+                | Some("qkv+o")
         )
     }
 
     fn gemma4_i8_lmhead_planned() -> bool {
-        std::env::var("NV_VERIFY_LMHEAD_INT8").as_deref() != Ok("0")
+        let raw = std::env::var("NV_VERIFY_LMHEAD_INT8").ok();
+        let planned = super::verify_lmhead_int8_from(raw.as_deref());
+        assert_eq!(
+            planned,
+            raw.as_deref() != Some("0"),
+            "verify_lmhead_int8_from must stay in lockstep with the raw \
+             NV_VERIFY_LMHEAD_INT8 != 0 reads in nv-models gemma4 load_model, or the plan \
+             prices a head the engine never builds"
+        );
+        planned
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -939,7 +1472,11 @@ mod family {
         AdapterServingLeanKeepsTheI8DecodeHeadNeverBuildsDrafters,
     }
 
-    pub fn plan_gemma4(model_dir: &Path, raw_cfg: &str, budget_bytes: u64) -> anyhow::Result<BootPlan> {
+    pub fn plan_gemma4(
+        model_dir: &Path,
+        raw_cfg: &str,
+        budget_bytes: u64,
+    ) -> anyhow::Result<BootPlan> {
         plan_gemma4_shaped(model_dir, raw_cfg, budget_bytes, BootPlanShape::Full)
     }
 
@@ -1149,18 +1686,26 @@ mod family {
         let tensors = checkpoint_tensor_bytes(model_dir)?;
         let mtp_selected = dense && nv_specdecode::qwen38_mtp::mtp_drafter_selected_from_env();
         let mtp_override = nv_specdecode::qwen38_mtp::mtp_draft_dir_override_from_env();
-        let is_mtp_tensor =
-            |n: &str| n.starts_with(nv_specdecode::qwen38_mtp::MTP_TENSOR_PREFIX);
+        let is_mtp_tensor = |n: &str| n.starts_with(nv_specdecode::qwen38_mtp::MTP_TENSOR_PREFIX);
         let weights = sum_where(&tensors, |n| !is_mtp_tensor(n));
-        let family: &'static str = if dense { "qwen3.5-dense" } else { "qwen3.5-moe" };
+        let family: &'static str = if dense {
+            "qwen3.5-dense"
+        } else {
+            "qwen3.5-moe"
+        };
         let mut plan = new_process_plan(model_dir, family, budget_bytes, true);
         plan.push(
             "weights-resident",
             weights,
-            format!("safetensors headers, {} tensors, mtp tensors excluded", tensors.len()),
+            format!(
+                "safetensors headers, {} tensors, mtp tensors excluded",
+                tensors.len()
+            ),
         );
         if mtp_selected {
-            let mtp_dir = mtp_override.clone().unwrap_or_else(|| model_dir.to_path_buf());
+            let mtp_dir = mtp_override
+                .clone()
+                .unwrap_or_else(|| model_dir.to_path_buf());
             let mtp_file = mtp_dir.join(nv_specdecode::qwen38_mtp::MTP_WEIGHTS_FILE_NAME);
             let mtp_bytes = if mtp_file.is_file() {
                 shard_tensor_bytes(&mtp_file)
@@ -1226,11 +1771,12 @@ mod family {
         };
         let kv_slots = kv_concurrent_cap();
         let spec_route_selected = nv_specdecode::qwen38_mtp::mtp_drafter_selected_from_env();
-        let lazy_slots = if batch_on {
-            if spec_route_selected { kv_slots } else { 0 }
-        } else {
-            kv_slots
-        };
+        let lazy_slots = qwen_lazy_kv_slots(
+            batch_on,
+            spec_route_selected,
+            crate::oapi::chat_engine::solo_via_lanes_env_opt_in_nv_q38_solo_via_lanes_1_a_lone_request_runs_as_a_one_lane_group(),
+            kv_slots,
+        );
         let cap = trunk.max_position_embeddings.max(1);
         let per_engine_env = per_engine_kv_env_for_family(family);
         let batch_kv_raw = if batch_on {
@@ -1302,7 +1848,11 @@ mod family {
                 KV_SOLVE_ORDER_IS_ENGINE_BOOT_ORDER_NV_CHAT_MODEL_DIRS_LEFT_TO_RIGHT_Q38_FIRST_ON_THE_GPU_HOST_SO_EACH_UNSET_ENGINE_TAKES_THE_LARGEST_KV_THE_REMAINING_BUDGET_ADMITS_AND_LATER_ENGINES_SOLVE_ONLY_WHAT_IT_LEFT
             ),
         };
-        let kept_sizes = if kept_sizes.is_empty() { vec![1] } else { kept_sizes };
+        let kept_sizes = if kept_sizes.is_empty() {
+            vec![1]
+        } else {
+            kept_sizes
+        };
         let pool_lanes = kept_sizes.last().copied().unwrap_or(1).max(1);
         let lane_kv = lane_kv_at(kv_max);
         let per_pool_lane = pool_lane_bytes_at(lane_kv);
@@ -1332,12 +1882,13 @@ mod family {
                 ),
             );
             if lazy_slots > 0 {
+                let route = if spec_route_selected { "spec" } else { "solo" };
                 plan.push(
-                    format!("kv-reserve-spec-route@kv_max={kv_max}x{lazy_slots}req"),
+                    format!("kv-reserve-{route}-route@kv_max={kv_max}x{lazy_slots}req"),
                     per_req * lazy_slots as u64,
                     format!(
-                        "greedy request groups route to the solo spec path (batch XOR spec) and \
-                         allocate per-request KV outside the prepaid lanes; kv_window() caps each \
+                        "singleton requests allocate MTP or eager KV outside the prepaid lanes; \
+                         only solo-via-lanes without MTP avoids this reserve; kv_window() caps each \
                          at kv_max by construction; kv_max {kv_env_shown}"
                     ),
                 );
@@ -1398,6 +1949,50 @@ mod family {
         })
     }
 
+    #[test]
+    fn qwen_plain_batch_full_cap_reserves_the_singleton_before_solving() {
+        let trunk = nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(include_str!(
+            "../../crates/nv-models/tests/qwen3_8_27b_config.json"
+        ))
+        .unwrap()
+        .trunk();
+        let geo = qwen35_geometry(&trunk);
+        let cap = 262144;
+        let per_lane = qwen35_per_lane_bytes(&geo, cap);
+        let lazy_slots = qwen_lazy_kv_slots(true, false, false, 1);
+        let reserve = per_lane * lazy_slots as u64;
+        let buckets = [1, 2, 4];
+        let kept = |budget: u64| {
+            solve_largest_bucket_prefix_that_fits(
+                &buckets,
+                per_lane,
+                budget.saturating_sub(reserve),
+            )
+        };
+        assert_eq!(geo.bytes_per_token_full_layers, 33280);
+        assert_eq!(reserve, per_lane, "the eager singleton owns another cache");
+        assert_eq!(kept(4 * per_lane), vec![1, 2]);
+        assert_eq!(kept(5 * per_lane), vec![1, 2, 4]);
+        assert_eq!(kept(5 * per_lane - 1), vec![1, 2]);
+        assert!(kept(2 * per_lane - 1).is_empty());
+
+        let fits = |kv| qwen35_per_lane_bytes(&geo, kv) * (4 + lazy_slots as u64) <= 4 * per_lane;
+        let solved = solve_max_kv_tokens_monotone(fits, cap).unwrap();
+        assert!(solved < cap && fits(solved));
+        assert!(!fits(
+            solved + KV_SOLVE_GRANULARITY_1024_ROUNDS_DOWN_SO_A_SOLVED_KV_NEVER_EXCEEDS_BUDGET
+        ));
+        let pool_only = qwen_lazy_kv_slots(true, false, true, 1);
+        assert_eq!(
+            solve_max_kv_tokens_monotone(
+                |kv| qwen35_per_lane_bytes(&geo, kv) * (4 + pool_only as u64) <= 4 * per_lane,
+                cap,
+            ),
+            Some(cap),
+            "solo-via-lanes reuses a prepaid cache when no MTP head is loaded"
+        );
+    }
+
     fn plan_unmodeled(
         model_dir: &Path,
         family: &'static str,
@@ -1446,6 +2041,7 @@ mod family {
                 plan_qwen35(model_dir, raw_cfg, false, grouped_graph, budget)?
             }
             PlanFamily::Unmodeled(name) => plan_unmodeled(model_dir, name, budget)?,
+            PlanFamily::Laguna => plan_laguna(model_dir, raw_cfg, budget, shape)?,
         };
         eprintln!("{}", boot.plan.render());
         tracing::info!("{}", boot.plan.render());
@@ -1460,6 +2056,176 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn qwen_lazy_kv_reservation_tracks_singletons_and_preserves_the_configured_cap() {
+        for kv_slots in [1, 3] {
+            for batch_on in [false, true] {
+                for mtp_selected in [false, true] {
+                    assert_eq!(
+                        qwen_lazy_kv_slots(batch_on, mtp_selected, false, kv_slots),
+                        kv_slots,
+                        "plain and MTP singletons allocate outside the lane pool"
+                    );
+                    assert_eq!(
+                        qwen_lazy_kv_slots(batch_on, mtp_selected, true, kv_slots),
+                        if batch_on && !mtp_selected {
+                            0
+                        } else {
+                            kv_slots
+                        },
+                        "solo-via-lanes cannot bypass an MTP head or a non-batched engine"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn laguna_cache_and_retained_pool_ledger_has_checked_geometry_and_shape_counts() {
+        let mut value = serde_json::json!({
+            "num_hidden_layers": 40,
+            "layer_types": (0..40).map(|i| if i % 4 == 0 { "full_attention" } else { "sliding_attention" }).collect::<Vec<_>>(),
+            "mlp_only_layers": [0], "num_key_value_heads": 8, "head_dim": 128,
+            "num_attention_heads": 48,
+            "num_attention_heads_per_layer": (0..40).map(|i| if i % 4 == 0 { 48 } else { 64 }).collect::<Vec<_>>(),
+            "sliding_window": 512, "num_experts": 256, "hidden_size": 2048,
+            "moe_intermediate_size": 512, "vocab_size": 154880, "intermediate_size": 8192,
+            "max_position_embeddings": 262144, "rms_norm_eps": 0.00001,
+            "num_experts_per_tok": 8, "shared_expert_intermediate_size": 512,
+            "rope_parameters": {
+                "full_attention": { "rope_theta": 500000 },
+                "sliding_attention": { "rope_theta": 500000 }
+            }
+        });
+        let raw = value.to_string();
+        let shape = LagunaSpecServeShape::from_config_json(&raw, 262144, 1024).unwrap();
+        assert_eq!(shape.sliding_slots().unwrap(), 1536);
+        assert_eq!(shape.bf16_cache_bytes().unwrap(), 10_926_161_920);
+        assert_eq!(shape.fp8_cache_bytes().unwrap(), 5_792_333_824);
+        assert_eq!(
+            shape.grouped_expert_copy_bytes(false).unwrap(),
+            17_666_608_128
+        );
+        assert_eq!(
+            shape.grouped_expert_copy_bytes(true).unwrap(),
+            17_735_618_316
+        );
+        assert_eq!(shape.verify_fa2_dequant_scratch_bytes().unwrap(), 1 << 30);
+        let larger = LagunaSpecServeShape::from_config_json(&raw, 262144, 2048).unwrap();
+        assert_eq!(
+            larger.bf16_cache_bytes().unwrap() - shape.bf16_cache_bytes().unwrap(),
+            125_829_120
+        );
+        assert_eq!(
+            larger.fp8_cache_bytes().unwrap() - shape.fp8_cache_bytes().unwrap(),
+            125_829_120
+        );
+        let small = LagunaSpecServeShape::from_config_json(&raw, 33, 1024).unwrap();
+        assert_eq!(small.sliding_slots().unwrap(), 33);
+        assert_eq!(small.bf16_cache_bytes().unwrap(), 5_406_720);
+        for (k, block, adapt, expected) in [
+            (2, 16, false, 1),
+            (4, 16, true, 4),
+            (7, 16, true, 7),
+            (20, 16, true, 15),
+        ] {
+            assert_eq!(
+                laguna_retained_verify_shapes(k, block, adapt).unwrap(),
+                expected
+            );
+        }
+        assert!(laguna_retained_verify_shapes(0, 16, true).is_err());
+        assert!(laguna_retained_verify_shapes(4, 1, true).is_err());
+        assert!(LagunaSpecServeShape::from_config_json(&raw, 0, 1024).is_err());
+        assert!(LagunaSpecServeShape::from_config_json(&raw, 262145, 1024).is_err());
+        assert!(LagunaSpecServeShape::from_config_json(&raw, 262144, 513).is_err());
+        assert!(LagunaSpecServeShape::from_config_json(&raw, 262144, 4096).is_ok());
+        assert!(LagunaSpecServeShape::from_config_json(&raw, 262144, 8192).is_ok());
+        let mut selectors = value.clone();
+        selectors["mlp_layer_types"] = serde_json::json!(vec!["dense"; 40]);
+        assert_eq!(
+            LagunaSpecServeShape::from_config_json(&selectors.to_string(), 262144, 1024)
+                .unwrap()
+                .moe_layers,
+            0
+        );
+        selectors["mlp_layer_types"][0] = serde_json::json!("sparse");
+        assert_eq!(
+            LagunaSpecServeShape::from_config_json(&selectors.to_string(), 262144, 1024)
+                .unwrap()
+                .moe_layers,
+            1,
+            "explicit sparse overrides mlp_only membership"
+        );
+        selectors.as_object_mut().unwrap().remove("mlp_layer_types");
+        selectors["mlp_only_layers"] = serde_json::json!([0, 0]);
+        assert_eq!(
+            LagunaSpecServeShape::from_config_json(&selectors.to_string(), 262144, 1024)
+                .unwrap()
+                .moe_layers,
+            39,
+            "duplicate dense membership does not remove another layer"
+        );
+        selectors["decoder_sparse_step"] = serde_json::json!(2);
+        selectors["mlp_only_layers"] = serde_json::json!([1, 1]);
+        assert_eq!(
+            LagunaSpecServeShape::from_config_json(&selectors.to_string(), 262144, 1024)
+                .unwrap()
+                .moe_layers,
+            19
+        );
+        selectors["num_experts"] = serde_json::json!(0);
+        assert_eq!(
+            LagunaSpecServeShape::from_config_json(&selectors.to_string(), 262144, 1024)
+                .unwrap()
+                .moe_layers,
+            0
+        );
+        selectors["num_key_value_heads"] = serde_json::json!(0);
+        assert!(
+            LagunaSpecServeShape::from_config_json(&selectors.to_string(), 262144, 1024).is_err()
+        );
+        value["head_dim"] = serde_json::json!(u64::MAX);
+        assert!(
+            LagunaSpecServeShape::from_config_json(&value.to_string(), 262144, 1024)
+                .unwrap()
+                .bf16_cache_bytes()
+                .is_err()
+        );
+        value["sliding_window"] = serde_json::json!(u64::MAX);
+        assert!(
+            LagunaSpecServeShape::from_config_json(&value.to_string(), 262144, 1024)
+                .unwrap()
+                .sliding_slots()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn verify_lmhead_int8_ships_on_when_unset_and_zero_is_the_bf16_escape() {
+        const {
+            assert!(
+                VERIFY_LMHEAD_INT8_SHIPS_ON_SIGNED_OFF_2026_09_02_V2_NORMX_MK_PLUS_GEMV_I8_PRENORMED_MK_AT_K_GE_4096_48_OF_48_TEACHER_FORCED_AGREEMENT_AND_ZERO_RESTORES_THE_BF16_VERIFY_HEAD,
+                "the int8 verify lm_head ships on: the 48/48 teacher-forced agreement suite \
+                 (gemma4_verify_lmhead_i8.rs) is the record, and NV_VERIFY_LMHEAD_INT8=0 \
+                 restores the bf16 verify head"
+            );
+        }
+        assert!(
+            verify_lmhead_int8_from(None),
+            "unset must resolve to the shipped int8 head"
+        );
+        assert!(
+            !verify_lmhead_int8_from(Some("0")),
+            "NV_VERIFY_LMHEAD_INT8=0 must restore the bf16 verify head"
+        );
+        assert!(
+            verify_lmhead_int8_from(Some("1")),
+            "NV_VERIFY_LMHEAD_INT8=1 must keep the int8 head"
+        );
+    }
 
     fn plan_of(budget: u64) -> VramPlan {
         VramPlan::new(Path::new("/x/model"), "test", budget, true)
@@ -1626,8 +2392,7 @@ mod tests {
         let per = 4096u64;
         let budget = 512 * MIB;
         let linear = solve_max_kv_tokens(budget, per, 1, 1 << 20).unwrap();
-        let mono =
-            solve_max_kv_tokens_monotone(|kv| kv as u64 * per <= budget, 1 << 20).unwrap();
+        let mono = solve_max_kv_tokens_monotone(|kv| kv as u64 * per <= budget, 1 << 20).unwrap();
         assert_eq!(linear, mono);
         assert!(solve_max_kv_tokens_monotone(|kv| kv <= 100, 1 << 20).is_none());
         assert_eq!(
@@ -1812,11 +2577,7 @@ mod tests {
             "the ledger's per-model gemma4 plan passed alone -- exactly the bug: the real boot \
              OOM'd at 97 GiB on a ~125 GiB requirement"
         );
-        push_prior_or_aux_process_items(
-            &mut g4,
-            q38.planned_total_bytes(),
-            &AuxEnv::default(),
-        );
+        push_prior_or_aux_process_items(&mut g4, q38.planned_total_bytes(), &AuxEnv::default());
         g4.kv_knob = Some(KvShrinkKnob {
             env: "NV_KV_MAX_SEQ_LEN",
             kv_max: 262144,
@@ -1833,7 +2594,10 @@ mod tests {
             msg.contains(PRIOR_ENGINES_ITEM_LABEL_STRIPPED_ON_RECORD_SO_EACH_ENGINE_COUNTS_ONCE),
             "{msg}"
         );
-        assert!(msg.contains("smallest changes that would fit, ranked:"), "{msg}");
+        assert!(
+            msg.contains("smallest changes that would fit, ranked:"),
+            "{msg}"
+        );
         assert!(
             msg.contains("option 1: set NV_KV_MAX_SEQ_LEN="),
             "the shared kv env drives BOTH engines' pools, so with the prior engines' \
@@ -1866,10 +2630,19 @@ mod tests {
         p.drafter_off_knob = Some((30 * MIB, "set NV_NO_SPEC=1"));
         let ranked = p.ranked_changes_to_fit();
         assert_eq!(ranked.len(), 4, "{ranked:?}");
-        assert!(ranked[0].starts_with("set NV_KV_MAX_SEQ_LEN="), "{ranked:?}");
-        assert!(ranked[1].starts_with("set NV_Q38_BATCH_SIZES="), "{ranked:?}");
+        assert!(
+            ranked[0].starts_with("set NV_KV_MAX_SEQ_LEN="),
+            "{ranked:?}"
+        );
+        assert!(
+            ranked[1].starts_with("set NV_Q38_BATCH_SIZES="),
+            "{ranked:?}"
+        );
         assert!(ranked[2].starts_with("set NV_NO_SPEC=1"), "{ranked:?}");
-        assert!(ranked[3].starts_with("raise NV_VRAM_BUDGET_GIB"), "{ranked:?}");
+        assert!(
+            ranked[3].starts_with("raise NV_VRAM_BUDGET_GIB"),
+            "{ranked:?}"
+        );
     }
 
     #[test]
@@ -1896,10 +2669,11 @@ mod tests {
     }
 
     #[test]
-    fn aux_itemization_totals_the_measured_ledger_arms_and_the_override_wins() {
+    fn aux_itemization_keeps_legacy_reserves_excludes_cpu_tts_and_honors_override() {
         let all = AuxEnv {
             aux_override_gib: None,
             speech_stack: true,
+            loaded_speech: None,
             embedding: true,
             tts_talker: true,
             dots_ocr: true,
@@ -1911,14 +2685,18 @@ mod tests {
         assert_eq!(p.items.len(), 6);
         assert_eq!(
             p.planned_total_bytes(),
-            (2638 + 1196 + 1816 + 7068 + 7882 + 2048) * MIB
+            (2638 + 1196 + 7068 + 7882 + 2048) * MIB
         );
-        assert_eq!(
-            (AUX_EMBEDDING_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS
-                + AUX_TTS_TALKER_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_ARM_AUX_EMBED_TTS),
-            3012,
-            "the split must re-add to the measured aux-embed-tts arm"
-        );
+        let tts = p
+            .items
+            .iter()
+            .find(|item| item.label == "aux-qwen3-tts-talker")
+            .unwrap();
+        assert_eq!(tts.bytes, 0);
+        assert!(!tts.unmeasured);
+        assert!(tts.basis.contains("Device::Cpu"));
+        assert_eq!(p.items.iter().filter(|item| item.unmeasured).count(), 5);
+        assert!(p.render().contains("INCOMPLETE ESTIMATE"));
         assert_eq!(
             (AUX_DOTS_OCR_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB
                 + AUX_DEEPSEEK_OCR2_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB),
@@ -1935,6 +2713,95 @@ mod tests {
         );
         assert_eq!(o.items.len(), 1);
         assert_eq!(o.planned_total_bytes(), (24.0 * GIB) as u64);
+    }
+
+    #[test]
+    fn aux_providers_distinguish_cpu_handles_from_cuda_and_unreported_sessions() {
+        let providers = |provider| {
+            ["kokoro", "diar-segmentation", "diar-embedding"]
+                .into_iter()
+                .map(|component| LoadedSpeechProvider {
+                    component,
+                    provider,
+                })
+                .collect()
+        };
+        let mut aux = AuxEnv {
+            speech_stack: true,
+            loaded_speech: Some(providers("CPUExecutionProvider")),
+            diar_gpu_limit_mib: Some(2048),
+            ..AuxEnv::default()
+        };
+        let mut cpu = plan_of(u64::MAX);
+        push_aux_items(&mut cpu, &aux);
+        assert_eq!(cpu.planned_total_bytes(), 0);
+        assert!(!cpu.items.iter().any(|item| item.unmeasured));
+        aux.loaded_speech = Some(providers("CUDAExecutionProvider"));
+        let mut cuda = plan_of(u64::MAX);
+        push_aux_items(&mut cuda, &aux);
+        assert_eq!(cuda.planned_total_bytes(), (2638 + 2048) * MIB);
+        assert!(cuda.items.iter().all(|item| item.unmeasured));
+        for component in ["kokoro", "diar-segmentation", "diar-embedding"] {
+            assert!(cuda
+                .render()
+                .contains(&format!("{component}=CUDAExecutionProvider")));
+        }
+        aux.loaded_speech = Some(vec![
+            LoadedSpeechProvider {
+                component: "parakeet-encoder",
+                provider: "cpu",
+            },
+            LoadedSpeechProvider {
+                component: "parakeet-nemo/joint",
+                provider: "unreported",
+            },
+        ]);
+        assert!(!aux.speech_is_cpu_only());
+        let mut partial = plan_of(u64::MAX);
+        push_aux_items(&mut partial, &aux);
+        assert_eq!(partial.planned_total_bytes(), (2638 + 2048) * MIB);
+        assert!(partial.render().contains("parakeet-nemo/joint=unreported"));
+        aux.loaded_speech = Some(Vec::new());
+        let mut absent = plan_of(u64::MAX);
+        push_aux_items(&mut absent, &aux);
+        assert_eq!(absent.planned_total_bytes(), 0);
+    }
+
+    #[test]
+    fn aux_reconcile_reports_incomplete_estimates_without_changing_tolerance() {
+        assert_eq!(reconcile_verdict(10, 13, 3, false), "WITHIN PLAN");
+        assert_eq!(
+            reconcile_verdict(10, 13, 3, true),
+            "WITHIN DECLARED BYTES; INCOMPLETE ESTIMATE"
+        );
+        for incomplete in [false, true] {
+            assert_eq!(reconcile_verdict(10, 14, 3, incomplete), "EXCEEDS PLAN");
+        }
+        assert_eq!(
+            reconcile_verdict(u64::MAX, u64::MAX, 3, true),
+            "WITHIN DECLARED BYTES; INCOMPLETE ESTIMATE"
+        );
+    }
+
+    #[test]
+    fn aux_unmeasured_entries_follow_record_owner_without_double_counting() {
+        let _own = ledger_tests_run_one_at_a_time();
+        let before_bytes = recorded_planned_total_bytes();
+        let before_unknown = recorded_unmeasured_items();
+        let mut first = plan_of(u64::MAX);
+        first.push_unmeasured("test-unknown-aux", 10 * MIB, "unknown resident bytes");
+        let first_record = record_boot_plan(&first);
+        let mut second = plan_of(u64::MAX);
+        push_prior_or_aux_process_items(&mut second, 10 * MIB, &AuxEnv::default());
+        second.push("test-second-engine", 5 * MIB, "headers");
+        let second_record = record_boot_plan(&second);
+        assert_eq!(recorded_planned_total_bytes(), before_bytes + 15 * MIB);
+        assert_eq!(recorded_unmeasured_items().len(), before_unknown.len() + 1);
+        drop(first_record);
+        assert_eq!(recorded_planned_total_bytes(), before_bytes + 5 * MIB);
+        assert_eq!(recorded_unmeasured_items(), before_unknown);
+        drop(second_record);
+        assert_eq!(recorded_planned_total_bytes(), before_bytes);
     }
 
     #[test]
@@ -2072,7 +2939,11 @@ mod tests {
             90 * MIB,
             "prior q38 at full context",
         );
-        p.push("kv-reserve@kv_max=4096x1req", 20 * MIB, "own kv already at the floor");
+        p.push(
+            "kv-reserve@kv_max=4096x1req",
+            20 * MIB,
+            "own kv already at the floor",
+        );
         p.kv_knob = Some(KvShrinkKnob {
             env: per_engine_kv_env_for_family("gemma4").unwrap(),
             kv_max: 4096,
@@ -2095,7 +2966,10 @@ mod tests {
             "shrinking the prior engine's per-engine kv is the only kv lever left: {ranked:?}"
         );
         assert!(
-            ranked.last().unwrap().starts_with("raise NV_VRAM_BUDGET_GIB"),
+            ranked
+                .last()
+                .unwrap()
+                .starts_with("raise NV_VRAM_BUDGET_GIB"),
             "{ranked:?}"
         );
         let target: usize = ranked[0]

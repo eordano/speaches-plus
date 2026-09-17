@@ -1,0 +1,2062 @@
+diff -ruN a/benches/benchmarks/where_cond.rs b/benches/benchmarks/where_cond.rs
+--- a/benches/benchmarks/where_cond.rs
++++ b/benches/benchmarks/where_cond.rs
+@@ -18,6 +18,18 @@
+     arr
+ }
+ 
++const fn create_causal_arr<const S: usize, const N: usize>() -> [u8; N] {
++    let mut arr = [0u8; N];
++    let mut i = 0;
++    while i < N {
++        let row = (i / S) % S;
++        let col = i % S;
++        arr[i] = if col > row { 1 } else { 0 };
++        i += 1;
++    }
++    arr
++}
++
+ const B: usize = 1;
+ const M: usize = 1024;
+ const K: usize = 1024;
+@@ -53,12 +65,177 @@
+     group.finish();
+ }
+ 
++const AB: usize = 1;
++const AH: usize = 4;
++const AS: usize = 512;
++
++static CAUSAL: [u8; AB * AH * AS * AS] = create_causal_arr::<AS, { AB * AH * AS * AS }>();
++
++fn run_masked_fill_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
++    let shape = (AB, AH, AS, AS);
++    let tensor = Tensor::from_slice(CAUSAL.as_slice(), shape, device).unwrap();
++    let on_true = Tensor::new(1.0, device)
++        .unwrap()
++        .to_dtype(dtype)
++        .unwrap()
++        .broadcast_as(shape)
++        .unwrap();
++    let on_false = Tensor::zeros(shape, dtype, device).unwrap();
++
++    let elements = AB * AH * AS * AS;
++    let flops = (2 * elements * dtype.size_in_bytes()) + elements;
++
++    let mut group = c.benchmark_group(device.bench_name(name));
++    group.throughput(Throughput::Bytes(flops as u64));
++    group.bench_function("iter", move |b| {
++        b.iter_custom(|iters| {
++            let start = Instant::now();
++            for _i in 0..iters {
++                run(
++                    black_box(&tensor),
++                    black_box(&on_true),
++                    black_box(&on_false),
++                );
++            }
++            device.sync().unwrap();
++            start.elapsed()
++        })
++    });
++    group.finish();
++}
++
++fn run_masked_fill_bcast_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
++    let shape = (AB, AH, AS, AS);
++    let tensor = Tensor::from_slice(&CAUSAL[..AS * AS], (1, 1, AS, AS), device)
++        .unwrap()
++        .broadcast_as(shape)
++        .unwrap();
++    let on_true = Tensor::new(1.0, device)
++        .unwrap()
++        .to_dtype(dtype)
++        .unwrap()
++        .broadcast_as(shape)
++        .unwrap();
++    let on_false = Tensor::zeros(shape, dtype, device).unwrap();
++
++    let elements = AB * AH * AS * AS;
++    let flops = (2 * elements * dtype.size_in_bytes()) + elements;
++
++    let mut group = c.benchmark_group(device.bench_name(name));
++    group.throughput(Throughput::Bytes(flops as u64));
++    group.bench_function("iter", move |b| {
++        b.iter_custom(|iters| {
++            let start = Instant::now();
++            for _i in 0..iters {
++                run(
++                    black_box(&tensor),
++                    black_box(&on_true),
++                    black_box(&on_false),
++                );
++            }
++            device.sync().unwrap();
++            start.elapsed()
++        })
++    });
++    group.finish();
++}
++
++fn run_transposed_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
++    let tensor = Tensor::from_slice(DATA.as_slice(), (M, K), device).unwrap();
++    let on_true = Tensor::ones((M, K), dtype, device).unwrap();
++    let on_false = Tensor::zeros((K, M), dtype, device)
++        .unwrap()
++        .transpose(0, 1)
++        .unwrap();
++
++    let elements = M * K;
++    let flops = (2 * elements * dtype.size_in_bytes()) + elements;
++
++    let mut group = c.benchmark_group(device.bench_name(name));
++    group.throughput(Throughput::Bytes(flops as u64));
++    group.bench_function("iter", move |b| {
++        b.iter_custom(|iters| {
++            let start = Instant::now();
++            for _i in 0..iters {
++                run(
++                    black_box(&tensor),
++                    black_box(&on_true),
++                    black_box(&on_false),
++                );
++            }
++            device.sync().unwrap();
++            start.elapsed()
++        })
++    });
++    group.finish();
++}
++
++const NB: usize = 256;
++const NS: usize = 512;
++const ND_PAD: usize = 8;
++const ND: usize = 3;
++
++fn run_narrow_inner_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &str) {
++    let padded = (NB, NS, ND_PAD);
++    let tensor = Tensor::from_slice(DATA.as_slice(), padded, device)
++        .unwrap()
++        .narrow(2, 0, ND)
++        .unwrap();
++    let on_true = Tensor::new(0f32, device)
++        .unwrap()
++        .to_dtype(dtype)
++        .unwrap()
++        .broadcast_as((NB, NS, ND))
++        .unwrap();
++    let on_false = Tensor::zeros(padded, dtype, device)
++        .unwrap()
++        .narrow(2, 0, ND)
++        .unwrap();
++
++    let elements = NB * NS * ND;
++    let flops = (2 * elements * dtype.size_in_bytes()) + elements;
++
++    let mut group = c.benchmark_group(device.bench_name(name));
++    group.throughput(Throughput::Bytes(flops as u64));
++    group.bench_function("iter", move |b| {
++        b.iter_custom(|iters| {
++            let start = Instant::now();
++            for _i in 0..iters {
++                run(
++                    black_box(&tensor),
++                    black_box(&on_true),
++                    black_box(&on_false),
++                );
++            }
++            device.sync().unwrap();
++            start.elapsed()
++        })
++    });
++    group.finish();
++}
++
+ fn criterion_benchmark(c: &mut Criterion) {
+     let device = BenchDeviceHandler::new().unwrap();
+     for d in device.devices {
+         run_where_cond_benchmark(c, &d, DType::F32, "where_cond_f32");
+         run_where_cond_benchmark(c, &d, DType::BF16, "where_cond_bf16");
+         run_where_cond_benchmark(c, &d, DType::F16, "where_cond_f16");
++
++        run_masked_fill_benchmark(c, &d, DType::F32, "where_cond_masked_fill_f32");
++        run_masked_fill_benchmark(c, &d, DType::BF16, "where_cond_masked_fill_bf16");
++        run_masked_fill_benchmark(c, &d, DType::F16, "where_cond_masked_fill_f16");
++
++        run_masked_fill_bcast_benchmark(c, &d, DType::F32, "where_cond_masked_fill_bcast_f32");
++        run_masked_fill_bcast_benchmark(c, &d, DType::BF16, "where_cond_masked_fill_bcast_bf16");
++        run_masked_fill_bcast_benchmark(c, &d, DType::F16, "where_cond_masked_fill_bcast_f16");
++
++        run_transposed_benchmark(c, &d, DType::F32, "where_cond_transposed_f32");
++        run_transposed_benchmark(c, &d, DType::BF16, "where_cond_transposed_bf16");
++        run_transposed_benchmark(c, &d, DType::F16, "where_cond_transposed_f16");
++
++        run_narrow_inner_benchmark(c, &d, DType::F32, "where_cond_narrow_inner_f32");
++        run_narrow_inner_benchmark(c, &d, DType::BF16, "where_cond_narrow_inner_bf16");
++        run_narrow_inner_benchmark(c, &d, DType::F16, "where_cond_narrow_inner_f16");
+     }
+ }
+ 
+diff -ruN a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -271,6 +271,6 @@
+ optional = true
+ 
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
+-version = "0.22.0"
++version = "0.23.1"
+ features = ["onig"]
+ default-features = false
+diff -ruN a/src/backprop.rs b/src/backprop.rs
+--- a/src/backprop.rs
++++ b/src/backprop.rs
+@@ -16,6 +16,21 @@
+     }
+ }
+ 
++// House patch: CANDLE_METAL_BACKWARD_SYNC_EVERY=N (0/unset = off) synchronizes
++// the metal device every N backward nodes. This was the workaround for the
++// pre-fix rank>=5 strided-reduce indexer bug (get_strided_idx_fallback in
++// reduce.metal, fixed on upstream main): it changed buffer-pool adjacency so
++// the out-of-bounds loads read benign memory. The bug is fixed; the knob stays
++// so the fenced path that produced published training numbers remains
++// reproducible. Read per backward() call, not cached, so setting or clearing
++// the env mid-process (tests, in-process job runners) always takes effect.
++fn metal_backward_sync_every() -> usize {
++    std::env::var("CANDLE_METAL_BACKWARD_SYNC_EVERY")
++        .ok()
++        .and_then(|v| v.parse().ok())
++        .unwrap_or(0)
++}
++
+ thread_local! {
+     static CANDLE_GRAD_DO_NOT_DETACH: bool = {
+         match std::env::var("CANDLE_GRAD_DO_NOT_DETACH") {
+@@ -33,6 +48,17 @@
+     /// argument.
+     /// This assumes that the op graph is a DAG.
+     pub fn sorted_nodes(&self) -> Vec<&Tensor> {
++        self.sorted_nodes_with_track_flags().0
++    }
++
++    // House patch: expose the walk's per-tensor track_grad verdicts so that
++    // backward() can skip computing gradients for arguments no Var feeds into.
++    // QLoRA-style training keeps large frozen weights as plain tensors;
++    // upstream still materializes their full-size gradients (matmul +
++    // zeros_like + add) only to drop them -- for a [151936, 1536] lm_head that
++    // is ~2.8 GB of buffers and a large GEMM per backward for values nobody
++    // ever reads.
++    fn sorted_nodes_with_track_flags(&self) -> (Vec<&Tensor>, HashMap<TensorId, bool>) {
+         // The vec of sorted nodes is passed as an owned value rather than a mutable reference
+         // to get around some lifetime limitations.
+         fn walk<'a>(
+@@ -157,19 +183,33 @@
+             }
+             (track_grad, nodes)
+         }
+-        let (_tg, mut nodes) = walk(self, vec![], &mut HashMap::new());
++        let mut already_seen = HashMap::new();
++        let (_tg, mut nodes) = walk(self, vec![], &mut already_seen);
+         nodes.reverse();
+-        nodes
++        (nodes, already_seen)
+     }
+ 
+     pub fn backward(&self) -> Result<GradStore> {
+-        let sorted_nodes = self.sorted_nodes();
++        let (sorted_nodes, track_flags) = self.sorted_nodes_with_track_flags();
++        // House patch: args absent from the walk map (e.g. behind an
++        // Affine{mul: 0} short-circuit) default to tracked, which is the
++        // upstream always-compute behavior.
++        let tracked = |t: &Tensor| *track_flags.get(&t.id()).unwrap_or(&true);
+         let mut grads = GradStore::new();
+         grads.insert(self, self.ones_like()?.contiguous()?);
++        let bwd_sync_every = metal_backward_sync_every();
++        let mut bwd_node_i = 0usize;
+         for node in sorted_nodes.iter() {
+             if node.is_variable() {
+                 continue;
+             }
++            bwd_node_i += 1;
++            if bwd_sync_every != 0
++                && bwd_node_i % bwd_sync_every == 0
++                && self.device().is_metal()
++            {
++                self.device().synchronize()?;
++            }
+             let grad = grads
+                 .remove(node)
+                 .expect("candle internal error - grad not populated");
+@@ -183,32 +223,36 @@
+             if let Some(op) = node.op() {
+                 match op {
+                     Op::Binary(lhs, rhs, BinaryOp::Add) => {
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&grad)?;
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        *rhs_sum_grad = rhs_sum_grad.add(&grad)?;
++                        if tracked(lhs) {
++                            grads.accumulate(lhs, grad.clone())?;
++                        }
++                        if tracked(rhs) {
++                            grads.accumulate(rhs, grad.clone())?;
++                        }
+                     }
+                     Op::Binary(lhs, rhs, BinaryOp::Sub) => {
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&grad)?;
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        *rhs_sum_grad = rhs_sum_grad.sub(&grad)?;
++                        if tracked(lhs) {
++                            grads.accumulate(lhs, grad.clone())?;
++                        }
++                        if tracked(rhs) {
++                            grads.accumulate_neg(rhs, grad.clone())?;
++                        }
+                     }
+                     Op::Binary(lhs, rhs, BinaryOp::Mul) => {
+-                        let lhs_grad = grad.mul(rhs)?;
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&lhs_grad)?;
+-                        let rhs_grad = grad.mul(lhs)?;
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        *rhs_sum_grad = rhs_sum_grad.add(&rhs_grad)?;
++                        if tracked(lhs) {
++                            grads.accumulate(lhs, grad.mul(rhs)?)?;
++                        }
++                        if tracked(rhs) {
++                            grads.accumulate(rhs, grad.mul(lhs)?)?;
++                        }
+                     }
+                     Op::Binary(lhs, rhs, BinaryOp::Div) => {
+-                        let lhs_grad = grad.div(rhs)?;
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&lhs_grad)?;
+-                        let rhs_grad = grad.mul(lhs)?.div(&rhs.sqr()?)?;
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        *rhs_sum_grad = rhs_sum_grad.sub(&rhs_grad)?;
++                        if tracked(lhs) {
++                            grads.accumulate(lhs, grad.div(rhs)?)?;
++                        }
++                        if tracked(rhs) {
++                            grads.accumulate_neg(rhs, grad.mul(lhs)?.div(&rhs.sqr()?)?)?;
++                        }
+                     }
+                     Op::Binary(lhs, rhs, BinaryOp::Minimum)
+                     | Op::Binary(lhs, rhs, BinaryOp::Maximum) => {
+@@ -217,22 +261,25 @@
+ 
+                         // If both masks are 1 one the same point, we want to scale the
+                         // gradient by 0.5 rather than 1.
+-                        let lhs_grad = mask_lhs.mul(&grad)?.div(&(&mask_rhs + 1.)?)?;
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&lhs_grad)?;
+-
+-                        let rhs_grad = mask_rhs.mul(&grad)?.div(&(&mask_lhs + 1.)?)?;
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        *rhs_sum_grad = rhs_sum_grad.add(&rhs_grad)?;
++                        if tracked(lhs) {
++                            let lhs_grad = mask_lhs.mul(&grad)?.div(&(&mask_rhs + 1.)?)?;
++                            grads.accumulate(lhs, lhs_grad)?;
++                        }
++                        if tracked(rhs) {
++                            let rhs_grad = mask_rhs.mul(&grad)?.div(&(&mask_lhs + 1.)?)?;
++                            grads.accumulate(rhs, rhs_grad)?;
++                        }
+                     }
+                     Op::WhereCond(pred, t, f) => {
+-                        let zeros = grad.zeros_like()?;
+-                        let t_sum_grad = grads.or_insert(t)?;
+-                        let t_grad = pred.where_cond(&grad, &zeros)?;
+-                        *t_sum_grad = t_sum_grad.add(&t_grad)?;
+-                        let f_sum_grad = grads.or_insert(f)?;
+-                        let f_grad = pred.where_cond(&zeros, &grad)?;
+-                        *f_sum_grad = f_sum_grad.add(&f_grad)?;
++                        if tracked(t) || tracked(f) {
++                            let zeros = grad.zeros_like()?;
++                            if tracked(t) {
++                                grads.accumulate(t, pred.where_cond(&grad, &zeros)?)?;
++                            }
++                            if tracked(f) {
++                                grads.accumulate(f, pred.where_cond(&zeros, &grad)?)?;
++                            }
++                        }
+                     }
+                     Op::Conv1D {
+                         arg,
+@@ -248,30 +295,32 @@
+                         let out_size =
+                             (grad_l_in - 1) * stride + dilation * (k_size - 1) + 1 - 2 * padding;
+                         let out_padding = arg.dim(2)? - out_size;
+-                        let grad_arg = grad.conv_transpose1d(
+-                            kernel,
+-                            *padding,
+-                            out_padding,
+-                            *stride,
+-                            *dilation,
+-                            /* groups */ 1,
+-                        )?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad_arg)?;
+-
+-                        let grad_kernel = arg
+-                            .transpose(0, 1)?
+-                            .conv1d(&grad.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
+-                            .transpose(0, 1)?;
+-                        let sum_grad = grads.or_insert(kernel)?;
+-                        let (_, _, k0) = kernel.dims3()?;
+-                        let (_, _, g_k0) = grad_kernel.dims3()?;
+-                        let grad_kernel = if g_k0 != k0 {
+-                            grad_kernel.narrow(2, 0, k0)?
+-                        } else {
+-                            grad_kernel
+-                        };
+-                        *sum_grad = sum_grad.add(&grad_kernel)?;
++                        if tracked(arg) {
++                            let grad_arg = grad.conv_transpose1d(
++                                kernel,
++                                *padding,
++                                out_padding,
++                                *stride,
++                                *dilation,
++                                /* groups */ 1,
++                            )?;
++                            grads.accumulate(arg, grad_arg)?;
++                        }
++
++                        if tracked(kernel) {
++                            let grad_kernel = arg
++                                .transpose(0, 1)?
++                                .conv1d(&grad.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
++                                .transpose(0, 1)?;
++                            let (_, _, k0) = kernel.dims3()?;
++                            let (_, _, g_k0) = grad_kernel.dims3()?;
++                            let grad_kernel = if g_k0 != k0 {
++                                grad_kernel.narrow(2, 0, k0)?
++                            } else {
++                                grad_kernel
++                            };
++                            grads.accumulate(kernel, grad_kernel)?;
++                        }
+                     }
+                     Op::Conv2D {
+                         arg,
+@@ -287,29 +336,31 @@
+                         let out_size =
+                             (grad_h - 1) * stride + dilation * (k_h - 1) + 1 - 2 * padding;
+                         let out_padding = arg.dim(2)? - out_size;
+-                        let grad_arg = grad.conv_transpose2d(
+-                            kernel,
+-                            *padding,
+-                            out_padding,
+-                            *stride,
+-                            *dilation,
+-                        )?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad_arg)?;
+-
+-                        let grad_kernel = arg
+-                            .transpose(0, 1)?
+-                            .conv2d(&grad.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
+-                            .transpose(0, 1)?;
+-                        let sum_grad = grads.or_insert(kernel)?;
+-                        let (_, _, k0, k1) = kernel.dims4()?;
+-                        let (_, _, g_k0, g_k1) = grad_kernel.dims4()?;
+-                        let grad_kernel = if g_k0 != k0 || g_k1 != k1 {
+-                            grad_kernel.narrow(2, 0, k0)?.narrow(3, 0, k1)?
+-                        } else {
+-                            grad_kernel
+-                        };
+-                        *sum_grad = sum_grad.add(&grad_kernel)?;
++                        if tracked(arg) {
++                            let grad_arg = grad.conv_transpose2d(
++                                kernel,
++                                *padding,
++                                out_padding,
++                                *stride,
++                                *dilation,
++                            )?;
++                            grads.accumulate(arg, grad_arg)?;
++                        }
++
++                        if tracked(kernel) {
++                            let grad_kernel = arg
++                                .transpose(0, 1)?
++                                .conv2d(&grad.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
++                                .transpose(0, 1)?;
++                            let (_, _, k0, k1) = kernel.dims4()?;
++                            let (_, _, g_k0, g_k1) = grad_kernel.dims4()?;
++                            let grad_kernel = if g_k0 != k0 || g_k1 != k1 {
++                                grad_kernel.narrow(2, 0, k0)?.narrow(3, 0, k1)?
++                            } else {
++                                grad_kernel
++                            };
++                            grads.accumulate(kernel, grad_kernel)?;
++                        }
+                     }
+                     Op::ConvTranspose1D { .. } => Err(Error::BackwardNotSupported {
+                         op: "conv-transpose1d",
+@@ -322,23 +373,25 @@
+                         dilation,
+                         output_padding: _output_padding,
+                     } => {
+-                        let grad_arg = grad.conv2d(kernel, *padding, *stride, *dilation, 1)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad_arg)?;
+-
+-                        let grad_kernel = grad
+-                            .transpose(0, 1)?
+-                            .conv2d(&arg.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
+-                            .transpose(0, 1)?;
+-                        let sum_grad = grads.or_insert(kernel)?;
+-                        let (_, _, k0, k1) = kernel.dims4()?;
+-                        let (_, _, g_k0, g_k1) = grad_kernel.dims4()?;
+-                        let grad_kernel = if g_k0 != k0 || g_k1 != k1 {
+-                            grad_kernel.narrow(2, 0, k0)?.narrow(3, 0, k1)?
+-                        } else {
+-                            grad_kernel
+-                        };
+-                        *sum_grad = sum_grad.add(&grad_kernel)?;
++                        if tracked(arg) {
++                            let grad_arg = grad.conv2d(kernel, *padding, *stride, *dilation, 1)?;
++                            grads.accumulate(arg, grad_arg)?;
++                        }
++
++                        if tracked(kernel) {
++                            let grad_kernel = grad
++                                .transpose(0, 1)?
++                                .conv2d(&arg.transpose(0, 1)?, *padding, *dilation, *stride, 1)?
++                                .transpose(0, 1)?;
++                            let (_, _, k0, k1) = kernel.dims4()?;
++                            let (_, _, g_k0, g_k1) = grad_kernel.dims4()?;
++                            let grad_kernel = if g_k0 != k0 || g_k1 != k1 {
++                                grad_kernel.narrow(2, 0, k0)?.narrow(3, 0, k1)?
++                            } else {
++                                grad_kernel
++                            };
++                            grads.accumulate(kernel, grad_kernel)?;
++                        }
+                     }
+                     Op::AvgPool2D {
+                         arg,
+@@ -352,8 +405,7 @@
+                         let grad_arg = grad.upsample_nearest2d(h, w)?;
+                         let grad_arg =
+                             (grad_arg * (1f64 / (kernel_size.0 * kernel_size.1) as f64))?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad_arg)?;
++                        grads.accumulate(arg, grad_arg)?;
+                     }
+                     Op::MaxPool2D {
+                         arg,
+@@ -372,8 +424,7 @@
+                         let mask = arg.eq(&node_upsampled)?.to_dtype(arg.dtype())?;
+                         let avg = mask.avg_pool2d_with_stride(*kernel_size, *stride)?;
+                         let grad_arg = ((grad * avg)?.upsample_nearest2d(h, w)? * mask)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad_arg)?;
++                        grads.accumulate(arg, grad_arg)?;
+                     }
+                     Op::UpsampleNearest1D { arg, target_size } => {
+                         let (_n, c, size) = arg.dims3()?;
+@@ -384,8 +435,8 @@
+ 
+                         let kernel = Tensor::ones((c, 1, scale), arg.dtype(), arg.device())?;
+                         let conv_sum = grad.conv1d(&kernel, 0, scale, 1, c)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = conv_sum;
++                        // Upstream overwrites rather than accumulates here; kept as-is.
++                        let _ = grads.insert(arg, conv_sum);
+                     }
+                     Op::UpsampleNearest2D {
+                         arg,
+@@ -405,50 +456,50 @@
+                         let kernel =
+                             Tensor::ones((c, 1, scale_h, scale_w), arg.dtype(), arg.device())?;
+                         let conv_sum = grad.conv2d(&kernel, 0, scale_h, 1, c)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = conv_sum;
++                        // Upstream overwrites rather than accumulates here; kept as-is.
++                        let _ = grads.insert(arg, conv_sum);
+                     }
+                     Op::UpsampleBilinear2D { .. } => {
+                         crate::bail!("backward not supported for upsample_bilinear2d")
+                     }
+                     Op::SliceScatter0(lhs, rhs, start_rhs) => {
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        let rhs_grad = grad.narrow(0, *start_rhs, rhs.dim(0)?)?;
+-                        *rhs_sum_grad = rhs_sum_grad.add(&rhs_grad)?;
+-
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        let lhs_grad = grad.slice_scatter0(&rhs.zeros_like()?, *start_rhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&lhs_grad)?
++                        if tracked(rhs) {
++                            grads.accumulate(rhs, grad.narrow(0, *start_rhs, rhs.dim(0)?)?)?;
++                        }
++                        if tracked(lhs) {
++                            let lhs_grad = grad.slice_scatter0(&rhs.zeros_like()?, *start_rhs)?;
++                            grads.accumulate(lhs, lhs_grad)?;
++                        }
+                     }
+                     Op::Gather(arg, indexes, dim) => {
+                         let sum_grad = grads.or_insert(arg)?;
+                         *sum_grad = sum_grad.scatter_add(indexes, &grad, *dim)?;
+                     }
+                     Op::Scatter(init, indexes, src, dim) => {
+-                        let init_sum_grad = grads.or_insert(init)?;
+-                        *init_sum_grad = init_sum_grad.add(&grad)?;
+-
+-                        let src_grad = grad.gather(indexes, *dim)?;
+-                        let src_sum_grad = grads.or_insert(src)?;
+-                        *src_sum_grad = src_sum_grad.add(&src_grad)?;
++                        if tracked(init) {
++                            grads.accumulate(init, grad.clone())?;
++                        }
++                        if tracked(src) {
++                            grads.accumulate(src, grad.gather(indexes, *dim)?)?;
++                        }
+                     }
+                     Op::ScatterAdd(init, indexes, src, dim) => {
+-                        let init_sum_grad = grads.or_insert(init)?;
+-                        let mask = init.ones_like()?;
+-                        let mask = mask.scatter(indexes, &mask.zeros_like()?, *dim)?;
+-                        *init_sum_grad = init_sum_grad.add(&grad.mul(&mask)?)?;
+-
+-                        let src_grad = grad.gather(indexes, *dim)?;
+-                        let src_sum_grad = grads.or_insert(src)?;
+-                        *src_sum_grad = src_sum_grad.add(&src_grad)?;
++                        if tracked(init) {
++                            let mask = init.ones_like()?;
++                            let mask = mask.scatter(indexes, &mask.zeros_like()?, *dim)?;
++                            grads.accumulate(init, grad.mul(&mask)?)?;
++                        }
++                        if tracked(src) {
++                            grads.accumulate(src, grad.gather(indexes, *dim)?)?;
++                        }
+                     }
+                     Op::IndexAdd(init, indexes, src, dim) => {
+-                        let init_sum_grad = grads.or_insert(init)?;
+-                        *init_sum_grad = init_sum_grad.add(&grad)?;
+-
+-                        let src_grad = grad.index_select(indexes, *dim)?;
+-                        let src_sum_grad = grads.or_insert(src)?;
+-                        *src_sum_grad = src_sum_grad.add(&src_grad)?;
++                        if tracked(init) {
++                            grads.accumulate(init, grad.clone())?;
++                        }
++                        if tracked(src) {
++                            grads.accumulate(src, grad.index_select(indexes, *dim)?)?;
++                        }
+                     }
+                     Op::IndexSelect(arg, indexes, dim) => {
+                         let sum_grad = grads.or_insert(arg)?;
+@@ -458,21 +509,20 @@
+                         // Skipping checks, the op went ok, we can skip
+                         // the matmul size checks for now.
+ 
+-                        let lhs_grad = grad.matmul(&rhs.t()?)?;
+-                        let lhs_sum_grad = grads.or_insert(lhs)?;
+-                        *lhs_sum_grad = lhs_sum_grad.add(&lhs_grad)?;
+-
+-                        let rhs_grad = lhs.t()?.matmul(&grad)?;
+-                        let rhs_sum_grad = grads.or_insert(rhs)?;
+-                        *rhs_sum_grad = rhs_sum_grad.add(&rhs_grad)?;
++                        if tracked(lhs) {
++                            grads.accumulate(lhs, grad.matmul(&rhs.t()?)?)?;
++                        }
++                        if tracked(rhs) {
++                            grads.accumulate(rhs, lhs.t()?.matmul(&grad)?)?;
++                        }
+                     }
+                     Op::Cat(args, dim) => {
+                         let mut start_idx = 0;
+                         for arg in args {
+                             let len = arg.dims()[*dim];
+-                            let arg_grad = grad.narrow(*dim, start_idx, len)?;
+-                            let sum_grad = grads.or_insert(arg)?;
+-                            *sum_grad = sum_grad.add(&arg_grad)?;
++                            if tracked(arg) {
++                                grads.accumulate(arg, grad.narrow(*dim, start_idx, len)?)?;
++                            }
+                             start_idx += len;
+                         }
+                     }
+@@ -496,76 +546,59 @@
+                         for _i in 0..left_dims {
+                             arg_grad = arg_grad.squeeze(0)?
+                         }
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad.broadcast_as(sum_grad.dims())?)?;
++                        grads.accumulate(arg, arg_grad.broadcast_as(arg.dims())?)?;
+                     }
+                     Op::Reduce(arg, ReduceOp::Sum, reduced_dims) => {
+                         let grad = broadcast_back(arg, &grad, reduced_dims)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad)?;
++                        grads.accumulate(arg, grad)?;
+                     }
+                     Op::Reduce(arg, ReduceOp::Max, reduced_dims) => {
+                         let node = broadcast_back(arg, node, reduced_dims)?;
+                         let grad = broadcast_back(arg, &grad, reduced_dims)?;
+                         let grad = node.eq(arg)?.to_dtype(grad.dtype())?.mul(&grad)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad.broadcast_as(sum_grad.dims())?)?;
++                        grads.accumulate(arg, grad.broadcast_as(arg.dims())?)?;
+                     }
+                     Op::Reduce(arg, ReduceOp::Min, reduced_dims) => {
+                         let node = broadcast_back(arg, node, reduced_dims)?;
+                         let grad = broadcast_back(arg, &grad, reduced_dims)?;
+                         let grad = node.eq(arg)?.to_dtype(grad.dtype())?.mul(&grad)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad.broadcast_as(sum_grad.dims())?)?;
++                        grads.accumulate(arg, grad.broadcast_as(arg.dims())?)?;
+                     }
+                     Op::ToDType(arg) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad.to_dtype(arg.dtype())?)?
++                        grads.accumulate(arg, grad.to_dtype(arg.dtype())?)?;
+                     }
+                     Op::Copy(arg) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&grad)?
++                        grads.accumulate(arg, grad.clone())?;
+                     }
+                     Op::Affine { arg, mul, .. } => {
+-                        let arg_grad = grad.affine(*mul, 0.)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, grad.affine(*mul, 0.)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Log) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&(grad / arg)?)?
++                        grads.accumulate(arg, (grad / arg)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Sin) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&(&grad * arg.cos())?)?
++                        grads.accumulate(arg, (&grad * arg.cos())?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Cos) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.sub(&(&grad * arg.sin())?)?
++                        grads.accumulate_neg(arg, (&grad * arg.sin())?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Tanh) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         let minus_dtanh = (node.sqr()? - 1.)?;
+-                        *sum_grad = sum_grad.sub(&(&grad * &minus_dtanh)?)?
++                        grads.accumulate_neg(arg, (&grad * &minus_dtanh)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Abs) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         let ones = arg.ones_like()?;
+                         let abs_grad = arg.ge(&arg.zeros_like()?)?.where_cond(&ones, &ones.neg()?);
+-                        *sum_grad = sum_grad.add(&(&grad * abs_grad)?)?
++                        grads.accumulate(arg, (&grad * abs_grad)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Exp) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&(&grad * *node)?)?
++                        grads.accumulate(arg, (&grad * *node)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Neg) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.sub(&grad)?
++                        grads.accumulate_neg(arg, grad.clone())?;
+                     }
+                     Op::Unary(arg, UnaryOp::Recip) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        let grad = (grad / arg.sqr()?)?;
+-                        *sum_grad = sum_grad.sub(&grad)?
++                        grads.accumulate_neg(arg, (grad / arg.sqr()?)?)?;
+                     }
+                     &Op::Narrow(ref arg, dim, start_idx, len) => {
+                         let arg_dims = arg.dims();
+@@ -590,8 +623,7 @@
+                             (None, Some(r)) => Tensor::cat(&[&grad, &r], dim)?,
+                             (Some(l), Some(r)) => Tensor::cat(&[&l, &grad, &r], dim)?,
+                         };
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, arg_grad)?;
+                     }
+                     Op::Unary(_, UnaryOp::Floor)
+                     | Op::Unary(_, UnaryOp::Round)
+@@ -600,126 +632,111 @@
+                     | Op::Unary(_, UnaryOp::Sign)
+                     | Op::Cmp(_, _) => {}
+                     Op::Reshape(arg) => {
+-                        let arg_grad = grad.reshape(arg.dims())?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, grad.reshape(arg.dims())?)?;
+                     }
+                     Op::Unary(_, UnaryOp::Ceil) => Err(Error::BackwardNotSupported { op: "ceil" })?,
+                     Op::Unary(arg, UnaryOp::Gelu) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         let cube = arg.powf(3.)?;
+                         let tanh = (0.0356774 * &cube + (0.797885 * arg)?)?.tanh()?;
+                         let gelu_grad = (((0.5 * &tanh)?
+                             + (0.0535161 * cube + (0.398942 * arg)?)? * (1. - tanh.powf(2.)?))?
+                             + 0.5)?;
+-                        *sum_grad = sum_grad.add(&(&grad * gelu_grad)?)?
++                        grads.accumulate(arg, (&grad * gelu_grad)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Erf) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         // d/dx erf(x) = 2/sqrt(pi) * e^(-x^2)
+                         let erf_grad =
+                             (2. / std::f64::consts::PI.sqrt()) * (arg.sqr()?.neg()?).exp()?;
+-                        *sum_grad = sum_grad.add(&(&grad * erf_grad)?)?
++                        grads.accumulate(arg, (&grad * erf_grad)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::GeluErf) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         // d/dx gelu_erf(x) = 0.5 + 0.398942 e^(-x^2/2) x + 0.5 erf(x/sqrt(2))
+                         let neg_half_square = (arg.sqr()?.neg()? / 2.)?;
+                         let scaled_exp_arg = (0.398942 * neg_half_square.exp()? * arg)?;
+                         let arg_scaled_sqrt = (arg / 2f64.sqrt())?;
+                         let erf_scaled_sqrt = (0.5 * arg_scaled_sqrt.erf()?)?;
+                         let gelu_erf_grad = (0.5 + scaled_exp_arg + erf_scaled_sqrt)?;
+-                        *sum_grad = sum_grad.add(&(&grad * gelu_erf_grad)?)?;
++                        grads.accumulate(arg, (&grad * gelu_erf_grad)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Relu) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         let relu_grad = arg.ge(&arg.zeros_like()?)?.to_dtype(arg.dtype())?;
+-                        *sum_grad = sum_grad.add(&(&grad * relu_grad)?)?
++                        grads.accumulate(arg, (&grad * relu_grad)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Silu) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+                         // d/dx silu = sigmoid(x) * (1 + x * (1 - sigmoid(x))) = sigmoid(x) * (1 - node) + node
+                         let sigmoid_arg = (arg.neg()?.exp()? + 1.)?.recip()?;
+                         let silu_grad = &sigmoid_arg * (1. - *node) + *node;
+-                        *sum_grad = sum_grad.add(&(&grad * silu_grad)?)?
++                        grads.accumulate(arg, (&grad * silu_grad)?)?;
+                     }
+                     Op::Elu(arg, alpha) => {
+                         // d/dx elu(x) = 1 for x > 0, alpha * e^x for x <= 0
+-                        let sum_grad = grads.or_insert(arg)?;
+                         let zeros = arg.zeros_like()?;
+                         let positive_mask = arg.gt(&zeros)?.to_dtype(arg.dtype())?;
+                         let negative_mask = arg.le(&zeros)?.to_dtype(arg.dtype())?;
+                         // node == alpha * (e^x - 1) for x <= 0, reuse it
+                         let negative_exp_mask = (negative_mask * (*node + *alpha))?;
+                         let combined_mask = (positive_mask + negative_exp_mask)?;
+-                        *sum_grad = sum_grad.add(&(grad * combined_mask)?)?
++                        grads.accumulate(arg, (grad * combined_mask)?)?;
+                     }
+                     Op::Powf(arg, e) => {
+                         let arg_grad = (&(grad * arg.powf(e - 1.)?)? * *e)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, arg_grad)?;
+                     }
+                     Op::CustomOp1(arg, c) => {
+                         if let Some(arg_grad) = c.bwd(arg, node, &grad)? {
+-                            let sum_grad = grads.or_insert(arg)?;
+-                            *sum_grad = sum_grad.add(&arg_grad)?
++                            grads.accumulate(arg, arg_grad)?;
+                         }
+                     }
+                     Op::CustomOp2(arg1, arg2, c) => {
+                         let (arg_grad1, arg_grad2) = c.bwd(arg1, arg2, node, &grad)?;
+                         if let Some(arg_grad1) = arg_grad1 {
+-                            let sum_grad = grads.or_insert(arg1)?;
+-                            *sum_grad = sum_grad.add(&arg_grad1)?
++                            if tracked(arg1) {
++                                grads.accumulate(arg1, arg_grad1)?;
++                            }
+                         }
+                         if let Some(arg_grad2) = arg_grad2 {
+-                            let sum_grad = grads.or_insert(arg2)?;
+-                            *sum_grad = sum_grad.add(&arg_grad2)?
++                            if tracked(arg2) {
++                                grads.accumulate(arg2, arg_grad2)?;
++                            }
+                         }
+                     }
+                     Op::CustomOp3(arg1, arg2, arg3, c) => {
+                         let (arg_grad1, arg_grad2, arg_grad3) =
+                             c.bwd(arg1, arg2, arg3, node, &grad)?;
+                         if let Some(arg_grad1) = arg_grad1 {
+-                            let sum_grad = grads.or_insert(arg1)?;
+-                            *sum_grad = sum_grad.add(&arg_grad1)?
++                            if tracked(arg1) {
++                                grads.accumulate(arg1, arg_grad1)?;
++                            }
+                         }
+                         if let Some(arg_grad2) = arg_grad2 {
+-                            let sum_grad = grads.or_insert(arg2)?;
+-                            *sum_grad = sum_grad.add(&arg_grad2)?
++                            if tracked(arg2) {
++                                grads.accumulate(arg2, arg_grad2)?;
++                            }
+                         }
+                         if let Some(arg_grad3) = arg_grad3 {
+-                            let sum_grad = grads.or_insert(arg3)?;
+-                            *sum_grad = sum_grad.add(&arg_grad3)?
++                            if tracked(arg3) {
++                                grads.accumulate(arg3, arg_grad3)?;
++                            }
+                         }
+                     }
+                     Op::Unary(arg, UnaryOp::Sqr) => {
+-                        let arg_grad = arg.mul(&grad)?.affine(2., 0.)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, arg.mul(&grad)?.affine(2., 0.)?)?;
+                     }
+                     Op::Unary(arg, UnaryOp::Sqrt) => {
+-                        let arg_grad = grad.div(node)?.affine(0.5, 0.)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, grad.div(node)?.affine(0.5, 0.)?)?;
+                     }
+                     Op::ToDevice(arg) => {
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        let arg_grad = grad.to_device(sum_grad.device())?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, grad.to_device(arg.device())?)?;
+                     }
+                     Op::Transpose(arg, dim1, dim2) => {
+-                        let arg_grad = grad.transpose(*dim1, *dim2)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, grad.transpose(*dim1, *dim2)?)?;
+                     }
+                     Op::Permute(arg, dims) => {
+                         let mut inv_dims = vec![0; dims.len()];
+                         for (i, &dim_idx) in dims.iter().enumerate() {
+                             inv_dims[dim_idx] = i
+                         }
+-                        let arg_grad = grad.permute(inv_dims)?;
+-                        let sum_grad = grads.or_insert(arg)?;
+-                        *sum_grad = sum_grad.add(&arg_grad)?
++                        grads.accumulate(arg, grad.permute(inv_dims)?)?;
+                     }
+                 };
+             }
+@@ -763,6 +780,38 @@
+         self.0.insert(id, grad)
+     }
+ 
++    // House patch: fold a gradient contribution into the store without first
++    // materializing a zeros_like tensor. The first contribution is stored
++    // contiguously (0 + g == g bitwise for the values autograd produces, and
++    // upstream's zeros_like + add always yielded a contiguous stored grad --
++    // scatter_add/index_add in later arms require that); later ones add. On
++    // Metal every fresh buffer pays a residency-set commit, so halving
++    // backward's allocations is a measured CPU-side win.
++    fn accumulate(&mut self, tensor: &Tensor, grad: Tensor) -> Result<()> {
++        match self.0.entry(tensor.id()) {
++            Entry::Occupied(mut entry) => {
++                *entry.get_mut() = entry.get().add(&grad)?;
++            }
++            Entry::Vacant(entry) => {
++                entry.insert(grad.contiguous()?);
++            }
++        }
++        Ok(())
++    }
++
++    // House patch: like accumulate, for ops whose contribution subtracts.
++    fn accumulate_neg(&mut self, tensor: &Tensor, grad: Tensor) -> Result<()> {
++        match self.0.entry(tensor.id()) {
++            Entry::Occupied(mut entry) => {
++                *entry.get_mut() = entry.get().sub(&grad)?;
++            }
++            Entry::Vacant(entry) => {
++                entry.insert(grad.neg()?);
++            }
++        }
++        Ok(())
++    }
++
+     /// Get the gradient tensor associated with the given tensor, or, if it does not exist,
+     /// insert a tensor of zeroes, with the same shape and type as the given tensors and return it
+     fn or_insert(&mut self, tensor: &Tensor) -> Result<&mut Tensor> {
+diff -ruN a/src/cpu/neon.rs b/src/cpu/neon.rs
+--- a/src/cpu/neon.rs
++++ b/src/cpu/neon.rs
+@@ -157,7 +157,7 @@
+         pub struct CurrentCpuF16 {}
+ 
+         impl CurrentCpuF16 {
+-            fn reduce_one(x: float16x8_t) -> f32 {
++            fn reduce_one(x: uint16x8_t) -> f32 {
+                 let result: f32;
+                 unsafe {
+                     asm!(
+@@ -185,8 +185,10 @@
+         }
+ 
+         impl CpuF16 for CurrentCpuF16 {
+-            type Unit = float16x8_t;
+-            type Array = [float16x8_t; Self::ARR];
++            // Keep the f16 lane bits in the stable integer vector type. The
++            // inline assembly assigns the floating-point interpretation.
++            type Unit = uint16x8_t;
++            type Array = [uint16x8_t; Self::ARR];
+ 
+             const STEP: usize = 32;
+             const EPR: usize = 8;
+diff -ruN a/src/cpu_backend/conv2d.rs b/src/cpu_backend/conv2d.rs
+--- a/src/cpu_backend/conv2d.rs
++++ b/src/cpu_backend/conv2d.rs
+@@ -401,10 +401,11 @@
+             .broadcast_as((b, k, n))?;
+         MatMul((b, m, n, k)).f(&col, &col_l, kernel, &kernel_l)?
+     } else {
+-        // Make the kernel contiguous if not already the case.
++        // copy_strided_src_ materializes the kernel into kernel_c starting at index 0, so the
++        // matmul layout must use offset 0, not the original (strided) kernel's start offset.
+         let mut kernel_c = alloc_uninit_vec(kernel_l.shape().elem_count());
+         copy_strided_src_(kernel, &mut kernel_c, 0, kernel_l);
+-        let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
++        let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
+             .transpose(1, 2)?
+             .broadcast_as((b, k, n))?;
+         MatMul((b, m, n, k)).f(&col, &col_l, &kernel_c, &kernel_l)?
+diff -ruN a/src/cpu_backend/mod.rs b/src/cpu_backend/mod.rs
+--- a/src/cpu_backend/mod.rs
++++ b/src/cpu_backend/mod.rs
+@@ -1,7 +1,7 @@
+ //! Implementation of Backend Fns for CPU
+ use crate::backend::{BackendDevice, BackendStorage};
+ use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
+-use crate::{DType, Error, IntDType, Layout, Result, Shape, WithDType};
++use crate::{DType, Error, IntDType, Layout, NdIter, Result, Shape, WithDType};
+ use float8::F8E4M3;
+ use half::{bf16, f16};
+ use rayon::prelude::*;
+@@ -84,6 +84,39 @@
+ 
+ struct WCond<'a, T: IntDType>(&'a [T], &'a Layout);
+ 
++#[allow(clippy::too_many_arguments)]
++#[inline(always)]
++fn where_impl<I, T, P, R, G>(
++    nd_iter: NdIter<3>,
++    ys_to_set: &mut [T],
++    pred: &[I],
++    t: &[T],
++    f: &[T],
++    pred_fn: P,
++    t_fn: R,
++    f_fn: G,
++) where
++    I: IntDType,
++    T: Copy,
++    P: Fn(usize, usize, usize) -> usize,
++    R: Fn(usize, usize, usize) -> usize,
++    G: Fn(usize, usize, usize) -> usize,
++{
++    let inner_size = nd_iter.inner_size;
++    let [inner_ps, inner_ts, inner_fs] = nd_iter.inner_strides;
++    let mut dst_off = 0usize;
++    for [p_off, t_off, f_off] in nd_iter {
++        for i in 0..inner_size {
++            let ep = pred[pred_fn(p_off, i, inner_ps)];
++            let et = t[t_fn(t_off, i, inner_ts)];
++            let ef = f[f_fn(f_off, i, inner_fs)];
++
++            ys_to_set[dst_off + i] = if ep.is_true() { et } else { ef };
++        }
++        dst_off += inner_size;
++    }
++}
++
+ impl<I: IntDType> Map2 for WCond<'_, I> {
+     const OP: &'static str = "where";
+     #[inline(always)]
+@@ -102,18 +135,57 @@
+                     .map(|(p, (&t, &f))| if p.is_true() { t } else { f })
+                     .collect::<Vec<_>>()
+             }
+-            _ => self
+-                .1
+-                .strided_index()
+-                .zip(t_l.strided_index().zip(f_l.strided_index()))
+-                .map(|(i_p, (i_t, i_f))| {
+-                    if self.0[i_p].is_true() {
+-                        t[i_t]
+-                    } else {
+-                        f[i_f]
++            _ => {
++                // Same allocation strategy as `binary_map_vec`
++                let el_count = self.1.shape().elem_count();
++
++                let mut ys: Vec<T> = Vec::with_capacity(el_count);
++                let ys_to_set = unsafe {
++                    let s = ys.spare_capacity_mut();
++                    std::mem::transmute::<&mut [std::mem::MaybeUninit<T>], &mut [T]>(s)
++                };
++
++                let nd_iter = NdIter::new([self.1, t_l, f_l]);
++                let [inner_ps, inner_ts, inner_fs] = nd_iter.inner_strides;
++
++                let offset = |off, i, _| off + i;
++                let boffset = |off, _, _| off;
++
++                match (inner_ps, inner_ts, inner_fs) {
++                    (1, 1, 1) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, offset, offset, offset);
++                    }
++                    (1, 1, 0) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, offset, offset, boffset);
++                    }
++                    (1, 0, 1) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, offset, boffset, offset);
++                    }
++                    (1, 0, 0) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, offset, boffset, boffset);
++                    }
++                    (0, 1, 1) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, boffset, offset, offset);
+                     }
+-                })
+-                .collect::<Vec<_>>(),
++                    (0, 1, 0) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, boffset, offset, boffset);
++                    }
++                    (0, 0, 1) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, boffset, boffset, offset);
++                    }
++                    (0, 0, 0) => {
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, boffset, boffset, boffset);
++                    }
++                    _ => {
++                        let offset = |off, i, inner| off + i * inner;
++                        where_impl(nd_iter, ys_to_set, self.0, t, f, offset, offset, offset);
++                    }
++                }
++
++                // SAFETY: all el_count elements have been written in the dispatch loop above.
++                unsafe { ys.set_len(el_count) };
++                ys
++            }
+         };
+         Ok(vs)
+     }
+diff -ruN a/src/cuda_backend/device.rs b/src/cuda_backend/device.rs
+--- a/src/cuda_backend/device.rs
++++ b/src/cuda_backend/device.rs
+@@ -417,7 +417,17 @@
+ 
+     fn new(ordinal: usize) -> Result<Self> {
+         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
+-        let stream = context.per_thread_stream();
++        // HOUSE PATCH (speaches-plus third-party): upstream 0.11.0 switched this to
++        // context.per_thread_stream() (CU_STREAM_PER_THREAD, raw handle 0x2) for candle's own
++        // graph-capture path. This workspace restores the 0.10 legacy default stream because
++        // (a) nv-quant/nv-models key cublasLt+nvfp4 caches and GraphTeardown release on the
++        // device stream's raw CUstream, and per-thread makes teardown release key 0 while
++        // installs key 0x2 (gemma4_batch_graph::graph_teardown tests assert this identity), and
++        // (b) CU_STREAM_PER_THREAD resolves to a different driver-level stream per OS thread,
++        // silently dropping the cross-thread launch ordering the multi-threaded server relies on.
++        // The house capture path forks its own stream (capture_stream::for_device) and does not
++        // use candle's capture support, so nothing here needs per-thread semantics.
++        let stream = context.default_stream();
+         Self::from_context_and_stream(context, stream)
+     }
+ 
+diff -ruN a/src/cuda_backend/mod.rs b/src/cuda_backend/mod.rs
+--- a/src/cuda_backend/mod.rs
++++ b/src/cuda_backend/mod.rs
+@@ -2022,15 +2022,16 @@
+                 Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+             col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
+         } else {
+-            // Make the kernel contiguous if not already the case.
++            // Make the kernel contiguous if not already the case. copy_strided_src writes the
++            // materialized kernel starting at offset 0, so the matmul layout must use offset 0,
++            // not the original (strided) kernel's start offset.
+             let mut kernel_c = unsafe {
+                 self.device()
+                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
+             };
+             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
+-            let kernel_l =
+-                Layout::contiguous_with_offset((n, k), kernel_l.start_offset()).transpose(0, 1)?;
+-            col.matmul(kernel, (1, b * m, n, k), &col_l, &kernel_l)?
++            let kernel_l = Layout::contiguous_with_offset((n, k), 0).transpose(0, 1)?;
++            col.matmul(&kernel_c, (1, b * m, n, k), &col_l, &kernel_l)?
+         };
+         let res_l = Layout::contiguous((b, h_out, w_out, n))
+             .transpose(1, 2)?
+diff -ruN a/src/custom_op.rs b/src/custom_op.rs
+--- a/src/custom_op.rs
++++ b/src/custom_op.rs
+@@ -451,6 +451,7 @@
+             depth: 1,
+         };
+         let group_dims = candle_metal_kernels::utils::get_block_dims(b, 1, 1);
++        let encoder: &candle_metal_kernels::metal::ComputeCommandEncoder = encoder.as_ref();
+         encoder.set_output_buffer(0, Some(sto.buffer()), 0);
+         encoder.dispatch_threads(grid_dims, group_dims);
+ 
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -166,7 +166,7 @@
+     }
+ }
+ 
+-/// A single forward method using a single single tensor argument and a flag to
++/// A single forward method using a single tensor argument and a flag to
+ /// separate the training and evaluation behaviors.
+ pub trait ModuleT {
+     fn forward_t(&self, xs: &Tensor, train: bool) -> Result<Tensor>;
+diff -ruN a/src/metal_backend/device.rs b/src/metal_backend/device.rs
+--- a/src/metal_backend/device.rs
++++ b/src/metal_backend/device.rs
+@@ -194,6 +194,22 @@
+         &self.device
+     }
+ 
++    /// Registers buffers in the device's residency set, keeping them
++    /// permanently GPU-resident instead of paying per-command-buffer residency
++    /// bookkeeping. Useful for buffers candle did not allocate, e.g.
++    /// `newBufferWithBytesNoCopy` views over an mmap'd weights file. No-op on
++    /// systems without residency-set support.
++    pub fn register_buffers<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
++        self.residency_set.insert_batch(bufs);
++    }
++
++    /// Unregisters buffers previously passed to `register_buffers`, releasing
++    /// the set's retain so they can be deallocated. Only unregister buffers
++    /// you registered yourself, after GPU work referencing them has completed.
++    pub fn unregister_buffers<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
++        self.residency_set.remove_batch(bufs);
++    }
++
+     /// Returns a builder for buffer allocation. See `BufferBuilder`.
+     pub fn new_buffer_builder(&self) -> BufferBuilder<'_> {
+         BufferBuilder::new(self)
+diff -ruN a/src/quantized/k_quants.rs b/src/quantized/k_quants.rs
+--- a/src/quantized/k_quants.rs
++++ b/src/quantized/k_quants.rs
+@@ -807,7 +807,8 @@
+             ys.len(),
+             Self::BLCK_SIZE
+         );
+-        for (block, ys) in xs.iter().zip(ys.chunks_exact_mut(Self::BLCK_SIZE)) {
++        let (y_chunks, _) = ys.as_chunks_mut::<{ Self::BLCK_SIZE }>();
++        for (block, ys) in xs.iter().zip(y_chunks) {
+             let d = block.d.to_f32();
+             for (dst, &src) in ys.iter_mut().zip(block.qs.iter()) {
+                 *dst = src as f32 * d;
+@@ -963,7 +964,8 @@
+ 
+             let sum_x2 = x.iter().map(|x| x * x).sum::<f32>();
+             let sigma2 = sum_x2 / QK_K as f32;
+-            for (j, x_scale_slice) in x.chunks_exact(16).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<16>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 for (l, (w_elem, x_elem)) in weights.iter_mut().zip(x_scale_slice).enumerate() {
+                     let imatrix_row = sblk_idx % (n_per_row / QK_K);
+                     let imatrix_w = imatrix_weights[imatrix_row * QK_K + 16 * j + l];
+@@ -1017,7 +1019,9 @@
+ 
+             let mut is = 0;
+ 
+-            for (y_block, qs) in y.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
++            let (y_chunks, _) = y.as_chunks_mut::<128>();
++            let (qs_chunks, _) = block.qs.as_chunks::<32>();
++            for (y_block, qs) in y_chunks.iter_mut().zip(qs_chunks) {
+                 // Step by 32 over q.
+                 let mut shift = 0;
+                 let mut y_block_index = 0;
+@@ -1190,7 +1194,8 @@
+     fn from_float(xs: &[f32], ys: &mut [Self]) {
+         for (block, x) in group_for_quantization(xs, ys) {
+             let mut scales: [f32; QK_K / 16] = [0.0; QK_K / 16];
+-            for (j, x_scale_slice) in x.chunks_exact(16).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<16>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 scales[j] = make_q3_quants(x_scale_slice, 4, true);
+             }
+ 
+@@ -1279,7 +1284,8 @@
+             let sum_x2 = x.iter().map(|x| x * x).sum::<f32>();
+             let sigma2 = 2. * sum_x2 / QK_K as f32;
+ 
+-            for (j, x_scale_slice) in x.chunks_exact(16).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<16>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 for (l_idx, (w_elem, x_elem)) in weights.iter_mut().zip(x_scale_slice).enumerate() {
+                     let imatrix_row = sblk_idx % (n_per_row / QK_K);
+                     let imatrix_w = imatrix_weights[imatrix_row * QK_K + 16 * j + l_idx];
+@@ -1392,11 +1398,16 @@
+             // Dequantize both 128 long blocks
+             // 32 qs values per 128 long block
+             // Each 16 elements get a scale
+-            for (y, qs) in y.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
++            let (y_chunks, _) = y.as_chunks_mut::<128>();
++            let (qs_chunks, _) = block.qs.as_chunks::<32>();
++            for (y, qs) in y_chunks.iter_mut().zip(qs_chunks) {
+                 let mut shift = 0;
+-                for shift_scoped_y in y.chunks_exact_mut(32) {
+-                    for (scale_index, scale_scoped_y) in
+-                        shift_scoped_y.chunks_exact_mut(16).enumerate()
++
++                let (scoped_y_chunks, _) = y.as_chunks_mut::<32>();
++                for shift_scoped_y in scoped_y_chunks {
++                    let (shift_scoped_chunks, _) = shift_scoped_y.as_chunks_mut::<16>();
++
++                    for (scale_index, scale_scoped_y) in shift_scoped_chunks.iter_mut().enumerate()
+                     {
+                         let dl = d_all * (scales[is] as f32 - 32.0);
+                         for (i, inner_y) in scale_scoped_y.iter_mut().enumerate() {
+@@ -1544,7 +1555,8 @@
+             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
+             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
+ 
+-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<32>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
+             }
+ 
+@@ -1611,7 +1623,8 @@
+             let sum_x2 = x.iter().map(|x| x * x).sum::<f32>();
+             let sigma2 = 2. * sum_x2 / QK_K as f32;
+ 
+-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<32>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 for (l, (w_elem, x_elem)) in weights.iter_mut().zip(x_scale_slice).enumerate() {
+                     let imatrix_row = sblk_idx % (n_per_row / QK_K);
+                     let imatrix_w = imatrix_weights[imatrix_row * QK_K + 32 * j + l];
+@@ -1806,7 +1819,8 @@
+             let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
+             let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
+ 
+-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<32>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 (scales[j], mins[j]) = make_qkx1_quants(31, 5, x_scale_slice);
+             }
+ 
+@@ -1888,7 +1902,8 @@
+             let sum_x2 = x.iter().map(|x| x * x).sum::<f32>();
+             let sigma2 = 2. * sum_x2 / QK_K as f32;
+ 
+-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
++            let (x_chunks, _) = x.as_chunks::<32>();
++            for (j, x_scale_slice) in x_chunks.iter().enumerate() {
+                 for (l, (w_elem, x_elem)) in weights.iter_mut().zip(x_scale_slice).enumerate() {
+                     let imatrix_row = sblk_idx % (n_per_row / QK_K);
+                     let imatrix_w = imatrix_weights[imatrix_row * QK_K + 32 * j + l];
+diff -ruN a/src/quantized/neon.rs b/src/quantized/neon.rs
+--- a/src/quantized/neon.rs
++++ b/src/quantized/neon.rs
+@@ -1099,7 +1099,8 @@
+         xs.len()
+     );
+     unsafe {
+-        for (chunk, y) in xs.chunks_exact(QK_K).zip(ys.iter_mut()) {
++        let (x_chunks, _) = xs.as_chunks::<QK_K>();
++        for (chunk, y) in x_chunks.iter().zip(ys.iter_mut()) {
+             // Find the element with the maximum absolute value, preserving its sign.
+             let (mut vabs_max0, mut vsmax0) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+             let (mut vabs_max1, mut vsmax1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+diff -ruN a/src/quantized/tokenizer.rs b/src/quantized/tokenizer.rs
+--- a/src/quantized/tokenizer.rs
++++ b/src/quantized/tokenizer.rs
+@@ -74,9 +74,9 @@
+ }
+ 
+ impl Pipeline {
+-    fn apply(self, tokenizer: &mut Tokenizer) {
++    fn apply(self, tokenizer: &mut Tokenizer) -> Result<()> {
+         if let Some(norm) = self.normalizer {
+-            tokenizer.with_normalizer(Some(norm));
++            tokenizer.with_normalizer(Some(norm)).map_err(Error::wrap)?;
+         }
+         if let Some(pt) = self.pretokenizer {
+             tokenizer.with_pre_tokenizer(Some(pt));
+@@ -87,6 +87,7 @@
+         if let Some(pp) = self.post_processor {
+             tokenizer.with_post_processor(Some(pp));
+         }
++        Ok(())
+     }
+ }
+ 
+@@ -258,7 +259,7 @@
+             .and_then(gguf_value_to_u32)
+             .ok();
+ 
+-        pipeline.apply(&mut tokenizer);
++        pipeline.apply(&mut tokenizer)?;
+ 
+         // Compose existing post-processor with a template-based one if needed
+         let template_pp = template_processor(&tokens, bos_id, eos_id, add_bos, add_eos);
+@@ -292,7 +293,9 @@
+                 }
+             }
+             if !specials.is_empty() {
+-                tokenizer.add_special_tokens(&specials);
++                tokenizer
++                    .add_special_tokens(specials)
++                    .map_err(Error::wrap)?;
+             }
+         }
+ 
+@@ -315,7 +318,9 @@
+                 .map(|tok| AddedToken::from(tok.clone(), true))
+                 .collect();
+             if !specials.is_empty() {
+-                tokenizer.add_special_tokens(&specials);
++                tokenizer
++                    .add_special_tokens(specials)
++                    .map_err(Error::wrap)?;
+             }
+         }
+ 
+diff -ruN a/src/shape.rs b/src/shape.rs
+--- a/src/shape.rs
++++ b/src/shape.rs
+@@ -9,7 +9,7 @@
+ 
+ impl std::fmt::Debug for Shape {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        write!(f, "{:?}", &self.dims())
++        write!(f, "{:?}", self.dims())
+     }
+ }
+ 
+@@ -472,8 +472,16 @@
+ }
+ 
+ impl<S: Into<Shape>> ShapeWithOneHole for S {
+-    fn into_shape(self, _el_count: usize) -> Result<Shape> {
+-        Ok(self.into())
++    fn into_shape(self, el_count: usize) -> Result<Shape> {
++        let shape = self.into();
++        if shape.elem_count() != el_count {
++            return Err(Error::ShapeMismatch {
++                buffer_size: el_count,
++                shape,
++            }
++            .bt());
++        }
++        Ok(shape)
+     }
+ }
+ 
+diff -ruN a/src/sort.rs b/src/sort.rs
+--- a/src/sort.rs
++++ b/src/sort.rs
+@@ -8,7 +8,11 @@
+ }
+ 
+ impl ArgSort {
+-    fn asort<T: crate::WithDType>(&self, vs: &[T], layout: &crate::Layout) -> Vec<u32> {
++    fn asort<T: crate::WithDType>(&self, vs: &[T], layout: &crate::Layout) -> Result<Vec<u32>> {
++        let vs = match layout.contiguous_offsets() {
++            None => crate::bail!("input has to be contiguous"),
++            Some((o1, o2)) => &vs[o1..o2],
++        };
+         #[allow(clippy::uninit_vec)]
+         // Safety: indexes are set later in the parallelized section.
+         let mut sort_indexes = unsafe {
+@@ -48,7 +52,7 @@
+                     })
+                 });
+         }
+-        sort_indexes
++        Ok(sort_indexes)
+     }
+ }
+ 
+@@ -114,16 +118,16 @@
+         layout: &crate::Layout,
+     ) -> Result<(crate::CpuStorage, crate::Shape)> {
+         let sort_indexes = match storage {
+-            crate::CpuStorage::U8(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::U32(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::I16(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::I32(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::I64(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::BF16(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::F16(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::F32(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::F64(vs) => self.asort(vs, layout),
+-            crate::CpuStorage::F8E4M3(vs) => self.asort(vs, layout),
++            crate::CpuStorage::U8(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::U32(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::I16(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::I32(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::I64(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::BF16(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::F16(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::F32(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::F64(vs) => self.asort(vs, layout)?,
++            crate::CpuStorage::F8E4M3(vs) => self.asort(vs, layout)?,
+             // Dummy types don't support sorting
+             crate::CpuStorage::F6E2M3(_) => {
+                 return Err(
+diff -ruN a/src/tensor.rs b/src/tensor.rs
+--- a/src/tensor.rs
++++ b/src/tensor.rs
+@@ -696,9 +696,11 @@
+             self.clone()
+         };
+         for (idx, &repeat) in repeats.iter().enumerate() {
+-            if repeat > 1 {
+-                inp = Tensor::cat(&vec![&inp; repeat], idx)?
+-            }
++            inp = match repeat {
++                0 => inp.narrow(idx, 0, 0)?,
++                1 => inp,
++                repeat => Tensor::cat(&vec![&inp; repeat], idx)?,
++            };
+         }
+         Ok(inp)
+     }
+@@ -1513,9 +1515,6 @@
+         let n = b_dims[dim - 1];
+ 
+         let c_shape = Shape::from(&a_dims[..dim - 2]).extend(&[m, n]);
+-        if c_shape.elem_count() == 0 || k == 0 {
+-            return Tensor::zeros(c_shape, self.dtype(), self.device());
+-        }
+         let batching: usize = a_dims[..dim - 2].iter().product();
+         let batching_b: usize = b_dims[..dim - 2].iter().product();
+         if k != k2 || batching != batching_b {
+@@ -1526,6 +1525,18 @@
+             }
+             .bt())?
+         }
++        if c_shape.elem_count() == 0 || k == 0 {
++            {
++                let lhs_storage = self.storage();
++                let rhs_storage = rhs.storage();
++                lhs_storage.same_device(&rhs_storage, "matmul")?;
++                lhs_storage.same_dtype(&rhs_storage, "matmul")?;
++            }
++
++            let storage = self.device().zeros(&c_shape, self.dtype())?;
++            let op = BackpropOp::new2(self, rhs, Op::Matmul);
++            return Ok(from_storage(storage, c_shape, op, false));
++        }
+ 
+         let storage = self.storage().matmul(
+             &rhs.storage(),
+@@ -1553,6 +1564,21 @@
+                 .broadcast_as(&l_shape)?
+                 .contiguous()?
+                 .matmul(&rhs.broadcast_as(&r_shape)?.contiguous()?),
++            // A rank-2 rhs is only broadcast over the batch dimensions, so the whole product is
++            // a single 2D matmul once the leading dims of lhs are folded into its row dimension.
++            // Broadcasting the rhs instead would copy it `batch` times -- for an lm_head that is
++            // the entire vocabulary matrix, per call. Same trick, and same contiguity guard, as
++            // `candle_nn::Linear::forward`.
++            (false, true) if rhs.rank() == 2 && lhs.is_contiguous() => {
++                let (lhs_dims, rhs_dims) = (lhs.dims(), rhs.dims());
++                let (m, k) = (lhs_dims[lhs.rank() - 2], lhs_dims[lhs.rank() - 1]);
++                let n = rhs_dims[1];
++                let batch: usize = lhs_dims[..lhs.rank() - 2].iter().product();
++                let mut out_dims = lhs_dims.to_vec();
++                out_dims.pop();
++                out_dims.push(n);
++                lhs.reshape((batch * m, k))?.matmul(rhs)?.reshape(out_dims)
++            }
+             (false, true) => lhs.matmul(&rhs.broadcast_as(&r_shape)?.contiguous()?),
+             (true, false) => lhs.broadcast_as(&l_shape)?.contiguous()?.matmul(rhs),
+             (false, false) => lhs.matmul(rhs),
+diff -ruN a/tests/conv_tests.rs b/tests/conv_tests.rs
+--- a/tests/conv_tests.rs
++++ b/tests/conv_tests.rs
+@@ -932,6 +932,49 @@
+     Ok(())
+ }
+ 
++// Regression test for https://github.com/huggingface/candle/issues/3735: a non-contiguous
++// kernel and its contiguous copy must produce identical forward results and gradients.
++fn conv2d_grad_noncontiguous_kernel(dev: &Device) -> Result<()> {
++    use candle_core::Var;
++    let input_data: Vec<f32> = (1..=32).map(|v| v as f32 * 0.1).collect();
++    let weight_data: Vec<f32> = (1..=12).map(|v| v as f32 * 0.1).collect();
++
++    // Non-contiguous kernel: a channel slice of a larger weight, so it has a non-zero offset.
++    let input = Var::from_slice(&input_data, (1, 2, 4, 4), dev)?;
++    let weight = Var::from_slice(&weight_data, (3, 4, 1, 1), dev)?;
++    let kernel = weight.i((.., 1..3, .., ..))?;
++    let loss = input.conv2d(&kernel, 0, 2, 1, 1)?.sqr()?.sum_all()?;
++    let grads = loss.backward()?;
++    let grad_input = grads.get(&input).unwrap();
++    let grad_weight = grads.get(&weight).unwrap();
++
++    // Reference: the same logical kernel forced contiguous.
++    let input_ref = Var::from_slice(&input_data, (1, 2, 4, 4), dev)?;
++    let weight_ref = Var::from_slice(&weight_data, (3, 4, 1, 1), dev)?;
++    let kernel_ref = weight_ref.i((.., 1..3, .., ..))?.contiguous()?;
++    let loss_ref = input_ref
++        .conv2d(&kernel_ref, 0, 2, 1, 1)?
++        .sqr()?
++        .sum_all()?;
++    let grads_ref = loss_ref.backward()?;
++    let grad_input_ref = grads_ref.get(&input_ref).unwrap();
++    let grad_weight_ref = grads_ref.get(&weight_ref).unwrap();
++
++    assert_eq!(
++        test_utils::to_vec0_round(&loss, 4)?,
++        test_utils::to_vec0_round(&loss_ref, 4)?,
++    );
++    assert_eq!(
++        test_utils::to_vec1_round(&grad_input.flatten_all()?, 4)?,
++        test_utils::to_vec1_round(&grad_input_ref.flatten_all()?, 4)?,
++    );
++    assert_eq!(
++        test_utils::to_vec1_round(&grad_weight.flatten_all()?, 4)?,
++        test_utils::to_vec1_round(&grad_weight_ref.flatten_all()?, 4)?,
++    );
++    Ok(())
++}
++
+ test_device!(conv1d, conv1d_cpu, conv1d_gpu, conv1d_metal);
+ test_device!(
+     conv1d_small,
+@@ -970,3 +1013,9 @@
+     conv2d_c_eq_h_eq_w_gpu,
+     conv2d_c_eq_h_eq_w_metal
+ );
++test_device!(
++    conv2d_grad_noncontiguous_kernel,
++    conv2d_grad_noncontiguous_kernel_cpu,
++    conv2d_grad_noncontiguous_kernel_gpu,
++    conv2d_grad_noncontiguous_kernel_metal
++);
+diff -ruN a/tests/grad_tests.rs b/tests/grad_tests.rs
+--- a/tests/grad_tests.rs
++++ b/tests/grad_tests.rs
+@@ -1,6 +1,8 @@
+ #![allow(clippy::approx_constant)]
+ use anyhow::{Context, Result};
+-use candle_core::{test_device, test_utils, DType, Device, Shape, Tensor, Var};
++use candle_core::{
++    backprop::GradStore, test_device, test_utils, DType, Device, Shape, Tensor, Var,
++};
+ 
+ fn simple_grad(device: &Device) -> Result<()> {
+     let x = Var::new(&[3f32, 1., 4.], device)?;
+@@ -36,6 +38,24 @@
+     Ok(())
+ }
+ 
++fn expand_grad(device: &Device) -> Result<()> {
++    // Computing the gradient sums over a middle dim of a 5D tensor, which
++    // takes the strided-index fallback path in the Metal reduce kernels,
++    // see issue #3847.
++    let data: Vec<f32> = (0..24).map(|v| v as f32).collect();
++    let x = Var::from_vec(data, (1, 1, 4, 6), device)?;
++    let e = x.as_tensor().unsqueeze(2)?.expand((1, 1, 3, 4, 6))?;
++    let loss = (e.sqr()?.sum_all()? * 0.5)?;
++    let grads = loss.backward()?;
++    let grad_x = grads.get(&x).context("no grad for x")?;
++    // loss = 0.5 * sum over the 3 broadcast copies of x^2, so dloss/dx = 3.x
++    assert_eq!(
++        grad_x.flatten_all()?.to_vec1::<f32>()?,
++        (0..24).map(|v| 3. * v as f32).collect::<Vec<f32>>()
++    );
++    Ok(())
++}
++
+ fn matmul_grad(device: &Device) -> Result<()> {
+     let data: Vec<_> = (0..12).map(|i| i as f32).collect();
+     let x = Var::from_slice(&data, (2, 2, 3), device)?;
+@@ -64,6 +84,49 @@
+     Ok(())
+ }
+ 
++fn assert_zero_grad(grads: &GradStore, var: &Var, shape: &[usize]) -> Result<()> {
++    let grad = grads.get(var).context("no gradient for variable")?;
++    assert_eq!(grad.dims(), shape);
++    assert_eq!(
++        grad.flatten_all()?.to_vec1::<f32>()?,
++        vec![0.; grad.elem_count()]
++    );
++    Ok(())
++}
++
++fn assert_zero_matmul_grads(
++    device: &Device,
++    lhs_shape: &[usize],
++    rhs_shape: &[usize],
++    output_shape: &[usize],
++) -> Result<()> {
++    let lhs = Var::zeros(lhs_shape, DType::F32, device)?;
++    let rhs = Var::zeros(rhs_shape, DType::F32, device)?;
++    let output = lhs.matmul(&rhs)?;
++    assert_eq!(output.dims(), output_shape);
++    assert_eq!(
++        output.flatten_all()?.to_vec1::<f32>()?,
++        vec![0.; output.elem_count()]
++    );
++    let grads = output.sum_all()?.backward()?;
++    assert_zero_grad(&grads, &lhs, lhs_shape)?;
++    assert_zero_grad(&grads, &rhs, rhs_shape)
++}
++
++fn zero_matmul_grad(device: &Device) -> Result<()> {
++    let cases: &[(&[usize], &[usize], &[usize])] = &[
++        (&[2, 0], &[0, 3], &[2, 3]),
++        (&[0, 2], &[2, 3], &[0, 3]),
++        (&[2, 3], &[3, 0], &[2, 0]),
++        (&[0, 2, 3], &[0, 3, 4], &[0, 2, 4]),
++        (&[2, 3, 0], &[2, 0, 4], &[2, 3, 4]),
++    ];
++    for &(lhs_shape, rhs_shape, output_shape) in cases {
++        assert_zero_matmul_grads(device, lhs_shape, rhs_shape, output_shape)?;
++    }
++    Ok(())
++}
++
+ // The simplest gradient descent, using scalar variable.
+ fn grad_descent(device: &Device) -> Result<()> {
+     let x = Var::new(0f32, device)?;
+@@ -543,12 +606,24 @@
+ );
+ test_device!(sum_grad, sum_grad_cpu, sum_grad_gpu, sum_grad_metal);
+ test_device!(
++    expand_grad,
++    expand_grad_cpu,
++    expand_grad_gpu,
++    expand_grad_metal
++);
++test_device!(
+     matmul_grad,
+     matmul_grad_cpu,
+     matmul_grad_gpu,
+     matmul_grad_metal
+ );
+ test_device!(
++    zero_matmul_grad,
++    zero_matmul_grad_cpu,
++    zero_matmul_grad_gpu,
++    zero_matmul_grad_metal
++);
++test_device!(
+     grad_descent,
+     grad_descent_cpu,
+     grad_descent_gpu,
+diff -ruN a/tests/matmul_tests.rs b/tests/matmul_tests.rs
+--- a/tests/matmul_tests.rs
++++ b/tests/matmul_tests.rs
+@@ -82,6 +82,102 @@
+     Ok(())
+ }
+ 
++fn zero_matmul(device: &Device) -> Result<()> {
++    let lhs = Tensor::zeros((2, 0), DType::F32, device)?;
++    let rhs = Tensor::zeros((0, 3), DType::F32, device)?;
++    let output = lhs.matmul(&rhs)?;
++    assert_eq!(output.dims(), &[2, 3]);
++    assert_eq!(output.to_vec2::<f32>()?, &[[0., 0., 0.], [0., 0., 0.]]);
++
++    let lhs = Tensor::zeros((2, 3, 4), DType::F32, device)?
++        .transpose(1, 2)?
++        .narrow(1, 0, 0)?;
++    let rhs = Tensor::zeros((2, 4, 3), DType::F32, device)?
++        .transpose(1, 2)?
++        .narrow(2, 0, 0)?;
++    assert!(!lhs.is_contiguous());
++    assert!(!rhs.is_contiguous());
++    assert_eq!(lhs.dims(), &[2, 0, 3]);
++    assert_eq!(rhs.dims(), &[2, 3, 0]);
++    assert_eq!(lhs.matmul(&rhs)?.dims(), &[2, 0, 0]);
++    Ok(())
++}
++
++fn assert_matmul_error(
++    device: &Device,
++    lhs: (&[usize], DType),
++    rhs: (&[usize], DType),
++    expected: &str,
++) -> Result<()> {
++    let lhs = Tensor::zeros(lhs.0, lhs.1, device)?;
++    let rhs = Tensor::zeros(rhs.0, rhs.1, device)?;
++    let err = lhs.matmul(&rhs).unwrap_err();
++    assert!(
++        err.to_string().starts_with(expected),
++        "unexpected error: {err}"
++    );
++    Ok(())
++}
++
++fn zero_matmul_validation(device: &Device) -> Result<()> {
++    use DType::{F16, F32};
++
++    let shape_error = "shape mismatch in matmul";
++    assert_matmul_error(device, (&[0, 2], F32), (&[3, 4], F16), shape_error)?;
++    assert_matmul_error(device, (&[2, 3], F32), (&[4, 0], F32), shape_error)?;
++    assert_matmul_error(device, (&[0, 2, 3], F32), (&[1, 3, 4], F32), shape_error)?;
++    assert_matmul_error(
++        device,
++        (&[0, 2], F32),
++        (&[2, 3], F16),
++        "dtype mismatch in matmul",
++    )?;
++    Ok(())
++}
++
++fn zero_matmul_device_validation(device: &Device) -> Result<()> {
++    if device.is_cpu() {
++        return Ok(());
++    }
++    let lhs = Tensor::zeros((0, 2), DType::F32, &Device::Cpu)?;
++    let rhs = Tensor::zeros((2, 3), DType::F16, device)?;
++    let err = lhs.matmul(&rhs).unwrap_err();
++    assert!(
++        err.to_string().starts_with("device mismatch in matmul"),
++        "unexpected error: {err}"
++    );
++    Ok(())
++}
++
++// A rank-2 rhs is broadcast over the batch dims only, which `broadcast_matmul` folds into a
++// single 2D matmul instead of copying the rhs. Check the folded path against the per-batch
++// products it stands for, contiguous lhs (folded) and non-contiguous lhs (fallback) alike.
++fn broadcast_matmul_rank2_rhs(device: &Device) -> Result<()> {
++    let rhs = Tensor::randn(0f32, 1f32, (5, 2), device)?;
++    for lhs in [
++        Tensor::randn(0f32, 1f32, (3, 4, 5), device)?,
++        Tensor::randn(0f32, 1f32, (3, 6, 4, 5), device)?,
++        Tensor::randn(0f32, 1f32, (1, 1, 5), device)?,
++        Tensor::randn(0f32, 1f32, (3, 5, 4), device)?.transpose(1, 2)?,
++    ] {
++        let out = lhs.broadcast_matmul(&rhs)?;
++        let mut dims = lhs.dims().to_vec();
++        let n = dims.len();
++        dims[n - 1] = 2;
++        assert_eq!(out.dims(), dims.as_slice());
++        // Same product, computed the way the doc comment describes it.
++        let batch: usize = lhs.dims()[..n - 2].iter().product();
++        let (m, k) = (lhs.dims()[n - 2], lhs.dims()[n - 1]);
++        let flat = lhs.reshape((batch, m, k))?;
++        let out = out.reshape((batch, m, 2))?;
++        for b in 0..batch {
++            let diff = (out.i(b)? - flat.i(b)?.matmul(&rhs)?)?.sqr()?.sum_all()?;
++            assert!(diff.to_vec0::<f32>()? < 1e-6);
++        }
++    }
++    Ok(())
++}
++
+ #[test]
+ fn tensor_dot() -> Result<()> {
+     let lhs = Tensor::new(&[1., 2., 3.], &Device::Cpu)?;
+@@ -142,5 +238,29 @@
+     broadcast_matmul_gpu,
+     broadcast_matmul_metal
+ );
++test_device!(
++    zero_matmul,
++    zero_matmul_cpu,
++    zero_matmul_gpu,
++    zero_matmul_metal
++);
++test_device!(
++    zero_matmul_validation,
++    zero_matmul_validation_cpu,
++    zero_matmul_validation_gpu,
++    zero_matmul_validation_metal
++);
++test_device!(
++    zero_matmul_device_validation,
++    zero_matmul_device_validation_cpu,
++    zero_matmul_device_validation_gpu,
++    zero_matmul_device_validation_metal
++);
++test_device!(
++    broadcast_matmul_rank2_rhs,
++    broadcast_matmul_rank2_rhs_cpu,
++    broadcast_matmul_rank2_rhs_gpu,
++    broadcast_matmul_rank2_rhs_metal
++);
+ test_device!(squeeze_mm, squeeze_mm_cpu, squeeze_mm_gpu, squeeze_mm_metal);
+ test_device!(mm_layout, mm_layout_cpu, mm_layout_gpu, mm_layout_metal);
+diff -ruN a/tests/tensor_tests.rs b/tests/tensor_tests.rs
+--- a/tests/tensor_tests.rs
++++ b/tests/tensor_tests.rs
+@@ -216,6 +216,15 @@
+         sorted.to_vec2::<f32>()?,
+         [[5.0, 4.0, 3.0, 1.1, 1.0], [8.0, 7.0, 2.1, 2.0, 1.0]]
+     );
++
++    let offset_view = Tensor::new(&[[1f32, 2., 3.], [30., 10., 20.]], device)?.narrow(0, 1, 1)?;
++    let (sorted, indexes) = offset_view.sort_last_dim(true)?;
++    assert_eq!(indexes.to_vec2::<u32>()?, [[1, 2, 0]]);
++    assert_eq!(sorted.to_vec2::<f32>()?, [[10., 20., 30.]]);
++
++    let (sorted, indexes) = offset_view.sort_last_dim(false)?;
++    assert_eq!(indexes.to_vec2::<u32>()?, [[0, 2, 1]]);
++    assert_eq!(sorted.to_vec2::<f32>()?, [[30., 20., 10.]]);
+     Ok(())
+ }
+ 
+@@ -379,6 +388,73 @@
+     assert_eq!(dims, [2, 5]);
+     let result: Vec<f32> = tensor.flatten_all()?.to_vec1()?;
+     assert_eq!(result, [10., 1., 12., 3., 14., 5., 6., 7., 18., 19.]);
++
++    let fill = Tensor::new(7f32, device)?.broadcast_as((2, 5))?; // strides [0, 0]
++    assert_eq!(
++        ids.where_cond(&fill, &b)?.to_vec2::<f32>()?,
++        [[10., 7., 12., 7., 14.], [7., 7., 7., 18., 19.]],
++    );
++
++    let mask = Tensor::new(&[[0u8, 1, 1, 0, 1]], device)?.broadcast_as((2, 5))?; // strides [0, 1]
++    assert_eq!(
++        mask.where_cond(&a, &b)?.to_vec2::<f32>()?,
++        mask.contiguous()?.where_cond(&a, &b)?.to_vec2::<f32>()?,
++    );
++
++    let a_t = Tensor::arange(0f32, 10., device)?.reshape((5, 2))?.t()?;
++    let ids_t = Tensor::new(&[[0u8, 1], [1, 1], [0, 0], [1, 0], [1, 1]], device)?.t()?;
++    assert_eq!(
++        ids_t.where_cond(&a_t, &b)?.to_vec2::<f32>()?,
++        ids_t
++            .contiguous()?
++            .where_cond(&a_t.contiguous()?, &b)?
++            .to_vec2::<f32>()?,
++    );
++
++    let narrowed = Tensor::arange(0f32, 14., device)?
++        .reshape((2, 7))?
++        .narrow(1, 1, 5)?; // strides [7, 1], offset 1
++    assert_eq!(
++        ids.where_cond(&fill, &narrowed)?.to_vec2::<f32>()?,
++        ids.where_cond(&fill.contiguous()?, &narrowed.contiguous()?)?
++            .to_vec2::<f32>()?,
++    );
++
++    let fill2 = Tensor::new(9f32, device)?.broadcast_as((2, 5))?;
++    assert_eq!(
++        ids.where_cond(&a, &fill)?.to_vec2::<f32>()?,
++        ids.where_cond(&a, &fill.contiguous()?)?.to_vec2::<f32>()?,
++    );
++    assert_eq!(
++        ids.where_cond(&fill, &fill2)?.to_vec2::<f32>()?,
++        ids.where_cond(&fill.contiguous()?, &fill2.contiguous()?)?
++            .to_vec2::<f32>()?,
++    );
++
++    let row_mask = Tensor::new(&[[1u8], [0u8]], device)?.broadcast_as((2, 5))?; // strides [1, 0]
++    let row_ref = row_mask.contiguous()?;
++    assert_eq!(
++        row_mask.where_cond(&a, &b)?.to_vec2::<f32>()?,
++        row_ref.where_cond(&a, &b)?.to_vec2::<f32>()?,
++    );
++    assert_eq!(
++        row_mask.where_cond(&a, &fill)?.to_vec2::<f32>()?,
++        row_ref
++            .where_cond(&a, &fill.contiguous()?)?
++            .to_vec2::<f32>()?,
++    );
++    assert_eq!(
++        row_mask.where_cond(&fill, &b)?.to_vec2::<f32>()?,
++        row_ref
++            .where_cond(&fill.contiguous()?, &b)?
++            .to_vec2::<f32>()?,
++    );
++    assert_eq!(
++        row_mask.where_cond(&fill, &fill2)?.to_vec2::<f32>()?,
++        row_ref
++            .where_cond(&fill.contiguous()?, &fill2.contiguous()?)?
++            .to_vec2::<f32>()?,
++    );
+     Ok(())
+ }
+ 
+@@ -1694,6 +1770,34 @@
+     Ok(())
+ }
+ 
++fn repeat_with_zero_factor(device: &Device) -> Result<()> {
++    let tensor = Tensor::new(&[[1u32, 2], [3, 4]], device)?;
++
++    let repeated_rows = tensor.repeat((0, 2))?;
++    assert_eq!(repeated_rows.dims(), &[0, 4]);
++    assert_eq!(repeated_rows.elem_count(), 0);
++
++    let repeated_columns = tensor.repeat((2, 0))?;
++    assert_eq!(repeated_columns.dims(), &[4, 0]);
++    assert_eq!(repeated_columns.elem_count(), 0);
++
++    Ok(())
++}
++
++fn meshgrid_with_empty_axis(device: &Device) -> Result<()> {
++    let empty_axis = Tensor::from_vec(Vec::<f32>::new(), 0, device)?;
++    let coordinates = Tensor::new(&[10f32, 20., 30.], device)?;
++
++    let grids = Tensor::meshgrid(&[&empty_axis, &coordinates], false)?;
++    assert_eq!(grids.len(), 2);
++    for grid in grids {
++        assert_eq!(grid.dims(), &[0, 3]);
++        assert_eq!(grid.elem_count(), 0);
++    }
++
++    Ok(())
++}
++
+ fn zero_dim(device: &Device) -> Result<()> {
+     let t = Tensor::zeros((4, 0, 1), DType::F32, device)?;
+     assert_eq!(t.dims3()?, (4, 0, 1));
+@@ -1763,6 +1867,18 @@
+ test_device!(asort, asort_cpu, asort_gpu, asort_metal);
+ test_device!(asort_big, asort_big_cpu, asort_big_gpu, asort_big_metal);
+ test_device!(var, var_cpu, var_gpu, var_metal);
++test_device!(
++    repeat_with_zero_factor,
++    repeat_with_zero_factor_cpu,
++    repeat_with_zero_factor_gpu,
++    repeat_with_zero_factor_metal
++);
++test_device!(
++    meshgrid_with_empty_axis,
++    meshgrid_with_empty_axis_cpu,
++    meshgrid_with_empty_axis_gpu,
++    meshgrid_with_empty_axis_metal
++);
+ test_device!(zero_dim, zero_dim_cpu, zero_dim_gpu, zero_dim_metal);
+ 
+ fn tensor_send_sync(device: &Device) -> Result<()> {
+@@ -2002,6 +2118,28 @@
+     Ok(())
+ }
+ 
++#[test]
++fn tensor_from_data_validates_concrete_shape() -> Result<()> {
++    let values = [1f32, 2., 3., 4.];
++
++    assert!(Tensor::from_slice(&values, (2, 2, 2), &Device::Cpu).is_err());
++    assert!(Tensor::from_slice(&values, (2, 1), &Device::Cpu).is_err());
++    assert!(Tensor::from_vec(values.to_vec(), (2, 2, 2), &Device::Cpu).is_err());
++    assert!(Tensor::from_vec(values.to_vec(), (2, 1), &Device::Cpu).is_err());
++
++    let tensor = Tensor::from_slice(&values, (2, 2), &Device::Cpu)?;
++    assert_eq!(tensor.dims(), &[2, 2]);
++
++    let tensor = Tensor::from_vec(values.to_vec(), ((), 2), &Device::Cpu)?;
++    assert_eq!(tensor.dims(), &[2, 2]);
++
++    let empty: &[f32] = &[];
++    let tensor = Tensor::from_slice(empty, (0, 3), &Device::Cpu)?;
++    assert_eq!(tensor.dims(), &[0, 3]);
++
++    Ok(())
++}
++
+ #[test]
+ fn tensor_new() -> Result<()> {
+     let t1 = Tensor::new(vec![1f32, 2.0, 3.0], &Device::Cpu)?;

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,7 +25,7 @@ fn default_dir() -> Option<PathBuf> {
     entries.into_iter().next()
 }
 
-fn load_rgb(path: &PathBuf) -> Result<RgbImage> {
+fn load_rgb(path: &Path) -> Result<RgbImage> {
     RgbImage::decode_file(path)
 }
 
@@ -139,8 +139,8 @@ fn main() -> Result<()> {
     }
 
     if let Some(rows) = &rows_path {
-        let data = std::fs::read_to_string(rows)
-            .with_context(|| format!("read {}", rows.display()))?;
+        let data =
+            std::fs::read_to_string(rows).with_context(|| format!("read {}", rows.display()))?;
         for (li, line) in data.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {

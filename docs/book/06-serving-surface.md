@@ -37,7 +37,7 @@ signature; errors use the Anthropic envelope and engine-busy sheds map to 529
 `/v1/chat/completions` as `usage.prompt_tokens_details.cached_tokens`. A
 stop-string hit is attributed only where the engine records it — the wgpu path
 and the echo engine emit `ChatEvent::StoppedBy` and report
-`stop_reason: "stop_sequence"`, the CUDA loops do not (01.4-STATUS.md).
+`stop_reason: "stop_sequence"`, the CUDA loops do not (the private status ledger).
 `/v1/messages/count_tokens` renders the same prompt off the request path
 (`spawn_blocking`) and counts it with the model dir's `tokenizer.json`, or
 answers 501 honestly when no tokenizer is on disk. `/v1/responses` is the
@@ -199,10 +199,26 @@ bit-identical to plain embedding — a property the test suite pins.
 from its `audio_config`; a checkpoint without one gets `require_vision()` /
 `require_audio()` naming the model. There is no generic multimodal abstraction —
 another family means another tower pair and another splice contract. Two known
-limits are in 01.4-STATUS.md: the w4a16-ct E4B checkpoint is text-only in
+limits are in the private status ledger: the w4a16-ct E4B checkpoint is text-only in
 practice, and the audio tower has architectural verification only.
 
 ## Tool calling
+
+Assistant messages accept both `reasoning` and `reasoning_content`. These
+fields survive request parsing and official-template rendering separately
+from answer text, so Laguna can retain thinking across tool results and later
+user turns. Callers must return the reasoning received with each assistant
+message; it cannot be reconstructed from the final answer.
+
+Official templates use `template_tojson` for MiniJinja JSON serialization.
+It accepts `ensure_ascii=false` for Unicode text and `ensure_ascii=true` for
+ASCII escapes, including surrogate pairs, while retaining the built-in filter's
+indentation and HTML escaping. Laguna's native history template uses this option
+for non-string tool arguments: numbers, booleans, nulls, arrays and objects must
+render without switching to the generic tool prompt. The model-independent
+`laguna_tool_history_serializes_non_string_arguments_without_fallback` test
+covers that history branch; first-turn tool tests cannot exercise it.
+
 
 Tools are prompt-level, then parsed back out of the text; there is no separate
 tool-call decoding channel. On the way in, `build_tool_messages` is the fallback
@@ -324,7 +340,7 @@ can serve which model class, with a per-class reason string for every refusal.
 It is served at `GET /v1/backends` and folded into
 `/v1/realtime/capabilities/backends`, covered by
 `rust/tests/backend_select_e2e.rs`; its verdicts and the three selector/engine
-divergences live in 01.4-STATUS.md.
+divergences live in the private status ledger.
 
 ## PII redaction
 
@@ -392,6 +408,41 @@ concurrency model is tabulated in 06.2 §4b, including the two results worth
 remembering here: STT deliberately takes no lock at all, and making
 `/v1/embeddings` concurrent was built, measured and reverted.
 
+## The cold tier
+
+The generative OCR backends (DeepSeek-OCR-2, dots.ocr, GOT) and the text
+embedding model are the cold tier: configured at boot, loaded by the first
+request that needs them, and unloaded after `NV_COLD_TIER_IDLE_SECS` seconds
+(default 600; `0` keeps them resident) without a request. `cold_tier::ColdSlot`
+owns one resident and the registry in `oapi::cold_tier` is the eviction order,
+least recently used first. Laguna with its caches and graphs, and the realtime
+speech stack (whisper, kokoro, VAD, diarization) are never in it: the chat engine
+is the product and takes minutes to come back, and a websocket session cannot
+wait for a reload.
+
+Eviction drops the shared reference. An in-flight request keeps its own `Arc`
+and finishes, so the memory returns when the last holder drops;
+`ColdSlot::evict` synchronizes the CUDA context afterwards so the freed bytes
+are visible to `cuMemGetInfo` before the next decision.
+
+Pressure is checked before the two known-large transients, not after an
+out-of-memory error. `ensure_free_async` reads free device memory and evicts
+cold residents in LRU order until `NV_COLD_TIER_CHAT_MIN_FREE_GIB` (default 2)
+is free before a chat request starts, and `NV_COLD_TIER_FIT_MIN_FREE_GIB`
+(default 6) before a voice fit; a cold resident's own load first evicts its
+siblings until its ledger estimate fits. The check costs nothing while the tier
+is empty. A CUDA out-of-memory inside an ONNX run or a graph replay is not
+retried; the shed and its `503` remain the answer there.
+
+`NV_COLD_TIER_PRELOAD=1` loads every cold resident at boot and keeps the idle
+unload, for hosts where first-request latency (13 s for dots, 39 s for
+DeepSeek-OCR-2 on an RTX PRO 6000) is unacceptable. A cold resident whose load fails
+answers `503 ocr_backend_load_failed` (`model_not_loaded` for embeddings) and
+is retried after `RETRY_AFTER_FAILED_LOAD`; `/v1/models` advertises a
+configured embedding model until its load has failed. The boot ledger charges
+the cold tier at its resident estimate because the plan is the everything-loaded
+worst case; `nvidia-smi` shows the difference.
+
 ## Readiness, and how a missing model degrades one endpoint
 
 `main.rs` distinguishes three states per subsystem: *configured* (its env var or
@@ -427,7 +478,8 @@ model is not mounted** — no chat registry means no `/v1/chat/completions` and 
 router-level 404, likewise voice profiles and the PII family. **A route that can
 exist with a subset of its backends is always mounted and answers 503 per
 request** — `/v1/ocr` returns `503 ocr_backend_not_loaded` naming the env var
-for the backend the caller asked for, `/v1/embeddings` returns
+for the backend the caller asked for (`503 ocr_backend_load_failed` when the
+backend is configured but its cold-tier load failed), `/v1/embeddings` returns
 `503 model_not_loaded` naming `NV_EMBEDDING_MODEL_DIR`, and `/v1/audio/speech`
 returns `503 tts_not_configured` naming both the talker env var and the Kokoro
 file layout.
@@ -438,3 +490,25 @@ hard boot gates are `ORT_DYLIB_PATH` pointing at a non-existent file and
 explicitly marked required. Every other load failure is a `warn!` plus a
 disabled feature, so one bad checkpoint costs one endpoint rather than the
 server.
+
+## CUDA build cache boundary
+
+The `nv-cuda-kernels` Nix package owns `nv-kernels` CUDA compilation, generated
+bindings and linker directives. Its source contains native headers, CUDA/C++
+sources and the build script, plus the workspace dependency manifests needed
+by Cargo. Application Rust sources do not participate in its derivation.
+Compiler/toolkit versions, GPU architectures and native source changes do.
+
+CUDA application packages set `NV_KERNELS_PREBUILT` to this immutable output.
+The crate build script copies its bindings and emits its linker directives;
+it does not run NVCC or bindgen on this path. Local builds without that
+variable retain the source compilation path. The package is also available
+as `speaches-plus-cuda.cudaKernels` and is shared by CUDA workspace binaries
+using the same toolchain and architecture settings. Model and request-handler
+edits still rebuild their Rust code, but reuse the native archives.
+
+The server and workspace binaries use one `cargoArtifacts` dependency build
+per toolchain and backend, selected with `--workspace`. The CUDA host constructs both
+the server and SAE with its host package set and CUDA toolkit; NixOS assertions
+keep their Rust dependency and native-kernel derivations identical. Cargo may
+still compile feature-specific variants needed by an individual binary.

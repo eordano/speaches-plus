@@ -91,6 +91,172 @@ pub struct MoeGroupedWeights {
     pub input_globals_gate_up_host: Vec<f32>,
 
     pub input_globals_down_host: Vec<f32>,
+    pub marlin_moe_twin_built_once_from_the_resident_grouped_buffers:
+        std::sync::OnceLock<Option<Arc<MarlinMoeTwin>>>,
+}
+
+pub struct MarlinMoeStack {
+    pub b_q: CudaSlice<u32>,
+    pub scales: CudaSlice<u8>,
+    pub globals: CudaSlice<f32>,
+}
+
+pub struct MarlinMoeTwin {
+    pub gate: MarlinMoeStack,
+    pub up: MarlinMoeStack,
+    pub gate_up_concat_when_every_expert_shares_one_global_scale: Option<MarlinMoeStack>,
+    pub down: MarlinMoeStack,
+    pub experts_total: usize,
+    pub hidden: usize,
+    pub inter: usize,
+}
+
+fn marlin_moe_stack(
+    stream: &Arc<CudaStream>,
+    packed: &CudaSlice<u8>,
+    swizzled: &CudaSlice<u8>,
+    alphas: &CudaSlice<f32>,
+    input_globals_host: &[f32],
+    experts: usize,
+    n: usize,
+    k: usize,
+) -> Result<MarlinMoeStack> {
+    let packed_h = stream.clone_dtoh(packed)?;
+    let swz_h = stream.clone_dtoh(swizzled)?;
+    let alphas_h = stream.clone_dtoh(alphas)?;
+    let swz_per = swizzled_scale_bytes(n, k);
+    let mut linear_per_expert = Vec::with_capacity(experts);
+    for e in 0..experts {
+        linear_per_expert.push(nv_quant::nvfp4::unswizzle_scales(
+            &swz_h[e * swz_per..(e + 1) * swz_per],
+            n,
+            k / 16,
+        ));
+    }
+    let globals: Vec<f32> = (0..experts)
+        .map(|e| alphas_h[e] * input_globals_host[e])
+        .collect();
+    marlin_moe_stack_from_linear(
+        stream,
+        &packed_h,
+        &linear_per_expert,
+        &globals,
+        experts,
+        n,
+        k,
+    )
+}
+
+pub(crate) fn marlin_moe_stack_from_linear(
+    stream: &Arc<CudaStream>,
+    packed_h: &[u8],
+    scales_linear_per_expert: &[Vec<u8>],
+    globals_in: &[f32],
+    experts: usize,
+    n: usize,
+    k: usize,
+) -> Result<MarlinMoeStack> {
+    anyhow::ensure!(
+        packed_h.len() == experts * n * k / 2,
+        "marlin moe stack: packed bytes {} != E*n*k/2",
+        packed_h.len()
+    );
+    anyhow::ensure!(
+        scales_linear_per_expert.len() == experts && globals_in.len() == experts,
+        "marlin moe stack: per-expert inputs short"
+    );
+    let words = k * n / 8;
+    let mut b_q: CudaSlice<u32> = stream.alloc_zeros::<u32>(experts * words)?;
+    let mut scales_all = Vec::with_capacity(experts * k * n / 16);
+    let mut globals = Vec::with_capacity(experts);
+    for e in 0..experts {
+        let pk = &packed_h[e * n * k / 2..(e + 1) * n * k / 2];
+        let kmajor = nv_quant::marlin_nvfp4::kmajor_int32_from_packed_rows(pk, n, k);
+        let sc = nv_quant::marlin_nvfp4::marlin_scales_from_linear(
+            &scales_linear_per_expert[e],
+            n,
+            k,
+            globals_in[e],
+        );
+        #[allow(deprecated)]
+        let d_kmajor: CudaSlice<u32> = stream.clone_htod(&kmajor)?;
+        let rc = unsafe {
+            let (pi, _g1) = d_kmajor.device_ptr(stream);
+            let (po, _g2) = b_q.device_ptr_mut(stream);
+            nv_kernels::cuda::marlin_repack_w4a16(
+                stream.cu_stream() as *mut c_void,
+                pi as *const c_void,
+                (po + (e * words * 4) as u64) as *mut c_void,
+                k as i32,
+                n as i32,
+                4,
+            )
+        };
+        anyhow::ensure!(rc == 0, "marlin moe repack expert {e} rc={rc}");
+        stream.synchronize()?;
+        scales_all.extend_from_slice(&sc.bytes_e5m3);
+        globals.push(sc.global_scale_processed);
+    }
+    #[allow(deprecated)]
+    let scales = stream.clone_htod(&scales_all)?;
+    #[allow(deprecated)]
+    let globals = stream.clone_htod(&globals)?;
+    Ok(MarlinMoeStack {
+        b_q,
+        scales,
+        globals,
+    })
+}
+
+impl MoeGroupedWeights {
+    pub fn marlin_moe_twin(&self, stream: &Arc<CudaStream>) -> Option<Arc<MarlinMoeTwin>> {
+        self.marlin_moe_twin_built_once_from_the_resident_grouped_buffers
+            .get_or_init(|| {
+                let hidden = self.hidden_size;
+                let inter = self.intermediate_size;
+                let experts_total = self.gate_w.len() * 2 / (inter * hidden);
+                let build = || -> Result<MarlinMoeTwin> {
+                    let gate = marlin_moe_stack(stream, &self.gate_w, &self.gate_w_scales, &self.gate_alphas, &self.input_globals_gate_up_host, experts_total, inter, hidden)?;
+                    let up = marlin_moe_stack(stream, &self.up_w, &self.up_w_scales, &self.up_alphas, &self.input_globals_gate_up_host, experts_total, inter, hidden)?;
+                    let down = marlin_moe_stack(stream, &self.down_w, &self.down_w_scales, &self.down_alphas, &self.input_globals_down_host, experts_total, hidden, inter)?;
+                    let ga = stream.clone_dtoh(&self.gate_alphas)?;
+                    let ua = stream.clone_dtoh(&self.up_alphas)?;
+                    let concat = if ga[..experts_total] == ua[..experts_total] {
+                        let gp = stream.clone_dtoh(&self.gate_w)?;
+                        let upk = stream.clone_dtoh(&self.up_w)?;
+                        let gs = stream.clone_dtoh(&self.gate_w_scales)?;
+                        let us = stream.clone_dtoh(&self.up_w_scales)?;
+                        let per_w = inter * hidden / 2;
+                        let swz_per = swizzled_scale_bytes(inter, hidden);
+                        let mut packed = Vec::with_capacity(experts_total * 2 * per_w);
+                        let mut lin = Vec::with_capacity(experts_total);
+                        for e in 0..experts_total {
+                            packed.extend_from_slice(&gp[e * per_w..(e + 1) * per_w]);
+                            packed.extend_from_slice(&upk[e * per_w..(e + 1) * per_w]);
+                            let mut l = nv_quant::nvfp4::unswizzle_scales(&gs[e * swz_per..(e + 1) * swz_per], inter, hidden / 16);
+                            l.extend_from_slice(&nv_quant::nvfp4::unswizzle_scales(&us[e * swz_per..(e + 1) * swz_per], inter, hidden / 16));
+                            lin.push(l);
+                        }
+                        let globals: Vec<f32> = (0..experts_total).map(|e| ga[e] * self.input_globals_gate_up_host[e]).collect();
+                        Some(marlin_moe_stack_from_linear(stream, &packed, &lin, &globals, experts_total, 2 * inter, hidden)?)
+                    } else {
+                        None
+                    };
+                    Ok(MarlinMoeTwin { gate, up, gate_up_concat_when_every_expert_shares_one_global_scale: concat, down, experts_total, hidden, inter })
+                };
+                match build() {
+                    Ok(t) => {
+                        eprintln!("[marlin_moe_twin] built experts={} hidden={hidden} inter={inter} gate_up_concat={}", t.experts_total, t.gate_up_concat_when_every_expert_shares_one_global_scale.is_some());
+                        Some(Arc::new(t))
+                    }
+                    Err(e) => {
+                        eprintln!("[marlin_moe_twin] unavailable: {e:#}");
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
 }
 
 impl MoeGroupedWeights {
@@ -272,7 +438,7 @@ impl MoeGroupedWeights {
         #[allow(deprecated)]
         let down_alphas_dev = stream.memcpy_stod(&down_alphas)?;
 
-        Ok(Self {
+        let built = Self {
             num_experts: routed_experts,
             hidden_size,
             intermediate_size,
@@ -297,7 +463,13 @@ impl MoeGroupedWeights {
             input_globals_down,
             input_globals_gate_up_host: globals_gate_up_host,
             input_globals_down_host: globals_down_host,
-        })
+            marlin_moe_twin_built_once_from_the_resident_grouped_buffers: std::sync::OnceLock::new(
+            ),
+        };
+        if marlin_moe_route_opt_in() {
+            let _ = built.marlin_moe_twin(stream);
+        }
+        Ok(built)
     }
 
     pub fn append_shared_expert_as_tile_e_costs_one_extra_expert_copy_on_top_of_the_cached_base(
@@ -359,12 +531,19 @@ impl MoeGroupedWeights {
             #[allow(deprecated)]
             {
                 stream.memcpy_dtod(old, &mut grown.slice_mut(0..e * per))?;
-                stream.memcpy_dtod(&tail.slice(0..n), &mut grown.slice_mut(e * per..e * per + n))?;
+                stream.memcpy_dtod(
+                    &tail.slice(0..n),
+                    &mut grown.slice_mut(e * per..e * per + n),
+                )?;
             }
             Ok(grown)
         };
         let append_alpha = |old: &CudaSlice<f32>, alpha: f32| -> Result<CudaSlice<f32>> {
-            anyhow::ensure!(old.len() == e, "shared fold: alpha len {} != {e}", old.len());
+            anyhow::ensure!(
+                old.len() == e,
+                "shared fold: alpha len {} != {e}",
+                old.len()
+            );
             let mut grown = stream.alloc_zeros::<f32>(e + 1)?;
             #[allow(deprecated)]
             {
@@ -425,6 +604,8 @@ impl MoeGroupedWeights {
             input_globals_down,
             input_globals_gate_up_host: globals_gate_up_host,
             input_globals_down_host: globals_down_host,
+            marlin_moe_twin_built_once_from_the_resident_grouped_buffers: std::sync::OnceLock::new(
+            ),
         })
     }
 }
@@ -438,8 +619,8 @@ pub fn per_expert_bytes(hidden_size: usize, intermediate_size: usize) -> usize {
 
 pub fn swizzled_scale_bytes(rows: usize, cols: usize) -> usize {
     let k_blocks = cols / BLOCK_SIZE;
-    let m_tiles = (rows + 127) / 128;
-    let k_tiles = (k_blocks + 3) / 4;
+    let m_tiles = rows.div_ceil(128);
+    let k_tiles = k_blocks.div_ceil(4);
     m_tiles * 128 * k_tiles * 4
 }
 
@@ -498,6 +679,371 @@ fn plan_routing(topk_ids: &[u32], n_tokens: usize, k: usize, num_experts: usize)
     }
 }
 
+struct DeviceTopk {
+    stream: Arc<CudaStream>,
+    ids: CudaSlice<i32>,
+    weights: CudaSlice<f32>,
+}
+
+pub struct PrefillDeviceRouting {
+    stream: Arc<CudaStream>,
+    _topk_ids: CudaSlice<i32>,
+    topk_weights: CudaSlice<f32>,
+    src_idx: CudaSlice<i32>,
+    inv_perm: CudaSlice<i32>,
+    active_experts: Vec<usize>,
+    m_total_padded: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_topk_device(
+    router_logits: &Tensor,
+    selection_bias: Option<&Tensor>,
+    n_tokens: usize,
+    num_experts: usize,
+    k: usize,
+    mode: i32,
+    softcap: f32,
+    norm_topk: bool,
+    routed_scaling: f32,
+    device: &Device,
+) -> Result<DeviceTopk> {
+    let dev = match device {
+        Device::Cuda(d) => d.clone(),
+        _ => anyhow::bail!("device prefill routing requires CUDA"),
+    };
+    anyhow::ensure!(
+        n_tokens > 0,
+        "device prefill routing requires at least one token"
+    );
+    anyhow::ensure!(
+        k > 0 && k <= num_experts,
+        "invalid prefill top-k {k}/{num_experts}"
+    );
+    let stream = crate::cuda_stream::current_stream(&dev);
+    let logits = router_logits.to_dtype(DType::F32)?.contiguous()?;
+    anyhow::ensure!(
+        logits.elem_count() == n_tokens * num_experts,
+        "prefill router logits have {} elements, expected {}x{}",
+        logits.elem_count(),
+        n_tokens,
+        num_experts
+    );
+    let bias = match selection_bias {
+        Some(b) => Some(b.to_dtype(DType::F32)?.contiguous()?),
+        None => None,
+    };
+    if let Some(b) = &bias {
+        anyhow::ensure!(
+            b.elem_count() == num_experts,
+            "prefill selection bias has {} elements, expected {num_experts}",
+            b.elem_count()
+        );
+    }
+
+    let routes = n_tokens
+        .checked_mul(k)
+        .context("prefill routing route count overflow")?;
+    let mut ids = stream.alloc_zeros::<i32>(routes)?;
+    let mut weights = stream.alloc_zeros::<f32>(routes)?;
+    {
+        let (ls, ll) = logits.storage_and_layout();
+        let l_cuda = match &*ls {
+            candle_core::Storage::Cuda(s) => s,
+            _ => anyhow::bail!("prefill router logits must be CUDA"),
+        };
+        let l_slice = l_cuda.as_cuda_slice::<f32>()?;
+        let (lp, _gl) = l_slice.device_ptr(&stream);
+        let lp = lp + (ll.start_offset() * std::mem::size_of::<f32>()) as u64;
+        let bias_ptr = match &bias {
+            Some(b) => {
+                let (bs, bl) = b.storage_and_layout();
+                let b_cuda = match &*bs {
+                    candle_core::Storage::Cuda(s) => s,
+                    _ => anyhow::bail!("prefill selection bias must be CUDA"),
+                };
+                let b_slice = b_cuda.as_cuda_slice::<f32>()?;
+                let (bp, _gb) = b_slice.device_ptr(&stream);
+                bp + (bl.start_offset() * std::mem::size_of::<f32>()) as u64
+            }
+            None => 0,
+        };
+        let (ip, _gi) = ids.device_ptr_mut(&stream);
+        let (wp, _gw) = weights.device_ptr_mut(&stream);
+        let rc = unsafe {
+            nv_kernels::cuda::moe_route_topk(
+                stream.cu_stream() as *mut c_void,
+                lp as *const f32,
+                bias_ptr as *const f32,
+                ip as *mut i32,
+                wp as *mut f32,
+                n_tokens as i32,
+                num_experts as i32,
+                k as i32,
+                mode,
+                softcap,
+                norm_topk as i32,
+                routed_scaling,
+            )
+        };
+        anyhow::ensure!(rc == 0, "prefill moe_route_topk rc={rc}");
+    }
+    Ok(DeviceTopk {
+        stream,
+        ids,
+        weights,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn route_topk_ids_on_the_device_as_u32_tokens_by_k(
+    router_logits: &Tensor,
+    selection_bias: Option<&Tensor>,
+    n_tokens: usize,
+    num_experts: usize,
+    k: usize,
+    mode: i32,
+    softcap: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    let dev = match device {
+        Device::Cuda(d) => d.clone(),
+        _ => anyhow::bail!("device routing requires CUDA"),
+    };
+    anyhow::ensure!(n_tokens > 0 && k > 0 && k <= num_experts, "invalid device routing shape");
+    let stream = crate::cuda_stream::current_stream(&dev);
+    let logits = router_logits.to_dtype(DType::F32)?.contiguous()?;
+    anyhow::ensure!(
+        logits.elem_count() == n_tokens * num_experts,
+        "router logits have {} elements, expected {n_tokens}x{num_experts}",
+        logits.elem_count()
+    );
+    let bias = match selection_bias {
+        Some(b) => Some(b.to_dtype(DType::F32)?.contiguous()?),
+        None => None,
+    };
+    let routes = n_tokens * k;
+    let mut ids = stream.alloc_zeros::<u32>(routes)?;
+    let mut weights = stream.alloc_zeros::<f32>(routes)?;
+    let f32_ptr = |t: &Tensor| -> Result<u64> {
+        let (st, l) = t.storage_and_layout();
+        let candle_core::Storage::Cuda(c) = &*st else {
+            anyhow::bail!("device routing operand must be CUDA");
+        };
+        let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(&stream);
+        Ok(p + (l.start_offset() * 4) as u64)
+    };
+    let lp = f32_ptr(&logits)?;
+    let bp = match &bias {
+        Some(b) => f32_ptr(b)?,
+        None => 0,
+    };
+    let rc = unsafe {
+        let (ip, _gi) = ids.device_ptr_mut(&stream);
+        let (wp, _gw) = weights.device_ptr_mut(&stream);
+        nv_kernels::cuda::moe_route_topk(
+            stream.cu_stream() as *mut std::ffi::c_void,
+            lp as *const f32,
+            bp as *const f32,
+            ip as *mut i32,
+            wp as *mut f32,
+            n_tokens as i32,
+            num_experts as i32,
+            k as i32,
+            mode,
+            softcap,
+            0,
+            1.0,
+        )
+    };
+    anyhow::ensure!(rc == 0, "device moe_route_topk rc={rc}");
+    Ok(Tensor::from_storage(
+        candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(ids, dev)),
+        (n_tokens, k),
+        candle_core::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn route_topk_device_then_copy_compact_for_prefill_dispatch(
+    router_logits: &Tensor,
+    selection_bias: Option<&Tensor>,
+    n_tokens: usize,
+    num_experts: usize,
+    k: usize,
+    mode: i32,
+    softcap: f32,
+    norm_topk: bool,
+    routed_scaling: f32,
+    device: &Device,
+) -> Result<(Vec<u32>, Vec<f32>)> {
+    let routed = route_topk_device(
+        router_logits,
+        selection_bias,
+        n_tokens,
+        num_experts,
+        k,
+        mode,
+        softcap,
+        norm_topk,
+        routed_scaling,
+        device,
+    )?;
+
+    #[allow(deprecated)]
+    let ids_host: Vec<i32> = routed.stream.memcpy_dtov(&routed.ids)?;
+    #[allow(deprecated)]
+    let weights_host: Vec<f32> = routed.stream.memcpy_dtov(&routed.weights)?;
+    anyhow::ensure!(
+        ids_host
+            .iter()
+            .all(|&e| e >= 0 && (e as usize) < num_experts),
+        "device prefill router returned an invalid expert ID"
+    );
+    anyhow::ensure!(
+        weights_host.iter().all(|w| w.is_finite()),
+        "device prefill router returned a non-finite weight"
+    );
+    Ok((
+        ids_host.into_iter().map(|e| e as u32).collect(),
+        weights_host,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn route_topk_and_plan_padded_on_device_for_prefill_dispatch(
+    router_logits: &Tensor,
+    selection_bias: Option<&Tensor>,
+    n_tokens: usize,
+    num_experts: usize,
+    k: usize,
+    mode: i32,
+    softcap: f32,
+    norm_topk: bool,
+    routed_scaling: f32,
+    device: &Device,
+) -> Result<PrefillDeviceRouting> {
+    let routed = route_topk_device(
+        router_logits,
+        selection_bias,
+        n_tokens,
+        num_experts,
+        k,
+        mode,
+        softcap,
+        norm_topk,
+        routed_scaling,
+        device,
+    )?;
+    let total = n_tokens
+        .checked_mul(k)
+        .context("prefill dispatch route count overflow")?;
+    let padding = num_experts
+        .checked_mul(MIN_TILE - 1)
+        .context("prefill dispatch padding overflow")?;
+    let padded_capacity = total
+        .checked_add(padding)
+        .context("prefill dispatch capacity overflow")?;
+    anyhow::ensure!(
+        padded_capacity <= i32::MAX as usize,
+        "prefill dispatch capacity {padded_capacity} exceeds i32"
+    );
+
+    let mut src_idx = routed.stream.alloc_zeros::<i32>(padded_capacity)?;
+    let mut expert_offsets = routed.stream.alloc_zeros::<i32>(num_experts + 2)?;
+    let mut inv_perm = routed.stream.alloc_zeros::<i32>(total)?;
+    let mut scratch_counts = routed.stream.alloc_zeros::<i32>(num_experts)?;
+    {
+        let (ids_ptr, _g1) = routed.ids.device_ptr(&routed.stream);
+        let (weights_ptr, _g2) = routed.weights.device_ptr(&routed.stream);
+        let (src_ptr, _g3) = src_idx.device_ptr_mut(&routed.stream);
+        let (off_ptr, _g4) = expert_offsets.device_ptr_mut(&routed.stream);
+        let (inv_ptr, _g5) = inv_perm.device_ptr_mut(&routed.stream);
+        let (count_ptr, _g6) = scratch_counts.device_ptr_mut(&routed.stream);
+        let rc = unsafe {
+            nv_kernels::cuda::moe_permute_padded(
+                routed.stream.cu_stream() as *mut c_void,
+                ids_ptr as *const i32,
+                weights_ptr as *const f32,
+                src_ptr as *mut i32,
+                off_ptr as *mut i32,
+                inv_ptr as *mut i32,
+                count_ptr as *mut i32,
+                n_tokens as i32,
+                k as i32,
+                num_experts as i32,
+                MIN_TILE as i32,
+                padded_capacity as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "prefill moe_permute_padded rc={rc}");
+    }
+
+    #[allow(deprecated)]
+    let offsets_host: Vec<i32> = routed.stream.memcpy_dtov(&expert_offsets)?;
+    anyhow::ensure!(
+        offsets_host.len() == num_experts + 2,
+        "prefill padded dispatch returned truncated validation metadata"
+    );
+    let status = offsets_host[num_experts + 1];
+    if status != 0 {
+        let mut issues = Vec::new();
+        if status & 1 != 0 {
+            issues.push("invalid expert ID");
+        }
+        if status & 2 != 0 {
+            issues.push("non-finite route weight");
+        }
+        if status & 4 != 0 {
+            issues.push("insufficient distinct route winners");
+        }
+        if status & 8 != 0 {
+            issues.push("padded dispatch capacity overflow");
+        }
+        anyhow::bail!(
+            "device prefill router rejected malformed routes (status={status}: {})",
+            issues.join(", ")
+        );
+    }
+    anyhow::ensure!(
+        offsets_host[0] == 0,
+        "prefill padded dispatch returned malformed expert offsets"
+    );
+    let mut active_experts = Vec::new();
+    for expert in 0..num_experts {
+        let start = offsets_host[expert];
+        let end = offsets_host[expert + 1];
+        anyhow::ensure!(
+            start >= 0 && end >= start && ((end - start) as usize).is_multiple_of(MIN_TILE),
+            "prefill padded dispatch returned invalid offsets for expert {expert}: {start}..{end}"
+        );
+        active_experts.extend(std::iter::repeat_n(
+            expert,
+            (end - start) as usize / MIN_TILE,
+        ));
+    }
+    let m_total_padded = offsets_host[num_experts] as usize;
+    anyhow::ensure!(
+        m_total_padded <= padded_capacity,
+        "prefill padded dispatch used {m_total_padded} rows beyond capacity {padded_capacity}"
+    );
+    anyhow::ensure!(
+        active_experts.len() * MIN_TILE == m_total_padded,
+        "prefill padded dispatch tile accounting mismatch"
+    );
+
+    Ok(PrefillDeviceRouting {
+        stream: routed.stream,
+        _topk_ids: routed.ids,
+        topk_weights: routed.weights,
+        src_idx,
+        inv_perm,
+        active_experts,
+        m_total_padded,
+    })
+}
+
 pub fn forward_grouped(
     w: &MoeGroupedWeights,
     experts_concat: &MoeGroupedWeights,
@@ -514,32 +1060,19 @@ pub fn forward_grouped(
         _ => anyhow::bail!("grouped MoE requires CUDA device"),
     };
     let stream = dev.cuda_stream();
-    let hidden = w.hidden_size;
-    let inter = w.intermediate_size;
 
     let plan = plan_routing(topk_ids, n_tokens, k, w.num_experts);
     anyhow::ensure!(
         !plan.overflow,
         "forward_grouped: an expert received more than {MIN_TILE} rows -- caller must split the token range"
     );
-    let a = plan.active_experts.len();
-    if a == 0 {
-        return Ok(Tensor::zeros((n_tokens, hidden), DType::F32, device)?);
+    if plan.active_experts.is_empty() {
+        return Ok(Tensor::zeros(
+            (n_tokens, w.hidden_size),
+            DType::F32,
+            device,
+        )?);
     }
-    let m_total = plan.m_total_padded;
-
-    let active_ids_i32: Vec<i32> = plan.active_experts.iter().map(|&e| e as i32).collect();
-
-    let mut input_gu_mini = vec![0f32; a];
-    let mut input_dn_mini = vec![0f32; a];
-    for (i, &e) in plan.active_experts.iter().enumerate() {
-        input_gu_mini[i] = w.input_globals_gate_up_host[e];
-        input_dn_mini[i] = w.input_globals_down_host[e];
-    }
-    #[allow(deprecated)]
-    let input_gu_dev = stream.memcpy_stod(&input_gu_mini)?;
-    #[allow(deprecated)]
-    let input_dn_dev = stream.memcpy_stod(&input_dn_mini)?;
 
     #[allow(deprecated)]
     let src_idx_dev = stream.memcpy_stod(&plan.src_idx)?;
@@ -547,6 +1080,101 @@ pub fn forward_grouped(
     let inv_perm_dev = stream.memcpy_stod(&plan.inv_perm)?;
     #[allow(deprecated)]
     let topk_weights_dev = stream.memcpy_stod(topk_weights)?;
+
+    let out = forward_grouped_from_device_buffers(
+        w,
+        x_flat,
+        n_tokens,
+        k,
+        device,
+        &stream,
+        &plan.active_experts,
+        plan.m_total_padded,
+        &src_idx_dev,
+        &inv_perm_dev,
+        &topk_weights_dev,
+        MAX_A_PER_GROUPED_CALL,
+    )?;
+    let _ = plan.real_m_per_active;
+    Ok(out)
+}
+
+pub fn forward_grouped_device_routing(
+    w: &MoeGroupedWeights,
+    experts_concat: &MoeGroupedWeights,
+    x_flat: &Tensor,
+    routing: &PrefillDeviceRouting,
+    n_tokens: usize,
+    k: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    let _ = experts_concat;
+    anyhow::ensure!(
+        routing.topk_weights.len() == n_tokens * k && routing.inv_perm.len() == n_tokens * k,
+        "device prefill routing shape mismatch"
+    );
+    if routing.active_experts.is_empty() {
+        return Ok(Tensor::zeros(
+            (n_tokens, w.hidden_size),
+            DType::F32,
+            device,
+        )?);
+    }
+    forward_grouped_from_device_buffers(
+        w,
+        x_flat,
+        n_tokens,
+        k,
+        device,
+        &routing.stream,
+        &routing.active_experts,
+        routing.m_total_padded,
+        &routing.src_idx,
+        &routing.inv_perm,
+        &routing.topk_weights,
+        prefill_tiles_per_grouped_call_default_256_user_signoff_20260912_bitwise_unset_is_256_and_8_restores_the_old_launch_width()?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_grouped_from_device_buffers(
+    w: &MoeGroupedWeights,
+    x_flat: &Tensor,
+    n_tokens: usize,
+    k: usize,
+    device: &Device,
+    stream: &Arc<CudaStream>,
+    active_experts: &[usize],
+    m_total: usize,
+    src_idx_dev: &CudaSlice<i32>,
+    inv_perm_dev: &CudaSlice<i32>,
+    topk_weights_dev: &CudaSlice<f32>,
+    max_a_per_grouped_call: usize,
+) -> Result<Tensor> {
+    let dev = match device {
+        Device::Cuda(d) => d.clone(),
+        _ => anyhow::bail!("grouped MoE requires CUDA device"),
+    };
+    let hidden = w.hidden_size;
+    let inter = w.intermediate_size;
+    let a = active_experts.len();
+    anyhow::ensure!(
+        a > 0 && m_total == a * MIN_TILE,
+        "grouped MoE device plan has {a} tiles and {m_total} padded rows"
+    );
+
+    let active_ids_i32: Vec<i32> = active_experts.iter().map(|&e| e as i32).collect();
+    let mut input_gu_mini = vec![0f32; a];
+    let mut input_dn_mini = vec![0f32; a];
+    for (i, &e) in active_experts.iter().enumerate() {
+        anyhow::ensure!(e < w.num_experts, "device dispatch expert {e} out of range");
+        input_gu_mini[i] = w.input_globals_gate_up_host[e];
+        input_dn_mini[i] = w.input_globals_down_host[e];
+    }
+    #[allow(deprecated)]
+    let input_gu_dev = stream.memcpy_stod(&input_gu_mini)?;
+    #[allow(deprecated)]
+    let input_dn_dev = stream.memcpy_stod(&input_dn_mini)?;
 
     let x_flat_bf = x_flat.to_dtype(DType::BF16)?.contiguous()?;
     let mut x_sorted: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m_total * hidden)? };
@@ -557,10 +1185,10 @@ pub fn forward_grouped(
             _ => anyhow::bail!("x_flat must be CUDA"),
         };
         let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
-        let (xp, _g1) = x_slice.device_ptr(&stream);
+        let (xp, _g1) = x_slice.device_ptr(stream);
         let xp = xp + (xl.start_offset() * std::mem::size_of::<bf16>()) as u64;
-        let (sp, _g2) = src_idx_dev.device_ptr(&stream);
-        let (op, _g3) = x_sorted.device_ptr_mut(&stream);
+        let (sp, _g2) = src_idx_dev.device_ptr(stream);
+        let (op, _g3) = x_sorted.device_ptr_mut(stream);
         let rc = unsafe {
             nv_kernels::cuda::gather_rows_bf16(
                 stream.cu_stream() as *mut c_void,
@@ -580,10 +1208,10 @@ pub fn forward_grouped(
     let mut x_fp4: CudaSlice<u8> = unsafe { stream.alloc::<u8>(x_fp4_bytes)? };
     let mut x_sf: CudaSlice<u8> = unsafe { stream.alloc::<u8>(x_sf_bytes)? };
     {
-        let (xp, _g1) = x_sorted.device_ptr(&stream);
-        let (fp, _g2) = x_fp4.device_ptr_mut(&stream);
-        let (sp, _g3) = x_sf.device_ptr_mut(&stream);
-        let (gp, _g4) = input_gu_dev.device_ptr(&stream);
+        let (xp, _g1) = x_sorted.device_ptr(stream);
+        let (fp, _g2) = x_fp4.device_ptr_mut(stream);
+        let (sp, _g3) = x_sf.device_ptr_mut(stream);
+        let (gp, _g4) = input_gu_dev.device_ptr(stream);
         let rc = unsafe {
             nv_kernels::cuda::quantize_nvfp4_bf16_per_expert(
                 stream.cu_stream() as *mut c_void,
@@ -604,7 +1232,7 @@ pub fn forward_grouped(
 
     let mut y_gate: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m_total * inter)? };
     grouped_gemm_chunked(
-        &stream,
+        stream,
         &x_fp4,
         &x_sf,
         &w.gate_w,
@@ -619,11 +1247,12 @@ pub fn forward_grouped(
         w.gate_c_stride_elems,
         &mut meta_scratch,
         &mut gemm_ws,
+        max_a_per_grouped_call,
     )?;
 
     let mut y_up: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m_total * inter)? };
     grouped_gemm_chunked(
-        &stream,
+        stream,
         &x_fp4,
         &x_sf,
         &w.up_w,
@@ -638,6 +1267,7 @@ pub fn forward_grouped(
         w.gate_c_stride_elems,
         &mut meta_scratch,
         &mut gemm_ws,
+        max_a_per_grouped_call,
     )?;
 
     let y_act_fp4_bytes = m_total * inter / 2;
@@ -645,11 +1275,11 @@ pub fn forward_grouped(
     let mut y_act_fp4: CudaSlice<u8> = unsafe { stream.alloc::<u8>(y_act_fp4_bytes)? };
     let mut y_act_sf: CudaSlice<u8> = unsafe { stream.alloc::<u8>(y_act_sf_bytes)? };
     {
-        let (gp_ptr, _g1) = y_gate.device_ptr(&stream);
-        let (up_ptr, _g2) = y_up.device_ptr(&stream);
-        let (fp, _g3) = y_act_fp4.device_ptr_mut(&stream);
-        let (sp, _g4) = y_act_sf.device_ptr_mut(&stream);
-        let (gl, _g5) = input_dn_dev.device_ptr(&stream);
+        let (gp_ptr, _g1) = y_gate.device_ptr(stream);
+        let (up_ptr, _g2) = y_up.device_ptr(stream);
+        let (fp, _g3) = y_act_fp4.device_ptr_mut(stream);
+        let (sp, _g4) = y_act_sf.device_ptr_mut(stream);
+        let (gl, _g5) = input_dn_dev.device_ptr(stream);
         let rc = unsafe {
             nv_kernels::cuda::silu_mul_quantize_nvfp4_bf16_per_expert(
                 stream.cu_stream() as *mut c_void,
@@ -668,7 +1298,7 @@ pub fn forward_grouped(
 
     let mut y_down: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m_total * hidden)? };
     grouped_gemm_chunked(
-        &stream,
+        stream,
         &y_act_fp4,
         &y_act_sf,
         &w.down_w,
@@ -683,14 +1313,15 @@ pub fn forward_grouped(
         w.down_c_stride_elems,
         &mut meta_scratch,
         &mut gemm_ws,
+        max_a_per_grouped_call,
     )?;
 
     let mut y_acc: CudaSlice<f32> = unsafe { stream.alloc::<f32>(n_tokens * hidden)? };
     {
-        let (yp, _g1) = y_down.device_ptr(&stream);
-        let (wp, _g2) = topk_weights_dev.device_ptr(&stream);
-        let (ip, _g3) = inv_perm_dev.device_ptr(&stream);
-        let (ap, _g4) = y_acc.device_ptr_mut(&stream);
+        let (yp, _g1) = y_down.device_ptr(stream);
+        let (wp, _g2) = topk_weights_dev.device_ptr(stream);
+        let (ip, _g3) = inv_perm_dev.device_ptr(stream);
+        let (ap, _g4) = y_acc.device_ptr_mut(stream);
         let rc = unsafe {
             nv_kernels::cuda::moe_unpermute_scatter(
                 stream.cu_stream() as *mut c_void,
@@ -707,8 +1338,6 @@ pub fn forward_grouped(
         anyhow::ensure!(rc == 0, "moe_unpermute_scatter rc={rc}");
     }
 
-    let _ = (plan.real_m_per_active,);
-
     let storage = candle_core::CudaStorage::wrap_cuda_slice(y_acc, dev);
     let out = candle_core::Tensor::from_storage(
         candle_core::Storage::Cuda(storage),
@@ -719,7 +1348,32 @@ pub fn forward_grouped(
     Ok(out)
 }
 
+pub struct MarlinMoeScratch {
+    sorted_ids: CudaSlice<i32>,
+    expert_ids: CudaSlice<i32>,
+    padded: CudaSlice<i32>,
+    gate_rows: CudaSlice<bf16>,
+    up_rows: CudaSlice<bf16>,
+    act_rows: CudaSlice<bf16>,
+    down_rows: CudaSlice<bf16>,
+    c_tmp: CudaSlice<f32>,
+    workspace: CudaSlice<i32>,
+    rows: usize,
+}
+
+const MARLIN_MOE_ROUTE_MIN_ROWS_3_BELOW_WHICH_THE_FUSED_GEMV_DECODE_PATH_IS_FASTER: usize = 3;
+
+fn marlin_moe_route_opt_in_again_since_20260913_peta31_measured_dflash_acceptance_halved_at_168k_prose_because_verify_rows_diverge_from_decode_rows(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_MOE_MARLIN")
+}
+
+fn marlin_moe_route_opt_in() -> bool {
+    marlin_moe_route_opt_in_again_since_20260913_peta31_measured_dflash_acceptance_halved_at_168k_prose_because_verify_rows_diverge_from_decode_rows()
+}
+
 pub struct GroupedDecodeContext {
+    marlin_scratch_built_once_per_context: Option<MarlinMoeScratch>,
     k: usize,
     tiles_per_token: usize,
     n_tokens: usize,
@@ -754,6 +1408,9 @@ pub struct GroupedDecodeContext {
     pub resid_in: CudaSlice<bf16>,
     pub ffn_bf16: CudaSlice<bf16>,
     pub out_bf16: CudaSlice<bf16>,
+    last_route_fused: bool,
+    last_chain_slim: bool,
+    last_chain_marlin: bool,
 }
 
 struct DecodeChunkMeta {
@@ -885,8 +1542,7 @@ impl GroupedDecodeContext {
         let gemm_ws2 = unsafe { stream.alloc::<u8>(16 * 1024 * 1024)? };
         let x_in = stream.alloc_zeros::<bf16>(n_tokens * hidden)?;
         let logits_f32 = stream.alloc_zeros::<f32>(n_tokens * num_experts)?;
-        let sg_logits_bf16_written_by_the_router_gemv_arm =
-            stream.alloc_zeros::<bf16>(n_tokens)?;
+        let sg_logits_bf16_written_by_the_router_gemv_arm = stream.alloc_zeros::<bf16>(n_tokens)?;
         let y_acc = stream.alloc_zeros::<f32>(n_tokens * hidden)?;
         let shared_f32 = stream.alloc_zeros::<f32>(n_tokens * hidden)?;
         let out_f32 = stream.alloc_zeros::<f32>(n_tokens * hidden)?;
@@ -926,9 +1582,13 @@ impl GroupedDecodeContext {
             y_acc,
             shared_f32,
             out_f32,
+            marlin_scratch_built_once_per_context: None,
             resid_in,
             ffn_bf16,
             out_bf16,
+            last_route_fused: false,
+            last_chain_slim: false,
+            last_chain_marlin: false,
         })
     }
 
@@ -952,8 +1612,80 @@ impl GroupedDecodeContext {
         self.tiles_per_token > self.k
     }
 
+    fn marlin_scratch(&mut self, stream: &Arc<CudaStream>) -> Result<&mut MarlinMoeScratch> {
+        if self.marlin_scratch_built_once_per_context.is_none() {
+            let rows = self.n_tokens * self.tiles_per_token;
+            let mut ws_ints = 0i32;
+            let rc =
+                unsafe { nv_kernels::cuda::marlin_moe_workspace_ints(&mut ws_ints as *mut i32) };
+            anyhow::ensure!(rc == 0 && ws_ints > 0, "marlin moe workspace ints rc={rc}");
+            let mut c_tmp_floats = 0i64;
+            let rc = unsafe {
+                nv_kernels::cuda::marlin_moe_nvfp4_c_tmp_floats(&mut c_tmp_floats as *mut i64)
+            };
+            anyhow::ensure!(
+                rc == 0 && c_tmp_floats > 0,
+                "marlin moe c_tmp floats rc={rc}"
+            );
+            self.marlin_scratch_built_once_per_context = Some(MarlinMoeScratch {
+                sorted_ids: stream.alloc_zeros::<i32>(rows * 8)?,
+                expert_ids: stream.alloc_zeros::<i32>(rows)?,
+                padded: stream.alloc_zeros::<i32>(1)?,
+                gate_rows: stream.alloc_zeros::<bf16>(rows * 2 * self.inter)?,
+                up_rows: stream.alloc_zeros::<bf16>(rows * self.inter)?,
+                act_rows: stream.alloc_zeros::<bf16>(rows * self.inter)?,
+                down_rows: stream.alloc_zeros::<bf16>(rows * self.hidden)?,
+                c_tmp: stream.alloc_zeros::<f32>(c_tmp_floats as usize)?,
+                workspace: stream.alloc_zeros::<i32>(ws_ints as usize)?,
+                rows,
+            });
+        }
+        Ok(self.marlin_scratch_built_once_per_context.as_mut().unwrap())
+    }
+
+    pub fn last_route_was_marlin(&self) -> bool {
+        self.last_chain_marlin
+    }
+
     pub fn top_k(&self) -> usize {
         self.k
+    }
+
+    pub fn last_call_used_fused_small_m_route_and_chain(&self) -> bool {
+        self.last_route_fused && self.last_chain_slim
+    }
+
+    pub fn copy_scattered_f32_into_owned_tensor(
+        &self,
+        device: &Device,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Tensor> {
+        let dev = match device {
+            Device::Cuda(dev) => dev.clone(),
+            _ => anyhow::bail!("grouped routed output copy requires CUDA device"),
+        };
+        let elems = self.n_tokens * self.hidden;
+        let mut owned: CudaSlice<f32> = unsafe { stream.alloc(elems)? };
+        {
+            let (src, _src_guard) = self.y_acc.device_ptr(stream);
+            let (dst, _dst_guard) = owned.device_ptr_mut(stream);
+            unsafe {
+                cudarc::driver::result::memcpy_dtod_async(
+                    dst,
+                    src,
+                    elems * std::mem::size_of::<f32>(),
+                    stream.cu_stream(),
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("grouped routed output copy dtod: {e:?}"))?;
+        }
+        let storage = candle_core::CudaStorage::wrap_cuda_slice(owned, dev);
+        Ok(Tensor::from_storage(
+            candle_core::Storage::Cuda(storage),
+            (self.n_tokens, self.hidden),
+            candle_core::op::BackpropOp::none(),
+            false,
+        ))
     }
 
     pub fn cast_router_logits_bf16_into_logits_f32_softcap_applied_at_route_not_here(
@@ -1484,6 +2216,7 @@ pub fn forward_grouped_decode_into(
     let fuse_route = n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
         && route_fuse_enabled()
         && e <= ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_256_EXPERTS;
+    ctx.last_route_fused = fuse_route;
     if fuse_route {
         let shared_tail_id: i32 = if ctx.folds_shared() { e as i32 } else { -1 };
         let (lp, _g1) = ctx.logits_f32.device_ptr(&stream);
@@ -1531,118 +2264,139 @@ pub fn forward_grouped_decode_into(
         prof_mark(0, &stream)?;
         prof_mark(1, &stream)?;
     } else {
-    {
-        let (lp, _g1) = ctx.logits_f32.device_ptr(&stream);
-        let folds = ctx.folds_shared();
-        let (ip, _g2) = ctx.topk_ids.device_ptr_mut(&stream);
-        let (wp, _g3) = ctx.topk_weights.device_ptr_mut(&stream);
-        let rc = if folds {
-            unsafe {
-                nv_kernels::cuda::moe_route_topk_shared_tail(
+        {
+            let (lp, _g1) = ctx.logits_f32.device_ptr(&stream);
+            let folds = ctx.folds_shared();
+            let (ip, _g2) = ctx.topk_ids.device_ptr_mut(&stream);
+            let (wp, _g3) = ctx.topk_weights.device_ptr_mut(&stream);
+            let rc = if folds {
+                unsafe {
+                    nv_kernels::cuda::moe_route_topk_shared_tail(
+                        stream.cu_stream() as *mut c_void,
+                        lp as *const f32,
+                        bias_ptr as *const f32,
+                        ip as *mut i32,
+                        wp as *mut f32,
+                        n_tokens as i32,
+                        e as i32,
+                        k as i32,
+                        mode,
+                        softcap,
+                        norm_topk as i32,
+                        routed_scaling,
+                        e as i32,
+                    )
+                }
+            } else {
+                unsafe {
+                    nv_kernels::cuda::moe_route_topk(
+                        stream.cu_stream() as *mut c_void,
+                        lp as *const f32,
+                        bias_ptr as *const f32,
+                        ip as *mut i32,
+                        wp as *mut f32,
+                        n_tokens as i32,
+                        e as i32,
+                        k as i32,
+                        mode,
+                        softcap,
+                        norm_topk as i32,
+                        routed_scaling,
+                    )
+                }
+            };
+            anyhow::ensure!(rc == 0, "moe_route_topk rc={rc}");
+        }
+        prof_mark(0, &stream)?;
+
+        for (globals, mini) in [
+            (&w.input_globals_gate_up, &mut ctx.input_gu_mini),
+            (&w.input_globals_down, &mut ctx.input_dn_mini),
+        ] {
+            let (sp, _g1) = globals.device_ptr(&stream);
+            let (ip, _g2) = ctx.topk_ids.device_ptr(&stream);
+            let (dp, _g3) = mini.device_ptr_mut(&stream);
+            let rc = unsafe {
+                nv_kernels::cuda::gather_f32_by_ids(
                     stream.cu_stream() as *mut c_void,
-                    lp as *const f32,
-                    bias_ptr as *const f32,
-                    ip as *mut i32,
-                    wp as *mut f32,
-                    n_tokens as i32,
-                    e as i32,
-                    k as i32,
-                    mode,
-                    softcap,
-                    norm_topk as i32,
-                    routed_scaling,
-                    e as i32,
+                    sp as *const f32,
+                    ip as *const i32,
+                    dp as *mut f32,
+                    tiles as i32,
                 )
-            }
-        } else {
-            unsafe {
-                nv_kernels::cuda::moe_route_topk(
+            };
+            anyhow::ensure!(rc == 0, "gather_f32_by_ids rc={rc}");
+        }
+
+        {
+            let (xp, _g1) = ctx.x_in.device_ptr(&stream);
+            let (sp, _g2) = ctx.src_idx.device_ptr(&stream);
+            let (op, _g3) = ctx.x_sorted.device_ptr_mut(&stream);
+            let rc = unsafe {
+                nv_kernels::cuda::gather_rows_bf16_strided(
                     stream.cu_stream() as *mut c_void,
-                    lp as *const f32,
-                    bias_ptr as *const f32,
-                    ip as *mut i32,
-                    wp as *mut f32,
+                    xp as *const u16,
+                    sp as *const i32,
+                    op as *mut u16,
+                    m_total as i32,
+                    hidden as i32,
                     n_tokens as i32,
-                    e as i32,
-                    k as i32,
-                    mode,
-                    softcap,
-                    norm_topk as i32,
-                    routed_scaling,
+                    MIN_TILE as i32,
                 )
-            }
-        };
-        anyhow::ensure!(rc == 0, "moe_route_topk rc={rc}");
-    }
-    prof_mark(0, &stream)?;
+            };
+            anyhow::ensure!(rc == 0, "gather_rows_bf16_strided rc={rc}");
+        }
 
-    for (globals, mini) in [
-        (&w.input_globals_gate_up, &mut ctx.input_gu_mini),
-        (&w.input_globals_down, &mut ctx.input_dn_mini),
-    ] {
-        let (sp, _g1) = globals.device_ptr(&stream);
-        let (ip, _g2) = ctx.topk_ids.device_ptr(&stream);
-        let (dp, _g3) = mini.device_ptr_mut(&stream);
-        let rc = unsafe {
-            nv_kernels::cuda::gather_f32_by_ids(
-                stream.cu_stream() as *mut c_void,
-                sp as *const f32,
-                ip as *const i32,
-                dp as *mut f32,
-                tiles as i32,
-            )
-        };
-        anyhow::ensure!(rc == 0, "gather_f32_by_ids rc={rc}");
+        {
+            let (xp, _g1) = ctx.x_sorted.device_ptr(&stream);
+            let (fp, _g2) = ctx.x_fp4.device_ptr_mut(&stream);
+            let (sp, _g3) = ctx.x_sf.device_ptr_mut(&stream);
+            let (gp, _g4) = ctx.input_gu_mini.device_ptr(&stream);
+            let rc = unsafe {
+                nv_kernels::cuda::quantize_nvfp4_bf16_per_expert_strided(
+                    stream.cu_stream() as *mut c_void,
+                    xp as *const u16,
+                    fp as *mut u8,
+                    sp as *mut u8,
+                    gp as *const f32,
+                    MIN_TILE as i32,
+                    m_total as i32,
+                    hidden as i32,
+                )
+            };
+            anyhow::ensure!(
+                rc == 0,
+                "quantize_nvfp4_bf16_per_expert_strided (x) rc={rc}"
+            );
+        }
+        prof_mark(1, &stream)?;
     }
 
+    ctx.last_chain_marlin = false;
+    if n_tokens >= MARLIN_MOE_ROUTE_MIN_ROWS_3_BELOW_WHICH_THE_FUSED_GEMV_DECODE_PATH_IS_FASTER
+        && marlin_moe_route_opt_in()
     {
-        let (xp, _g1) = ctx.x_in.device_ptr(&stream);
-        let (sp, _g2) = ctx.src_idx.device_ptr(&stream);
-        let (op, _g3) = ctx.x_sorted.device_ptr_mut(&stream);
-        let rc = unsafe {
-            nv_kernels::cuda::gather_rows_bf16_strided(
-                stream.cu_stream() as *mut c_void,
-                xp as *const u16,
-                sp as *const i32,
-                op as *mut u16,
-                m_total as i32,
-                hidden as i32,
-                n_tokens as i32,
-                MIN_TILE as i32,
-            )
-        };
-        anyhow::ensure!(rc == 0, "gather_rows_bf16_strided rc={rc}");
+        if let Some(tw) = w.marlin_moe_twin(&stream) {
+            forward_grouped_decode_marlin_moe(
+                w,
+                ctx,
+                &tw,
+                hidden,
+                inter,
+                n_tokens,
+                run_scatter,
+                &stream,
+                &prof_mark,
+            )?;
+            ctx.last_chain_marlin = true;
+            return Ok(());
+        }
     }
-
-    {
-        let (xp, _g1) = ctx.x_sorted.device_ptr(&stream);
-        let (fp, _g2) = ctx.x_fp4.device_ptr_mut(&stream);
-        let (sp, _g3) = ctx.x_sf.device_ptr_mut(&stream);
-        let (gp, _g4) = ctx.input_gu_mini.device_ptr(&stream);
-        let rc = unsafe {
-            nv_kernels::cuda::quantize_nvfp4_bf16_per_expert_strided(
-                stream.cu_stream() as *mut c_void,
-                xp as *const u16,
-                fp as *mut u8,
-                sp as *mut u8,
-                gp as *const f32,
-                MIN_TILE as i32,
-                m_total as i32,
-                hidden as i32,
-            )
-        };
-        anyhow::ensure!(
-            rc == 0,
-            "quantize_nvfp4_bf16_per_expert_strided (x) rc={rc}"
-        );
-    }
-    prof_mark(1, &stream)?;
-    }
-
     let slim = use_decode_gemv()
         && chain_slim_launches_enabled()
         && n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
         && ctx.chunk_meta.len() == 1;
+    ctx.last_chain_slim = slim;
     if slim {
         let experts_total_gu = w.gate_w.len() * 2 / (inter * hidden);
         anyhow::ensure!(
@@ -1683,7 +2437,10 @@ pub fn forward_grouped_decode_into(
                 MIN_TILE as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe_grouped_fp4_gemv_gate_up_silu_quant_small_m rc={rc}");
+        anyhow::ensure!(
+            rc == 0,
+            "moe_grouped_fp4_gemv_gate_up_silu_quant_small_m rc={rc}"
+        );
         prof_mark(2, &stream)?;
         prof_mark(3, &stream)?;
     } else if let Some(s2) = aux_stream {
@@ -1848,13 +2605,225 @@ pub fn forward_grouped_decode_into(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn forward_grouped_decode_marlin_moe(
+    w: &MoeGroupedWeights,
+    ctx: &mut GroupedDecodeContext,
+    tw: &MarlinMoeTwin,
+    hidden: usize,
+    inter: usize,
+    n_tokens: usize,
+    run_scatter: bool,
+    stream: &Arc<CudaStream>,
+    prof_mark: &dyn Fn(usize, &Arc<CudaStream>) -> Result<()>,
+) -> Result<()> {
+    let slots = ctx.tiles_per_token;
+    let rows = n_tokens * slots;
+    anyhow::ensure!(
+        tw.hidden == hidden && tw.inter == inter,
+        "marlin moe twin shape mismatch"
+    );
+    let experts_total = tw.experts_total;
+    anyhow::ensure!(
+        experts_total >= w.num_experts + usize::from(ctx.folds_shared()),
+        "marlin moe twin has {experts_total} experts, route needs at least {}",
+        w.num_experts + usize::from(ctx.folds_shared())
+    );
+    ctx.marlin_scratch(stream)?;
+    let mut sc = ctx
+        .marlin_scratch_built_once_per_context
+        .take()
+        .expect("marlin scratch built above");
+    let result = forward_grouped_decode_marlin_moe_launches(
+        ctx,
+        tw,
+        &mut sc,
+        hidden,
+        inter,
+        n_tokens,
+        rows,
+        experts_total,
+        run_scatter,
+        stream,
+        prof_mark,
+    );
+    ctx.marlin_scratch_built_once_per_context = Some(sc);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_grouped_decode_marlin_moe_launches(
+    ctx: &mut GroupedDecodeContext,
+    tw: &MarlinMoeTwin,
+    sc: &mut MarlinMoeScratch,
+    hidden: usize,
+    inter: usize,
+    n_tokens: usize,
+    rows: usize,
+    experts_total: usize,
+    run_scatter: bool,
+    stream: &Arc<CudaStream>,
+    prof_mark: &dyn Fn(usize, &Arc<CudaStream>) -> Result<()>,
+) -> Result<()> {
+    let slots = ctx.tiles_per_token;
+    anyhow::ensure!(sc.rows == rows, "marlin scratch rows {} != {rows}", sc.rows);
+    let c_tmp_floats = sc.c_tmp.len() as i64;
+    let (xin, _gx) = ctx.x_in.device_ptr(stream);
+    let (ids, _gi) = ctx.topk_ids.device_ptr(stream);
+    let (tkw, _gw) = ctx.topk_weights.device_ptr(stream);
+    let (ivp, _gp) = ctx.inv_perm.device_ptr(stream);
+    let (yacc, _ga) = ctx.y_acc.device_ptr_mut(stream);
+    let (ydown, _gd) = ctx.y_down.device_ptr_mut(stream);
+    let (so, _g1) = sc.sorted_ids.device_ptr_mut(stream);
+    let (ex, _g2) = sc.expert_ids.device_ptr_mut(stream);
+    let (pd, _g3) = sc.padded.device_ptr_mut(stream);
+    let rc = unsafe {
+        nv_kernels::cuda::marlin_moe_align_block8_small(
+            stream.cu_stream() as *mut c_void,
+            ids as *const i32,
+            rows as i32,
+            experts_total as i32,
+            so as *mut i32,
+            ex as *mut i32,
+            pd as *mut i32,
+        )
+    };
+    anyhow::ensure!(rc == 0, "marlin moe align rc={rc}");
+    prof_mark(1, stream)?;
+    let (ct, _g4) = sc.c_tmp.device_ptr_mut(stream);
+    let (ws, _g5) = sc.workspace.device_ptr_mut(stream);
+    let gemm = |st: &MarlinMoeStack,
+                a: u64,
+                c: u64,
+                size_m: usize,
+                top_k: usize,
+                mul: i32,
+                n: usize,
+                k: usize,
+                what: &str|
+     -> Result<()> {
+        let (pb, _h1) = st.b_q.device_ptr(stream);
+        let (ps, _h2) = st.scales.device_ptr(stream);
+        let (pg, _h3) = st.globals.device_ptr(stream);
+        let rc = unsafe {
+            nv_kernels::cuda::marlin_moe_nvfp4_w4a16(
+                stream.cu_stream() as *mut c_void,
+                a as *const c_void,
+                pb as *const c_void,
+                ps as *const c_void,
+                pg as *const f32,
+                c as *mut c_void,
+                ct as *mut c_void,
+                c_tmp_floats,
+                ws as *mut c_void,
+                so as *const i32,
+                ex as *const i32,
+                pd as *const i32,
+                tkw as *const f32,
+                experts_total as i32,
+                top_k as i32,
+                mul,
+                size_m as i32,
+                n as i32,
+                k as i32,
+            )
+        };
+        anyhow::ensure!(rc == 0, "marlin moe {what} rc={rc}");
+        Ok(())
+    };
+    let (gr, _g6) = sc.gate_rows.device_ptr_mut(stream);
+    let (ur, _g7) = sc.up_rows.device_ptr_mut(stream);
+    let (ar, _g8) = sc.act_rows.device_ptr_mut(stream);
+    let (dr, _g9) = sc.down_rows.device_ptr_mut(stream);
+    let rc = if let Some(cat) = tw
+        .gate_up_concat_when_every_expert_shares_one_global_scale
+        .as_ref()
+    {
+        gemm(
+            cat,
+            xin,
+            gr,
+            n_tokens,
+            slots,
+            0,
+            2 * inter,
+            hidden,
+            "gate_up",
+        )?;
+        prof_mark(2, stream)?;
+        unsafe {
+            nv_kernels::cuda::marlin_moe_silu_mul_halves(
+                stream.cu_stream() as *mut c_void,
+                gr as *const u16,
+                ar as *mut u16,
+                rows as i32,
+                inter as i32,
+            )
+        }
+    } else {
+        gemm(&tw.gate, xin, gr, n_tokens, slots, 0, inter, hidden, "gate")?;
+        gemm(&tw.up, xin, ur, n_tokens, slots, 0, inter, hidden, "up")?;
+        prof_mark(2, stream)?;
+        unsafe {
+            nv_kernels::cuda::silu_mul_bf16_candle(
+                stream.cu_stream() as *mut c_void,
+                gr as *const u16,
+                ur as *const u16,
+                ar as *mut u16,
+                rows * inter,
+            )
+        }
+    };
+    anyhow::ensure!(rc == 0, "marlin moe silu_mul rc={rc}");
+    prof_mark(3, stream)?;
+    gemm(
+        &tw.down,
+        ar,
+        dr,
+        rows,
+        1,
+        i32::from(run_scatter),
+        hidden,
+        inter,
+        "down",
+    )?;
+    prof_mark(4, stream)?;
+    let rc = if run_scatter {
+        unsafe {
+            nv_kernels::cuda::marlin_moe_sum_slots_into_f32(
+                stream.cu_stream() as *mut c_void,
+                dr as *const u16,
+                yacc as *mut f32,
+                n_tokens as i32,
+                slots as i32,
+                hidden as i32,
+            )
+        }
+    } else {
+        unsafe {
+            nv_kernels::cuda::marlin_moe_place_rows_by_inv_perm(
+                stream.cu_stream() as *mut c_void,
+                dr as *const u16,
+                ivp as *const i32,
+                ydown as *mut u16,
+                rows as i32,
+                hidden as i32,
+            )
+        }
+    };
+    anyhow::ensure!(
+        rc == 0,
+        "marlin moe tail placement rc={rc} run_scatter={run_scatter}"
+    );
+    prof_mark(5, stream)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum GemmShape {
     GateUp,
     Down,
 }
-
-#[allow(clippy::too_many_arguments)]
 
 const DECODE_TILE_CTA_THRESHOLD: usize = 96;
 
@@ -1930,7 +2899,7 @@ fn grouped_gemm_decode(
 
         if use_decode_gemv() {
             anyhow::ensure!(
-                group_k % 4 == 0,
+                group_k.is_multiple_of(4),
                 "decode GEMV requires K/16 divisible by 4 (K={k_dim})"
             );
             anyhow::ensure!(
@@ -2009,6 +2978,33 @@ fn grouped_gemm_decode(
 }
 
 const MAX_A_PER_GROUPED_CALL: usize = 8;
+const PREFILL_TILES_PER_GROUPED_CALL_MAX_1024_IS_THE_STARTS_KERNEL_BLOCK_DIM: usize = 1024;
+const PREFILL_TILES_PER_GROUPED_CALL_DEFAULT_256_ONE_LAUNCH_PER_GEMM_STAGE: usize = 256;
+
+fn prefill_tiles_per_grouped_call_default_256_user_signoff_20260912_bitwise_unset_is_256_and_8_restores_the_old_launch_width(
+) -> Result<usize> {
+    match std::env::var("NV_LAGUNA_PREFILL_GROUP") {
+        Ok(v) => {
+            let n: usize = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!("NV_LAGUNA_PREFILL_GROUP must be an integer tile count, got {v:?}")
+            })?;
+            anyhow::ensure!(
+                (1..=PREFILL_TILES_PER_GROUPED_CALL_MAX_1024_IS_THE_STARTS_KERNEL_BLOCK_DIM)
+                    .contains(&n),
+                "NV_LAGUNA_PREFILL_GROUP must be 1..=1024, got {n}"
+            );
+            Ok(n)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(
+            if nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_PREFILL_GROUP32") {
+                32
+            } else {
+                PREFILL_TILES_PER_GROUPED_CALL_DEFAULT_256_ONE_LAUNCH_PER_GEMM_STAGE
+            },
+        ),
+        Err(e) => Err(e).context("NV_LAGUNA_PREFILL_GROUP must be valid UTF-8"),
+    }
+}
 
 const MAX_TILES_PER_GROUPED_CALL: usize = 256;
 
@@ -2028,12 +3024,13 @@ fn grouped_gemm_chunked(
     c_row_stride_elems: i64,
     meta_scratch: &mut CudaSlice<u8>,
     gemm_ws: &mut CudaSlice<u8>,
+    max_a_per_grouped_call: usize,
 ) -> Result<()> {
     let total_a = active_ids_host.len();
     if total_a == 0 {
         return Ok(());
     }
-    let min_tile = MIN_TILE as usize;
+    let min_tile = MIN_TILE;
     let n_us = n as usize;
     let k_us = k as usize;
     let group_size = BLOCK_SIZE;
@@ -2052,9 +3049,9 @@ fn grouped_gemm_chunked(
     let (ms_ptr, _gm) = meta_scratch.device_ptr_mut(stream);
     let (ws_ptr, _gw) = gemm_ws.device_ptr_mut(stream);
 
-    for (chunk_idx, chunk) in active_ids_host.chunks(MAX_A_PER_GROUPED_CALL).enumerate() {
+    for (chunk_idx, chunk) in active_ids_host.chunks(max_a_per_grouped_call).enumerate() {
         let chunk_size = chunk.len();
-        let chunk_start_rows = chunk_idx * MAX_A_PER_GROUPED_CALL * min_tile;
+        let chunk_start_rows = chunk_idx * max_a_per_grouped_call * min_tile;
 
         let a_chunk_ptr = a_base + (chunk_start_rows * half_k) as u64;
 
@@ -2110,10 +3107,103 @@ fn grouped_gemm_chunked(
             .map_err(|rc| {
                 anyhow::anyhow!(
                     "chunked grouped FP4 GEMM rc={rc} (chunk {chunk_idx} of {})",
-                    (total_a + MAX_A_PER_GROUPED_CALL - 1) / MAX_A_PER_GROUPED_CALL
+                    total_a.div_ceil(max_a_per_grouped_call)
                 )
             })?
         };
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod prefill_device_routing_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA; directly proves copied routed F32 output remains owned after persistent scratch reuse"]
+    fn copied_scattered_f32_output_survives_context_scratch_overwrite() {
+        let device = Device::new_cuda(0).expect("CUDA");
+        let dev = match &device {
+            Device::Cuda(dev) => dev.clone(),
+            _ => unreachable!(),
+        };
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let mut ctx = GroupedDecodeContext::new_multi(128, 128, 1, 1, 2, &stream).unwrap();
+        let first: Vec<f32> = (0..256).map(|i| i as f32 * 0.25 - 7.0).collect();
+        stream.memcpy_htod(&first, &mut ctx.y_acc).unwrap();
+        let owned = ctx
+            .copy_scattered_f32_into_owned_tensor(&device, &stream)
+            .unwrap();
+        let second: Vec<f32> = (0..256).map(|i| 1000.0 - i as f32).collect();
+        stream.memcpy_htod(&second, &mut ctx.y_acc).unwrap();
+        stream.synchronize().unwrap();
+        let retained = owned.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(
+            retained.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            first.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "LAGUNA-B2-OWNED-OUTPUT-GATE copied_y_acc=bitwise retained_after_scratch_overwrite=bitwise"
+        );
+    }
+
+    #[test]
+    fn malformed_gpu_router_rows_fail_safely_and_recover_same_context() {
+        let device = Device::new_cuda(0).expect("CUDA");
+        let num_experts = 8usize;
+        let k = 4usize;
+
+        let route = |values: Vec<f32>, routed_scaling: f32| {
+            let logits = Tensor::from_vec(values, (1, num_experts), &device).unwrap();
+            route_topk_and_plan_padded_on_device_for_prefill_dispatch(
+                &logits,
+                None,
+                1,
+                num_experts,
+                k,
+                1,
+                0.0,
+                true,
+                routed_scaling,
+                &device,
+            )
+        };
+        let valid_logits = || (0..num_experts).map(|i| i as f32 - 4.0).collect();
+
+        let invalid_cases = [
+            ("all_nonfinite_winners", vec![f32::NAN; num_experts], 1.0),
+            (
+                "insufficient_finite_winners",
+                vec![
+                    0.0,
+                    f32::NAN,
+                    f32::NAN,
+                    f32::NAN,
+                    f32::NAN,
+                    f32::NAN,
+                    f32::NAN,
+                    f32::NAN,
+                ],
+                1.0,
+            ),
+            ("nonfinite_route_weights", valid_logits(), f32::INFINITY),
+        ];
+
+        for (name, logits, scaling) in invalid_cases {
+            let err = route(logits, scaling)
+                .err()
+                .unwrap_or_else(|| panic!("{name} unexpectedly produced a dispatch plan"));
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("device prefill router rejected malformed routes"),
+                "{name} returned the wrong error: {message}"
+            );
+
+            let recovery = route(valid_logits(), 1.0)
+                .unwrap_or_else(|e| panic!("valid route after {name} did not recover: {e:#}"));
+            assert_eq!(recovery.topk_weights.len(), k);
+            assert_eq!(recovery.inv_perm.len(), k);
+            assert_eq!(recovery.m_total_padded, k * MIN_TILE);
+        }
+    }
 }

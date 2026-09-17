@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Context;
+use anyhow::Result;
 use candle_core::{DType, Tensor, D};
 use nv_weights::WeightLoader;
 
@@ -215,10 +217,10 @@ pub fn chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths() -
 }
 
 pub fn gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations() -> bool {
-    const CHUNK_GEMM_OPT_IN_AFTER_THE_FREEFORM_V1_8192_NONFINITE_REPRO_THE_WY_UT_SCAN_NANS_ONE_SUBCHUNK_CARRY_WHERE_THE_TOKEN_SEQUENTIAL_KERNEL_STAYS_FINITE_COSTING_ITS_FLIP_MARGIN_7447_VS_7391_TOK_S_AT_8K_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP_UNTIL_THE_CARRY_IS_STABILIZED:
+    const CHUNK_GEMM_DEFAULT_ON_AGAIN_THE_NEG80_LOG_DECAY_FLOOR_FIXED_THE_FREEFORM_NONFINITE_AND_THE_REPRO_SUITE_GATES_IT_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP:
         &str = "NV_Q38_GDN_CHUNK_GEMM";
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-        CHUNK_GEMM_OPT_IN_AFTER_THE_FREEFORM_V1_8192_NONFINITE_REPRO_THE_WY_UT_SCAN_NANS_ONE_SUBCHUNK_CARRY_WHERE_THE_TOKEN_SEQUENTIAL_KERNEL_STAYS_FINITE_COSTING_ITS_FLIP_MARGIN_7447_VS_7391_TOK_S_AT_8K_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP_UNTIL_THE_CARRY_IS_STABILIZED,
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        CHUNK_GEMM_DEFAULT_ON_AGAIN_THE_NEG80_LOG_DECAY_FLOOR_FIXED_THE_FREEFORM_NONFINITE_AND_THE_REPRO_SUITE_GATES_IT_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP,
     )
 }
 
@@ -234,9 +236,9 @@ pub fn mrow_verify_env_read_per_call_so_one_process_can_ab_both_verify_paths() -
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_MROW_VERIFY")
 }
 
-pub fn verify_tc_env_read_per_call_nv_q38_verify_tc_1_selects_projections_once_plus_lt_gemm_verify_arms(
+pub fn verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify(
 ) -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_VERIFY_TC")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_VERIFY_TC")
 }
 
 #[cfg(feature = "cuda")]
@@ -441,6 +443,21 @@ fn gdn_decode_scratch_take_or_build(
     )
 }
 
+pub mod gdn_stage_hook {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+    pub fn install(f: fn(usize)) {
+        HOOK.store(f as usize, Ordering::Release);
+    }
+    pub fn mark(k: usize) {
+        let raw = HOOK.load(Ordering::Acquire);
+        if raw != 0 {
+            let f: fn(usize) = unsafe { std::mem::transmute(raw) };
+            f(k);
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 pub fn fused_decode_env() -> Option<bool> {
     static V: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
@@ -506,6 +523,82 @@ fn copy_tensor_data(src: &Tensor, dst: &Tensor) -> Result<()> {
     Ok(())
 }
 
+pub const GDN_ROLLBACK_BATCH_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ONE_BATCHED_STATE_COPY_KERNEL_REPLACES_THE_96_PER_SLOT_MEMCPY_DTOD_BITWISE_STATE_PARITY_GATED_SET_0_RESTORES_THE_PER_SLOT_PATH: &str =
+    "NV_Q38_GDN_ROLLBACK_BATCH";
+
+pub fn gdn_rollback_batch_default_on_unless_0() -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        GDN_ROLLBACK_BATCH_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ONE_BATCHED_STATE_COPY_KERNEL_REPLACES_THE_96_PER_SLOT_MEMCPY_DTOD_BITWISE_STATE_PARITY_GATED_SET_0_RESTORES_THE_PER_SLOT_PATH,
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn batched_rollback_copy(pairs: &[(&LinAttnState, &LinAttnState)]) -> Result<()> {
+    use cudarc::driver::DevicePtr;
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let mut dsts: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
+    let mut srcs: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
+    let mut nwords: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
+    let mut dev_out: Option<candle_core::CudaDevice> = None;
+    for (live, ckpt) in pairs {
+        for (dst_t, src_t) in [
+            (&live.conv_state, &ckpt.conv_state),
+            (&live.recurrent_state, &ckpt.recurrent_state),
+        ] {
+            anyhow::ensure!(
+                src_t.dtype() == dst_t.dtype() && src_t.elem_count() == dst_t.elem_count(),
+                "batched rollback size/dtype mismatch"
+            );
+            let (dev, src_ptr, bytes) = cuda_tensor_raw(src_t)?;
+            let (_d2, dst_ptr, b2) = cuda_tensor_raw(dst_t)?;
+            anyhow::ensure!(
+                bytes == b2 && bytes % 4 == 0,
+                "batched rollback byte mismatch"
+            );
+            srcs.push(src_ptr);
+            dsts.push(dst_ptr);
+            nwords.push((bytes / 4) as u32);
+            dev_out = Some(dev);
+        }
+    }
+    let dev = dev_out.expect("nonempty pairs");
+    let stream = crate::cuda_stream::current_stream(&dev);
+    let d_dsts = stream.clone_htod(&dsts).map_err(|e| anyhow::anyhow!(e))?;
+    let d_srcs = stream.clone_htod(&srcs).map_err(|e| anyhow::anyhow!(e))?;
+    let d_nw = stream.clone_htod(&nwords).map_err(|e| anyhow::anyhow!(e))?;
+    let count = nwords.len() as i32;
+    let rc = {
+        let (pd, _a) = d_dsts.device_ptr(&stream);
+        let (ps, _b) = d_srcs.device_ptr(&stream);
+        let (pn, _c) = d_nw.device_ptr(&stream);
+        unsafe {
+            nv_kernels::cuda::batched_copy_u32(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                pd as *const u64,
+                ps as *const u64,
+                pn as *const u32,
+                count,
+            )
+        }
+    };
+    anyhow::ensure!(rc == 0, "batched_copy_u32 rc={rc}");
+    ROLLBACK_DESC_BUFS_HELD_UNTIL_THE_NEXT_ROLLBACK_SO_THE_ASYNC_KERNEL_NEVER_READS_FREED_DESCRIPTOR_MEMORY_THE_ROUND_END_SYNC_RETIRES_THE_PRIOR_KERNEL_BEFORE_THIS_REPLACES_IT.with(|h| {
+        *h.borrow_mut() = Some((d_dsts, d_srcs, d_nw));
+    });
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+thread_local! {
+    static ROLLBACK_DESC_BUFS_HELD_UNTIL_THE_NEXT_ROLLBACK_SO_THE_ASYNC_KERNEL_NEVER_READS_FREED_DESCRIPTOR_MEMORY_THE_ROUND_END_SYNC_RETIRES_THE_PRIOR_KERNEL_BEFORE_THIS_REPLACES_IT: std::cell::RefCell<Option<(
+        cudarc::driver::CudaSlice<u64>,
+        cudarc::driver::CudaSlice<u64>,
+        cudarc::driver::CudaSlice<u32>,
+    )>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(feature = "cuda")]
 fn zero_tensor_data(t: &Tensor) -> Result<()> {
     let (dev, ptr, bytes) = cuda_tensor_raw(t)?;
@@ -557,18 +650,52 @@ fn deep_clone_tensor(t: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
-#[cfg(feature = "cuda")]
-pub struct QkvzConcatFp8DecodeArm {
-    weight_u8: cudarc::driver::CudaSlice<u8>,
-    row_scales_dev: cudarc::driver::CudaSlice<f32>,
+pub fn gdn_nvfp4_env_opt_in_double_quants_the_fp8_gdn_projections_to_half_byte_resident_needs_a_ppl_gate_before_any_flip(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_NVFP4")
 }
 
-pub fn gdn_fuse_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_FUSE")
+pub const GDN_NVFP4_SCOPE_TENSOR_SHORTS_ARE_QKV_Z_OUT: [&str; 3] = ["qkv", "z", "out"];
+
+pub fn gdn_nvfp4_scope_layers_env_comma_list_of_layer_indices_unset_means_every_gdn_layer(
+) -> Option<Vec<usize>> {
+    let v = std::env::var("NV_Q38_GDN_NVFP4_LAYERS").ok()?;
+    let layers: Vec<usize> = v
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse()
+                .expect("NV_Q38_GDN_NVFP4_LAYERS entries must be layer indices")
+        })
+        .collect();
+    assert!(
+        !layers.is_empty(),
+        "NV_Q38_GDN_NVFP4_LAYERS is set but names no layer; unset it to quantize every layer"
+    );
+    Some(layers)
 }
 
-pub fn gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_SPLIT")
+pub fn gdn_nvfp4_scope_tensors_env_comma_list_of_qkv_z_out_unset_means_all_three(
+) -> Option<Vec<String>> {
+    let v = std::env::var("NV_Q38_GDN_NVFP4_TENSORS").ok()?;
+    let tensors: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+    for t in &tensors {
+        assert!(
+            GDN_NVFP4_SCOPE_TENSOR_SHORTS_ARE_QKV_Z_OUT.contains(&t.as_str()),
+            "NV_Q38_GDN_NVFP4_TENSORS names unknown tensor {t}; the tensors are qkv, z, out"
+        );
+    }
+    Some(tensors)
+}
+
+pub fn gdn_nvfp4_cf_env_opt_in_1_quantizes_on_host_with_the_closed_form_ue4m3_scale_search_instead_of_amax_parking(
+) -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_NVFP4_CF")
+}
+
+pub fn gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step(
+) -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_GDN_SPLIT")
 }
 
 pub const GDN_SPLIT_STEP_TRADES_ONE_LANE_PRIVATE_KERNEL_FOR_THREE_THAT_SHARE_ONE_LANE_WIDE_PREP_SCRATCH_SO_A_LANE_GROUP_RUNNING_IT_CANNOT_FORK_ITS_PER_LANE_STREAMS: &str =
@@ -600,7 +727,7 @@ pub fn gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungate
 pub fn gdn_split_selected_for_lane_count(m: usize) -> bool {
     let _ = GDN_SPLIT_STEP_TRADES_ONE_LANE_PRIVATE_KERNEL_FOR_THREE_THAT_SHARE_ONE_LANE_WIDE_PREP_SCRATCH_SO_A_LANE_GROUP_RUNNING_IT_CANNOT_FORK_ITS_PER_LANE_STREAMS;
     let _ = GDN_SPLIT_STEP_WIDTH_LADDER_MEASURED_ON_QWEN38_27B_NVFP4_SO_THE_LANE_CAP_IS_NEVER_READ_AS_ARBITRARY;
-    gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process()
+    gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step()
         && m <= gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
 }
 
@@ -627,9 +754,23 @@ pub const GDN_GROUP_LANE_STATE_POINTERS_RIDE_KERNEL_PARAMS_NOT_A_DEVICE_ARRAY_BE
      bytes of the 4 KB parameter space and is baked into the graph node exactly as the per-lane \
      launches' single state pointer already is";
 
+pub const GDN_LANES_GROUP_IS_IMPLIED_BY_THE_BATCH_LANE_POOL_BECAUSE_WITHOUT_IT_RAISING_THE_LANE_COUNT_REGRESSES_N8_AGGREGATE_117P4_VS_176P7_TOK_S_AND_THE_IDENTITY_SUITE_PROVES_IT_COSTS_NO_BITS: &str =
+    "the batch path batches only the qkv/z/ab projection GEMM and then runs PER-LANE conv+step      kernels, so the GDN conv and step are serial in the lane count (2m launches per layer).      Measured on a live N-parallel streaming ladder at 8 lanes: without this arm N=8 reads 117.4      tok/s aggregate, WORSE than the 4-lane pool's 142.8; with it N=8 reads 176.7 and 8 lanes      finally beats 4. gdn_lanes_group_identity proves lanes 1..16 bit-identical in mixed, gated,      conv_state and recurrent_state, so arming it with the pool costs no bits.      NV_Q38_GDN_LANES_GROUP=0 still forces the per-lane loop";
+
 pub fn gdn_lanes_group_env_opt_in_nv_q38_gdn_lanes_group_1_one_conv_and_one_step_launch_span_the_group(
 ) -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_LANES_GROUP")
+    match std::env::var("NV_Q38_GDN_LANES_GROUP")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("1") => true,
+        Some("0") => false,
+        _ => matches!(
+            std::env::var("NV_Q38_BATCH").ok().as_deref().map(str::trim),
+            Some("1")
+        ),
+    }
 }
 
 pub const THE_GROUP_FORM_REMOVES_THE_VERY_MECHANISM_THE_SPLIT_STEPS_SIX_LANE_CAP_EXISTS_FOR_SO_A_GROUP_SPANNING_SPLIT_IS_NOT_CAPPED_AT_SIX: &str =
@@ -643,14 +784,13 @@ pub fn gdn_lanes_group_selected_for_lane_count(m: usize) -> bool {
     let _ = GDN_GROUP_LANES_IS_BIT_IDENTICAL_TO_THE_PER_LANE_LOOP_BECAUSE_BOTH_RUN_THE_SAME_DEVICE_FUNCTION_ON_THE_SAME_BLOCK_SHAPE_AND_ONLY_THE_LANE_BASE_POINTER_MOVES_FROM_THE_HOST_INTO_GRID_Y;
     let _ = GDN_GROUP_LANE_STATE_POINTERS_RIDE_KERNEL_PARAMS_NOT_A_DEVICE_ARRAY_BECAUSE_A_CAPTURED_DECODE_GRAPH_ALREADY_BAKES_THE_SAME_POINTERS_AS_PARAMS_OF_THE_M_LAUNCHES_THIS_REPLACES;
     gdn_lanes_group_env_opt_in_nv_q38_gdn_lanes_group_1_one_conv_and_one_step_launch_span_the_group()
-        && m >= 2
-        && m <= GDN_GROUP_STEP_LANE_CAP_IS_THE_KERNELS_BY_VALUE_POINTER_PACK_WIDTH_SO_A_WIDER_GROUP_FALLS_BACK_TO_THE_PER_LANE_LOOP_INSTEAD_OF_READING_PAST_IT
+        && (2..=GDN_GROUP_STEP_LANE_CAP_IS_THE_KERNELS_BY_VALUE_POINTER_PACK_WIDTH_SO_A_WIDER_GROUP_FALLS_BACK_TO_THE_PER_LANE_LOOP_INSTEAD_OF_READING_PAST_IT).contains(&m)
 }
 
 pub fn gdn_lanes_group_takes_the_split_step_form_when_the_split_arm_is_set(m: usize) -> bool {
     let _ = THE_GROUP_FORM_REMOVES_THE_VERY_MECHANISM_THE_SPLIT_STEPS_SIX_LANE_CAP_EXISTS_FOR_SO_A_GROUP_SPANNING_SPLIT_IS_NOT_CAPPED_AT_SIX;
     gdn_lanes_group_selected_for_lane_count(m)
-        && gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process()
+        && gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step()
 }
 
 pub const A_NULLED_GDN_SUBSTAGE_SERVES_MEANINGLESS_TOKENS_BY_CONSTRUCTION_BECAUSE_IT_WRITES_ZEROS_INSTEAD_OF_ITS_FUNCTION_AND_ONLY_THE_GRAPHED_STEP_DELTA_AGAINST_THE_SAME_SESSIONS_UNNULLED_CELL_IS_A_MEASUREMENT: &str =
@@ -701,13 +841,203 @@ pub fn gdn_qkvz_one_env_read_per_call_so_the_kill_switch_works_mid_process() -> 
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_QKVZ_ONE")
 }
 
+pub const GDN_QKVZ_ONE_UNDER_VERIFY_TC_KEEPS_THE_DUAL_E4M3_MK_GEMV_FOR_THE_VERIFY_ROWS_WHERE_THE_LT_GEMM_PAYS_61_PLUS_49_US_AGAINST_88_AT_M4_ON_THE_STAGE_BENCH:
+    &str = "NV_Q38_GDN_QKVZ_ONE_UNDER_VERIFY_TC";
+
+pub const GDN_MROW_FP8MMA_ENV_1_ROUTES_THE_VERIFY_ROW_QKV_AND_Z_PROJECTIONS_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT:
+    &str = "NV_Q38_GDN_MROW_FP8MMA";
+
+pub fn q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
+    raw: Option<&std::ffi::OsStr>,
+) -> bool {
+    raw.is_none_or(|value| value == "1")
+}
+
+#[cfg(test)]
+mod q38_projection_user_signed_default_tests {
+    use super::q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11 as selected;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn only_unset_changes_explicit_values_retain_the_prior_eq_one_grammar() {
+        assert!(selected(None));
+        assert!(selected(Some(OsStr::new("1"))));
+        for value in ["0", "", "yes", "gate", " 1", "1 "] {
+            assert!(!selected(Some(OsStr::new(value))));
+        }
+    }
+}
+
+pub const GDN_MROW_FP8MMA_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_00232_TILED_PLUS_0_00056_FREEFORM_MINUS_0_00964_MEAN_MINUS_0_00225_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_42_LEDGER_16384_M4_24_3_TO_23_6_SET_0_TO_RESTORE_CUBLASLT:
+    &str = "temp/q38-coord/reports/host-runs/fusedtc-42-fp8mma-graphed-walk.log";
+
+pub fn gdn_mrow_fp8mma_env_opt_in_1_reread_every_call() -> bool {
+    let _ = GDN_MROW_FP8MMA_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_00232_TILED_PLUS_0_00056_FREEFORM_MINUS_0_00964_MEAN_MINUS_0_00225_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_42_LEDGER_16384_M4_24_3_TO_23_6_SET_0_TO_RESTORE_CUBLASLT;
+    q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
+        std::env::var_os(GDN_MROW_FP8MMA_ENV_1_ROUTES_THE_VERIFY_ROW_QKV_AND_Z_PROJECTIONS_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT).as_deref(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+pub fn e4m3_mrows_f16mma_projection(
+    lin: &Linear,
+    x_c: &Tensor,
+    m: usize,
+    dev: &candle_core::CudaDevice,
+    on: bool,
+) -> Result<Option<Tensor>> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    if !on || m == 0 || m > 8 || lin.has_lora() || !x_c.layout().is_contiguous() {
+        return Ok(None);
+    }
+    let Some((wq, rs)) =
+        lin.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
+    else {
+        return Ok(None);
+    };
+    let k = lin.in_features();
+    let n = lin.out_features();
+    if !k.is_multiple_of(128) || x_c.dtype() != DType::BF16 || x_c.elem_count() != m * k {
+        return Ok(None);
+    }
+    let stream = crate::cuda_stream::current_stream(dev);
+    let mut y = unsafe {
+        stream
+            .alloc::<half::bf16>(m * n)
+            .map_err(|e| anyhow::anyhow!(e))?
+    };
+    let (xs, xl) = x_c.storage_and_layout();
+    let candle_core::Storage::Cuda(xc) = &*xs else {
+        return Ok(None);
+    };
+    let xv = xc.as_cuda_slice::<half::bf16>()?.slice(xl.start_offset()..);
+    let rc = {
+        let (pw, _a) = wq.device_ptr(&stream);
+        let (prs, _b) = rs.device_ptr(&stream);
+        let (px, _c) = xv.device_ptr(&stream);
+        let (py, _d) = y.device_ptr_mut(&stream);
+        unsafe {
+            nv_kernels::cuda::gemm_e4m3_mrows_f16mma(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                pw as *const u8,
+                prs as *const f32,
+                px as *const u16,
+                py as *mut u16,
+                n as i32,
+                k as i32,
+                m as i32,
+            )
+        }
+    };
+    anyhow::ensure!(rc == 0, "gemm_e4m3_mrows_f16mma n={n} k={k} m={m} rc={rc}");
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone());
+    Ok(Some(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        vec![1usize, m, n],
+        candle_core::op::BackpropOp::none(),
+        false,
+    )))
+}
+
+pub const GDN_MROW_FP8MMA_OUT_ENV_1_ROUTES_THE_VERIFY_ROW_OUT_PROJ_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT:
+    &str = "NV_Q38_GDN_MROW_FP8MMA_OUT";
+
+pub const GDN_MROW_FP8MMA_OUT_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_01521_TILED_MINUS_0_00250_FREEFORM_MINUS_0_00561_MEAN_PLUS_0_00237_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_50_23_80_TO_23_07_23_28_SET_0_TO_RESTORE_CUBLASLT:
+    &str = "temp/q38-coord/reports/host-runs/fusedtc-46-outab-graphed-walk.log";
+
+pub fn gdn_mrow_fp8mma_out_env_opt_in_1_reread_every_call() -> bool {
+    let _ = GDN_MROW_FP8MMA_OUT_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_01521_TILED_MINUS_0_00250_FREEFORM_MINUS_0_00561_MEAN_PLUS_0_00237_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_50_23_80_TO_23_07_23_28_SET_0_TO_RESTORE_CUBLASLT;
+    q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
+        std::env::var_os(GDN_MROW_FP8MMA_OUT_ENV_1_ROUTES_THE_VERIFY_ROW_OUT_PROJ_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT).as_deref(),
+    )
+}
+
+pub const GDN_AB_ROWS_GEMV_ENV_1_RUNS_THE_VERIFY_ROW_A_AND_B_PROJECTIONS_AS_ONE_GEMV_BF16_ROWS_LAUNCH_BITWISE_THE_M1_GEMV_PER_ROW:
+    &str = "NV_Q38_GDN_AB_ROWS_GEMV";
+
+pub const GDN_AB_ROWS_GEMV_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_BITWISE_THE_M1_DECODE_ROW_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_OUTAB_VS_CTL_NLL_DELTA_AGENTIC_MINUS_0_01538_TILED_MINUS_0_00484_FREEFORM_PLUS_0_01241_MEAN_MINUS_0_00260_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_54_TO_23_22_SET_0_TO_RESTORE_THE_TWO_CUBLASLT_LAUNCHES:
+    &str = "temp/q38-coord/reports/host-runs/fusedtc-46-outab-graphed-walk.log";
+
+pub fn gdn_ab_rows_gemv_env_opt_in_1_reread_every_call() -> bool {
+    let _ = GDN_AB_ROWS_GEMV_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_BITWISE_THE_M1_DECODE_ROW_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_OUTAB_VS_CTL_NLL_DELTA_AGENTIC_MINUS_0_01538_TILED_MINUS_0_00484_FREEFORM_PLUS_0_01241_MEAN_MINUS_0_00260_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_54_TO_23_22_SET_0_TO_RESTORE_THE_TWO_CUBLASLT_LAUNCHES;
+    q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
+        std::env::var_os(GDN_AB_ROWS_GEMV_ENV_1_RUNS_THE_VERIFY_ROW_A_AND_B_PROJECTIONS_AS_ONE_GEMV_BF16_ROWS_LAUNCH_BITWISE_THE_M1_GEMV_PER_ROW).as_deref(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn bf16_rows_gemv_one_launch(
+    lin: &Linear,
+    x_c: &Tensor,
+    m: usize,
+    dev: &candle_core::CudaDevice,
+) -> Result<Option<Tensor>> {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let Some(w) = lin.weight() else {
+        return Ok(None);
+    };
+    let k = lin.in_features();
+    let n = lin.out_features();
+    if m == 0
+        || m > 8
+        || !k.is_multiple_of(8)
+        || lin.has_lora()
+        || w.dtype() != DType::BF16
+        || x_c.dtype() != DType::BF16
+        || x_c.elem_count() != m * k
+    {
+        return Ok(None);
+    }
+    let stream = crate::cuda_stream::current_stream(dev);
+    let mut y = unsafe {
+        stream
+            .alloc::<half::bf16>(m * n)
+            .map_err(|e| anyhow::anyhow!(e))?
+    };
+    let (_dw, pw, _lw) = cuda_tensor_raw(w)?;
+    let (xs, xl) = x_c.storage_and_layout();
+    let candle_core::Storage::Cuda(xc) = &*xs else {
+        return Ok(None);
+    };
+    let xv = xc.as_cuda_slice::<half::bf16>()?.slice(xl.start_offset()..);
+    let rc = {
+        let (px, _c) = xv.device_ptr(&stream);
+        let (py, _d) = y.device_ptr_mut(&stream);
+        unsafe {
+            nv_kernels::cuda::gemv_bf16_rows(
+                stream.cu_stream() as *mut std::ffi::c_void,
+                pw as *const u16,
+                px as *const u16,
+                py as *mut u16,
+                n as i32,
+                k as i32,
+                m as i32,
+            )
+        }
+    };
+    anyhow::ensure!(rc == 0, "gemv_bf16_rows n={n} k={k} m={m} rc={rc}");
+    let storage = candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone());
+    Ok(Some(Tensor::from_storage(
+        candle_core::Storage::Cuda(storage),
+        vec![1usize, m, n],
+        candle_core::op::BackpropOp::none(),
+        false,
+    )))
+}
+
+pub fn gdn_qkvz_one_under_verify_tc_env_opt_in_1_reread_every_call() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        GDN_QKVZ_ONE_UNDER_VERIFY_TC_KEEPS_THE_DUAL_E4M3_MK_GEMV_FOR_THE_VERIFY_ROWS_WHERE_THE_LT_GEMM_PAYS_61_PLUS_49_US_AGAINST_88_AT_M4_ON_THE_STAGE_BENCH,
+    )
+}
+
 pub fn gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_AB_ONE")
 }
 
 #[cfg(feature = "cuda")]
-
-pub fn gdn_nvfp4_verify_env_read_per_call_arms_the_qkv_z_twin_route() -> bool {
+pub fn gdn_nvfp4_verify_env_read_per_call_opt_in_1_or_qkv_arms_the_twin_route_unset_off_because_the_user_declined_the_failed_freeform_cert_override_2026_09_04(
+) -> bool {
     matches!(
         std::env::var("NV_Q38_GDN_NVFP4_VERIFY").as_deref(),
         Ok("1") | Ok("qkv")
@@ -740,16 +1070,19 @@ fn gdn_qkv_z_nvfp4_w4a8_pair(
     let n_a = qkv_t.out_features();
     let n_b = z_t.out_features();
     let stream = crate::cuda_stream::current_stream(dev);
-    let mut x_q8: cudarc::driver::CudaSlice<i8> = unsafe {
-        stream.alloc::<i8>(m * k).map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut x_q8: cudarc::driver::CudaSlice<i8> =
+        unsafe { stream.alloc::<i8>(m * k).map_err(|e| anyhow::anyhow!(e))? };
     let mut x_scales: cudarc::driver::CudaSlice<f32> =
         unsafe { stream.alloc::<f32>(m).map_err(|e| anyhow::anyhow!(e))? };
     let mut y_a: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream.alloc::<bf16>(m * n_a).map_err(|e| anyhow::anyhow!(e))?
+        stream
+            .alloc::<bf16>(m * n_a)
+            .map_err(|e| anyhow::anyhow!(e))?
     };
     let mut y_b: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream.alloc::<bf16>(m * n_b).map_err(|e| anyhow::anyhow!(e))?
+        stream
+            .alloc::<bf16>(m * n_b)
+            .map_err(|e| anyhow::anyhow!(e))?
     };
     {
         let (xs_store, xl) = x_c.storage_and_layout();
@@ -827,7 +1160,10 @@ fn qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
     if m == 0 || m > 16 || x.dtype() != DType::BF16 {
         return Ok(None);
     }
-    if m >= 2 && crate::linear::verify_tc_fp8_lt_gemm_scope_active() {
+    if m >= 2
+        && crate::linear::verify_tc_fp8_lt_gemm_scope_active()
+        && !gdn_qkvz_one_under_verify_tc_env_opt_in_1_reread_every_call()
+    {
         return Ok(None);
     }
     if in_proj_qkv.has_lora() || in_proj_z.has_lora() {
@@ -839,8 +1175,8 @@ fn qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
     }
     let x_c = x.contiguous()?;
     let x_c = &x_c;
-    let Some((qkv_wq, qkv_scales)) = in_proj_qkv
-        .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
+    let Some((qkv_wq, qkv_scales)) =
+        in_proj_qkv.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
     else {
         return Ok(None);
     };
@@ -954,8 +1290,9 @@ fn ab_rows_one_gemm_bf16_mk_launch_bit_identical_to_the_per_lane_gemv_loop(
     }
     let n = ab.out_features();
     let k = ab.in_features();
-    if m == 0 || m > GDN_AB_WIDE_ROWS_STOP_AT_THE_KMAXGEMMM_TEMPLATE_CAP_THE_KERNEL_REFUSES_ABOVE
-        || k % 8 != 0
+    if m == 0
+        || m > GDN_AB_WIDE_ROWS_STOP_AT_THE_KMAXGEMMM_TEMPLATE_CAP_THE_KERNEL_REFUSES_ABOVE
+        || !k.is_multiple_of(8)
         || x_c.elem_count() != m * k
     {
         return Ok(None);
@@ -1026,9 +1363,11 @@ pub fn gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split
     )
 }
 
-pub fn verify_gdn_chunk_env_opt_in_nv_q38_verify_gdn_chunk_1_writes_ckpts_in_place_off_pooled_scratch(
+pub fn verify_gdn_chunk_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_gdn_chunk_0_for_per_row_ckpt_copies(
 ) -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_VERIFY_GDN_CHUNK")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_Q38_VERIFY_GDN_CHUNK",
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -1186,6 +1525,7 @@ pub struct LinearAttention {
     cfg: LinearAttentionConfig,
     in_proj_qkv: Linear,
     in_proj_z: Linear,
+    #[cfg(feature = "cuda")]
     nvfp4_verify_qkv_z_twins_lazily_quantized_from_the_fp8_residents_because_the_arm_is_opt_in:
         std::sync::OnceLock<Option<(Linear, Linear)>>,
     in_proj_a: Linear,
@@ -1195,11 +1535,9 @@ pub struct LinearAttention {
     dt_bias: Tensor,
     norm_weight: Tensor,
     out_proj: Linear,
+    #[cfg(feature = "cuda")]
     ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency:
         Option<Linear>,
-    #[cfg(feature = "cuda")]
-    qkvz_concat_fp8_built_only_under_nv_q38_gdn_fuse_costing_a_duplicate_resident_copy:
-        Option<QkvzConcatFp8DecodeArm>,
 }
 
 impl LinearAttention {
@@ -1288,6 +1626,7 @@ impl LinearAttention {
                 out_proj.in_features()
             );
         }
+        #[cfg(feature = "cuda")]
         let ab_concat = match (in_proj_a.weight(), in_proj_b.weight()) {
             (Some(wa), Some(wb))
                 if wa.dtype() == DType::BF16
@@ -1304,6 +1643,7 @@ impl LinearAttention {
             cfg,
             in_proj_qkv,
             in_proj_z,
+            #[cfg(feature = "cuda")]
             nvfp4_verify_qkv_z_twins_lazily_quantized_from_the_fp8_residents_because_the_arm_is_opt_in:
                 std::sync::OnceLock::new(),
             in_proj_a,
@@ -1313,51 +1653,46 @@ impl LinearAttention {
             dt_bias,
             norm_weight,
             out_proj,
+            #[cfg(feature = "cuda")]
             ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency:
                 ab_concat,
-            #[cfg(feature = "cuda")]
-            qkvz_concat_fp8_built_only_under_nv_q38_gdn_fuse_costing_a_duplicate_resident_copy:
-                None,
         })
     }
 
     #[cfg(feature = "cuda")]
-    pub fn install_qkvz_concat_fp8_decode_arm(
+    pub fn load_ab_fp8_before_capture(
         &mut self,
-        weight_bytes: &[u8],
-        row_scales: &[f32],
+        prefix: &str,
+        weights: &WeightLoader,
         device: &Device,
+        fp8_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::fp8::Fp8GemmRunner>>,
     ) -> Result<()> {
-        let rows = self.cfg.conv_dim() + self.cfg.value_dim();
-        let k = self.cfg.hidden_size;
-        anyhow::ensure!(
-            weight_bytes.len() == rows * k,
-            "qkvz concat: {} weight bytes != rows {rows} x k {k}",
-            weight_bytes.len()
-        );
-        anyhow::ensure!(
-            row_scales.len() == rows,
-            "qkvz concat: {} row scales != rows {rows}",
-            row_scales.len()
-        );
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("qkvz concat requires a CUDA device"),
+        let load = |name: &str| {
+            load_linear_fp8_resident_quantizing_bf16_checkpoint_modules_because_qwen36_ships_gdn_qkv_z_out_as_bf16(
+                weights,
+                &format!("{prefix}.{name}"),
+                self.cfg.linear_num_value_heads,
+                self.cfg.hidden_size,
+                device,
+                fp8_runner,
+            )
         };
-        let stream = crate::cuda_stream::current_stream(&dev);
-        #[allow(deprecated)]
-        let weight_u8 = stream
-            .clone_htod(weight_bytes)
-            .map_err(|e| anyhow::anyhow!("qkvz concat weight htod: {e:?}"))?;
-        #[allow(deprecated)]
-        let row_scales_dev = stream
-            .clone_htod(row_scales)
-            .map_err(|e| anyhow::anyhow!("qkvz concat scales htod: {e:?}"))?;
-        self.qkvz_concat_fp8_built_only_under_nv_q38_gdn_fuse_costing_a_duplicate_resident_copy =
-            Some(QkvzConcatFp8DecodeArm {
-                weight_u8,
-                row_scales_dev,
-            });
+        let a = load("in_proj_a")?;
+        let b = load("in_proj_b")?;
+        for linear in [&a, &b] {
+            anyhow::ensure!(
+                linear.weight().is_none()
+                    && matches!(
+                        linear.fp8_scale_parts(),
+                        Some((_, nv_quant::fp8::Fp8ScaleMode::PerOuterRow))
+                    ),
+                "GDN A/B conversion requires resident row-scaled FP8 with no BF16 weight"
+            );
+        }
+        self.in_proj_a = a;
+        self.in_proj_b = b;
+        self.ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency =
+            None;
         Ok(())
     }
 
@@ -1383,28 +1718,53 @@ impl LinearAttention {
         device: &Device,
         fp8_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::fp8::Fp8GemmRunner>>,
     ) -> Result<Self> {
-        let mut la = Self::from_loader_with_projection_loader(
-            cfg,
-            prefix,
-            weights,
-            dtype,
-            &|w, m, o, i| {
-                load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_byte_per_param(
+        Self::from_loader_with_projection_loader(cfg, prefix, weights, dtype, &|w, m, o, i| {
+            load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_byte_per_param(
                     w, m, o, i, dtype, device, fp8_runner,
                 )
-            },
-        )?;
-        if gdn_fuse_env_read_per_call_so_the_kill_switch_works_mid_process() {
-            let conv_dim = la.cfg.conv_dim();
-            let value_dim = la.cfg.value_dim();
-            let hidden = la.cfg.hidden_size;
-            if let Some((bytes, scales)) = qkvz_concat_raw_fp8_if_both_modules_are_fp8(
-                weights, prefix, conv_dim, value_dim, hidden,
-            )? {
-                la.install_qkvz_concat_fp8_decode_arm(&bytes, &scales, device)?;
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn from_loader_nvfp4_projections_resident_half_byte_per_param_double_quant_from_the_fp8_checkpoint(
+        cfg: LinearAttentionConfig,
+        prefix: &str,
+        weights: &WeightLoader,
+        dtype: DType,
+        device: &Device,
+        nvfp4_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+        fp8_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::fp8::Fp8GemmRunner>>,
+        layer_idx: usize,
+    ) -> Result<Self> {
+        let scope_layers =
+            gdn_nvfp4_scope_layers_env_comma_list_of_layer_indices_unset_means_every_gdn_layer();
+        let scope_tensors =
+            gdn_nvfp4_scope_tensors_env_comma_list_of_qkv_z_out_unset_means_all_three();
+        Self::from_loader_with_projection_loader(cfg, prefix, weights, dtype, &|w, m, o, i| {
+            let tensor_short = if m.ends_with(".in_proj_qkv") {
+                "qkv"
+            } else if m.ends_with(".in_proj_z") {
+                "z"
+            } else {
+                "out"
+            };
+            let layer_in_scope = scope_layers
+                .as_ref()
+                .map(|ls| ls.contains(&layer_idx))
+                .unwrap_or(true);
+            let tensor_in_scope = scope_tensors
+                .as_ref()
+                .map(|ts| ts.iter().any(|t| t == tensor_short))
+                .unwrap_or(true);
+            if !(layer_in_scope && tensor_in_scope) {
+                return load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_byte_per_param(
+                    w, m, o, i, dtype, device, fp8_runner,
+                );
             }
-        }
-        Ok(la)
+            load_linear_nvfp4_resident_double_quant_from_the_fp8_checkpoint_because_gdn_decode_bandwidth_wants_half_a_byte_per_param(
+                w, m, o, i, device, nvfp4_runner,
+            )
+        })
     }
 
     #[cfg(feature = "cuda")]
@@ -2068,8 +2428,8 @@ impl LinearAttention {
             };
             anyhow::ensure!(rc == 0, "gdn_prefill_qk_l2norm_from_mixed rc={rc}");
         }
-        let chunk_gemm_armed =
-            b == 1 && gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations();
+        let chunk_gemm_armed = b == 1
+            && gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations();
         if chunk_gemm_armed {
             static WS_CACHED_PER_STREAM_BECAUSE_A_PER_CALL_GIGABYTE_ALLOC_COSTS_MORE_WALL_THAN_THE_SCAN_SAVES:
                 std::sync::OnceLock<
@@ -2079,7 +2439,10 @@ impl LinearAttention {
                 > = std::sync::OnceLock::new();
             let ws_elems =
                 nvk::gdn_chunk_gemm_scan_workspace_elems(t as i32, n_v as i32, n_k as i32);
-            anyhow::ensure!(ws_elems > 0, "gdn_chunk_gemm workspace_elems returned 0 for t={t}");
+            anyhow::ensure!(
+                ws_elems > 0,
+                "gdn_chunk_gemm workspace_elems returned 0 for t={t}"
+            );
             let cache =
                 WS_CACHED_PER_STREAM_BECAUSE_A_PER_CALL_GIGABYTE_ALLOC_COSTS_MORE_WALL_THAN_THE_SCAN_SAVES
                     .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -2203,7 +2566,7 @@ impl LinearAttention {
         let c = &self.cfg;
         c.mamba_ssm_dtype == DType::F32
             && c.linear_conv_kernel_dim >= 2
-            && c.linear_value_head_dim % 32 == 0
+            && c.linear_value_head_dim.is_multiple_of(32)
             && c.linear_value_head_dim >= 32
             && c.linear_value_head_dim <= 1024
             && c.linear_key_head_dim >= 1
@@ -2331,16 +2694,6 @@ impl LinearAttention {
             _ => return Ok(None),
         };
 
-        if gdn_fuse_env_read_per_call_so_the_kill_switch_works_mid_process() {
-            if let Some(concat) = &self
-                .qkvz_concat_fp8_built_only_under_nv_q38_gdn_fuse_costing_a_duplicate_resident_copy
-            {
-                if let Some(out) = self.forward_decode_fused_qkvz_concat(x, state, concat, &dev)? {
-                    return Ok(Some(out));
-                }
-            }
-        }
-
         let n_v = self.cfg.linear_num_value_heads;
         let mut prof = gdn_step_prof::SyncLaps::begin_if_armed(&dev);
         let qkvz_pair = qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
@@ -2384,6 +2737,7 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("in_ab");
         }
+        gdn_stage_hook::mark(0);
         if qkv.dtype() != DType::BF16
             || z.dtype() != DType::BF16
             || a.dtype() != DType::BF16
@@ -2469,6 +2823,7 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("conv");
         }
+        gdn_stage_hook::mark(1);
         let mut split_step_taken = false;
         let (_gdev, gated_ptr, _glen) = cuda_tensor_raw(
             &scratch.gated_tensor_reused_across_layers_because_the_stream_serializes,
@@ -2548,6 +2903,8 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("step");
         }
+        gdn_stage_hook::mark(2);
+        gdn_stage_hook::mark(3);
 
         let flat = scratch
             .gated_tensor_reused_across_layers_because_the_stream_serializes
@@ -2686,9 +3043,7 @@ impl LinearAttention {
                 rows.push(row);
             }
             let refs: Vec<&Tensor> = rows.iter().collect();
-            let per_row_m1_gemv_because_bf16_ab_has_no_m_row_twin_and_96_rows_by_hidden_is_cheap =
-                Tensor::cat(&refs, 1)?.contiguous()?;
-            per_row_m1_gemv_because_bf16_ab_has_no_m_row_twin_and_96_rows_by_hidden_is_cheap
+            Tensor::cat(&refs, 1)?.contiguous()?
         };
         if let Some(p) = prof.as_deref_mut() {
             p.lap("b.gdn.ab_proj");
@@ -2775,7 +3130,7 @@ impl LinearAttention {
             ONCE.call_once(|| {
                 eprintln!(
                     "[linear_attn] gdn split lane gate: env={} m={m} cap={} -> split={split_env}",
-                    gdn_split_env_read_per_call_so_the_kill_switch_works_mid_process(),
+                    gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step(),
                     gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
                 );
             });
@@ -2874,10 +3229,7 @@ impl LinearAttention {
                 if rc == 0 {
                     group_split_step_taken = true;
                 } else {
-                    anyhow::ensure!(
-                        rc == -1,
-                        "gdn_decode_step_split_group_bf16 rc={rc} m={m}"
-                    );
+                    anyhow::ensure!(rc == -1, "gdn_decode_step_split_group_bf16 rc={rc} m={m}");
                 }
             }
             if !group_split_step_taken {
@@ -2908,11 +3260,7 @@ impl LinearAttention {
                 anyhow::ensure!(rc == 0, "gdn_decode_step_group_bf16 rc={rc} m={m}");
             }
         }
-        let conc_steps = conc_arm.filter(|_| {
-            let scratch_free_non_split_step_writes_only_lane_private_buffers =
-                !split_env && !group_lanes;
-            scratch_free_non_split_step_writes_only_lane_private_buffers
-        });
+        let conc_steps = conc_arm.filter(|_| !split_env && !group_lanes);
         if let Some(ls) = conc_steps {
             let ev = stream
                 .record_event(None)
@@ -3049,7 +3397,7 @@ impl LinearAttention {
         } else {
             self.out_proj.forward(&flat)?
         };
-        if let Some(p) = prof.as_deref_mut() {
+        if let Some(p) = prof {
             p.lap("b.gdn.o_proj");
         }
         Ok(Some(out))
@@ -3214,6 +3562,7 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("in_ab");
         }
+        gdn_stage_hook::mark(0);
         {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -3245,153 +3594,11 @@ impl LinearAttention {
     }
 
     #[cfg(feature = "cuda")]
-    fn forward_decode_fused_qkvz_concat(
-        &self,
-        x: &Tensor,
-        state: &LinAttnState,
-        concat: &QkvzConcatFp8DecodeArm,
-        dev: &candle_core::CudaDevice,
-    ) -> Result<Option<Tensor>> {
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
-
-        let hidden = self.cfg.hidden_size;
-        if hidden % 16 != 0 {
-            return Ok(None);
-        }
-        let Some(a_w_t) = self.in_proj_a.weight() else {
-            return Ok(None);
-        };
-        let Some(b_w_t) = self.in_proj_b.weight() else {
-            return Ok(None);
-        };
-        if a_w_t.dtype() != DType::BF16 || b_w_t.dtype() != DType::BF16 {
-            return Ok(None);
-        }
-        let stream = crate::cuda_stream::current_stream(dev);
-        let conv_dim = self.cfg.conv_dim();
-        let value_dim = self.cfg.value_dim();
-        let n_k = self.cfg.linear_num_key_heads;
-        let n_v = self.cfg.linear_num_value_heads;
-        let d_k = self.cfg.linear_key_head_dim;
-        let d_v = self.cfg.linear_value_head_dim;
-        let kernel = self.cfg.linear_conv_kernel_dim;
-
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                eprintln!(
-                    "[linear_attn] NV_Q38_GDN_FUSE qkvz+conv gemv and ab+step fused decode arm \
-                     active (3 kernels per gdn layer)"
-                );
-            });
-        }
-
-        let x_c = x.contiguous()?;
-        let (_dx, x_ptr, _lx) = cuda_tensor_raw(&x_c)?;
-        let a_w_c = a_w_t.contiguous()?;
-        let b_w_c = b_w_t.contiguous()?;
-        let (_da, a_w_ptr, _la) = cuda_tensor_raw(&a_w_c)?;
-        let (_db, b_w_ptr, _lb) = cuda_tensor_raw(&b_w_c)?;
-        let w_c = self.conv1d_weight.contiguous()?;
-        let (_dw, conv_w_ptr, _lw) = cuda_tensor_raw(&w_c)?;
-        let (_dc, conv_state_ptr, _lc) = cuda_tensor_raw(&state.conv_state)?;
-        let (_dr, rec_state_ptr, _lr) = cuda_tensor_raw(&state.recurrent_state)?;
-        let a_log_c = self.a_log.contiguous()?;
-        let dt_c = self.dt_bias.contiguous()?;
-        let nw_c = self.norm_weight.contiguous()?;
-        let (_d8, a_log_ptr, _l8) = cuda_tensor_raw(&a_log_c)?;
-        let (_d9, dt_ptr, _l9) = cuda_tensor_raw(&dt_c)?;
-        let (_d10, nw_ptr, _l10) = cuda_tensor_raw(&nw_c)?;
-
-        let mut mixed: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(conv_dim)
-                .map_err(|e| anyhow::anyhow!("alloc mixed: {e:?}"))?
-        };
-        let mut zbuf: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(value_dim)
-                .map_err(|e| anyhow::anyhow!("alloc z: {e:?}"))?
-        };
-        let mut gated: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(value_dim)
-                .map_err(|e| anyhow::anyhow!("alloc gated: {e:?}"))?
-        };
-
-        {
-            let (wp, _gw) = concat.weight_u8.device_ptr(&stream);
-            let (sp, _gs) = concat.row_scales_dev.device_ptr(&stream);
-            let (mp, _gm) = mixed.device_ptr_mut(&stream);
-            let (zp, _gz) = zbuf.device_ptr_mut(&stream);
-            let rc = unsafe {
-                nv_kernels::cuda::gemv_e4m3_qkvz_conv_m1(
-                    stream.cu_stream() as *mut std::ffi::c_void,
-                    wp as *const u8,
-                    sp as *const f32,
-                    x_ptr as *const u16,
-                    conv_w_ptr as *const u16,
-                    conv_state_ptr as *mut u16,
-                    mp as *mut u16,
-                    zp as *mut u16,
-                    (conv_dim + value_dim) as i32,
-                    hidden as i32,
-                    conv_dim as i32,
-                    kernel as i32,
-                )
-            };
-            if rc == -1 {
-                return Ok(None);
-            }
-            anyhow::ensure!(rc == 0, "gemv_e4m3_qkvz_conv_m1 rc={rc}");
-        }
-        {
-            let (mp, _gm) = mixed.device_ptr(&stream);
-            let (zp, _gz) = zbuf.device_ptr(&stream);
-            let (gp, _gg) = gated.device_ptr_mut(&stream);
-            let rc = unsafe {
-                nv_kernels::cuda::gdn_decode_step_ab_fused_bf16(
-                    stream.cu_stream() as *mut std::ffi::c_void,
-                    x_ptr as *const u16,
-                    a_w_ptr as *const u16,
-                    b_w_ptr as *const u16,
-                    mp as *const u16,
-                    zp as *const u16,
-                    a_log_ptr as *const u16,
-                    dt_ptr as *const u16,
-                    nw_ptr as *const u16,
-                    rec_state_ptr as *mut f32,
-                    gp as *mut u16,
-                    hidden as i32,
-                    n_k as i32,
-                    n_v as i32,
-                    d_k as i32,
-                    d_v as i32,
-                    self.cfg.rms_eps as f32,
-                )
-            };
-            anyhow::ensure!(rc == 0, "gdn_decode_step_ab_fused_bf16 rc={rc}");
-        }
-
-        let flat = {
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(gated, dev.clone());
-            Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
-                (1usize, 1usize, value_dim),
-                candle_core::op::BackpropOp::none(),
-                false,
-            )
-        };
-        let out = self.out_proj.forward(&flat)?;
-        Ok(Some(out))
-    }
-
-    #[cfg(feature = "cuda")]
     pub fn prebuild_nvfp4_verify_twins_from_the_fp8_residents_the_disk_itself_stores_qkv_z_as_f8e4m3(
         &self,
         dev: &candle_core::CudaDevice,
     ) {
-        if !gdn_nvfp4_verify_env_read_per_call_arms_the_qkv_z_twin_route() {
+        if !gdn_nvfp4_verify_env_read_per_call_opt_in_1_or_qkv_arms_the_twin_route_unset_off_because_the_user_declined_the_failed_freeform_cert_override_2026_09_04() {
             return;
         }
         let _ = self
@@ -3452,8 +3659,7 @@ impl LinearAttention {
             return Ok(None);
         }
         let m = dims[1];
-        if m < 2
-            || m > MROW_VERIFY_ROWS_MAX_16_THE_GDN_CHUNK_KERNEL_T_CAP
+        if !(2..=MROW_VERIFY_ROWS_MAX_16_THE_GDN_CHUNK_KERNEL_T_CAP).contains(&m)
             || dims[2] != self.cfg.hidden_size
         {
             return Ok(None);
@@ -3480,7 +3686,7 @@ impl LinearAttention {
 
         let mut prof = gdn_step_prof::SyncLaps::begin_if_armed(&dev);
         let x_c = x.contiguous()?;
-        let nvfp4_pair = if gdn_nvfp4_verify_env_read_per_call_arms_the_qkv_z_twin_route()
+        let nvfp4_pair = if gdn_nvfp4_verify_env_read_per_call_opt_in_1_or_qkv_arms_the_twin_route_unset_off_because_the_user_declined_the_failed_freeform_cert_override_2026_09_04()
             && (2..=8).contains(&m)
         {
             match self
@@ -3522,39 +3728,54 @@ impl LinearAttention {
             }
             pair
         } else {
-        match qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
-            &self.in_proj_qkv,
-            &self.in_proj_z,
-            &x_c,
-            m,
-            &dev,
-        )? {
-            Some(pair) => {
-                if let Some(p) = prof.as_mut() {
-                    p.lap("mrow_in_qkvz_one");
+            match qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
+                &self.in_proj_qkv,
+                &self.in_proj_z,
+                &x_c,
+                m,
+                &dev,
+            )? {
+                Some(pair) => {
+                    if let Some(p) = prof.as_mut() {
+                        p.lap("mrow_in_qkvz_one");
+                    }
+                    pair
                 }
-                pair
-            }
-            None => {
-                let qkv = self.in_proj_qkv.forward(&x_c)?.contiguous()?;
-                if let Some(p) = prof.as_mut() {
-                    p.lap("mrow_in_qkv");
+                None => {
+                    let fp8mma = gdn_mrow_fp8mma_env_opt_in_1_reread_every_call();
+                    let qkv = match e4m3_mrows_f16mma_projection(
+                        &self.in_proj_qkv,
+                        &x_c,
+                        m,
+                        &dev,
+                        fp8mma,
+                    )? {
+                        Some(t) => t,
+                        None => self.in_proj_qkv.forward(&x_c)?.contiguous()?,
+                    };
+                    if let Some(p) = prof.as_mut() {
+                        p.lap("mrow_in_qkv");
+                    }
+                    let z =
+                        match e4m3_mrows_f16mma_projection(&self.in_proj_z, &x_c, m, &dev, fp8mma)?
+                        {
+                            Some(t) => t,
+                            None => self.in_proj_z.forward(&x_c)?.contiguous()?,
+                        };
+                    (qkv, z)
                 }
-                let z = self.in_proj_z.forward(&x_c)?.contiguous()?;
-                (qkv, z)
             }
-        }
         };
-        let ab_one_holder = if gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process()
+        let ab_one_holder = match &self
+            .ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
         {
-            match &self
-                .ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
-            {
-                Some(ab) => Some(ab.forward(&x_c)?.contiguous()?),
-                None => None,
+            Some(ab) if gdn_ab_rows_gemv_env_opt_in_1_reread_every_call() => {
+                bf16_rows_gemv_one_launch(ab, &x_c, m, &dev)?
             }
-        } else {
-            None
+            Some(ab) if gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process() => {
+                Some(ab.forward(&x_c)?.contiguous()?)
+            }
+            _ => None,
         };
         let ab_separate_holder = match &ab_one_holder {
             Some(_) => None,
@@ -3566,11 +3787,10 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_in_z_a_b");
         }
+        gdn_stage_hook::mark(0);
         let ab_dtype_bf16 = match (&ab_one_holder, &ab_separate_holder) {
             (Some(ab), _) => ab.dtype() == DType::BF16,
-            (None, Some((a, b_proj))) => {
-                a.dtype() == DType::BF16 && b_proj.dtype() == DType::BF16
-            }
+            (None, Some((a, b_proj))) => a.dtype() == DType::BF16 && b_proj.dtype() == DType::BF16,
             (None, None) => unreachable!("one of the two ab holders is always built"),
         };
         if qkv.dtype() != DType::BF16 || z.dtype() != DType::BF16 || !ab_dtype_bf16 {
@@ -3587,7 +3807,7 @@ impl LinearAttention {
                 );
             });
         }
-        if verify_gdn_chunk_env_opt_in_nv_q38_verify_gdn_chunk_1_writes_ckpts_in_place_off_pooled_scratch()
+        if verify_gdn_chunk_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_gdn_chunk_0_for_per_row_ckpt_copies()
         {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -3644,7 +3864,7 @@ impl LinearAttention {
         let (_d10, rec_state_ptr, _l10) = cuda_tensor_raw(&state.recurrent_state)?;
 
         let key_dim = n_k * d_k;
-        let ckpt_in_place_bases = if verify_gdn_chunk_env_opt_in_nv_q38_verify_gdn_chunk_1_writes_ckpts_in_place_off_pooled_scratch()
+        let ckpt_in_place_bases = if verify_gdn_chunk_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_gdn_chunk_0_for_per_row_ckpt_copies()
         {
             ckpt_rows_contiguous_base(&ckpts[..m], conv_row_elems, rec_row_elems)?
         } else {
@@ -3723,20 +3943,19 @@ impl LinearAttention {
             }
         };
 
-        let tree_parents_ptr = match
-            tree_parents_forking_each_row_from_its_parents_ckpt_slot_none_means_linear_chain
-        {
-            Some(parents) => {
-                anyhow::ensure!(
-                    parents.len() >= m,
-                    "m-row verify tree: parents buffer holds {} rows, verify has {m}",
-                    parents.len()
-                );
-                let (p, _g) = parents.device_ptr(&stream);
-                Some(p)
-            }
-            None => None,
-        };
+        let tree_parents_ptr =
+            match tree_parents_forking_each_row_from_its_parents_ckpt_slot_none_means_linear_chain {
+                Some(parents) => {
+                    anyhow::ensure!(
+                        parents.len() >= m,
+                        "m-row verify tree: parents buffer holds {} rows, verify has {m}",
+                        parents.len()
+                    );
+                    let (p, _g) = parents.device_ptr(&stream);
+                    Some(p)
+                }
+                None => None,
+            };
         {
             let mp = mixed_ptr;
             let cp = ckpt_conv_base;
@@ -3774,6 +3993,7 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_conv_chunk");
         }
+        gdn_stage_hook::mark(1);
         anyhow::ensure!(
             tree_parents_ptr.is_none()
                 || gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0(),
@@ -3933,6 +4153,7 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_state_chunk");
         }
+        gdn_stage_hook::mark(2);
 
         let conv_row_bytes = conv_row_elems * 2;
         let rec_row_bytes = rec_row_elems * 4;
@@ -3985,6 +4206,7 @@ impl LinearAttention {
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_ckpt_dtod");
         }
+        gdn_stage_hook::mark(3);
         let flat = {
             let storage = candle_core::CudaStorage::wrap_cuda_slice(gated, dev.clone());
             Tensor::from_storage(
@@ -3994,7 +4216,16 @@ impl LinearAttention {
                 false,
             )
         };
-        let out = self.out_proj.forward(&flat)?;
+        let out = match e4m3_mrows_f16mma_projection(
+            &self.out_proj,
+            &flat,
+            m,
+            &dev,
+            gdn_mrow_fp8mma_out_env_opt_in_1_reread_every_call(),
+        )? {
+            Some(t) => t,
+            None => self.out_proj.forward(&flat)?,
+        };
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_out_proj");
         }
@@ -4657,56 +4888,6 @@ fn load_linear_else_fp8_rowscale_dequant_because_q38_mixed_checkpoints_store_gdn
 }
 
 #[cfg(feature = "cuda")]
-fn qkvz_concat_raw_fp8_if_both_modules_are_fp8(
-    weights: &WeightLoader,
-    prefix: &str,
-    conv_dim: usize,
-    value_dim: usize,
-    hidden: usize,
-) -> Result<Option<(Vec<u8>, Vec<f32>)>> {
-    let mut bytes: Vec<u8> = Vec::with_capacity((conv_dim + value_dim) * hidden);
-    let mut scales: Vec<f32> = Vec::with_capacity(conv_dim + value_dim);
-    for (module, rows) in [
-        (format!("{prefix}.in_proj_qkv"), conv_dim),
-        (format!("{prefix}.in_proj_z"), value_dim),
-    ] {
-        let resolved_w = crate::weight_load::resolve_stripping_model_prefix(
-            weights,
-            &format!("{module}.weight"),
-        )?;
-        let resolved_module = resolved_w
-            .strip_suffix(".weight")
-            .unwrap_or(&resolved_w)
-            .to_string();
-        if !crate::linear::checkpoint_module_is_fp8_e4m3_weight_with_scale(
-            weights,
-            &resolved_module,
-        ) {
-            return Ok(None);
-        }
-        let raw = weights
-            .raw_bytes(&resolved_w)
-            .map_err(|e| anyhow::anyhow!("read {resolved_w}: {e}"))?;
-        anyhow::ensure!(
-            raw.len() == rows * hidden,
-            "{resolved_w}: {} bytes != rows {rows} x hidden {hidden}",
-            raw.len()
-        );
-        bytes.extend_from_slice(raw);
-        let scale_name = format!("{resolved_module}.weight_scale");
-        let scale_t = weights
-            .get(&scale_name, DType::F32)
-            .map_err(|e| anyhow::anyhow!("load {scale_name}: {e}"))?;
-        let scale_dims = scale_t.dims().to_vec();
-        let scale_vals: Vec<f32> = scale_t.flatten_all()?.to_vec1()?;
-        let row_scales = nv_weights::fp8_row_scales_from(&scale_dims, &scale_vals, rows)
-            .map_err(|e| anyhow::anyhow!("{scale_name} shape {scale_dims:?}: {e}"))?;
-        scales.extend_from_slice(&row_scales);
-    }
-    Ok(Some((bytes, scales)))
-}
-
-#[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_byte_per_param(
     weights: &WeightLoader,
@@ -4740,6 +4921,138 @@ fn load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_b
         in_features,
         dtype,
         crate::weight_load::resolve_stripping_model_prefix,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn load_linear_nvfp4_resident_double_quant_from_the_fp8_checkpoint_because_gdn_decode_bandwidth_wants_half_a_byte_per_param(
+    weights: &WeightLoader,
+    module: &str,
+    out_features: usize,
+    in_features: usize,
+    device: &Device,
+    nvfp4_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+) -> Result<Linear> {
+    let bf16_linear =
+        load_linear_else_fp8_rowscale_dequant_because_q38_mixed_checkpoints_store_gdn_qkv_z_out_as_f8e4m3(
+            weights, module, out_features, in_features, DType::BF16,
+        )?;
+    if !in_features.is_multiple_of(nv_quant::nvfp4::BLOCK_SIZE)
+        || out_features < nv_quant::nvfp4::MIN_TILE
+        || in_features < nv_quant::nvfp4::MIN_TILE
+    {
+        return Ok(bf16_linear);
+    }
+    let Some(weight) = bf16_linear.dequant_weight()? else {
+        return Ok(bf16_linear);
+    };
+    if gdn_nvfp4_cf_env_opt_in_1_quantizes_on_host_with_the_closed_form_ue4m3_scale_search_instead_of_amax_parking()
+    {
+        return host_closed_form_nvfp4_linear_same_ue4m3_grid_as_the_dev_kernel_but_error_optimal_scale_bytes(
+            &weight,
+            out_features,
+            in_features,
+            device,
+            nvfp4_runner,
+        );
+    }
+    crate::linear::Linear::from_bf16_quantized_nvfp4_dev(
+        &weight,
+        None,
+        device,
+        nvfp4_runner.clone(),
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn host_closed_form_nvfp4_linear_same_ue4m3_grid_as_the_dev_kernel_but_error_optimal_scale_bytes(
+    weight: &Tensor,
+    out_features: usize,
+    in_features: usize,
+    device: &Device,
+    nvfp4_runner: &std::sync::Arc<std::sync::Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+) -> Result<Linear> {
+    use nv_quant::nvfp4::BLOCK_SIZE;
+    let host: Vec<half::bf16> = weight
+        .to_dtype(DType::BF16)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<half::bf16>()?;
+    anyhow::ensure!(
+        host.len() == out_features * in_features,
+        "closed-form nvfp4: weight has {} elements, expected {out_features}x{in_features}",
+        host.len()
+    );
+    let amax = host.iter().fold(0f32, |a, b| a.max(b.to_f32().abs()));
+    anyhow::ensure!(
+        amax.is_finite() && amax > 0.0,
+        "closed-form nvfp4: tensor amax {amax} is not positive finite"
+    );
+    let stored_global = (448.0f32 * 6.0) / amax;
+    let blocks_per_row = in_features / BLOCK_SIZE;
+    let jobs = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8)
+        .clamp(1, out_features);
+    let rows_per_job = out_features.div_ceil(jobs);
+    let mut packed = vec![0u8; out_features * in_features / 2];
+    let mut scales_linear = vec![0u8; out_features * blocks_per_row];
+    std::thread::scope(|s| {
+        let host = &host;
+        for (ci, (packed_chunk, scales_chunk)) in packed
+            .chunks_mut(rows_per_job * in_features / 2)
+            .zip(scales_linear.chunks_mut(rows_per_job * blocks_per_row))
+            .enumerate()
+        {
+            let base = ci * rows_per_job;
+            s.spawn(move || {
+                for (r_local, (row_packed, row_scales)) in packed_chunk
+                    .chunks_mut(in_features / 2)
+                    .zip(scales_chunk.chunks_mut(blocks_per_row))
+                    .enumerate()
+                {
+                    let r = base + r_local;
+                    let row: Vec<f32> = host[r * in_features..(r + 1) * in_features]
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect();
+                    for (b, block) in row.chunks(BLOCK_SIZE).enumerate() {
+                        let (pb, sb) = nv_quant::nvfp4::quantize_block_with_global_closed_form(
+                            block,
+                            stored_global,
+                        );
+                        row_packed[b * (BLOCK_SIZE / 2)..(b + 1) * (BLOCK_SIZE / 2)]
+                            .copy_from_slice(&pb);
+                        row_scales[b] = sb;
+                    }
+                }
+            });
+        }
+    });
+    let scales_sw = nv_quant::nvfp4::swizzle_scales(&scales_linear, out_features, blocks_per_row);
+    let dev = match device {
+        Device::Cuda(d) => d.clone(),
+        _ => anyhow::bail!("NVFP4 Linear requires a CUDA device"),
+    };
+    let stream = crate::cuda_stream::current_stream(&dev);
+    #[allow(deprecated)]
+    let packed_dev = stream
+        .clone_htod(&packed)
+        .map_err(|e| anyhow::anyhow!("htod closed-form packed: {e:?}"))?;
+    #[allow(deprecated)]
+    let scales_dev = stream
+        .clone_htod(&scales_sw)
+        .map_err(|e| anyhow::anyhow!("htod closed-form scales: {e:?}"))?;
+    crate::linear::Linear::new_nvfp4_scaled(
+        packed_dev,
+        scales_dev,
+        in_features,
+        out_features,
+        None,
+        device,
+        nvfp4_runner.clone(),
+        1.0 / stored_global,
+        1.0,
     )
 }
 
@@ -4885,7 +5198,7 @@ mod gdn_decode_scratch_lifetime_tests {
             })
             .unwrap();
         fork.synchronize().unwrap();
-        let first: Vec<f32> = fork.memcpy_dtov(&out).unwrap();
+        let first: Vec<f32> = fork.clone_dtoh(&out).unwrap();
         assert!(
             first.iter().all(|v| (*v - expected).abs() < 1e-3),
             "first launch must route the pattern through the dims-A qn scratch: got {} expected \
@@ -4916,7 +5229,7 @@ mod gdn_decode_scratch_lifetime_tests {
             })
             .unwrap();
         fork.synchronize().unwrap();
-        let replay: Vec<f32> = fork.memcpy_dtov(&out).unwrap();
+        let replay: Vec<f32> = fork.clone_dtoh(&out).unwrap();
         assert!(
             replay.iter().all(|v| (*v - expected).abs() < 1e-3),
             "replaying the dims-A graph after a dims-B take on the same thread read freed or \
@@ -4924,7 +5237,7 @@ mod gdn_decode_scratch_lifetime_tests {
             replay[0]
         );
         for (i, c) in canaries.iter().enumerate() {
-            let canary_back: Vec<f32> = stream.memcpy_dtov(c).unwrap();
+            let canary_back: Vec<f32> = stream.clone_dtoh(c).unwrap();
             assert!(
                 canary_back
                     .iter()

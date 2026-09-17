@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device};
@@ -9,7 +10,7 @@ use tracing::{info, warn};
 use nv_omni::vocoder::{Vocoder, NUM_CODEBOOKS, STREAM_CHUNK_FRAMES, STREAM_LEFT_CONTEXT_FRAMES};
 use nv_tts::{
     Qwen3TtsCodecDecoder, Qwen3TtsTalker, Qwen3TtsTokenizer, Sampler, SamplerConfig,
-    VocoderInventory, VocoderLoadReport, VoiceProfileStore,
+    VocoderInventory, VocoderLoadReport, VoiceStoreHandle,
 };
 
 use crate::oapi::audio_speech::{
@@ -35,8 +36,6 @@ pub const ENV_STREAM_CHUNK_FRAMES: &str = "NV_TTS_STREAM_CHUNK_FRAMES";
 
 pub const ENV_STREAM_LEFT_CONTEXT: &str = "NV_TTS_STREAM_LEFT_CONTEXT";
 
-pub const ENV_SPEAKER: &str = "NV_TTS_SPEAKER";
-
 pub const ENV_LANGUAGE: &str = "NV_TTS_LANG";
 
 pub const ENV_SEED: &str = "NV_TTS_SEED";
@@ -44,6 +43,8 @@ pub const ENV_SEED: &str = "NV_TTS_SEED";
 pub const ENV_GREEDY: &str = "NV_TTS_GREEDY";
 
 pub const DEFAULT_SPEAKER: &str = "serena";
+
+pub const DEFAULT_PROFILE: &str = "default";
 
 pub struct Qwen3TtsAudioSpeech {
     pub talker_dir: PathBuf,
@@ -57,8 +58,9 @@ pub struct Qwen3TtsAudioSpeech {
     pub vocoder_inventory: VocoderInventory,
     pub vocoder_report: VocoderLoadReport,
 
-    pub voice_profiles: Option<Arc<VoiceProfileStore>>,
+    pub voice_profiles: Arc<VoiceStoreHandle>,
     pub profiles_supported: bool,
+    pub default_voice: Arc<DefaultVoiceCache>,
 
     pub sample_rate: u32,
 
@@ -206,11 +208,7 @@ impl Qwen3TtsAudioSpeech {
             "nv-tts AudioSpeech ready"
         );
         let inventory = report.inventory.clone();
-        let voice_profiles = match VoiceProfileStore::open(voice_profile_root()) {
-            Ok(store) => Some(Arc::new(store)),
-            Err(_) => None,
-        };
-
+        let voice_profiles = Arc::new(VoiceStoreHandle::new(voice_profile_root()));
         let profiles_supported = tts_model_type(talker_dir).as_deref() == Some("base");
 
         Ok(Self {
@@ -224,6 +222,7 @@ impl Qwen3TtsAudioSpeech {
             vocoder_report: report,
             voice_profiles,
             profiles_supported,
+            default_voice: Arc::new(DefaultVoiceCache::default()),
             sample_rate: NV_TTS_SAMPLE_RATE,
             allow_silent_vocoder,
         })
@@ -237,6 +236,26 @@ impl Qwen3TtsAudioSpeech {
 pub fn is_default_voice_alias(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
     n.is_empty() || n == "default" || crate::tts::text::is_openai_voice_alias(&n)
+}
+
+fn alias_without_speakers_message(voice: &str, profiles_supported: bool, hidden: usize) -> String {
+    if profiles_supported {
+        format!(
+            "voice {voice:?} is an OpenAI alias, but this Base checkpoint ships no built-in \
+             speakers (spk_id is empty), no voice profile named {DEFAULT_PROFILE:?} is \
+             enrolled, and the engine's built-in default voice is not {hidden}-d, so there is \
+             nothing to condition on; enroll a profile via POST /v1/voice-profiles and pass \
+             its name as `voice`, or enroll one named {DEFAULT_PROFILE:?} to give the OpenAI \
+             aliases a voice"
+        )
+    } else {
+        format!(
+            "voice {voice:?} is an OpenAI alias, but this checkpoint ships no built-in speakers \
+             (spk_id is empty) and its tts_model_type != \"base\" cannot use voice profiles \
+             either; load a CustomVoice checkpoint for named speakers or a Base checkpoint for \
+             profiles"
+        )
+    }
 }
 
 fn unknown_voice_message(
@@ -318,7 +337,15 @@ impl AudioSpeech for Qwen3TtsAudioSpeech {
             if talker.has_text_embedding() && !token_ids.is_empty() {
                 let vocoder = self.vocoder.clone();
                 let role_ids = self.role_prefix_ids()?;
-                let (speaker_embed, speaker_name) = self.resolve_speaker_embed(voice)?;
+                let (speaker_embed, speaker_name) = match self.resolver() {
+                    Some(r) => {
+                        let voice = voice.to_string();
+                        tokio::task::spawn_blocking(move || r.resolve(&voice))
+                            .await
+                            .context("speaker resolution task")??
+                    }
+                    None => (None, "none".to_string()),
+                };
                 let language_id = self.resolve_language_id();
                 let tk = self.tokenizer.clone();
                 let (chunk_frames, left_context) = stream_geometry();
@@ -486,50 +513,175 @@ impl AudioSpeech for Qwen3TtsAudioSpeech {
     }
 }
 
-impl Qwen3TtsAudioSpeech {
-    fn profile_speaker_embed(&self, voice: &str) -> Option<Result<candle_core::Tensor>> {
-        let store = self.voice_profiles.as_ref()?;
-        let profile = store.get(voice).ok()?;
-        let talker = match self.talker.as_ref() {
-            Some(t) => t,
-            None => {
-                return Some(Err(anyhow::anyhow!(
-                    "voice profile requested but no talker loaded"
-                )))
+const BUILTIN_DEFAULT_XVECTOR: &[u8] =
+    include_bytes!("../../voices/qwen3-tts-0_6b-default.xvector.json");
+
+fn builtin_default_profile() -> Option<&'static nv_tts::VoiceProfile> {
+    static PARSED: std::sync::OnceLock<Option<nv_tts::VoiceProfile>> = std::sync::OnceLock::new();
+    PARSED
+        .get_or_init(|| match serde_json::from_slice(BUILTIN_DEFAULT_XVECTOR) {
+            Ok(p) => Some(p),
+            Err(err) => {
+                tracing::error!(error = %err, "built-in default x-vector does not parse");
+                None
             }
-        };
-        if !self.profiles_supported {
-            return Some(Err(anyhow::Error::new(InvalidVoiceRequest(format!(
-                "voice profile {voice:?} cannot be used with this checkpoint: it has \
-                 tts_model_type != \"base\" (CustomVoice/VoiceDesign checkpoints carry no \
-                 speaker-conditioning pathway for x-vectors); load a Qwen3-TTS Base \
-                 checkpoint via {ENV_TALKER_DIR} to use voice profiles"
-            )))));
+        })
+        .as_ref()
+}
+
+pub fn builtin_default_xvector(hidden: usize) -> Option<&'static [f32]> {
+    let p = builtin_default_profile()?;
+    (p.embedding.len() == hidden).then_some(p.embedding.as_slice())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultVoiceSource {
+    Profile(Option<SystemTime>),
+    Builtin,
+}
+
+#[derive(Default)]
+pub struct DefaultVoiceCache {
+    slot: std::sync::Mutex<Option<(DefaultVoiceSource, candle_core::Tensor)>>,
+}
+
+impl DefaultVoiceCache {
+    fn get_or_build(
+        &self,
+        source: DefaultVoiceSource,
+        build: impl FnOnce() -> Result<candle_core::Tensor>,
+    ) -> Result<candle_core::Tensor> {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_source, tensor)) = slot.as_ref() {
+            if *cached_source == source {
+                return Ok(tensor.clone());
+            }
         }
-        let hidden = talker.config().hidden_size;
-        if profile.embedding.len() != hidden {
-            return Some(Err(anyhow::Error::new(InvalidVoiceRequest(format!(
-                "voice profile {voice:?} has a {}-d embedding but this talker expects {hidden}-d; \
-                 re-enroll the profile against the current checkpoint",
-                profile.embedding.len()
-            )))));
+        let tensor = build()?;
+        *slot = Some((source, tensor.clone()));
+        Ok(tensor)
+    }
+}
+
+pub struct SpeakerResolver {
+    pub talker: Arc<Qwen3TtsTalker>,
+    pub store: Arc<VoiceStoreHandle>,
+    pub profiles_supported: bool,
+    pub cache: Arc<DefaultVoiceCache>,
+}
+
+fn profile_tensor(profile: nv_tts::VoiceProfile, hidden: usize) -> Result<candle_core::Tensor> {
+    let name = profile.name;
+    if profile.embedding.len() != hidden {
+        return Err(anyhow::Error::new(InvalidVoiceRequest(format!(
+            "voice profile {name:?} has a {}-d embedding but this talker expects {hidden}-d; \
+             re-enroll the profile against the current checkpoint",
+            profile.embedding.len()
+        ))));
+    }
+    if profile.embedding.iter().all(|x| *x == 0.0) {
+        return Err(anyhow::Error::new(InvalidVoiceRequest(format!(
+            "voice profile {name:?} has an all-zero embedding (enrolled without a \
+             speaker encoder); re-enroll it against a Base checkpoint"
+        ))));
+    }
+    candle_core::Tensor::from_vec(profile.embedding, (1usize, 1usize, hidden), &Device::Cpu)
+        .map_err(|e| anyhow::anyhow!("voice profile tensor: {e}"))
+}
+
+impl SpeakerResolver {
+    fn codec_row(&self, name: &str, id: u32) -> Result<(Option<candle_core::Tensor>, String)> {
+        match self.talker.codec_embed_rows(&[id]) {
+            Ok(emb) => Ok((Some(emb), name.to_string())),
+            Err(err) => {
+                warn!(error = %err, speaker = %name, "speaker codec embed failed");
+                Ok((None, "none".to_string()))
+            }
         }
-        if profile.embedding.iter().all(|x| *x == 0.0) {
-            return Some(Err(anyhow::Error::new(InvalidVoiceRequest(format!(
-                "voice profile {voice:?} has an all-zero embedding (enrolled without a \
-                 speaker encoder); re-enroll it against a Base checkpoint"
-            )))));
-        }
-        Some(
-            candle_core::Tensor::from_vec(
-                profile.embedding.clone(),
-                (1usize, 1usize, hidden),
-                &Device::Cpu,
-            )
-            .map_err(|e| anyhow::anyhow!("voice profile tensor: {e}")),
-        )
     }
 
+    fn named_profile(&self, voice: &str) -> Result<(Option<candle_core::Tensor>, String)> {
+        let spk_map = &self.talker.config().spk_id;
+        if !self.profiles_supported {
+            return Err(anyhow::Error::new(UnknownVoice(unknown_voice_message(
+                voice, spk_map, false,
+            ))));
+        }
+        let store = self.store.get()?;
+        if !store.exists(voice) {
+            return Err(anyhow::Error::new(UnknownVoice(unknown_voice_message(
+                voice, spk_map, true,
+            ))));
+        }
+        let profile = store
+            .get(voice)
+            .map_err(|e| InvalidVoiceRequest(format!("voice profile {voice:?}: {e:#}")))?;
+        let tensor = profile_tensor(profile, self.talker.config().hidden_size)?;
+        Ok((Some(tensor), format!("profile:{voice}")))
+    }
+
+    fn default_voice(&self, requested: &str) -> Result<(Option<candle_core::Tensor>, String)> {
+        let hidden = self.talker.config().hidden_size;
+        if !self.profiles_supported {
+            return Err(anyhow::Error::new(UnknownVoice(
+                alias_without_speakers_message(requested, false, hidden),
+            )));
+        }
+        let store = match self.store.get() {
+            Ok(store) => Some(store),
+            Err(err) => {
+                tracing::debug!(error = %err, "voice store unavailable; using the built-in default voice");
+                None
+            }
+        };
+        if let Some(store) = store.filter(|s| s.exists(DEFAULT_PROFILE)) {
+            let source = DefaultVoiceSource::Profile(store.modified(DEFAULT_PROFILE));
+            let tensor = self.cache.get_or_build(source, || {
+                let profile = store.get(DEFAULT_PROFILE).map_err(|e| {
+                    InvalidVoiceRequest(format!("voice profile {DEFAULT_PROFILE:?}: {e:#}"))
+                })?;
+                profile_tensor(profile, hidden)
+            })?;
+            return Ok((Some(tensor), format!("profile:{DEFAULT_PROFILE}")));
+        }
+        if let Some(xvec) = builtin_default_xvector(hidden) {
+            let tensor = self.cache.get_or_build(DefaultVoiceSource::Builtin, || {
+                candle_core::Tensor::from_vec(xvec.to_vec(), (1usize, 1usize, hidden), &Device::Cpu)
+                    .map_err(|e| anyhow::anyhow!("built-in default voice tensor: {e}"))
+            })?;
+            return Ok((Some(tensor), "builtin:default".to_string()));
+        }
+        Err(anyhow::Error::new(UnknownVoice(
+            alias_without_speakers_message(requested, self.profiles_supported, hidden),
+        )))
+    }
+
+    pub fn resolve(&self, voice: &str) -> Result<(Option<candle_core::Tensor>, String)> {
+        let spk_map = &self.talker.config().spk_id;
+        let requested = voice.trim().to_lowercase();
+        if let Some((name, id)) = spk_map.iter().find(|(name, _)| *name == requested) {
+            return self.codec_row(name, *id);
+        }
+        if is_default_voice_alias(&requested) {
+            if spk_map.is_empty() {
+                return self.default_voice(voice);
+            }
+            let (name, id) = spk_map
+                .iter()
+                .find(|(name, _)| name == DEFAULT_SPEAKER)
+                .or_else(|| spk_map.first())
+                .cloned()
+                .expect("non-empty spk_map");
+            return self.codec_row(&name, id);
+        }
+        self.named_profile(voice)
+    }
+}
+
+impl Qwen3TtsAudioSpeech {
     fn role_prefix_ids(&self) -> Result<Vec<u32>> {
         let ids = self
             .tokenizer
@@ -545,49 +697,18 @@ impl Qwen3TtsAudioSpeech {
         Ok(ids)
     }
 
+    pub fn resolver(&self) -> Option<SpeakerResolver> {
+        Some(SpeakerResolver {
+            talker: self.talker.clone()?,
+            store: self.voice_profiles.clone(),
+            profiles_supported: self.profiles_supported,
+            cache: self.default_voice.clone(),
+        })
+    }
+
     fn resolve_speaker_embed(&self, voice: &str) -> Result<(Option<candle_core::Tensor>, String)> {
-        let talker = match self.talker.as_ref() {
-            Some(t) => t,
-            None => return Ok((None, "none".to_string())),
-        };
-        let spk_map = &talker.config().spk_id;
-        let requested = voice.to_lowercase();
-        let mut chosen: Option<(String, u32)> =
-            spk_map.iter().find(|(name, _)| *name == requested).cloned();
-        if chosen.is_none() {
-            if let Some(profile) = self.profile_speaker_embed(voice) {
-                let embed = profile?;
-                return Ok((Some(embed), format!("profile:{voice}")));
-            }
-            if !is_default_voice_alias(&requested) {
-                return Err(anyhow::Error::new(UnknownVoice(unknown_voice_message(
-                    voice,
-                    spk_map,
-                    self.profiles_supported,
-                ))));
-            }
-            warn!(
-                requested = %voice,
-                fallback = DEFAULT_SPEAKER,
-                "openai voice alias falling back to the default nv-tts speaker"
-            );
-            let fallback = std::env::var(ENV_SPEAKER)
-                .unwrap_or_else(|_| DEFAULT_SPEAKER.to_string())
-                .to_lowercase();
-            chosen = spk_map
-                .iter()
-                .find(|(name, _)| *name == fallback)
-                .cloned()
-                .or_else(|| spk_map.first().cloned());
-        }
-        match chosen {
-            Some((name, id)) => match talker.codec_embed_rows(&[id]) {
-                Ok(emb) => Ok((Some(emb), name)),
-                Err(err) => {
-                    warn!(error = %err, speaker = %name, "speaker codec embed failed");
-                    Ok((None, "none".to_string()))
-                }
-            },
+        match self.resolver() {
+            Some(r) => r.resolve(voice),
             None => Ok((None, "none".to_string())),
         }
     }
@@ -804,108 +925,353 @@ mod tests {
 
     #[test]
     fn profile_resolution_rules_on_real_checkpoint() {
-        use nv_tts::{VoiceProfile, VoiceProfileStore};
+        use nv_tts::VoiceProfile;
 
         let Some(dir) = cached_or_skip() else {
             eprintln!("skip profile_resolution_rules_on_real_checkpoint: cache absent");
             return;
         };
         let mut svc = Qwen3TtsAudioSpeech::from_dirs(&dir, None).expect("bootstrap");
-        assert!(
-            !svc.profiles_supported,
-            "CustomVoice checkpoint must report profiles_supported == false"
+        let talker = svc.talker.clone().expect("talker");
+        let hidden = talker.config().hidden_size;
+        let has_speakers = !talker.config().spk_id.is_empty();
+        assert_eq!(
+            svc.profiles_supported, !has_speakers,
+            "Base ships no speakers and supports profiles; CustomVoice the opposite"
         );
 
+        let (tmp, store) = temp_profile_store("vp_rules");
+        for (name, schema, emb) in [
+            ("p_good", 2, vec![0.1; hidden]),
+            ("p_short", 2, vec![0.1; 8]),
+            ("p_zero", 1, vec![0.0; hidden]),
+        ] {
+            store
+                .put(&VoiceProfile {
+                    schema_version: schema,
+                    name: name.into(),
+                    embedding: emb,
+                    design_params: None,
+                })
+                .unwrap();
+        }
+        svc.voice_profiles = Arc::new(VoiceStoreHandle::new(&tmp));
+
+        let err = svc
+            .resolve_speaker_embed("no_such_voice")
+            .expect_err("unknown voice must be refused, not silently substituted");
+        let msg = format!("{err:#}");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{msg}");
+        assert!(msg.contains("no_such_voice"), "{msg}");
+
+        if has_speakers {
+            let err = svc
+                .resolve_speaker_embed("p_good")
+                .expect_err("profiles are not usable on a CustomVoice checkpoint");
+            assert!(format!("{err:#}").contains("tts_model_type"), "{err:#}");
+            let (emb, name) = svc.resolve_speaker_embed("serena").expect("named speaker");
+            assert_eq!(name, "serena");
+            assert!(emb.is_some());
+            for alias in ["default", "alloy", ""] {
+                let (_, name) = svc.resolve_speaker_embed(alias).expect("alias");
+                assert_eq!(name, DEFAULT_SPEAKER, "{alias:?}");
+            }
+        } else {
+            let (emb, name) = svc.resolve_speaker_embed("p_good").expect("profile embed");
+            assert_eq!(name, "profile:p_good");
+            assert_eq!(emb.expect("tensor").dims(), &[1usize, 1, hidden]);
+            for bad in ["p_short", "p_zero"] {
+                let err = svc.resolve_speaker_embed(bad).expect_err("must reject");
+                assert!(
+                    err.downcast_ref::<InvalidVoiceRequest>().is_some(),
+                    "{bad}: expected InvalidVoiceRequest, got: {err:#}"
+                );
+            }
+            for alias in ["default", "alloy", ""] {
+                let (_, name) = svc.resolve_speaker_embed(alias).expect("alias");
+                assert_eq!(name, "builtin:default", "{alias:?}");
+            }
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn fake_talker(hidden: usize, spk_id: Vec<(String, u32)>) -> Arc<Qwen3TtsTalker> {
+        let cfg = nv_tts::Qwen3TtsTalkerConfig {
+            hidden_size: hidden,
+            num_hidden_layers: 1,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            intermediate_size: 64,
+            speech_vocab_size: 16,
+            text_vocab_size: 64,
+            text_hidden_size: 16,
+            rope_theta: 10000.0,
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            mrope_section: vec![2, 1, 1],
+            dtype: DType::F32,
+            spk_id,
+            language_id: Vec::new(),
+        };
+        Arc::new(Qwen3TtsTalker::new(cfg, &Device::Cpu).expect("build tiny talker"))
+    }
+
+    fn temp_profile_store(tag: &str) -> (PathBuf, nv_tts::VoiceProfileStore) {
         let tmp = std::env::temp_dir().join(format!(
-            "nvtts_vp_rules_{}_{}",
+            "nvtts_{tag}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let store = VoiceProfileStore::open(&tmp).expect("open temp store");
-        let hidden = svc.talker.as_ref().unwrap().config().hidden_size;
-        store
-            .put(&VoiceProfile {
-                schema_version: 2,
-                name: "p_good".into(),
-                embedding: vec![0.1; hidden],
-                design_params: None,
-            })
-            .unwrap();
-        store
-            .put(&VoiceProfile {
-                schema_version: 2,
-                name: "p_short".into(),
-                embedding: vec![0.1; 8],
-                design_params: None,
-            })
-            .unwrap();
-        store
-            .put(&VoiceProfile {
-                schema_version: 1,
-                name: "p_zero".into(),
-                embedding: vec![0.0; hidden],
-                design_params: None,
-            })
-            .unwrap();
-        svc.voice_profiles = Some(Arc::new(store));
+        let store = nv_tts::VoiceProfileStore::open(&tmp).expect("open temp store");
+        (tmp, store)
+    }
 
-        let err = svc
-            .resolve_speaker_embed("p_good")
-            .expect_err("must reject");
-        assert!(
-            err.downcast_ref::<InvalidVoiceRequest>().is_some(),
-            "profile on non-base checkpoint must be an InvalidVoiceRequest, got: {err:#}"
-        );
+    fn resolver(
+        talker: &Arc<Qwen3TtsTalker>,
+        root: &std::path::Path,
+        profiles_supported: bool,
+    ) -> SpeakerResolver {
+        SpeakerResolver {
+            talker: talker.clone(),
+            store: Arc::new(VoiceStoreHandle::new(root)),
+            profiles_supported,
+            cache: Arc::new(DefaultVoiceCache::default()),
+        }
+    }
 
-        let (emb, name) = svc.resolve_speaker_embed("serena").expect("named speaker");
-        assert_eq!(name, "serena");
-        assert!(
-            emb.is_some(),
-            "named speaker must resolve to a codec embed row"
-        );
+    fn row(emb: Option<candle_core::Tensor>) -> Vec<f32> {
+        emb.expect("embed")
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap()
+    }
 
-        svc.profiles_supported = true;
-        let (emb, name) = svc.resolve_speaker_embed("p_good").expect("profile embed");
-        assert_eq!(name, "profile:p_good");
-        let emb = emb.expect("profile embed tensor");
-        assert_eq!(emb.dims(), &[1usize, 1, hidden]);
+    #[test]
+    fn builtin_default_xvector_matches_the_0_6b_talker_width() {
+        let xvec = builtin_default_xvector(1024).expect("shipped for the 0.6B family");
+        assert_eq!(xvec.len(), 1024);
+        assert!(xvec.iter().any(|x| *x != 0.0));
+        assert!(builtin_default_xvector(2048).is_none());
+        assert!(builtin_default_xvector(32).is_none());
+    }
 
-        for bad in ["p_short", "p_zero"] {
-            let err = svc.resolve_speaker_embed(bad).expect_err("must reject");
-            assert!(
-                err.downcast_ref::<InvalidVoiceRequest>().is_some(),
-                "{bad}: expected InvalidVoiceRequest, got: {err:#}"
-            );
+    #[test]
+    fn base_talker_aliases_use_the_default_profile_then_the_builtin_voice() {
+        use nv_tts::VoiceProfile;
+
+        let talker = fake_talker(1024, Vec::new());
+        let (tmp, store) = temp_profile_store("vp_alias");
+        let r = resolver(&talker, &tmp, true);
+        let builtin = builtin_default_xvector(1024).unwrap();
+
+        for alias in ["alloy", "shimmer", "default", "", "Echo"] {
+            let (emb, name) = r
+                .resolve(alias)
+                .unwrap_or_else(|e| panic!("{alias:?} must resolve without any enrollment: {e:#}"));
+            assert_eq!(name, "builtin:default", "{alias:?}");
+            assert_eq!(row(emb), builtin, "{alias:?}");
         }
 
-        let err = svc
-            .resolve_speaker_embed("no_such_voice")
-            .expect_err("unknown voice must be refused, not silently substituted");
+        let err = r
+            .resolve("nope")
+            .expect_err("unknown non-alias voice is refused");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{err:#}");
+        assert!(format!("{err:#}").contains("nope"));
+
+        store
+            .put(&VoiceProfile {
+                schema_version: 2,
+                name: "mine".into(),
+                embedding: vec![0.25; 1024],
+                design_params: None,
+            })
+            .unwrap();
+        let (emb, name) = r.resolve("mine").expect("profile");
+        assert_eq!(name, "profile:mine");
+        assert_eq!(emb.expect("embed").dims(), &[1usize, 1, 1024]);
+        let (_, name) = r.resolve("alloy").expect("alias");
+        assert_eq!(
+            name, "builtin:default",
+            "a profile that is not named default does not capture the aliases"
+        );
+
+        store
+            .put(&VoiceProfile {
+                schema_version: 2,
+                name: DEFAULT_PROFILE.into(),
+                embedding: vec![0.5; 1024],
+                design_params: None,
+            })
+            .unwrap();
+        for alias in ["alloy", "echo", "default", ""] {
+            let (emb, name) = r.resolve(alias).expect("routed");
+            assert_eq!(name, format!("profile:{DEFAULT_PROFILE}"), "{alias:?}");
+            assert!(
+                row(emb).iter().all(|x| (*x - 0.5).abs() < 1e-6),
+                "{alias:?}"
+            );
+        }
+        let (_, name) = r.resolve("mine").expect("profile");
+        assert_eq!(
+            name, "profile:mine",
+            "a named profile still wins over the default"
+        );
+
+        store.delete(DEFAULT_PROFILE).unwrap();
+        let (emb, name) = r.resolve("alloy").expect("alias");
+        assert_eq!(
+            name, "builtin:default",
+            "deleting the profile falls back again"
+        );
+        assert_eq!(row(emb), builtin);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn base_talker_without_a_matching_builtin_refuses_aliases() {
+        let talker = fake_talker(32, Vec::new());
+        let (tmp, _store) = temp_profile_store("vp_narrow");
+        let r = resolver(&talker, &tmp, true);
+        let err = r.resolve("alloy").expect_err("no 32-d default exists");
         let msg = format!("{err:#}");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{msg}");
         assert!(
-            err.downcast_ref::<UnknownVoice>().is_some(),
-            "expected UnknownVoice, got: {msg}"
+            msg.contains(DEFAULT_PROFILE) && msg.contains("32-d"),
+            "{msg}"
         );
-        assert!(msg.contains("no_such_voice"), "{msg}");
-        assert!(
-            msg.contains("serena"),
-            "message must list valid voices: {msg}"
-        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
-        for alias in ["default", "alloy", "shimmer"] {
-            let (emb, name) = svc
-                .resolve_speaker_embed(alias)
-                .unwrap_or_else(|e| panic!("{alias} must fall back: {e:#}"));
-            assert!(
-                name != "none" && !name.starts_with("profile:"),
-                "{alias} must fall back to a built-in speaker, got {name}"
-            );
-            assert!(emb.is_some(), "{alias} fallback must resolve an embed row");
+    #[test]
+    fn non_base_talker_without_speakers_refuses_aliases_and_profiles() {
+        let talker = fake_talker(1024, Vec::new());
+        let (tmp, _store) = temp_profile_store("vp_design");
+        let r = resolver(&talker, &tmp, false);
+        let err = r.resolve("alloy").expect_err("no conditioning pathway");
+        let msg = format!("{err:#}");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{msg}");
+        assert!(msg.contains("tts_model_type"), "{msg}");
+        let err = r.resolve("mine").expect_err("profiles are not usable");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{err:#}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn custom_voice_talker_never_touches_the_store() {
+        use nv_tts::VoiceProfile;
+
+        let talker = fake_talker(32, vec![("serena".to_string(), 0), ("ryan".to_string(), 1)]);
+        let (tmp, store) = temp_profile_store("vp_custom");
+        store
+            .put(&VoiceProfile {
+                schema_version: 2,
+                name: DEFAULT_PROFILE.into(),
+                embedding: vec![0.5; 32],
+                design_params: None,
+            })
+            .unwrap();
+        let r = resolver(&talker, &tmp, false);
+        for alias in ["default", "alloy", ""] {
+            let (emb, name) = r.resolve(alias).expect("alias");
+            assert_eq!(name, "serena", "{alias:?}");
+            assert!(emb.is_some());
         }
+        let (_, name) = r.resolve("Ryan").expect("named");
+        assert_eq!(name, "ryan");
+        let err = r.resolve("mine").expect_err("no profiles on CustomVoice");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{err:#}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
+    #[test]
+    fn unreachable_store_degrades_to_the_builtin_voice_and_503s_named_profiles() {
+        let talker = fake_talker(1024, Vec::new());
+        let blocker = std::env::temp_dir().join(format!(
+            "nvtts_vp_blocked_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let root = blocker.join("voices");
+        let r = SpeakerResolver {
+            store: Arc::new(
+                VoiceStoreHandle::new(&root).with_reopen_backoff(std::time::Duration::ZERO),
+            ),
+            ..resolver(&talker, &root, true)
+        };
+        assert!(!r.store.is_live());
+
+        let (emb, name) = r.resolve("alloy").expect("aliases keep working");
+        assert_eq!(name, "builtin:default");
+        assert_eq!(row(emb), builtin_default_xvector(1024).unwrap());
+
+        let err = r
+            .resolve("mine")
+            .expect_err("a named profile needs the store");
+        assert!(nv_tts::is_store_unavailable(&err), "{err:#}");
+        assert!(err.downcast_ref::<UnknownVoice>().is_none());
+
+        std::fs::remove_file(&blocker).unwrap();
+        assert!(
+            r.store.is_live(),
+            "the handle reopens once the root is creatable"
+        );
+        let err = r.resolve("mine").expect_err("now a plain unknown voice");
+        assert!(err.downcast_ref::<UnknownVoice>().is_some(), "{err:#}");
+        let _ = std::fs::remove_dir_all(&blocker);
+    }
+
+    #[test]
+    #[ignore = "needs the real Qwen3-TTS Base checkpoint (NV_TTS_BASE_TALKER_DIR or the HF cache)"]
+    fn real_base_checkpoint_serves_aliases_from_the_builtin_then_the_default_profile() {
+        use nv_tts::VoiceProfile;
+
+        let dir = nv_tts::qwen3_tts_base_dir().expect("NV_TTS_BASE_TALKER_DIR or the HF cache");
+        let mut svc = Qwen3TtsAudioSpeech::from_dirs(&dir, None).expect("bootstrap on Base");
+        assert!(
+            svc.profiles_supported,
+            "Base must report profiles_supported"
+        );
+        let talker = svc.talker.as_ref().expect("talker");
+        assert!(
+            talker.config().spk_id.is_empty(),
+            "Base ships spk_id = {{}}"
+        );
+        assert!(svc.voices().is_empty());
+        let hidden = talker.config().hidden_size;
+        assert!(
+            builtin_default_xvector(hidden).is_some(),
+            "the shipped default x-vector must match the Base talker width {hidden}"
+        );
+
+        let (tmp, store) = temp_profile_store("vp_base_alias");
+        svc.voice_profiles = Arc::new(VoiceStoreHandle::new(&tmp));
+        let (emb, name) = svc.resolve_speaker_embed("alloy").expect("builtin default");
+        assert_eq!(name, "builtin:default");
+        assert_eq!(emb.expect("embed").dims(), &[1usize, 1, hidden]);
+
+        store
+            .put(&VoiceProfile {
+                schema_version: 2,
+                name: DEFAULT_PROFILE.into(),
+                embedding: vec![0.01; hidden],
+                design_params: None,
+            })
+            .unwrap();
+        let (emb, name) = svc.resolve_speaker_embed("alloy").expect("routed");
+        assert_eq!(name, format!("profile:{DEFAULT_PROFILE}"));
+        assert_eq!(emb.expect("embed").dims(), &[1usize, 1, hidden]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

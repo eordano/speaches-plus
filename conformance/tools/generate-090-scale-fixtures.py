@@ -5,14 +5,17 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
-OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser(
-    "~/NixOS/projects/speaches-plus/conformance/fixtures-scale"
+from fontfind import font_file
+
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "fixtures-scale"
 )
 
-SUP = "/System/Library/Fonts/Supplemental"
-FONT_REG = os.path.join(SUP, "Arial.ttf")
-FONT_BOLD = os.path.join(SUP, "Arial Bold.ttf")
-FONT_MONO = os.path.join(SUP, "Courier New.ttf")
+FONT_REG = font_file("LiberationSans-Regular.ttf", "FONT_REG")
+FONT_BOLD = font_file("LiberationSans-Bold.ttf", "FONT_BOLD")
+FONT_MONO = font_file("LiberationMono-Regular.ttf", "FONT_MONO")
+GENERATOR = "generate-090-scale-fixtures.py (PIL, %s + %s)" % (
+    os.path.basename(FONT_REG), os.path.basename(FONT_MONO))
 
 CAP_MAX_PIXELS = 11_289_600
 
@@ -80,7 +83,7 @@ class Page:
             "input": "input.png",
             "expected_text": "\n".join(self.lines),
             "render": {
-                "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+                "generator": GENERATOR,
                 "page_px": [self.w, self.h],
                 "megapixels": round(mp, 2),
                 "single_pass_downscale_at_default_cap": round(downscale, 3),
@@ -629,6 +632,48 @@ def screen(name, w, h, key, dark=False):
            "pane, terminal and status bar at native UI glyph sizes.")
 
 
+def darkdoc_4mp():
+    p = Page(1700, 2400)
+    ink = (222, 222, 222)
+    p.d.rectangle((0, 0, 1700, 2400), fill=(24, 25, 28))
+    m = 120
+    bw = 74
+    y = p.block(m, 160, ["NIGHTSIDE OPERATIONS MANUAL"], 64, "heading",
+                bold=True, fill=ink)
+    y = p.block(m, y + 40, ["Section 7: Thermal Watch Procedures"], 44,
+                "heading", fill=ink)
+    y = p.block(m, y + 60, wrap(
+        "During eclipse passes the radiator loop runs unpumped and the watch "
+        "officer logs the plateau temperature of both accumulator tanks every "
+        "eleven minutes. A divergence beyond four kelvin between the tanks "
+        "indicates a stuck bypass valve and the recovery checklist on page "
+        "ninety-one applies without further authorization.", bw), 34, "body",
+        fill=ink)
+    y = p.block(m, y + 70, wrap(
+        "Heater bank C remains isolated while the survey instrument records. "
+        "Its inrush transient couples into the magnetometer boom and has "
+        "produced false substorm signatures twice this quarter, most recently "
+        "on the descending node over the Weddell Sea anomaly.", bw), 34,
+        "body", fill=ink)
+    y = p.block(m, y + 90, [
+        "Watch handover requires three items:",
+        "1. Signed plateau log with divergence column initialed",
+        "2. Valve position table read back against telemetry",
+        "3. Heater bank C isolation breaker photographed",
+    ], 34, "list", fill=ink)
+    y = p.block(m, y + 90, wrap(
+        "Deviations are recorded in the anomaly ledger before end of shift. "
+        "The ledger is the controlling document in any disagreement between "
+        "console notes and downlinked housekeeping frames.", bw), 34, "body",
+        fill=ink)
+    p.block(m, 2400 - 140, ["NOM-7 rev D  |  approved flight ops  |  page 88"],
+            28, "footer", fill=ink)
+    p.save("094-dark-4mp-report", "094-dark",
+           "Dark-themed document render (1700x2400 portrait, light-on-dark "
+           "prose): title, body paragraphs, list and footer -- the dark "
+           "DOCUMENT geometry beside the 091 dark UI screen.")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     catalog_15mp()
@@ -643,6 +688,7 @@ def main():
     screen("091-screen-5k-editor", 5120, 2880, "5k")
     screen("091-screen-uw49-editor", 5120, 1440, "uw49")
     screen("091-screen-4k-darkmode", 3840, 2160, "4k", dark=True)
+    darkdoc_4mp()
 
 
 if __name__ == "__main__":

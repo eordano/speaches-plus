@@ -5,7 +5,7 @@
   "input": "input.png",
   "expected_text": "File   Edit   View   Terminal   Window   Help\nPROJECT FILES\nflightdeck.rs\ntelemetry.rs\npacket_codec.rs\nground_station.toml\nREADME.md\ntelemetry.rs - flightdeck workspace\npub fn decode_frame(buf: &[u8]) -> Result<Frame, CodecError> {\n    let sync = u16::from_be_bytes([buf[0], buf[1]]);\n    if sync != 0xEB90 { return Err(CodecError::BadSync(sync)); }\n    let apid = u16::from_be_bytes([buf[2], buf[3]]) & 0x07FF;\n    Frame::checked(apid, &buf[6..])\n}\ncargo test --package flightdeck\nrunning 42 tests ... 42 passed, 0 failed in 3.81s\nwarning: field `dropped_frames` is never read\nmain branch  |  UTF-8  |  Ln 214, Col 9  |  rust-analyzer ready",
   "render": {
-    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "generator": "generate-090-scale-fixtures.py (PIL, LiberationSans-Regular.ttf + LiberationMono-Regular.ttf)",
     "page_px": [
       3840,
       2160
@@ -18,7 +18,7 @@
       "bbox": [
         36,
         20,
-        612,
+        607,
         48
       ],
       "tier": "menubar",
@@ -27,8 +27,8 @@
     {
       "bbox": [
         32,
-        110,
-        316,
+        111,
+        313,
         378
       ],
       "tier": "sidebar",
@@ -38,7 +38,7 @@
       "bbox": [
         680,
         124,
-        1410,
+        1413,
         165
       ],
       "tier": "title",
@@ -47,9 +47,9 @@
     {
       "bbox": [
         680,
-        216,
-        1896,
-        480
+        212,
+        1909,
+        483
       ],
       "tier": "code",
       "text": "pub fn decode_frame(buf: &[u8]) -> Result<Frame, CodecError> {\n    let sync = u16::from_be_bytes([buf[0], buf[1]]);\n    if sync != 0xEB90 { return Err(CodecError::BadSync(sync)); }\n    let apid = u16::from_be_bytes([buf[2], buf[3]]) & 0x07FF;\n    Frame::checked(apid, &buf[6..])\n}"
@@ -57,9 +57,9 @@
     {
       "bbox": [
         680,
-        563,
+        560,
         1562,
-        680
+        678
       ],
       "tier": "terminal",
       "text": "cargo test --package flightdeck\nrunning 42 tests ... 42 passed, 0 failed in 3.81s\nwarning: field `dropped_frames` is never read"
@@ -67,8 +67,8 @@
     {
       "bbox": [
         36,
-        2117,
-        800,
+        2118,
+        791,
         2144
       ],
       "tier": "statusbar",

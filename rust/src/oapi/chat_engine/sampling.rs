@@ -979,7 +979,8 @@ mod think_close_tests {
             tokenizers::AddedToken::from("<|start|>", true),
             tokenizers::AddedToken::from("<|message|>", true),
             tokenizers::AddedToken::from("<|eos|>", true),
-        ]);
+        ])
+        .expect("test tokenizer special tokens");
         tk
     }
 
@@ -1000,7 +1001,8 @@ mod think_close_tests {
             tokenizers::AddedToken::from("think", true),
             tokenizers::AddedToken::from(">", true),
             tokenizers::AddedToken::from("<|eos|>", true),
-        ]);
+        ])
+        .expect("test tokenizer special tokens");
         tk
     }
 

@@ -24,6 +24,7 @@
 #endif
 
 #include "marlin.cuh"
+#include "m1_tail.cuh"
 #include "marlin_dtypes.cuh"
 #include "dequant.h"
 #include "marlin_mma.h"
@@ -267,7 +268,8 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    MarlinM1Tail m1_tail) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -2072,6 +2074,25 @@ __global__ void Marlin(
         }
         start_pipes();
       }
+    }
+  }
+
+  if (m1_tail.kind != kMarlinM1TailNone) {
+    unsigned* m1_tail_ticket = reinterpret_cast<unsigned*>(sh);
+    cp_async_wait<0>();
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) *m1_tail_ticket = atomicAdd(m1_tail.counter, 1u);
+    __syncthreads();
+    const unsigned ticket = *m1_tail_ticket;
+    __syncthreads();
+    if (ticket == gridDim.x - 1) {
+      __threadfence();
+      marlin_m1_tail_in_the_last_block_to_finish<threads>(
+          m1_tail, reinterpret_cast<const __nv_bfloat16*>(C0), prob_n,
+          reinterpret_cast<float*>(sh));
+      __syncthreads();
+      if (threadIdx.x == 0) *m1_tail.counter = 0u;
     }
   }
 }

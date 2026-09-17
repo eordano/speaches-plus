@@ -1,6 +1,9 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cstdlib>
 #include "nv_kernels.h"
+#include "nvk_gdn_conv.cuh"
+#include "nvk_grid.cuh"
 
 __global__ void gdn_prefill_qk_l2norm_from_mixed_kernel(
     const __nv_bfloat16* __restrict__ mixed,
@@ -382,10 +385,12 @@ extern "C" int nv_kernels_gdn_prefill_rmsnorm_gate_bf16(
         (const __nv_bfloat16*)norm_weight, (__nv_bfloat16*)gated, rms_eps);
     return (int)cudaGetLastError();
 }
+template<typename Weight>
 __global__ void gdn_conv1d_silu_bt_kernel(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ state_in,
-    const __nv_bfloat16* __restrict__ w,
+    const Weight* __restrict__ w,
+    const float* __restrict__ weight_scales,
     __nv_bfloat16* __restrict__ y,
     __nv_bfloat16* __restrict__ state_out,
     int B, int T, int C, int K
@@ -395,6 +400,8 @@ __global__ void gdn_conv1d_silu_bt_kernel(
     int t = blockIdx.x % T;
     int b = blockIdx.x / T;
     int P = K - 1;
+    const Weight* w_row = w + (size_t)c * K;
+    float scale = weight_scales ? weight_scales[c] : 1.f;
     float acc = 0.f;
     for (int j = 0; j < K; ++j) {
         int ti = t + j - P;
@@ -402,7 +409,7 @@ __global__ void gdn_conv1d_silu_bt_kernel(
         if (ti >= 0) v = __bfloat162float(x[((size_t)b * T + ti) * C + c]);
         else if (state_in) v = __bfloat162float(state_in[((size_t)b * C + c) * P + (P + ti)]);
         else v = 0.f;
-        acc += v * __bfloat162float(w[c * K + j]);
+        acc += v * nvk_gdn_conv_weight(w_row, j, scale);
     }
     float sig = 1.f / (1.f + expf(-acc));
     y[((size_t)b * T + t) * C + c] = __float2bfloat16(acc * sig);
@@ -418,6 +425,91 @@ __global__ void gdn_conv1d_silu_bt_kernel(
     }
 }
 
+__global__ void gdn_conv1d_silu_bt_rolling_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ state_in,
+    const __nv_bfloat16* __restrict__ w,
+    __nv_bfloat16* __restrict__ y,
+    __nv_bfloat16* __restrict__ state_out,
+    int T, int C
+) {
+    constexpr int ROWS = 16;
+    int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    int tiles = 1 + (T - 1) / ROWS;
+    int t = (blockIdx.x % tiles) * ROWS;
+    int b = blockIdx.x / tiles;
+    float weights[4], history[3];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) weights[j] = __bfloat162float(w[(size_t)c * 4 + j]);
+    #pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        int ti = t + j - 3;
+        history[j] = ti >= 0 ? __bfloat162float(x[((size_t)b * T + ti) * C + c])
+            : state_in ? __bfloat162float(state_in[((size_t)b * C + c) * 3 + j]) : 0.f;
+    }
+    #pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+        if (t + i < T) {
+            float current = __bfloat162float(x[((size_t)b * T + t + i) * C + c]);
+            float acc = 0.f;
+            #pragma unroll
+            for (int j = 0; j < 3; ++j) acc += history[j] * weights[j];
+            acc += current * weights[3];
+            float sig = 1.f / (1.f + expf(-acc));
+            y[((size_t)b * T + t + i) * C + c] = __float2bfloat16(acc * sig);
+            history[0] = history[1];
+            history[1] = history[2];
+            history[2] = current;
+        }
+    }
+    if (t == 0 && state_out) {
+        #pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            int ti = T - 3 + p;
+            float v = ti >= 0 ? __bfloat162float(x[((size_t)b * T + ti) * C + c])
+                : state_in ? __bfloat162float(state_in[((size_t)b * C + c) * 3 + 3 + ti]) : 0.f;
+            state_out[((size_t)b * C + c) * 3 + p] = __float2bfloat16(v);
+        }
+    }
+}
+
+template<typename Weight>
+static int launch_gdn_conv1d_silu_bt(
+    void* stream,
+    const uint16_t* x,
+    const uint16_t* state_in,
+    const Weight* w,
+    const float* weight_scales,
+    uint16_t* y,
+    uint16_t* state_out,
+    int B,
+    int T,
+    int C,
+    int K
+) {
+    cudaStream_t s = (cudaStream_t)stream;
+    if (B == 0 || T == 0 || C == 0) return 0;
+    if (K < 2 || K > 8) return -2;
+    dim3 grid((unsigned)(B * T), (unsigned)(1 + (C - 1) / 256));
+    gdn_conv1d_silu_bt_kernel<Weight><<<grid, 256, 0, s>>>(
+        (const __nv_bfloat16*)x, (const __nv_bfloat16*)state_in, w, weight_scales,
+        (__nv_bfloat16*)y, (__nv_bfloat16*)state_out, B, T, C, K);
+    return (int)cudaGetLastError();
+}
+
+static constexpr bool gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(const char* raw) {
+    return !raw || (raw[0] == '1' && raw[1] == '6' && raw[2] == '\0');
+}
+
+static_assert(gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(nullptr));
+static_assert(gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("16"));
+static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("0"));
+static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(""));
+static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("1"));
+static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(" 16"));
+static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("16 "));
+
 extern "C" int nv_kernels_gdn_conv1d_silu_bt_bf16(
     void* stream,
     const uint16_t* x,
@@ -430,12 +522,35 @@ extern "C" int nv_kernels_gdn_conv1d_silu_bt_bf16(
     int C,
     int K
 ) {
-    cudaStream_t s = (cudaStream_t)stream;
-    if (B * T * C == 0) return 0;
-    if (K < 2 || K > 8) return -2;
-    dim3 grid((unsigned)(B * T), (unsigned)((C + 255) / 256));
-    gdn_conv1d_silu_bt_kernel<<<grid, 256, 0, s>>>(
-        (const __nv_bfloat16*)x, (const __nv_bfloat16*)state_in, (const __nv_bfloat16*)w,
-        (__nv_bfloat16*)y, (__nv_bfloat16*)state_out, B, T, C, K);
-    return (int)cudaGetLastError();
+    const char* rolling = std::getenv("NV_Q38_GDN_CONV_TILE");
+    if (B > 0 && T > 0 && C > 0 && K == 4 && gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(rolling)) {
+        dim3 grid((unsigned)(B * (1 + (T - 1) / 16)), (unsigned)(1 + (C - 1) / 256));
+        gdn_conv1d_silu_bt_rolling_kernel<<<grid, 256, 0, (cudaStream_t)stream>>>(
+            (const __nv_bfloat16*)x, (const __nv_bfloat16*)state_in, (const __nv_bfloat16*)w,
+            (__nv_bfloat16*)y, (__nv_bfloat16*)state_out, T, C);
+        return (int)cudaGetLastError();
+    }
+    return launch_gdn_conv1d_silu_bt(stream, x, state_in, reinterpret_cast<const __nv_bfloat16*>(w), nullptr, y, state_out, B, T, C, K);
+}
+
+extern "C" int nv_kernels_gdn_conv1d_silu_bt_fp8_weights(
+    void* stream,
+    const uint16_t* x,
+    const uint16_t* state_in,
+    const uint8_t* w,
+    const float* weight_scales,
+    uint16_t* y,
+    uint16_t* state_out,
+    int B,
+    int T,
+    int C,
+    int K
+) {
+    if (B <= 0 || T <= 0 || C <= 0) return 0;
+    if (K < 2 || K > NVK_GDN_CONV_MAX_K) return -2;
+    if (!stream || !x || !w || !weight_scales || !y) return -3;
+    if (T > INT32_MAX - (K - 1)) return -3;
+    if ((uint64_t)B * T > INT32_MAX || 1 + (C - 1) / 256 > 65535) return NVK_ERR_GRID_AXIS;
+    if ((uint64_t)B * T > SIZE_MAX / ((uint64_t)C * sizeof(uint16_t))) return -3;
+    return launch_gdn_conv1d_silu_bt(stream, x, state_in, w, weight_scales, y, state_out, B, T, C, K);
 }

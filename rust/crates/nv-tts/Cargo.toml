@@ -14,7 +14,12 @@ nv-config = { workspace = true }
 nv-layers = { workspace = true }
 nv-omni = { workspace = true }
 nv-weights = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"] }
 
 [features]
 default = []

@@ -320,10 +320,7 @@ fn wgpu_decoder_class_list() -> String {
 pub const KNOWN_MODELS: &[(&str, ModelClass)] = &[
     ("nvidia/Gemma-4-31B-IT-NVFP4", ModelClass::Gemma4Dense),
     ("google/gemma-4-E4B-it", ModelClass::Gemma4E4b),
-    (
-        "google/gemma-4-E4B-it-qat-w4a16-ct",
-        ModelClass::Gemma4E4b,
-    ),
+    ("google/gemma-4-E4B-it-qat-w4a16-ct", ModelClass::Gemma4E4b),
     ("google/gemma-4-26B-A4B-it", ModelClass::Gemma4Moe),
     ("RedHatAI/Qwen3.6-35B-A3B-NVFP4", ModelClass::Qwen36Moe),
     ("Qwen/Qwen3.5-MoE", ModelClass::Qwen35Moe),
@@ -895,7 +892,10 @@ mod tests {
         assert_eq!(ModelClass::Qwen38Max.wgpu_decoder(), None);
         let wgpu_err = wgpu_model_support(ModelClass::Qwen38Max)
             .expect_err("no wgpu decoder row may exist for a checkpoint no single card can hold");
-        assert!(wgpu_err.contains(QWEN38_MAX_EXCEEDS_ANY_SINGLE_CARD), "{wgpu_err}");
+        assert!(
+            wgpu_err.contains(QWEN38_MAX_EXCEEDS_ANY_SINGLE_CARD),
+            "{wgpu_err}"
+        );
         let err = resolve_with_build(
             ServeBackend::Auto,
             "Qwen/Qwen3.8-2.4T-A95B",

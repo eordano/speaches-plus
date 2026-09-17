@@ -27,7 +27,8 @@ func Tokenize(phonemes string) []int64 {
 	return tokens
 }
 
-func CleanPhonemes(phonemes string) string {
+func CleanPhonemes(phonemes string, lang string) string {
+	englishRAndXRemap := len(lang) >= 2 && lang[:2] == "en"
 	rep := []struct{ from, to string }{
 		{"kəkˈoːɹoʊ", "kˈoʊkəɹoʊ"},
 		{"kəkˈɔːɹəʊ", "kˈəʊkəɹəʊ"},
@@ -41,9 +42,17 @@ func CleanPhonemes(phonemes string) string {
 		case 'ʲ':
 			mapped = append(mapped, 'j')
 		case 'r':
-			mapped = append(mapped, 'ɹ')
+			if englishRAndXRemap {
+				mapped = append(mapped, 'ɹ')
+			} else {
+				mapped = append(mapped, r)
+			}
 		case 'x':
-			mapped = append(mapped, 'k')
+			if englishRAndXRemap {
+				mapped = append(mapped, 'k')
+			} else {
+				mapped = append(mapped, r)
+			}
 		case 'ɬ':
 			mapped = append(mapped, 'l')
 		default:

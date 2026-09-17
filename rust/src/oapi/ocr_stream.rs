@@ -16,13 +16,12 @@ use nv_ocr::{DeepSeekMode, DotsOcrMode, OcrEngine, ResolutionHint};
 
 use super::gate::SurfaceGate;
 use super::ocr::{
-    backend_name, bad_request, configured_default_backend, elapsed_ms, loaded_backends,
+    backend_name, bad_request, configured_default_backend, elapsed_ms, configured_backends,
     parse_backend, parse_max_new_tokens, pick_default_backend, Backend, OcrRuntime,
 };
 use super::{kind, openai_error};
 
-const HEARTBEAT_EVERY_SO_THE_VIEW_SEES_LIFE_DURING_A_LONG_DECODE: Duration =
-    Duration::from_secs(1);
+const HEARTBEAT_EVERY_SO_THE_VIEW_SEES_LIFE_DURING_A_LONG_DECODE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamMode {
@@ -153,7 +152,7 @@ pub(super) async fn handle_ocr_stream(
     let backend = match backend {
         Some(b) => b,
         None => {
-            let loaded = loaded_backends(&rt.app);
+            let loaded = configured_backends(&rt.app);
             match pick_default_backend(&loaded, configured_default_backend()) {
                 Ok(b) => b,
                 Err(err) => {
@@ -166,7 +165,13 @@ pub(super) async fn handle_ocr_stream(
                     } else {
                         kind::SERVICE_UNAVAIL
                     };
-                    return openai_error(err.status, err.message, k, Some("backend"), Some(err.code));
+                    return openai_error(
+                        err.status,
+                        err.message,
+                        k,
+                        Some("backend"),
+                        Some(err.code),
+                    );
                 }
             }
         }
@@ -183,12 +188,15 @@ pub(super) async fn handle_ocr_stream(
         );
     }
 
-    let engine = match backend {
-        Backend::Tesseract => rt.app.tesseract.clone(),
-        Backend::DeepSeek => rt.app.deepseek.clone(),
-        Backend::Dots => rt.app.dots.clone(),
-        Backend::Got => rt.app.got.clone(),
+    let (configured, engine) = match backend {
+        Backend::Tesseract => (rt.app.tesseract.is_some(), rt.app.tesseract.clone()),
+        Backend::DeepSeek => (rt.app.deepseek.is_some(), super::ocr::demand(&rt.app.deepseek).await),
+        Backend::Dots => (rt.app.dots.is_some(), super::ocr::demand(&rt.app.dots).await),
+        Backend::Got => (rt.app.got.is_some(), super::ocr::demand(&rt.app.got).await),
     };
+    if configured && engine.is_none() {
+        return super::ocr::load_failed_response(backend);
+    }
     let Some(engine) = engine else {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -252,40 +260,7 @@ async fn run_stream(
         return;
     }
 
-    let dims_bytes = image_bytes.clone();
-    let dims = tokio::task::spawn_blocking(move || {
-        super::ocr_batch::decode_rgb(&dims_bytes)
-            .map(|img| (img.w, img.h))
-            .map_err(|e| format!("{e:#}"))
-    })
-    .await;
-    match dims {
-        Ok(Ok((w, h))) => {
-            if !emit(&tx, json!({"type": "meta", "width": w, "height": h})).await {
-                return;
-            }
-        }
-        Ok(Err(msg)) => {
-            emit(
-                &tx,
-                json!({"type": "error", "code": "undecodable_image",
-                       "message": format!("undecodable image: {msg}")}),
-            )
-            .await;
-            return;
-        }
-        Err(join) => {
-            emit(
-                &tx,
-                json!({"type": "error", "code": "ocr_failed",
-                       "message": format!("decode task join: {join}")}),
-            )
-            .await;
-            return;
-        }
-    }
-
-    let _permit = match gate {
+    let permit = match gate {
         None => None,
         Some(gate) => {
             if !emit(&tx, json!({"type": "phase", "phase": "queued"})).await {
@@ -306,6 +281,41 @@ async fn run_stream(
         }
     };
 
+    let dims_bytes = image_bytes.clone();
+    let dims = tokio::task::spawn_blocking(move || {
+        let dims = super::ocr_batch::decode_rgb(&dims_bytes)
+            .map(|img| (img.w, img.h))
+            .map_err(|e| format!("{e:#}"));
+        (permit, dims)
+    })
+    .await;
+    let permit = match dims {
+        Ok((permit, Ok((w, h)))) => {
+            if !emit(&tx, json!({"type": "meta", "width": w, "height": h})).await {
+                return;
+            }
+            permit
+        }
+        Ok((_permit, Err(msg))) => {
+            emit(
+                &tx,
+                json!({"type": "error", "code": "undecodable_image",
+                       "message": format!("undecodable image: {msg}")}),
+            )
+            .await;
+            return;
+        }
+        Err(join) => {
+            emit(
+                &tx,
+                json!({"type": "error", "code": "ocr_failed",
+                       "message": format!("decode task join: {join}")}),
+            )
+            .await;
+            return;
+        }
+    };
+
     let t0 = Instant::now();
     if !emit(
         &tx,
@@ -316,20 +326,24 @@ async fn run_stream(
         return;
     }
 
-    let mut job = tokio::task::spawn_blocking(move || match backend {
-        Backend::Dots => StreamOutcome::Dots(engine.recognize_dots_layout_budgeted(
-            &image_bytes,
-            dots_mode(mode),
-            max_new_override,
-        )),
-        _ => StreamOutcome::Plain(engine.recognize_hinted_budgeted(
-            &image_bytes,
-            deepseek_mode(mode),
-            ResolutionHint::Auto,
-            max_new_override,
-        )),
+    let mut job = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match backend {
+            Backend::Dots => StreamOutcome::Dots(engine.recognize_dots_layout_budgeted(
+                &image_bytes,
+                dots_mode(mode),
+                max_new_override,
+            )),
+            _ => StreamOutcome::Plain(engine.recognize_hinted_budgeted(
+                &image_bytes,
+                deepseek_mode(mode),
+                ResolutionHint::Auto,
+                max_new_override,
+            )),
+        }
     });
-    let mut tick = tokio::time::interval(HEARTBEAT_EVERY_SO_THE_VIEW_SEES_LIFE_DURING_A_LONG_DECODE);
+    let mut tick =
+        tokio::time::interval(HEARTBEAT_EVERY_SO_THE_VIEW_SEES_LIFE_DURING_A_LONG_DECODE);
     tick.tick().await;
     let joined = loop {
         tokio::select! {
@@ -373,10 +387,11 @@ async fn run_stream(
                     return;
                 }
             }
-            if res.layout.elements.is_empty() && !res.result.text.is_empty() {
-                if !emit(&tx, json!({"type": "delta", "text": res.result.text})).await {
-                    return;
-                }
+            if res.layout.elements.is_empty()
+                && !res.result.text.is_empty()
+                && !emit(&tx, json!({"type": "delta", "text": res.result.text})).await
+            {
+                return;
             }
             info!(
                 backend = "dots",
@@ -499,10 +514,7 @@ mod tests {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-        (
-            format!("multipart/form-data; boundary={boundary}"),
-            body,
-        )
+        (format!("multipart/form-data; boundary={boundary}"), body)
     }
 
     async fn sse_frames(resp: axum::response::Response) -> Vec<serde_json::Value> {
@@ -516,10 +528,40 @@ mod tests {
 
     fn fake_dots_router() -> axum::Router {
         let state = crate::oapi::ocr::OcrAppState {
-            dots: Some(Arc::new(OcrEngine::from_dots(Box::new(FakeDots)))),
+            dots: Some(crate::oapi::cold_tier::ColdSlot::resident(
+                "ocr-dots",
+                Arc::new(OcrEngine::from_dots(Box::new(FakeDots))),
+            )),
             ..Default::default()
         };
         crate::oapi::ocr::router(state)
+    }
+
+    #[tokio::test]
+    async fn saturated_streams_are_refused_before_image_decode() {
+        let gate = Arc::new(SurfaceGate::new("ocr-stream-test", 1, 50));
+        let _held = gate.acquire().await.unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        run_stream(
+            tx,
+            Arc::new(OcrEngine::from_dots(Box::new(FakeDots))),
+            Some(gate.clone()),
+            None,
+            Backend::Dots,
+            StreamMode::Layout,
+            None,
+            b"not an image".to_vec(),
+        )
+        .await;
+        let mut frames = String::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push_str(&format!("{frame:?}"));
+        }
+        assert!(frames.contains("ocr_saturated"), "{frames}");
+        assert!(
+            !frames.contains("undecodable_image"),
+            "image work preceded admission: {frames}"
+        );
     }
 
     #[tokio::test]
@@ -548,12 +590,11 @@ mod tests {
             .filter_map(|f| f["type"].as_str())
             .filter(|t| *t != "phase")
             .collect();
+        assert_eq!(types, ["meta", "region", "done"], "frames were: {frames:?}");
         assert_eq!(
-            types,
-            ["meta", "region", "done"],
-            "frames were: {frames:?}"
+            frames[0]["type"], "phase",
+            "the first frame announces receipt"
         );
-        assert_eq!(frames[0]["type"], "phase", "the first frame announces receipt");
         let meta = frames.iter().find(|f| f["type"] == "meta").unwrap();
         assert_eq!(meta["width"], 1);
         assert_eq!(meta["height"], 1);
@@ -596,7 +637,10 @@ mod tests {
             ("mode", b"layout"),
         ]);
         let state = crate::oapi::ocr::OcrAppState {
-            dots: Some(Arc::new(OcrEngine::from_dots(Box::new(FakeDots)))),
+            dots: Some(crate::oapi::cold_tier::ColdSlot::resident(
+                "ocr-dots",
+                Arc::new(OcrEngine::from_dots(Box::new(FakeDots))),
+            )),
             ..Default::default()
         };
         let resp = crate::oapi::ocr::router(state)

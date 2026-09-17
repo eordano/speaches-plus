@@ -22,7 +22,9 @@ use crate::laguna_fa2::{batch_decode_fwd_bf16, varlen_fwd_bf16, BatchDecodeArgs,
 pub fn attn_batched() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_ATTN_BATCH")
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_DSOCR_ATTN_BATCH",
+        )
     })
 }
 use nv_kernels::graph::CudaGraphRunner;
@@ -304,10 +306,9 @@ fn moe_decode_ffn_batch(
         };
         anyhow::ensure!(rc == 0, "moe batch route rc={rc}");
     }
-    if scratch.ids_log.is_some() {
+    if let Some(log) = scratch.ids_log.as_mut() {
         let base = li * scratch.max_b * k;
         let src = scratch.ids.slice(0..b * k);
-        let log = scratch.ids_log.as_mut().unwrap();
         let mut dst = log.slice_mut(base..base + b * k);
         stream
             .memcpy_dtod(&src, &mut dst)
@@ -330,7 +331,7 @@ fn moe_decode_ffn_batch(
             anyhow::ensure!(rc == 0, "moe batch weight gather rc={rc}");
         }
     }
-    match moe_pre.as_deref_mut() {
+    match moe_pre {
         Some(mp) => mp.shared_cast(li, x_normed, b, &mut scratch.shared_f32, &stream)?,
         None => {
             let shared_t = moe.shared_expert().forward_fused_cuda(x_normed)?;
@@ -955,7 +956,7 @@ impl DsocrBatchDecodeGraph {
         for (j, t) in tokens.iter().enumerate() {
             if t.is_some() {
                 anyhow::ensure!(
-                    self.lens[j] + 1 <= self.cap,
+                    self.lens[j] < self.cap,
                     "dsocr bs=N step overflows capacity {} on slot {j}",
                     self.cap
                 );

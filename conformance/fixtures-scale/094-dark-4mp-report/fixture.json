@@ -1,0 +1,90 @@
+{
+  "name": "094-dark-4mp-report",
+  "family": "094-dark",
+  "description": "Dark-themed document render (1700x2400 portrait, light-on-dark prose): title, body paragraphs, list and footer -- the dark DOCUMENT geometry beside the 091 dark UI screen.",
+  "input": "input.png",
+  "expected_text": "NIGHTSIDE OPERATIONS MANUAL\nSection 7: Thermal Watch Procedures\nDuring eclipse passes the radiator loop runs unpumped and the watch\nofficer logs the plateau temperature of both accumulator tanks every\neleven minutes. A divergence beyond four kelvin between the tanks\nindicates a stuck bypass valve and the recovery checklist on page\nninety-one applies without further authorization.\nHeater bank C remains isolated while the survey instrument records. Its\ninrush transient couples into the magnetometer boom and has produced false\nsubstorm signatures twice this quarter, most recently on the descending\nnode over the Weddell Sea anomaly.\nWatch handover requires three items:\n1. Signed plateau log with divergence column initialed\n2. Valve position table read back against telemetry\n3. Heater bank C isolation breaker photographed\nDeviations are recorded in the anomaly ledger before end of shift. The\nledger is the controlling document in any disagreement between console\nnotes and downlinked housekeeping frames.\nNOM-7 rev D  |  approved flight ops  |  page 88",
+  "render": {
+    "generator": "generate-090-scale-fixtures.py (PIL, LiberationSans-Regular.ttf + LiberationMono-Regular.ttf)",
+    "page_px": [
+      1700,
+      2400
+    ],
+    "megapixels": 4.08,
+    "single_pass_downscale_at_default_cap": 1.0
+  },
+  "regions": [
+    {
+      "bbox": [
+        120,
+        173,
+        1200,
+        219
+      ],
+      "tier": "heading",
+      "text": "NIGHTSIDE OPERATIONS MANUAL"
+    },
+    {
+      "bbox": [
+        120,
+        291,
+        861,
+        323
+      ],
+      "tier": "heading",
+      "text": "Section 7: Thermal Watch Procedures"
+    },
+    {
+      "bbox": [
+        120,
+        406,
+        1175,
+        614
+      ],
+      "tier": "body",
+      "text": "During eclipse passes the radiator loop runs unpumped and the watch\nofficer logs the plateau temperature of both accumulator tanks every\neleven minutes. A divergence beyond four kelvin between the tanks\nindicates a stuck bypass valve and the recovery checklist on page\nninety-one applies without further authorization."
+    },
+    {
+      "bbox": [
+        120,
+        696,
+        1286,
+        860
+      ],
+      "tier": "body",
+      "text": "Heater bank C remains isolated while the survey instrument records. Its\ninrush transient couples into the magnetometer boom and has produced false\nsubstorm signatures twice this quarter, most recently on the descending\nnode over the Weddell Sea anomaly."
+    },
+    {
+      "bbox": [
+        120,
+        962,
+        929,
+        1126
+      ],
+      "tier": "list",
+      "text": "Watch handover requires three items:\n1. Signed plateau log with divergence column initialed\n2. Valve position table read back against telemetry\n3. Heater bank C isolation breaker photographed"
+    },
+    {
+      "bbox": [
+        120,
+        1228,
+        1209,
+        1348
+      ],
+      "tier": "body",
+      "text": "Deviations are recorded in the anomaly ledger before end of shift. The\nledger is the controlling document in any disagreement between console\nnotes and downlinked housekeeping frames."
+    },
+    {
+      "bbox": [
+        120,
+        2266,
+        700,
+        2292
+      ],
+      "tier": "footer",
+      "text": "NOM-7 rev D  |  approved flight ops  |  page 88"
+    }
+  ],
+  "comparison_strategy": "cer",
+  "skip_when_no_model": true
+}

@@ -106,7 +106,7 @@ func (k *kokoro) Synthesize(text, voice, lang string, speed float32) (Audio, err
 	if err != nil {
 		return Audio{}, fmt.Errorf("phonemize: %w", err)
 	}
-	cleaned := CleanPhonemes(rawIPA)
+	cleaned := CleanPhonemes(rawIPA, lang)
 	if cleaned == "" {
 		return Audio{}, fmt.Errorf("phonemize produced empty output for %q", text)
 	}

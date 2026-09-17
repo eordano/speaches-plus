@@ -1,0 +1,27 @@
+[package]
+name = "nv-sae"
+version = "0.0.1"
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "nv-sae"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+candle-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokenizers = { workspace = true }
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+
+[lints]
+workspace = true

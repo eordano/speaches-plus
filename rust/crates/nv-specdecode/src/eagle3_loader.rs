@@ -1015,7 +1015,7 @@ impl LoadedEagle3Scorer {
         let nh = self.cfg.num_attention_heads;
         let nkv = self.cfg.num_key_value_heads;
         let hd = self.cfg.head_dim;
-        if hd > 512 || nkv == 0 || nh % nkv != 0 {
+        if hd > 512 || nkv == 0 || !nh.is_multiple_of(nkv) {
             return Ok(None);
         }
         let n = k_all.dims()[1];
@@ -1607,7 +1607,7 @@ impl LoadedEagle3Scorer {
         let nh = self.cfg.num_attention_heads;
         let nkv = self.cfg.num_key_value_heads;
         let hd = self.cfg.head_dim;
-        if hd > 512 || nkv == 0 || nh % nkv != 0 {
+        if hd > 512 || nkv == 0 || !nh.is_multiple_of(nkv) {
             cache.dev_off = true;
             return Ok(None);
         }
@@ -1661,11 +1661,11 @@ impl LoadedEagle3Scorer {
                     .map_err(|e| anyhow!("dev_n alloc: {e:?}"))?,
             );
         }
-        if !cache.dev_masks.contains_key(&m) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = cache.dev_masks.entry(m) {
             let mask = stream
                 .clone_htod(&crate::chain::lower_tri_mask(m))
                 .map_err(|e| anyhow!("tail mask htod: {e:?}"))?;
-            cache.dev_masks.insert(m, mask);
+            entry.insert(mask);
         }
 
         let q = self
@@ -2408,7 +2408,7 @@ impl LoadedEagle3Scorer {
         if !self.embed_tokens.is_contiguous() {
             bail!("chain graph: embed_tokens must be contiguous");
         }
-        if self.cfg.head_dim % 2 != 0 {
+        if !self.cfg.head_dim.is_multiple_of(2) {
             bail!("chain graph: head_dim must be even");
         }
         for (name, l) in [
@@ -2757,7 +2757,7 @@ impl LoadedEagle3Scorer {
             .map(|b| chain_slice_ptr(b, &fk))
             .collect();
 
-        let mut body = |s: &std::sync::Arc<cudarc::driver::CudaStream>| -> Result<()> {
+        let body = |s: &std::sync::Arc<cudarc::driver::CudaStream>| -> Result<()> {
             let cu = s.cu_stream() as *mut std::ffi::c_void;
             let gemv = |w: u64, x: u64, y: u64, n: usize, k: usize, what: &str| -> Result<()> {
                 let rc = unsafe {
@@ -3000,7 +3000,7 @@ impl LoadedEagle3Scorer {
             body(&fk)?;
             fk.synchronize().map_err(|e| anyhow!(e))?;
         }
-        g.runner.run(kd as u64, &mut body)?;
+        g.runner.run(kd as u64, body)?;
         g.captured = true;
         fk.synchronize().map_err(|e| anyhow!(e))?;
         let out: Vec<u32> = fk
@@ -3028,7 +3028,7 @@ where
     let sl = cuda.as_cuda_slice::<T>()?;
     let view = sl.slice(l.start_offset()..);
     let (p, _g) = view.device_ptr(s);
-    Ok(p as u64)
+    Ok(p)
 }
 
 #[cfg(feature = "cuda")]
@@ -3062,7 +3062,7 @@ pub(crate) fn chain_slice_ptr<T: cudarc::driver::DeviceRepr>(
 ) -> u64 {
     use cudarc::driver::DevicePtr;
     let (p, _g) = sl.device_ptr(s);
-    p as u64
+    p
 }
 
 #[cfg(test)]
@@ -3331,7 +3331,10 @@ mod tests {
         let cap = 512 * 1024 * 1024;
         assert_eq!(encode_attn_query_block(4, 1024, 12, cap), 1024);
         let big = encode_attn_query_block(32, 1024, 24576, cap);
-        assert!(big >= 1 && big < 1024, "24576-prefix must sub-block: {big}");
+        assert!(
+            (1..1024).contains(&big),
+            "24576-prefix must sub-block: {big}"
+        );
         assert_eq!(
             encode_attn_query_block(32, 1024, usize::MAX, 4),
             1,

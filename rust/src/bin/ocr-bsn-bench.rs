@@ -11,9 +11,9 @@ use nv_models::deepseek_ocr::{build_prompt_tokens, DsocrDecodeGraph, GenerateOpt
 use nv_models::deepseek_ocr::{
     DecoderPrecision, DeepSeekOcr2Pipeline, ResolutionMode, PROMPT_FREE_OCR,
 };
-use speaches_plus::oapi::ocr_batch::{
-    decode_rgb, BatchOptions, DsocrScheduler, JobInput, OcrJob, OcrOutput,
-};
+#[cfg(feature = "cuda")]
+use speaches_plus::oapi::ocr_batch::decode_rgb;
+use speaches_plus::oapi::ocr_batch::{BatchOptions, DsocrScheduler, JobInput, OcrJob, OcrOutput};
 
 #[cfg(feature = "cuda")]
 use speaches_plus::oapi::ocr_batch_n::{BsnOptions, DsocrBsnEngine};

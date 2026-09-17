@@ -10,6 +10,11 @@ use serde::Deserialize;
 use crate::laguna::{attention, softplus_f32, Laguna};
 
 #[cfg(feature = "cuda")]
+pub(crate) mod context_commit;
+#[cfg(feature = "cuda")]
+pub mod prefix;
+
+#[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 #[cfg(feature = "cuda")]
 use half::bf16;
@@ -18,10 +23,32 @@ use nv_kernels::graph::CudaGraphRunner;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-pub const ROPE_TABLE_CAP: usize = 65536;
-
 pub const DFLASH_CODE_THETA: f32 = 1.0e4;
 pub const DFLASH_PROSE_THETA: f32 = 5.0e5;
+
+pub fn dflash_nvfp4_enabled() -> Result<bool> {
+    match std::env::var("NV_LAGUNA_DFLASH_NVFP4") {
+        Ok(v) if v == "1" => Ok(true),
+        Ok(v) if v == "0" => Ok(false),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        _ => anyhow::bail!("NV_LAGUNA_DFLASH_NVFP4 must be 0 or 1"),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DflashQuantizationSummary {
+    pub weight_format: &'static str,
+    pub packed_linears: usize,
+    pub fp8_linears: usize,
+    pub fp8_norms: usize,
+    pub excluded_linears: usize,
+    pub excluded_norms: usize,
+    pub bf16_fallback_linears: usize,
+    pub bf16act_rows: usize,
+    pub bf16act_armed_linears: usize,
+    pub packed_weight_bytes: usize,
+    pub scale_bytes: usize,
+}
 
 pub fn dflash_graph_enabled() -> bool {
     std::env::var("NV_LAGUNA_DFLASH_GRAPH")
@@ -497,6 +524,11 @@ impl LagunaDflashConfig {
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
         let cfg: LagunaDflashConfig =
             serde_json::from_str(s).context("deserialize laguna dflash config")?;
+        anyhow::ensure!(
+            (1..=i32::MAX as usize).contains(&cfg.max_position_embeddings),
+            "laguna dflash: max_position_embeddings must fit positive i32 positions, got {}",
+            cfg.max_position_embeddings
+        );
         if !cfg.layer_types.is_empty() {
             if cfg.layer_types.len() != cfg.num_hidden_layers {
                 anyhow::bail!(
@@ -609,6 +641,8 @@ impl DflashLayer {
 }
 
 pub struct LagunaDflash {
+    w4a16_rows: usize,
+    w4a16_armed: usize,
     config: LagunaDflashConfig,
     aux_hidden_norms: Vec<RmsNorm>,
     fc: Linear,
@@ -710,6 +744,26 @@ impl DflashCtxCache {
         }
     }
 
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn initialized_ring_rows_for_test(&self) -> Result<Vec<u16>> {
+        let ring = self
+            .ring
+            .as_ref()
+            .context("draft ring inspection requires ring storage")?;
+        let mut values = Vec::new();
+        for tensor in ring.k.iter().chain(&ring.v) {
+            values.extend(
+                tensor
+                    .narrow(1, 0, ring.stored)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?
+                    .into_iter()
+                    .map(half::bf16::to_bits),
+            );
+        }
+        Ok(values)
+    }
+
     fn layer_ctx(&self, li: usize) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "cuda")]
         if let Some(r) = &self.ring {
@@ -779,6 +833,80 @@ impl LagunaDflash {
         &self.config
     }
 
+    pub fn quantization_summary(&self) -> DflashQuantizationSummary {
+        let mut summary = DflashQuantizationSummary {
+            weight_format: "bf16",
+            packed_linears: 0,
+            excluded_linears: 0,
+            fp8_linears: 0,
+            fp8_norms: 0,
+            excluded_norms: self.aux_hidden_norms.len() + 2 + 4 * self.layers.len(),
+            bf16_fallback_linears: 0,
+            packed_weight_bytes: 0,
+            scale_bytes: 0,
+            bf16act_rows: self.w4a16_rows,
+            bf16act_armed_linears: self.w4a16_armed,
+        };
+        let linears = std::iter::once(&self.fc).chain(self.layers.iter().flat_map(|l| {
+            [
+                &l.q_proj,
+                &l.k_proj,
+                &l.v_proj,
+                &l.o_proj,
+                &l.g_proj,
+                l.mlp.gate_proj(),
+                l.mlp.up_proj(),
+                l.mlp.down_proj(),
+            ]
+        }));
+        for linear in linears {
+            #[cfg(feature = "cuda")]
+            if let Some((packed, scales, _, _)) = linear.nvfp4_parts() {
+                summary.packed_linears += 1;
+                summary.packed_weight_bytes += packed.len();
+                summary.scale_bytes += scales.len();
+                continue;
+            }
+            #[cfg(feature = "cuda")]
+            if linear
+                .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
+                .is_some()
+            {
+                summary.fp8_linears += 1;
+            }
+            if linear.out_features() < nv_quant::nvfp4::MIN_TILE
+                || linear.in_features() < nv_quant::nvfp4::MIN_TILE
+            {
+                summary.excluded_linears += 1;
+            } else {
+                summary.bf16_fallback_linears += 1;
+            }
+        }
+        #[cfg(feature = "cuda")]
+        for norm in self
+            .aux_hidden_norms
+            .iter()
+            .chain([&self.hidden_norm, &self.norm])
+            .chain(self.layers.iter().flat_map(|layer| {
+                [
+                    &layer.input_layernorm,
+                    &layer.post_attention_layernorm,
+                    &layer.q_norm,
+                    &layer.k_norm,
+                ]
+            }))
+        {
+            if norm.fp8_e4m3_active() {
+                summary.fp8_norms += 1;
+                summary.excluded_norms -= 1;
+            }
+        }
+        if summary.packed_linears > 0 {
+            summary.weight_format = "nvfp4-derived";
+        }
+        summary
+    }
+
     pub fn attn_fp8_active(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
@@ -793,6 +921,60 @@ impl LagunaDflash {
         weights: &WeightLoader,
         device: &Device,
     ) -> Result<Self> {
+        fn dflash_w4a16_rows_env() -> Result<Option<usize>> {
+            match std::env::var("NV_DFLASH_W4A16_ROWS") {
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Ok(v) if v == "0" => Ok(None),
+                Ok(v) => {
+                    let rows: usize = v.parse().context("NV_DFLASH_W4A16_ROWS must be an integer row limit (8 = proposal M5 and catch-up M1..M5 use bf16 activations; prompt-context rows above it stay W4A4)")?;
+                    anyhow::ensure!(
+                        (1..=8).contains(&rows),
+                        "NV_DFLASH_W4A16_ROWS must be 1..=8, got {rows}"
+                    );
+                    Ok(Some(rows))
+                }
+                Err(e) => Err(e).context("NV_DFLASH_W4A16_ROWS must be valid UTF-8"),
+            }
+        }
+        let nvfp4 = dflash_nvfp4_enabled()?;
+        let fp8 = crate::laguna::weight_linears_fp8_enabled();
+        anyhow::ensure!(!nvfp4 || std::env::var_os("NV_DFLASH_ATTN_FP8").is_none(), "NV_LAGUNA_DFLASH_NVFP4=1 conflicts with NV_DFLASH_ATTN_FP8; packed projections must not be replaced by an FP8 copy");
+        #[cfg(feature = "cuda")]
+        let nvfp4_runner = if nvfp4 {
+            let Device::Cuda(dev) = device else {
+                anyhow::bail!("NV_LAGUNA_DFLASH_NVFP4=1 requires CUDA; refusing BF16 fallback");
+            };
+            Some(Arc::new(std::sync::Mutex::new(
+                nv_quant::nvfp4::Nvfp4GemmRunner::new(dev.cuda_stream())?,
+            )))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        anyhow::ensure!(
+            !nvfp4,
+            "NV_LAGUNA_DFLASH_NVFP4=1 requires the CUDA build; refusing BF16 fallback"
+        );
+        #[cfg(not(feature = "cuda"))]
+        anyhow::ensure!(!fp8, "NV_LAGUNA_WEIGHT_LINEARS_FP8 requires the CUDA build for DFlash; refusing BF16 fallback");
+        #[cfg(feature = "cuda")]
+        let fp8_runner: crate::laguna::Fp8RunnerHandle = if fp8 {
+            let Device::Cuda(dev) = device else {
+                anyhow::bail!(
+                    "NV_LAGUNA_WEIGHT_LINEARS_FP8 requires CUDA for the DFlash gate projections"
+                );
+            };
+            Some(Arc::new(std::sync::Mutex::new(
+                nv_quant::fp8::Fp8GemmRunner::new(dev.cuda_stream().clone())?,
+            )))
+        } else {
+            None
+        };
+        anyhow::ensure!(
+            (1..=i32::MAX as usize).contains(&config.max_position_embeddings),
+            "laguna dflash: max_position_embeddings must fit positive i32 positions, got {}",
+            config.max_position_embeddings
+        );
         let dtype = DType::BF16;
         let h = config.hidden_size;
         let hd = config.head_dim;
@@ -809,7 +991,44 @@ impl LagunaDflash {
             if d != [dim] {
                 anyhow::bail!("rmsnorm {name}: expected [{dim}], got {d:?}");
             }
+            #[cfg(feature = "cuda")]
+            if fp8 {
+                return RmsNorm::new_fp8_e4m3(w, eps);
+            }
             Ok(RmsNorm::new(w, eps))
+        };
+        let w4a16_rows = dflash_w4a16_rows_env()?;
+        anyhow::ensure!(w4a16_rows.is_none() || nvfp4, "NV_DFLASH_W4A16_ROWS requires NV_LAGUNA_DFLASH_NVFP4=1; large draft weights must remain packed four-bit");
+        let w4a16_armed = std::cell::Cell::new(0usize);
+        let from_tensor = |name: &str, w: Tensor, small_gate: bool| -> Result<Linear> {
+            #[cfg(feature = "cuda")]
+            if let Some(runner) = &nvfp4_runner {
+                if !small_gate || w.dims()[0] >= nv_quant::nvfp4::MIN_TILE {
+                    let mut packed = Linear::from_bf16_quantized_nvfp4_dev(
+                        &w,
+                        None,
+                        device,
+                        runner.clone(),
+                    )
+                    .with_context(|| {
+                        format!("pack DFlash projection {name} as NVFP4; BF16 fallback is disabled")
+                    })?;
+                    if let Some(rows) = w4a16_rows {
+                        packed
+                            .set_nvfp4_bf16act_rows_before_sharing(rows)
+                            .with_context(|| format!("arm draft-only W4A16 (bf16 activations, rows<={rows}) on {name}"))?;
+                        w4a16_armed.set(w4a16_armed.get() + 1);
+                    }
+                    return Ok(packed);
+                }
+            }
+            #[cfg(feature = "cuda")]
+            if fp8_runner.is_some() {
+                return crate::laguna::load_linear_from_tensor_maybe_fp8(w, &fp8_runner, device)
+                    .with_context(|| format!("load DFlash projection {name} as e4m3 row-scaled (NV_LAGUNA_WEIGHT_LINEARS_FP8)"));
+            }
+            let _ = (name, small_gate);
+            Linear::new(w, None)
         };
         let lin = |name: &str, out: usize, inp: usize| -> Result<Linear> {
             let w = weights
@@ -819,7 +1038,7 @@ impl LagunaDflash {
             if d != [out, inp] {
                 anyhow::bail!("linear {name}: expected [{out}, {inp}], got {d:?}");
             }
-            Linear::new(w, None)
+            from_tensor(name, w, name.ends_with(".g_proj.weight"))
         };
 
         let mut aux_hidden_norms = Vec::with_capacity(num_aux);
@@ -846,12 +1065,22 @@ impl LagunaDflash {
                     q_rows + 2 * kv_rows
                 );
             }
-            let q_proj = Linear::new(qkv.narrow(0, 0, q_rows)?.contiguous()?, None)?;
-            let k_proj = Linear::new(qkv.narrow(0, q_rows, kv_rows)?.contiguous()?, None)?;
-            let v_proj = Linear::new(
-                qkv.narrow(0, q_rows + kv_rows, kv_rows)?.contiguous()?,
-                None,
+            let q_proj = from_tensor(
+                &format!("{p}.self_attn.q_proj"),
+                qkv.narrow(0, 0, q_rows)?.contiguous()?,
+                false,
             )?;
+            let k_proj = from_tensor(
+                &format!("{p}.self_attn.k_proj"),
+                qkv.narrow(0, q_rows, kv_rows)?.contiguous()?,
+                false,
+            )?;
+            let v_proj = from_tensor(
+                &format!("{p}.self_attn.v_proj"),
+                qkv.narrow(0, q_rows + kv_rows, kv_rows)?.contiguous()?,
+                false,
+            )?;
+            drop(qkv);
             let o_proj = lin(&format!("{p}.self_attn.o_proj.weight"), h, q_rows)?;
             #[cfg(feature = "cuda")]
             let w8 = if nv_config::env_arm_present_at_all_reread_every_call("NV_DFLASH_ATTN_FP8")
@@ -911,7 +1140,7 @@ impl LagunaDflash {
             config.rope_theta,
             rope_theta_policy() != RopeThetaPolicy::Fixed,
         );
-        let max_seq = config.max_position_embeddings.min(ROPE_TABLE_CAP);
+        let max_seq = config.max_position_embeddings;
         let mut ropes = Vec::with_capacity(thetas.len());
         for t in thetas {
             let r = Rope::new(
@@ -926,7 +1155,9 @@ impl LagunaDflash {
             ropes.push((t, r));
         }
 
-        Ok(Self {
+        let draft = Self {
+            w4a16_rows: w4a16_rows.unwrap_or(0),
+            w4a16_armed: w4a16_armed.get(),
             config,
             aux_hidden_norms,
             fc,
@@ -937,12 +1168,40 @@ impl LagunaDflash {
             rope_active: std::sync::atomic::AtomicUsize::new(0),
             dtype,
             device: device.clone(),
-        })
+        };
+        if nvfp4 {
+            let summary = draft.quantization_summary();
+            anyhow::ensure!(summary.packed_linears > 0 && summary.bf16_fallback_linears == 0,
+                "NV_LAGUNA_DFLASH_NVFP4=1 did not produce a fully packed large-projection draft: {summary:?}");
+            if fp8 {
+                anyhow::ensure!(summary.packed_linears == 1 + 7 * draft.layers.len()
+                    && summary.fp8_linears == draft.layers.len()
+                    && summary.fp8_norms == draft.aux_hidden_norms.len() + 2 + 4 * draft.layers.len()
+                    && summary.excluded_norms == 0,
+                    "FP8 DFlash mode must retain packed large projections, FP8 gates and all learned norms: {summary:?}");
+                eprintln!("[laguna_dflash_fp8] packed_linears={} fp8_linears={} fp8_norms={} excluded_norms={}",
+                    summary.packed_linears, summary.fp8_linears, summary.fp8_norms, summary.excluded_norms);
+            }
+        }
+        Ok(draft)
     }
 
     fn rope(&self) -> &Rope {
         let i = self.rope_active.load(std::sync::atomic::Ordering::Relaxed);
         &self.ropes[i].1
+    }
+
+    pub fn rope_max_seq_len(&self) -> usize {
+        self.rope().config().max_seq_len
+    }
+
+    pub(crate) fn check_rope_span(&self, start: usize, rows: usize) -> Result<()> {
+        let capacity = self.rope_max_seq_len();
+        anyhow::ensure!(
+            start.checked_add(rows).is_some_and(|end| end <= capacity),
+            "dflash: positions starting at {start} with {rows} rows exceed RoPE capacity {capacity}"
+        );
+        Ok(())
     }
 
     pub fn active_rope_theta(&self) -> f32 {
@@ -1063,7 +1322,7 @@ impl LagunaDflash {
         &self,
         cache: &mut DflashCtxCache,
         combined: &Tensor,
-        positions: &Tensor,
+        positions: &[i32],
     ) -> Result<()> {
         let dims = combined.dims();
         if dims.len() != 3 || dims[0] != 1 || dims[2] != self.config.hidden_size {
@@ -1073,14 +1332,22 @@ impl LagunaDflash {
             );
         }
         let rows = dims[1];
-        if positions.dims() != [rows] {
+        if positions.len() != rows {
             anyhow::bail!(
                 "append_context: positions must be [{rows}], got {:?}",
-                positions.dims()
+                positions.len()
             );
         }
-        let n_kv = self.config.num_key_value_heads;
-        let hd = self.config.head_dim;
+        self.check_rope_span(cache.len, rows)?;
+        anyhow::ensure!(
+            positions
+                .iter()
+                .enumerate()
+                .all(|(i, &p)| p >= 0 && p as usize == cache.len + i),
+            "append_context: positions must be contiguous from context length {}",
+            cache.len
+        );
+        let positions = Tensor::from_slice(positions, rows, &self.device)?;
         #[cfg(feature = "cuda")]
         let plan = cache
             .ring
@@ -1088,22 +1355,7 @@ impl LagunaDflash {
             .map(|r| plan_ctx_append(r.stored, r.window, r.window, rows));
         let mode = norm_mode();
         for (li, layer) in self.layers.iter().enumerate() {
-            let normed = match mode {
-                NormMode::Checkpoint => layer.input_layernorm.forward(combined)?,
-                NormMode::Reference => combined.clone(),
-            };
-            let k = layer
-                .proj_k(&normed, rows)?
-                .reshape((1usize, rows, n_kv, hd))?;
-            let k = layer.k_norm.forward(&k)?;
-            let kf = k.to_dtype(DType::F32)?;
-            let (k_rot, _) = self.rope().apply(&kf, &kf, positions)?;
-            let k_rot = k_rot.to_dtype(self.dtype)?.contiguous()?;
-            let v = layer
-                .proj_v(&normed, rows)?
-                .reshape((1usize, rows, n_kv, hd))?
-                .to_dtype(self.dtype)?
-                .contiguous()?;
+            let (k_rot, v) = self.context_layer_kv(layer, combined, &positions, rows, mode)?;
             #[cfg(feature = "cuda")]
             if let (Some(r), Some(p)) = (cache.ring.as_ref(), plan) {
                 self.ring_append_layer(r, li, &k_rot, &v, p, rows)?;
@@ -1124,6 +1376,35 @@ impl LagunaDflash {
         }
         cache.len += rows;
         Ok(())
+    }
+
+    fn context_layer_kv(
+        &self,
+        layer: &DflashLayer,
+        combined: &Tensor,
+        positions: &Tensor,
+        rows: usize,
+        mode: NormMode,
+    ) -> Result<(Tensor, Tensor)> {
+        let n_kv = self.config.num_key_value_heads;
+        let hd = self.config.head_dim;
+        let normed = match mode {
+            NormMode::Checkpoint => layer.input_layernorm.forward(combined)?,
+            NormMode::Reference => combined.clone(),
+        };
+        let k = layer
+            .proj_k(&normed, rows)?
+            .reshape((1usize, rows, n_kv, hd))?;
+        let k = layer.k_norm.forward(&k)?;
+        let kf = k.to_dtype(DType::F32)?;
+        let (k_rot, _) = self.rope().apply(&kf, &kf, positions)?;
+        let k_rot = k_rot.to_dtype(self.dtype)?.contiguous()?;
+        let v = layer
+            .proj_v(&normed, rows)?
+            .reshape((1usize, rows, n_kv, hd))?
+            .to_dtype(self.dtype)?
+            .contiguous()?;
+        Ok((k_rot, v))
     }
 
     #[cfg(feature = "cuda")]
@@ -1192,7 +1473,7 @@ impl LagunaDflash {
         cache: &DflashCtxCache,
         anchor: u32,
         anchor_pos: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<Vec<u32>> {
         let k = self.config.dflash_config.block_size - 1;
@@ -1205,7 +1486,7 @@ impl LagunaDflash {
         anchor: u32,
         anchor_pos: usize,
         k: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<Vec<u32>> {
         let logits = self.propose_logits(cache, anchor, anchor_pos, k, embed_weight, lm_head)?;
@@ -1224,7 +1505,7 @@ impl LagunaDflash {
         anchor: u32,
         anchor_pos: usize,
         k: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
         let logits = self.propose_logits(cache, anchor, anchor_pos, k, embed_weight, lm_head)?;
@@ -1259,7 +1540,7 @@ impl LagunaDflash {
         anchor: u32,
         anchor_pos: usize,
         k: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
         let logits = self.propose_logits(cache, anchor, anchor_pos, k, embed_weight, lm_head)?;
@@ -1291,13 +1572,13 @@ impl LagunaDflash {
         Ok((drafts, top1_prob))
     }
 
-    fn propose_logits(
+    pub fn propose_logits(
         &self,
         cache: &DflashCtxCache,
         anchor: u32,
         anchor_pos: usize,
         k: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<Tensor> {
         if cache.is_empty() {
@@ -1317,6 +1598,7 @@ impl LagunaDflash {
             );
         }
         let bs = k + 1;
+        self.check_rope_span(anchor_pos, bs)?;
         let mask_id = self.config.dflash_config.mask_token_id;
         let h = self.config.hidden_size;
         let hd = self.config.head_dim;
@@ -1327,7 +1609,7 @@ impl LagunaDflash {
         block_tokens[0] = anchor;
         let tokens_t = Tensor::from_vec(block_tokens, bs, &self.device)?.to_dtype(DType::U32)?;
         let mut x = embed_weight
-            .index_select(&tokens_t, 0)?
+            .lookup(&tokens_t)?
             .reshape((1usize, bs, h))?
             .to_dtype(self.dtype)?;
 
@@ -1454,7 +1736,7 @@ impl LagunaDflash {
         pos_t: &Tensor,
         mask_dev: &CudaSlice<u8>,
         committed_dev: &CudaSlice<i32>,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<Tensor> {
         let bs = tokens_t.dims()[0];
@@ -1469,7 +1751,8 @@ impl LagunaDflash {
         };
         let device = self.device.clone();
 
-        let mut x = crate::gemma4::embed_lookup_bf16_op(embed_weight, tokens_t, &device)?
+        let mut x = embed_weight
+            .lookup_captured(tokens_t, &device)?
             .reshape((1usize, bs, h))?;
 
         for (li, layer) in self.layers.iter().enumerate() {
@@ -1703,12 +1986,18 @@ pub struct DflashGraphProposer {
     parts: usize,
     collect_conf: bool,
     last_conf: Option<Vec<f32>>,
+    recorded_logits: Option<CudaSlice<f32>>,
     captured: bool,
 }
 
 #[cfg(feature = "cuda")]
 impl DflashGraphProposer {
     pub fn new(draft: &LagunaDflash, num_speculative: usize) -> Result<Self> {
+        anyhow::ensure!(
+            num_speculative >= 1 && num_speculative < draft.config.dflash_config.block_size,
+            "dflash graph proposer: speculative count {num_speculative} must be in 1..{}",
+            draft.config.dflash_config.block_size
+        );
         let dev = match &draft.device {
             Device::Cuda(d) => d.clone(),
             _ => anyhow::bail!("dflash graph proposer requires a CUDA device"),
@@ -1785,8 +2074,70 @@ impl DflashGraphProposer {
             parts,
             collect_conf: dflash_adapt_enabled(),
             last_conf: None,
+            recorded_logits: None,
             captured: false,
         })
+    }
+
+    pub fn new_recording_logits(draft: &LagunaDflash, num_speculative: usize) -> Result<Self> {
+        let mut proposer = Self::new(draft, num_speculative)?;
+        proposer.recorded_logits = Some(
+            proposer
+                .forked
+                .alloc_zeros::<f32>(proposer.bs * draft.config.vocab_size)
+                .map_err(|e| anyhow::anyhow!("allocate draft diagnostic logits: {e:?}"))?,
+        );
+        Ok(proposer)
+    }
+
+    pub fn recorded_logits_host(&self) -> Result<Vec<f32>> {
+        anyhow::ensure!(self.captured, "no captured draft logits are available");
+        let logits = self
+            .recorded_logits
+            .as_ref()
+            .context("construct the diagnostic proposer with new_recording_logits")?;
+        self.forked.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        #[allow(deprecated)]
+        let values = self.forked.memcpy_dtov(logits);
+        values.map_err(|e| anyhow::anyhow!("draft diagnostic logits dtoh: {e:?}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn uncaptured_tree_logits_host(
+        &mut self,
+        draft: &LagunaDflash,
+        cache: &DflashCtxCache,
+        anchor: u32,
+        anchor_pos: usize,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
+        lm_head: &Linear,
+    ) -> Result<Vec<f32>> {
+        let ring = self.prepare_inputs(draft, cache, anchor, anchor_pos)?;
+        self.forked.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        let tokens = Tensor::from_vec(self.host_toks.clone(), self.bs, &draft.device)?;
+        let positions = Tensor::from_vec(self.host_pos.clone(), self.bs, &draft.device)?;
+        draft.device.synchronize()?;
+        let logits =
+            nv_layers::cuda_stream::with_stream(self.forked.clone(), || -> Result<Tensor> {
+                self.forked
+                    .memcpy_htod(&self.host_committed[..], &mut self.committed_buf)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                draft.forward_block_tree(
+                    ring,
+                    &tokens,
+                    &positions,
+                    &self.mask_buf,
+                    &self.committed_buf,
+                    embed_weight,
+                    lm_head,
+                )
+            })?;
+        self.forked.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        anyhow::ensure!(
+            logits.dtype() == DType::F32 && logits.dims() == [1, self.bs, draft.config.vocab_size],
+            "uncaptured tree logits have unexpected shape or dtype"
+        );
+        logits.flatten_all()?.to_vec1::<f32>().map_err(Into::into)
     }
 
     pub fn last_conf(&self) -> Option<&[f32]> {
@@ -1804,7 +2155,7 @@ impl DflashGraphProposer {
         cache: &DflashCtxCache,
         anchor: u32,
         anchor_pos: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<Vec<u32>> {
         self.propose_inner(
@@ -1825,7 +2176,7 @@ impl DflashGraphProposer {
         cache: &DflashCtxCache,
         anchor: u32,
         anchor_pos: usize,
-        embed_weight: &Tensor,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
         lm_head: &Linear,
     ) -> Result<usize> {
         self.propose_inner(
@@ -1840,17 +2191,13 @@ impl DflashGraphProposer {
         Ok(self.bs - 1)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn propose_inner(
+    fn prepare_inputs<'a>(
         &mut self,
         draft: &LagunaDflash,
-        cache: &DflashCtxCache,
+        cache: &'a DflashCtxCache,
         anchor: u32,
         anchor_pos: usize,
-        embed_weight: &Tensor,
-        lm_head: &Linear,
-        want_dtoh: bool,
-    ) -> Result<Vec<u32>> {
+    ) -> Result<&'a DflashCtxRing> {
         let ring = cache
             .ring
             .as_ref()
@@ -1874,20 +2221,31 @@ impl DflashGraphProposer {
             anchor_pos,
             cache.len
         );
-        anyhow::ensure!(
-            anchor_pos + self.bs <= ROPE_TABLE_CAP,
-            "graph propose: position {} beyond rope table",
-            anchor_pos
-        );
-        let dev = match &draft.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("cuda"),
-        };
+        draft.check_rope_span(anchor_pos, self.bs)?;
         self.host_toks[0] = anchor;
         for (i, p) in self.host_pos.iter_mut().enumerate() {
             *p = (anchor_pos + i) as i32;
         }
         self.host_committed[0] = ring.stored as i32;
+        Ok(ring)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn propose_inner(
+        &mut self,
+        draft: &LagunaDflash,
+        cache: &DflashCtxCache,
+        anchor: u32,
+        anchor_pos: usize,
+        embed_weight: &dyn crate::laguna::LagunaEmbedding,
+        lm_head: &Linear,
+        want_dtoh: bool,
+    ) -> Result<Vec<u32>> {
+        let ring = self.prepare_inputs(draft, cache, anchor, anchor_pos)?;
+        let dev = match &draft.device {
+            Device::Cuda(d) => d.clone(),
+            _ => anyhow::bail!("cuda"),
+        };
 
         let legacy = dev.cuda_stream();
         let raw_ctx = legacy.context().clone();
@@ -1916,6 +2274,7 @@ impl DflashGraphProposer {
             host_toks,
             host_pos,
             host_committed,
+            recorded_logits,
             ..
         } = self;
         let bs = *bs;
@@ -1970,6 +2329,11 @@ impl DflashGraphProposer {
                     _ => anyhow::bail!("graph logits not CUDA"),
                 };
                 let l_slice = l_cuda.as_cuda_slice::<f32>()?;
+                if let Some(recorded) = recorded_logits.as_mut() {
+                    let src = l_slice.slice(ll.start_offset()..ll.start_offset() + bs * vocab);
+                    s.memcpy_dtod(&src, recorded)
+                        .map_err(|e| anyhow::anyhow!("record captured draft logits: {e:?}"))?;
+                }
                 let (lp0, _gl) = l_slice.device_ptr(s);
 
                 let lp = lp0 + ((ll.start_offset() + vocab) * std::mem::size_of::<f32>()) as u64;
@@ -2341,27 +2705,73 @@ pub(crate) struct AcceptSlots {
     prof_ts: Option<CudaSlice<u64>>,
 }
 
-pub(crate) fn accept_block_on_host(vlogits: &Tensor, drafts: &[u32]) -> Result<(usize, Vec<u32>)> {
-    let k = drafts.len();
-    let vtoks: Vec<u32> = vlogits
-        .argmax(candle_core::D::Minus1)?
-        .flatten_all()?
-        .to_vec1()?;
-    let mut accepted = 0usize;
-    let mut emitted: Vec<u32> = Vec::with_capacity(k + 1);
-    for (i, &d) in drafts.iter().enumerate() {
-        let vtok = vtoks[i];
-        if vtok == d {
-            emitted.push(d);
-            accepted += 1;
-        } else {
-            emitted.push(vtok);
-            break;
+#[derive(Debug)]
+struct DflashInvalidLogits {
+    row: usize,
+}
+
+impl std::fmt::Display for DflashInvalidLogits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "engine busy: DFlash verification logits are invalid at row {}; try later.",
+            self.row
+        )
+    }
+}
+
+impl std::error::Error for DflashInvalidLogits {}
+
+#[cfg(feature = "cuda")]
+fn invalid_dflash_logits(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<DflashInvalidLogits>().is_some()
+}
+
+pub(crate) fn checked_target_argmax_row(row: &[f32]) -> Option<u32> {
+    if row.len() > u32::MAX as usize {
+        return None;
+    }
+    let mut best = f32::NEG_INFINITY;
+    let mut best_id = 0u32;
+    for (index, &value) in row.iter().enumerate() {
+        if value.is_nan() || value == f32::INFINITY {
+            return None;
+        }
+        if value > best {
+            best = value;
+            best_id = index as u32;
         }
     }
-    if accepted == k {
-        emitted.push(vtoks[k]);
+    best.is_finite().then_some(best_id)
+}
+
+pub(crate) fn accept_block_on_host(vlogits: &Tensor, drafts: &[u32]) -> Result<(usize, Vec<u32>)> {
+    let k = drafts.len();
+    let m = k
+        .checked_add(1)
+        .context("DFlash acceptance row count overflow")?;
+    let dims = vlogits.dims();
+    anyhow::ensure!(
+        dims.len() == 3 && dims[0] == 1 && dims[1] == m && dims[2] > 0,
+        "host DFlash acceptance requires [1,{m},vocab>0], got {dims:?}"
+    );
+    let vocab = dims[2];
+    anyhow::ensure!(
+        vocab <= i32::MAX as usize && vlogits.dtype() == DType::F32,
+        "host DFlash acceptance requires F32 logits and vocab <= INT_MAX"
+    );
+    let logits: Vec<f32> = vlogits.flatten_all()?.to_vec1()?;
+    let mut vtoks = Vec::with_capacity(m);
+    for (row_index, row) in logits.chunks_exact(vocab).enumerate() {
+        vtoks.push(checked_target_argmax_row(row).ok_or(DflashInvalidLogits { row: row_index })?);
     }
+    let accepted = drafts
+        .iter()
+        .zip(&vtoks)
+        .take_while(|(draft, target)| draft == target)
+        .count();
+    let mut emitted = drafts[..accepted].to_vec();
+    emitted.push(vtoks[accepted]);
     Ok((accepted, emitted))
 }
 
@@ -2373,35 +2783,68 @@ pub(crate) fn accept_block_on_device(
     drafts: &[u32],
     device_drafts: Option<u64>,
 ) -> Result<(usize, Vec<u32>)> {
-    let dev = match target.device() {
+    accept_block_on_device_with_status(target, slots_map, vlogits, drafts, device_drafts, None)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn accept_block_on_device_with_status(
+    target: &Laguna,
+    slots_map: &mut std::collections::HashMap<usize, AcceptSlots>,
+    vlogits: &Tensor,
+    drafts: &[u32],
+    device_drafts: Option<u64>,
+    xqa_status_device: Option<u64>,
+) -> Result<(usize, Vec<u32>)> {
+    accept_block_on_device_for_vocab(
+        target.device(),
+        target.config().vocab_size,
+        slots_map,
+        vlogits,
+        drafts,
+        device_drafts,
+        xqa_status_device,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn accept_block_on_device_for_vocab(
+    device: &Device,
+    vocab: usize,
+    slots_map: &mut std::collections::HashMap<usize, AcceptSlots>,
+    vlogits: &Tensor,
+    drafts: &[u32],
+    device_drafts: Option<u64>,
+    xqa_status_device: Option<u64>,
+) -> Result<(usize, Vec<u32>)> {
+    let dev = match device {
         Device::Cuda(d) => d.clone(),
         _ => anyhow::bail!("accept_on_device requires a CUDA device"),
     };
     let stream = dev.cuda_stream();
     let k = drafts.len();
     let m = k + 1;
-    let vocab = target.config().vocab_size;
     let parts = nv_kernels::cuda::dflash_accept_parts();
     anyhow::ensure!(parts > 0, "dflash accept kernel unavailable");
-    if !slots_map.contains_key(&k) {
+    let out_words = m + 1 + usize::from(xqa_status_device.is_some());
+    if let std::collections::hash_map::Entry::Vacant(entry) = slots_map.entry(k) {
         let prof_ts = if crate::laguna_step_graph::verify_prof_enabled() {
             Some(stream.alloc_zeros::<u64>(2)?)
         } else {
             None
         };
-        slots_map.insert(
-            k,
-            AcceptSlots {
-                drafts: stream.alloc_zeros::<u32>(k)?,
-                row_argmax: stream.alloc_zeros::<u32>(m)?,
-                out: stream.alloc_zeros::<u32>(m + 1)?,
-                part_val: stream.alloc_zeros::<f32>(m * parts)?,
-                part_idx: stream.alloc_zeros::<i32>(m * parts)?,
-                prof_ts,
-            },
-        );
+        entry.insert(AcceptSlots {
+            drafts: stream.alloc_zeros::<u32>(k)?,
+            row_argmax: stream.alloc_zeros::<u32>(m)?,
+            out: stream.alloc_zeros::<u32>(out_words)?,
+            part_val: stream.alloc_zeros::<f32>(m * parts)?,
+            part_idx: stream.alloc_zeros::<i32>(m * parts)?,
+            prof_ts,
+        });
     }
     let slots = slots_map.get_mut(&k).unwrap();
+    if slots.out.len() < out_words {
+        slots.out = stream.alloc_zeros::<u32>(out_words)?;
+    }
     anyhow::ensure!(
         slots.drafts.len() == k && slots.row_argmax.len() == m,
         "accept slots sized for a different k"
@@ -2456,11 +2899,35 @@ pub(crate) fn accept_block_on_device(
             crate::laguna_step_graph::prof_timestamp_at(ts, 1, &stream)?;
         }
     }
+    if let Some(status_device) = xqa_status_device {
+        anyhow::ensure!(
+            status_device != 0,
+            "engine busy: XQA status pointer missing; try later."
+        );
+        let mut dst = slots.out.slice_mut(m + 1..m + 2);
+        let (dst_ptr, _guard) = dst.device_ptr_mut(&stream);
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                dst_ptr,
+                status_device,
+                std::mem::size_of::<u32>(),
+                stream.cu_stream(),
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("engine busy: XQA status copy failed; try later: {e:?}"))?;
+    }
     #[allow(deprecated)]
     let out_host: Vec<u32> = stream
-        .memcpy_dtov(&slots.out)
+        .memcpy_dtov(&slots.out.slice(0..out_words))
         .map_err(|e| anyhow::anyhow!("accept out dtoh: {e:?}"))?;
     decandle_stats::tick_dtoh();
+    if xqa_status_device.is_some() {
+        anyhow::ensure!(
+            out_host[m + 1] == 0,
+            "engine busy: XQA verification status {} (invalid committed span); try later.",
+            out_host[m + 1]
+        );
+    }
     if let Some(ts) = slots.prof_ts.as_ref() {
         #[allow(deprecated)]
         let t: Vec<u64> = stream
@@ -2468,6 +2935,16 @@ pub(crate) fn accept_block_on_device(
             .map_err(|e| anyhow::anyhow!("accept prof dtoh: {e:?}"))?;
         let ms = t[1].saturating_sub(t[0]) as f64 / 1e6;
         eprintln!("[laguna_verify_prof] accept={ms:.3}");
+    }
+    if out_host[0] == u32::MAX {
+        anyhow::ensure!(
+            (out_host[1] as usize) < m,
+            "DFlash acceptance invalid-row status exceeds M"
+        );
+        return Err(DflashInvalidLogits {
+            row: out_host[1] as usize,
+        }
+        .into());
     }
     let accepted = out_host[0] as usize;
     anyhow::ensure!(accepted <= k, "accept count {accepted} > k {k}");
@@ -2595,23 +3072,27 @@ impl<'a> LagunaDflashEngine<'a> {
         if prompt.is_empty() {
             anyhow::bail!("generate_greedy: empty prompt");
         }
+        if use_draft {
+            self.draft.check_rope_span(0, prompt.len())?;
+        }
         let device = self.target.device().clone();
         let mask_id = self.draft.config.dflash_config.mask_token_id;
 
         #[cfg(feature = "cuda")]
-        let mut target_cache = if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV") {
-            match self.target.new_kv_cache_fp8(max_seq) {
-                Ok(c) => SpecTargetCache::Fp8(c),
-                Err(e) => {
-                    eprintln!(
+        let mut target_cache =
+            if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV") {
+                match self.target.new_kv_cache_fp8(max_seq) {
+                    Ok(c) => SpecTargetCache::Fp8(c),
+                    Err(e) => {
+                        eprintln!(
                         "[dflash] NV_LAGUNA_FP8_KV set but fp8 KV cache unavailable, bf16: {e:#}"
                     );
-                    SpecTargetCache::Bf16(self.target.new_kv_cache(max_seq)?)
+                        SpecTargetCache::Bf16(self.target.new_kv_cache(max_seq)?)
+                    }
                 }
-            }
-        } else {
-            SpecTargetCache::Bf16(self.target.new_kv_cache(max_seq)?)
-        };
+            } else {
+                SpecTargetCache::Bf16(self.target.new_kv_cache(max_seq)?)
+            };
         #[cfg(not(feature = "cuda"))]
         let mut target_cache = SpecTargetCache::Bf16(self.target.new_kv_cache(max_seq)?);
         let mut ctx = self.draft.new_ctx_cache();
@@ -2645,8 +3126,7 @@ impl<'a> LagunaDflashEngine<'a> {
             )?;
             if use_draft {
                 let combined = self.draft.combine_aux(&aux)?;
-                let ctx_pos = Tensor::from_vec(pos_host, n, &device)?;
-                self.draft.append_context(&mut ctx, &combined, &ctx_pos)?;
+                self.draft.append_context(&mut ctx, &combined, &pos_host)?;
             }
             last_logits = Some((logits, n));
             offset += n;
@@ -2792,7 +3272,7 @@ impl<'a> LagunaDflashEngine<'a> {
                                 &ctx,
                                 anchor,
                                 num_ctx,
-                                self.target.embed_weight(),
+                                self.target,
                                 self.target.lm_head(),
                             ) {
                                 Ok(n) => {
@@ -2812,7 +3292,7 @@ impl<'a> LagunaDflashEngine<'a> {
                                 &ctx,
                                 anchor,
                                 num_ctx,
-                                self.target.embed_weight(),
+                                self.target,
                                 self.target.lm_head(),
                             ) {
                                 Ok(v) => {
@@ -2839,7 +3319,7 @@ impl<'a> LagunaDflashEngine<'a> {
                                 anchor,
                                 num_ctx,
                                 draft_k,
-                                self.target.embed_weight(),
+                                self.target,
                                 self.target.lm_head(),
                             )?;
                             (d, Some(c))
@@ -2850,7 +3330,7 @@ impl<'a> LagunaDflashEngine<'a> {
                                 anchor,
                                 num_ctx,
                                 draft_k,
-                                self.target.embed_weight(),
+                                self.target,
                                 self.target.lm_head(),
                             )?;
                             (d, Some(c))
@@ -2861,7 +3341,7 @@ impl<'a> LagunaDflashEngine<'a> {
                                 anchor,
                                 num_ctx,
                                 draft_k,
-                                self.target.embed_weight(),
+                                self.target,
                                 self.target.lm_head(),
                             )?,
                             None,
@@ -2876,7 +3356,7 @@ impl<'a> LagunaDflashEngine<'a> {
                             anchor,
                             num_ctx,
                             draft_k,
-                            self.target.embed_weight(),
+                            self.target,
                             self.target.lm_head(),
                         )?;
                         (d, Some(c))
@@ -2886,7 +3366,7 @@ impl<'a> LagunaDflashEngine<'a> {
                             anchor,
                             num_ctx,
                             draft_k,
-                            self.target.embed_weight(),
+                            self.target,
                             self.target.lm_head(),
                         )?;
                         (d, Some(c))
@@ -2897,7 +3377,7 @@ impl<'a> LagunaDflashEngine<'a> {
                                 anchor,
                                 num_ctx,
                                 draft_k,
-                                self.target.embed_weight(),
+                                self.target,
                                 self.target.lm_head(),
                             )?,
                             None,
@@ -3048,6 +3528,7 @@ impl<'a> LagunaDflashEngine<'a> {
                     };
                 match self.accept_on_device(&mut accept_slots, &vlogits, &drafts, device_drafts) {
                     Ok(r) => accept_res = Some(r),
+                    Err(e) if invalid_dflash_logits(&e) => return Err(e),
                     Err(e) => {
                         eprintln!("[dflash] device accept failed, host fallback: {e:#}")
                     }
@@ -3076,8 +3557,7 @@ impl<'a> LagunaDflashEngine<'a> {
                 }
                 let combined = self.draft.combine_aux(&vaux_kept)?;
                 let new_pos: Vec<i32> = (0..consumed).map(|i| (num_ctx + i) as i32).collect();
-                let np = Tensor::from_vec(new_pos, consumed, &device)?;
-                self.draft.append_context(&mut ctx, &combined, &np)?;
+                self.draft.append_context(&mut ctx, &combined, &new_pos)?;
             }
 
             sync(prof);
@@ -3176,6 +3656,258 @@ pub fn argmax_row(row: &[f32]) -> u32 {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "runs CUDA acceptance and injected status reuse; set NV_DFLASH_ACCEPT_STATUS_TEST=1"]
+    fn device_accept_status_rejects_before_return_and_reuses_slots() {
+        assert_eq!(
+            std::env::var("NV_DFLASH_ACCEPT_STATUS_TEST").as_deref(),
+            Ok("1")
+        );
+        let device = Device::new_cuda(0).expect("CUDA status test must not skip");
+        let Device::Cuda(dev) = &device else {
+            unreachable!()
+        };
+        let stream = dev.cuda_stream();
+        let vocab = 100352;
+        let drafts = [7u32, 3, 9, 10];
+        let logits = |peaks: [usize; 5]| {
+            let mut values = vec![-1.0f32; 5 * vocab];
+            for (row, token) in peaks.into_iter().enumerate() {
+                values[row * vocab + token] = 10.0;
+            }
+            Tensor::from_vec(values, (1, 5, vocab), &device).unwrap()
+        };
+        let partial = logits([7, 3, 2, 5, 11]);
+        let all = logits([7, 3, 9, 10, 11]);
+        let mut slots = std::collections::HashMap::new();
+        assert_eq!(
+            accept_block_on_device_for_vocab(
+                &device, vocab, &mut slots, &partial, &drafts, None, None,
+            )
+            .unwrap(),
+            (2, vec![7, 3, 2])
+        );
+        let mut status = stream.alloc_zeros::<u32>(1).unwrap();
+        let status_ptr = {
+            let (ptr, _guard) = status.device_ptr(&stream);
+            ptr
+        };
+        assert_eq!(
+            accept_block_on_device_for_vocab(
+                &device,
+                vocab,
+                &mut slots,
+                &partial,
+                &drafts,
+                None,
+                Some(status_ptr),
+            )
+            .unwrap(),
+            (2, vec![7, 3, 2])
+        );
+        assert_eq!(slots[&4].out.len(), 7);
+        let output_ptr = {
+            let (ptr, _guard) = slots[&4].out.device_ptr(&stream);
+            ptr
+        };
+        for error_status in [1u32, 0x80000000, u32::MAX] {
+            stream.memcpy_htod(&[error_status], &mut status).unwrap();
+            let error = accept_block_on_device_for_vocab(
+                &device,
+                vocab,
+                &mut slots,
+                &all,
+                &drafts,
+                None,
+                Some(status_ptr),
+            )
+            .expect_err("a nonzero verification status must not return accepted tokens");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("XQA verification status {error_status}")),
+                "{message}"
+            );
+            assert!(message.contains("try later"), "{message}");
+        }
+        stream.memcpy_htod(&[0u32], &mut status).unwrap();
+        assert_eq!(
+            accept_block_on_device_for_vocab(
+                &device,
+                vocab,
+                &mut slots,
+                &all,
+                &drafts,
+                None,
+                Some(status_ptr),
+            )
+            .unwrap(),
+            (4, vec![7, 3, 9, 10, 11])
+        );
+        let (reused_ptr, _guard) = slots[&4].out.device_ptr(&stream);
+        assert_eq!(
+            reused_ptr, output_ptr,
+            "steady acceptance must reuse the existing output allocation"
+        );
+        stream
+            .synchronize()
+            .expect("CUDA remains healthy after status error and reuse");
+        eprintln!("LAGUNA-DFLASH-ACCEPT-STATUS passed=true vocab={vocab} k=4 injected_statuses=3 post_error_reuse=true model_loaded=false http_fallback=not_evaluated");
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "runs CUDA acceptance with invalid-logit injection; set NV_DFLASH_ACCEPT_STATUS_TEST=1"]
+    fn device_accept_invalid_logits_rejects_and_reuses_slots() {
+        assert_eq!(
+            std::env::var("NV_DFLASH_ACCEPT_STATUS_TEST").as_deref(),
+            Ok("1")
+        );
+        let device = Device::new_cuda(0).expect("CUDA invalid-logit acceptance test must not skip");
+        let Device::Cuda(dev) = &device else {
+            unreachable!()
+        };
+        let stream = dev.cuda_stream();
+        let vocab = 100352usize;
+        let drafts = [7u32, 3, 9, 10];
+        let peaks = [7usize, 3, 9, 10, vocab - 1];
+        let mut finite = vec![-1.0f32; 5 * vocab];
+        let mut masked = vec![f32::NEG_INFINITY; 5 * vocab];
+        for (row, &token) in peaks.iter().enumerate() {
+            finite[row * vocab + token] = 10.0;
+            masked[row * vocab + token] = 10.0;
+        }
+        finite[8] = 10.0;
+        masked[8] = 10.0;
+        finite[63 * 256 + 17] = 10.0;
+        masked[63 * 256 + 17] = 10.0;
+        let expected = (4usize, vec![7u32, 3, 9, 10, (vocab - 1) as u32]);
+        let mut slots = std::collections::HashMap::new();
+        let status = stream.alloc_zeros::<u32>(1).unwrap();
+        let status_ptr = {
+            let (p, _g) = status.device_ptr(&stream);
+            p
+        };
+        let device_drafts = stream.clone_htod(&drafts).unwrap();
+        let drafts_ptr = {
+            let (p, _g) = device_drafts.device_ptr(&stream);
+            p
+        };
+        for values in [&finite, &masked] {
+            let tensor = Tensor::from_vec(values.clone(), (1, 5, vocab), &device).unwrap();
+            assert_eq!(accept_block_on_host(&tensor, &drafts).unwrap(), expected);
+            assert_eq!(
+                accept_block_on_device_for_vocab(
+                    &device,
+                    vocab,
+                    &mut slots,
+                    &tensor,
+                    &drafts,
+                    Some(drafts_ptr),
+                    Some(status_ptr)
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        let output_ptr = {
+            let (p, _g) = slots[&4].out.device_ptr(&stream);
+            p
+        };
+        let invalid_cases = [
+            ("nan-low", 0usize, 0usize, f32::NAN, false),
+            (
+                "nan-high-part",
+                1,
+                63 * 256 + 17,
+                f32::from_bits(0xffc00001),
+                false,
+            ),
+            ("inf-later-stride", 2, 4 * 16384 + 5, f32::INFINITY, false),
+            ("inf-tail", 4, vocab - 1, f32::INFINITY, false),
+            ("all-masked-first", 0, 0, f32::NEG_INFINITY, true),
+            ("all-masked-unused-tail", 4, 0, f32::NEG_INFINITY, true),
+            ("all-nan", 3, 0, f32::NAN, true),
+        ];
+        for (case, row, token, value, whole_row) in invalid_cases {
+            let mut values = finite.clone();
+            if row == 4 {
+                values[7] = -1.0;
+                values[2] = 11.0;
+            }
+            if whole_row {
+                values[row * vocab..(row + 1) * vocab].fill(value);
+            } else {
+                values[row * vocab + token] = value;
+            }
+            let tensor = Tensor::from_vec(values, (1, 5, vocab), &device).unwrap();
+            for checked_status in [None, Some(status_ptr)] {
+                let error = accept_block_on_device_for_vocab(
+                    &device,
+                    vocab,
+                    &mut slots,
+                    &tensor,
+                    &drafts,
+                    Some(drafts_ptr),
+                    checked_status,
+                )
+                .expect_err("invalid logits must not return an acceptance result");
+                assert!(invalid_dflash_logits(&error), "{case}: {error:#}");
+                assert_eq!(
+                    error.downcast_ref::<DflashInvalidLogits>().unwrap().row,
+                    row,
+                    "{case}"
+                );
+                assert!(format!("{error:#}").contains("try later"), "{case}");
+                let raw = stream.clone_dtoh(&slots[&4].out.slice(..2)).unwrap();
+                assert_eq!(
+                    raw,
+                    [u32::MAX, row as u32],
+                    "{case}: invalid status must precede token extraction"
+                );
+                let row_ids = stream.clone_dtoh(&slots[&4].row_argmax).unwrap();
+                assert!(row_ids.iter().all(|id| (*id as usize) < vocab),
+                    "{case}: the shared proposer argmax output must remain bounded even when accept_out rejects it");
+                let fallback = accept_block_on_host(&tensor, &drafts).expect_err(
+                    "the non-XQA HTTP/standalone host fallback must also reject invalid rows",
+                );
+                assert!(invalid_dflash_logits(&fallback), "{case}: {fallback:#}");
+            }
+            let tensor = Tensor::from_vec(masked.clone(), (1, 5, vocab), &device).unwrap();
+            assert_eq!(
+                accept_block_on_device_for_vocab(
+                    &device, vocab, &mut slots, &tensor, &drafts, None, None
+                )
+                .unwrap(),
+                expected,
+                "{case}: valid reuse"
+            );
+            let (p, _g) = slots[&4].out.device_ptr(&stream);
+            assert_eq!(
+                p, output_ptr,
+                "{case}: rejection must not force new acceptance allocations"
+            );
+        }
+        let mut zero = finite.clone();
+        zero[7] = -1.0;
+        zero[8] = -1.0;
+        zero[0] = 11.0;
+        let zero = Tensor::from_vec(zero, (1, 5, vocab), &device).unwrap();
+        assert_eq!(
+            accept_block_on_device_for_vocab(
+                &device, vocab, &mut slots, &zero, &drafts, None, None
+            )
+            .unwrap(),
+            (0, vec![0]),
+            "a finite winning token0 is legitimate"
+        );
+        assert_eq!(accept_block_on_host(&zero, &drafts).unwrap(), (0, vec![0]));
+        stream
+            .synchronize()
+            .expect("numeric rejection must leave this healthy CUDA context reusable");
+        eprintln!("LAGUNA-DFLASH-INVALID-LOGITS passed=true vocab={vocab} k=4 finite_first_max=true masked_negative_inf=true nan_positive_inf_rejected=true all_masked_rejected=true unused_tail_validated=true token0_finite_allowed=true status_reuse=true checked_host_fallback=true actual_http=false model_loaded=false sticky_cuda_recovery=false");
+    }
+
     const DRAFT_CONFIG: &str = r#"{
       "attention_bias": false,
       "head_dim": 128,
@@ -3225,6 +3957,210 @@ mod tests {
         assert_eq!(cfg.dflash_config.target_layer_ids, vec![1, 13, 25, 33, 39]);
         assert!(cfg.dflash_config.causal);
         assert_eq!(cfg.num_aux(), 5);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "loads the NVFP4-target-trained BF16 DFlash source; set NV_LAGUNA_TEST=1, NV_LAGUNA_DFLASH_NVFP4=1 and NV_DFLASH_DRAFT_DIR"]
+    fn real_nvfp4_dflash_qkv_packing_is_deterministic_and_matches_source_rows() {
+        assert_eq!(
+            std::env::var("NV_LAGUNA_TEST").as_deref(),
+            Ok("1"),
+            "this real-weight gate must not silently skip"
+        );
+        assert!(dflash_nvfp4_enabled().unwrap());
+        let dir = std::path::PathBuf::from(
+            std::env::var("NV_DFLASH_DRAFT_DIR")
+                .expect("pin the NVFP4-target-trained DFlash source"),
+        );
+        let device = Device::new_cuda(0).unwrap();
+        let config = LagunaDflashConfig::from_hf_json_file(&dir.join("config.json")).unwrap();
+        let weights = WeightLoader::open_dir(&dir, &device).unwrap();
+        let draft = LagunaDflash::from_loader(config, &weights, &device).unwrap();
+        let summary = draft.quantization_summary();
+        assert_eq!(summary.weight_format, "nvfp4-derived");
+        assert_eq!(summary.packed_linears, 1 + 7 * draft.layers.len());
+        let Device::Cuda(dev) = &device else {
+            unreachable!()
+        };
+        let stream = dev.cuda_stream();
+        let fp8 = crate::laguna::weight_linears_fp8_enabled();
+        assert_eq!(summary.fp8_linears, if fp8 { 5 } else { 0 });
+        assert_eq!(summary.fp8_norms, if fp8 { 27 } else { 0 });
+        assert_eq!(summary.excluded_norms, if fp8 { 0 } else { 27 });
+        let mut checked_norms = 0;
+        let mut check_norm = |name: &str, norm: &RmsNorm, dim: usize| {
+            assert_eq!(
+                weights.get(name, DType::BF16).unwrap().dims(),
+                &[dim],
+                "{name} source shape"
+            );
+            assert_eq!(norm.fp8_e4m3_active(), fp8, "{name} storage mode");
+            if fp8 {
+                let (bytes, scale, hidden) =
+                    norm.fp8_e4m3_weight_and_scale().expect("resident FP8 norm");
+                assert_eq!(
+                    (bytes.len(), scale.len(), hidden),
+                    (dim, 1, dim),
+                    "{name} backing shape"
+                );
+                assert!(
+                    stream
+                        .clone_dtoh(bytes)
+                        .unwrap()
+                        .iter()
+                        .all(|&b| b & 0x7f != 0x7f),
+                    "{name} non-finite E4M3 weight"
+                );
+                assert!(
+                    stream
+                        .clone_dtoh(scale)
+                        .unwrap()
+                        .iter()
+                        .all(|s| s.is_finite() && *s > 0.0),
+                    "{name} invalid scale"
+                );
+            } else {
+                assert_eq!(
+                    norm.weight().dims(),
+                    &[dim],
+                    "{name} original storage shape"
+                );
+            }
+            checked_norms += 1;
+        };
+        for (i, norm) in draft.aux_hidden_norms.iter().enumerate() {
+            check_norm(&format!("aux_hidden_norms.{i}.weight"), norm, 2048);
+        }
+        check_norm("hidden_norm.weight", &draft.hidden_norm, 2048);
+        check_norm("norm.weight", &draft.norm, 2048);
+        for (i, layer) in draft.layers.iter().enumerate() {
+            check_norm(
+                &format!("layers.{i}.input_layernorm.weight"),
+                &layer.input_layernorm,
+                2048,
+            );
+            check_norm(
+                &format!("layers.{i}.post_attention_layernorm.weight"),
+                &layer.post_attention_layernorm,
+                2048,
+            );
+            check_norm(
+                &format!("layers.{i}.self_attn.q_norm.weight"),
+                &layer.q_norm,
+                128,
+            );
+            check_norm(
+                &format!("layers.{i}.self_attn.k_norm.weight"),
+                &layer.k_norm,
+                128,
+            );
+        }
+        assert_eq!(checked_norms, 27);
+        if fp8 {
+            assert_eq!(draft.layers.len(), 5);
+            for layer in &draft.layers {
+                assert!(
+                    layer.g_proj.weight().is_none(),
+                    "FP8 draft gate retained a BF16 matrix"
+                );
+                let (bytes, scales) = layer
+                    .g_proj
+                    .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
+                    .expect("actual FP8 draft gate storage");
+                assert_eq!(bytes.len(), 64 * 2048);
+                assert_eq!(scales.len(), 64);
+                assert!(
+                    stream
+                        .clone_dtoh(bytes)
+                        .unwrap()
+                        .iter()
+                        .all(|&b| b & 0x7f != 0x7f),
+                    "non-finite FP8 gate weight"
+                );
+                assert!(
+                    stream
+                        .clone_dtoh(scales)
+                        .unwrap()
+                        .iter()
+                        .all(|s| s.is_finite() && *s > 0.0),
+                    "invalid FP8 gate scale"
+                );
+            }
+        }
+        eprintln!(
+            "LAGUNA-DFLASH-STORAGE norms_checked={checked_norms} fp8_norms={} fp8_linears={}",
+            summary.fp8_norms, summary.fp8_linears
+        );
+        assert_eq!(summary.excluded_linears, draft.layers.len());
+        assert_eq!(summary.bf16_fallback_linears, 0);
+        let fused = weights
+            .get("layers.0.self_attn.qkv_proj.weight", DType::BF16)
+            .unwrap();
+        let q_rows = draft.config.num_attention_heads * draft.config.head_dim;
+        let kv_rows = draft.config.num_key_value_heads * draft.config.head_dim;
+        let hidden = draft.config.hidden_size;
+        for (name, linear, start, rows) in [
+            ("Q", &draft.layers[0].q_proj, 0, q_rows),
+            ("K", &draft.layers[0].k_proj, q_rows, kv_rows),
+            ("V", &draft.layers[0].v_proj, q_rows + kv_rows, kv_rows),
+        ] {
+            assert!(
+                linear.weight().is_none(),
+                "{name} retained a BF16 weight copy"
+            );
+            let (packed, scales, alpha, input_global) =
+                linear.nvfp4_parts().expect("actual packed storage");
+            let packed = stream.clone_dtoh(packed).unwrap();
+            let scales = stream.clone_dtoh(scales).unwrap();
+            assert_eq!(packed.len(), rows * hidden / 2);
+            assert!(alpha.is_finite() && alpha > 0.0 && input_global == 1.0);
+            let original = fused.narrow(0, start, rows).unwrap().contiguous().unwrap();
+            let twin = Linear::from_bf16_quantized_nvfp4_dev(
+                &original,
+                None,
+                &device,
+                linear.nvfp4_runner().unwrap(),
+            )
+            .unwrap();
+            let (tp, ts, ta, ti) = twin.nvfp4_parts().unwrap();
+            assert!(
+                packed == stream.clone_dtoh(tp).unwrap(),
+                "{name} packed bytes changed on deterministic repeat"
+            );
+            assert!(
+                scales == stream.clone_dtoh(ts).unwrap(),
+                "{name} scales changed on deterministic repeat"
+            );
+            assert_eq!(alpha.to_bits(), ta.to_bits());
+            assert_eq!(input_global.to_bits(), ti.to_bits());
+            let reconstructed = nv_quant::nvfp4::dequantize_packed_swizzled(
+                &packed,
+                &scales,
+                rows,
+                hidden,
+                alpha * input_global,
+            );
+            let source = original
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(source.len(), reconstructed.len());
+            assert!(source.iter().chain(&reconstructed).all(|v| v.is_finite()));
+            let signal: f64 = source.iter().map(|&v| (v as f64).powi(2)).sum();
+            let error: f64 = source
+                .iter()
+                .zip(&reconstructed)
+                .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                .sum();
+            assert!(signal > 0.0, "{name} source is degenerate");
+            let relative_rmse = (error / signal).sqrt();
+            assert!(relative_rmse < 0.20, "{name}: CPU dequantization differs from the correct source row slice by relative RMSE {relative_rmse}");
+            eprintln!("LAGUNA-DFLASH-NVFP4-PACK projection={name} packed_bytes={} source_rows={start}..{} relative_rmse={relative_rmse:.6} deterministic=true bf16_resident=false", packed.len(), start + rows);
+        }
     }
 
     #[test]
@@ -3574,6 +4510,8 @@ mod tests {
             .reshape((h, 2 * h))
             .unwrap();
         LagunaDflash {
+            w4a16_rows: 0,
+            w4a16_armed: 0,
             config,
             aux_hidden_norms: vec![RmsNorm::new(w2.clone(), 1e-6), RmsNorm::new(w2, 1e-6)],
             fc: Linear::new(fc_w, None).unwrap(),
@@ -3585,6 +4523,121 @@ mod tests {
             dtype: DType::F32,
             device: dev.clone(),
         }
+    }
+
+    fn loaded_tiny_dflash_with_capacity(capacity: usize) -> LagunaDflash {
+        let mut config = LagunaDflashConfig::from_hf_json_str(TINY_CONFIG).unwrap();
+        config.max_position_embeddings = capacity;
+        config.head_dim = 8;
+        let dir =
+            std::env::temp_dir().join(format!("laguna-rope-{}-{capacity}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut weights = std::collections::HashMap::<String, Tensor>::new();
+        for name in [
+            "aux_hidden_norms.0.weight",
+            "aux_hidden_norms.1.weight",
+            "hidden_norm.weight",
+            "norm.weight",
+        ] {
+            weights.insert(
+                name.into(),
+                Tensor::ones(4, DType::F32, &Device::Cpu).unwrap(),
+            );
+        }
+        weights.insert(
+            "fc.weight".into(),
+            Tensor::ones((4, 8), DType::F32, &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&weights, dir.join("model.safetensors")).unwrap();
+        let loader = WeightLoader::open_dir(&dir, &Device::Cpu).unwrap();
+        let draft = LagunaDflash::from_loader(config, &loader, &Device::Cpu).unwrap();
+        drop(loader);
+        std::fs::remove_dir_all(&dir).unwrap();
+        draft
+    }
+
+    #[test]
+    fn declared_rope_capacity_preserves_prefix_and_covers_positions_above_64k() {
+        let old = loaded_tiny_dflash_with_capacity(65536);
+        let draft = loaded_tiny_dflash_with_capacity(262144);
+        assert_eq!(draft.rope_max_seq_len(), 262144);
+        for (name, old_table, full_table) in [
+            ("cos", old.rope().cos(), draft.rope().cos()),
+            ("sin", old.rope().sin(), draft.rope().sin()),
+        ] {
+            let before = old_table.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let after = full_table
+                .narrow(0, 0, 65536)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                before
+                    .iter()
+                    .zip(&after)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "extending {name} changed existing frequencies"
+            );
+        }
+        let input = Tensor::from_vec(
+            vec![1f32, 1., 1., 1., 0., 0., 0., 0.],
+            (1, 1, 1, 8),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let mut cache = DflashCtxCache::new(0);
+        let combined = Tensor::zeros((1, 1, 4), DType::F32, &Device::Cpu).unwrap();
+        for position in [65535usize, 65536, 168000, 262143] {
+            cache.len = position;
+            draft
+                .append_context(&mut cache, &combined, &[position as i32])
+                .unwrap();
+            assert_eq!(cache.len(), position + 1);
+            draft.check_rope_span(position, 1).unwrap();
+            let positions = Tensor::from_vec(vec![position as u32], 1, &Device::Cpu).unwrap();
+            let (rotated, _) = draft.rope().apply(&input, &input, &positions).unwrap();
+            let rotated = rotated.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(
+                (rotated[0] - (position as f32).cos()).abs() < 1e-6,
+                "cos at {position}"
+            );
+            assert!(
+                (rotated[4] - (position as f32).sin()).abs() < 1e-6,
+                "sin at {position}"
+            );
+        }
+        for (start, rows) in [(262144, 1), (262143, 2), (usize::MAX, 1)] {
+            assert!(draft
+                .check_rope_span(start, rows)
+                .unwrap_err()
+                .to_string()
+                .contains("RoPE capacity"));
+        }
+        cache.len = 262144;
+        assert!(draft
+            .append_context(&mut cache, &combined, &[262144])
+            .unwrap_err()
+            .to_string()
+            .contains("RoPE capacity"));
+        assert_eq!(cache.len(), 262144);
+        cache.len = 0;
+        for positions in [&[-1][..], &[1][..], &[262144][..]] {
+            assert!(draft
+                .append_context(&mut cache, &combined, positions)
+                .unwrap_err()
+                .to_string()
+                .contains("contiguous"));
+            assert_eq!(cache.len(), 0);
+        }
+        draft.append_context(&mut cache, &combined, &[0]).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(LagunaDflashConfig::from_hf_json_str(&TINY_CONFIG.replace(
+            "\"max_position_embeddings\": 64",
+            "\"max_position_embeddings\": 0"
+        ))
+        .is_err());
     }
 
     #[test]

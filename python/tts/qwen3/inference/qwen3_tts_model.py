@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Any, Union
 from urllib.parse import urlparse
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -135,6 +134,7 @@ class Qwen3TTSModel:
         return base64.b64decode(b64)
 
     def _load_audio_to_np(self, x: str) -> tuple[np.ndarray, int]:
+        import librosa
         if self._is_url(x):
             with urllib.request.urlopen(x) as resp:
                 audio_bytes = resp.read()
@@ -254,6 +254,7 @@ class Qwen3TTSModel:
         x_vector_only_mode: bool | list[bool] = False,
     ) -> list[VoiceClonePromptItem]:
 
+        import librosa
         if self.model.tts_model_type != "base":
             raise ValueError(
                 f"model with \ntokenizer_type: {self.model.tokenizer_type}\n"

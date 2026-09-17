@@ -23,7 +23,8 @@ pub const SPEC_K_MAX: usize = 8;
 pub const SPEC_K_DEFAULT: usize = 8;
 pub const SPEC_MIN_MATCH_DEFAULT: usize = 3;
 
-pub const SPEC_KINDS_DEFAULT_IS_GEMMA4_E4B_ALONE_BECAUSE_A_VERIFY_FORWARD_IS_NOT_A_MEASURED_WIN: &str =
+pub const SPEC_KINDS_DEFAULT_IS_GEMMA4_E4B_ALONE_BECAUSE_A_VERIFY_FORWARD_IS_NOT_A_MEASURED_WIN:
+    &str =
     "admitting a kind to the chain route the moment its decoder grows verify_chain would flip a \
      serving default onto a path measured SLOWER: on unsloth/Qwen3.8-27B-NVFP4 at max_seq 2048, \
      192 greedy tokens over three prompts ran 7.93/7.22/7.71 s with the route off and \
@@ -44,11 +45,8 @@ pub const SPEC_KINDS_ABSENT_FROM_THE_SLUG_TABLE_HAVE_NO_CHAIN_TARGET_ARM_ON_THIS
      refuses the flash decode default and a slug would flip a serving default onto an unmeasured \
      path.";
 
-pub const SPEC_CHAIN_ROUTE_SLUGS: [&[&str]; 3] = [
-    &["gemma4-e4b"],
-    &["qwen3.5-dense", "qwen3.8"],
-    &["gpt-oss"],
-];
+pub const SPEC_CHAIN_ROUTE_SLUGS: [&[&str]; 3] =
+    [&["gemma4-e4b"], &["qwen3.5-dense", "qwen3.8"], &["gpt-oss"]];
 
 pub const SPEC_CHAIN_ROUTE_ROW_OF_THE_ONLY_KIND_ADMITTED_WITHOUT_AN_OPT_IN: usize = 0;
 

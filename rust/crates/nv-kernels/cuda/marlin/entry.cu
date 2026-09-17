@@ -209,8 +209,14 @@ static int marlin_mm_raw(
     bool has_bias, bool has_act_order, bool is_k_full, bool has_zp,
     int num_groups, int group_size, int dev, cudaStream_t stream,
     int thread_k_init, int thread_n_init, int sms, bool use_atomic_add,
-    bool use_fp32_reduce, bool is_zp_float) {
+    bool use_fp32_reduce, bool is_zp_float,
+    const MarlinM1Tail* m1_tail) {
   bool is_a_8bit = a_type.size_bits() == 8;
+  MarlinM1Tail tail_by_value = {};
+  if (m1_tail != nullptr) {
+    if (prob_m != 1) return -1;
+    tail_by_value = *m1_tail;
+  }
   if (!(prob_m > 0 && prob_n > 0 && prob_k > 0)) return -1;
 
   int group_blocks = 0;
@@ -353,7 +359,7 @@ static int marlin_mm_raw(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
         g_idx_ptr, num_groups,
         prob_m_split, prob_n, prob_k, lda, locks, has_bias, part_use_atomic_add,
-        use_fp32_reduce, max_shared_mem_new);
+        use_fp32_reduce, max_shared_mem_new, tail_by_value);
     // clang-format on
 
     A_ptr += prob_m_split * (lda / (is_a_8bit ? 16 : 8));
@@ -364,11 +370,10 @@ static int marlin_mm_raw(
   return 0;
 }
 
-template <int const num_threads>
+template <int const num_threads, int const num_bits>
 __global__ void gptq_marlin_repack_w4_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr,
     uint32_t* __restrict__ out_ptr, int size_k, int size_n) {
-  constexpr int num_bits = 4;
   constexpr int pack_factor = 32 / num_bits;
 
   constexpr int target_tile_n_size = tile_n_size;
@@ -475,15 +480,30 @@ __global__ void gptq_marlin_repack_w4_kernel(
         target_tile_k_size * target_tile_n_size / pack_factor;
     int out_offset = (k_tile_id * n_tiles + n_tile_id) * rtile_size;
 
-    int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+    if constexpr (num_bits == 4) {
+      int pack_idx[8] = {0, 2, 4, 6, 1, 3, 5, 7};
 
-    uint32_t res = 0;
+      uint32_t res = 0;
 #pragma unroll
-    for (int i = 0; i < 8; i++) {
-      res |= vals[pack_idx[i]] << (i * 4);
-    }
+      for (int i = 0; i < 8; i++) {
+        res |= vals[pack_idx[i]] << (i * 4);
+      }
 
-    out_ptr[out_offset + th_id * 4 + warp_id] = res;
+      out_ptr[out_offset + th_id * 4 + warp_id] = res;
+    } else {
+      constexpr int pack_idx[4] = {0, 2, 1, 3};
+
+      uint32_t res1 = 0;
+      uint32_t res2 = 0;
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        res1 |= vals[pack_idx[i]] << (i * 8);
+        res2 |= vals[4 + pack_idx[i]] << (i * 8);
+      }
+
+      out_ptr[out_offset + th_id * 8 + (warp_id * 2) + 0] = res1;
+      out_ptr[out_offset + th_id * 8 + (warp_id * 2) + 1] = res2;
+    }
   };
 
   auto start_pipes = [&](int k_tile_id, int n_tile_id) {
@@ -513,6 +533,7 @@ __global__ void gptq_marlin_repack_w4_kernel(
   }
 }
 
+template <int const num_bits>
 static int gptq_marlin_repack_w4_raw(uint32_t const* b_q_weight_ptr,
                                      uint32_t* out_ptr, int size_k, int size_n,
                                      int dev, cudaStream_t stream) {
@@ -527,10 +548,10 @@ static int gptq_marlin_repack_w4_raw(uint32_t const* b_q_weight_ptr,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   if (!(max_shared_mem > 0)) return -1;
 
-  cudaFuncSetAttribute(gptq_marlin_repack_w4_kernel<repack_threads>,
+  cudaFuncSetAttribute(gptq_marlin_repack_w4_kernel<repack_threads, num_bits>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
-  gptq_marlin_repack_w4_kernel<repack_threads>
+  gptq_marlin_repack_w4_kernel<repack_threads, num_bits>
       <<<blocks, repack_threads, max_shared_mem, stream>>>(b_q_weight_ptr,
                                                            out_ptr, size_k,
                                                            size_n);
@@ -744,7 +765,8 @@ static int marlin_gemm_w4a16_impl(void* stream, const void* a_bf16,
                                   const void* b_q_marlin, const void* b_scales,
                                   void* c_out, void* workspace, int m, int n,
                                   int k, int group_size, int a_is_bf16,
-                                  int c_prezeroed) {
+                                  int c_prezeroed,
+                                  const marlin::MarlinM1Tail* m1_tail) {
   if (m == 0) return 0;
   if (a_bf16 == nullptr || b_q_marlin == nullptr || b_scales == nullptr ||
       c_out == nullptr || workspace == nullptr)
@@ -784,7 +806,8 @@ static int marlin_gemm_w4a16_impl(void* stream, const void* a_bf16,
       s_type, false, false, true,
       false, num_groups, group_size, dev, cu_stream,
       -1, -1, sms, true,
-      false, false);
+      false, false,
+      m1_tail);
 
   if (rc == 0) {
     cudaError_t e = cudaGetLastError();
@@ -798,7 +821,8 @@ int nv_kernels_marlin_gemm_w4a16(void* stream, const void* a_bf16,
                                  void* c_out, void* workspace, int m, int n,
                                  int k, int group_size, int a_is_bf16) {
   return marlin_gemm_w4a16_impl(stream, a_bf16, b_q_marlin, b_scales, c_out,
-                                workspace, m, n, k, group_size, a_is_bf16, 0);
+                                workspace, m, n, k, group_size, a_is_bf16, 0,
+                                nullptr);
 }
 
 int nv_kernels_marlin_gemm_w4a16_prezeroed(void* stream, const void* a_bf16,
@@ -808,14 +832,50 @@ int nv_kernels_marlin_gemm_w4a16_prezeroed(void* stream, const void* a_bf16,
                                            int k, int group_size,
                                            int a_is_bf16) {
   return marlin_gemm_w4a16_impl(stream, a_bf16, b_q_marlin, b_scales, c_out,
-                                workspace, m, n, k, group_size, a_is_bf16, 1);
+                                workspace, m, n, k, group_size, a_is_bf16, 1,
+                                nullptr);
+}
+
+int nv_kernels_marlin_gemm_w4a16_m1_tail(
+    void* stream, const void* a_bf16, const void* b_q_marlin,
+    const void* b_scales, void* c_out, void* workspace, int n, int k,
+    int group_size, int kind, const uint16_t* res, const uint16_t* w,
+    uint16_t* h_out, float* rstd_out, const uint16_t* next_w,
+    uint16_t* normed_out, const float* pli, uint16_t* gelu_out, float eps,
+    float scale, float eps_next, unsigned int* counter) {
+  if (counter == nullptr) return -1;
+  if (kind == marlin::kMarlinM1TailRmsnormAddScaleThenOptionalNextNormChain) {
+    if (res == nullptr || w == nullptr || h_out == nullptr) return -1;
+    if (normed_out != nullptr && next_w == nullptr) return -1;
+  } else if (kind == marlin::kMarlinM1TailGeluTimesPerLayerInput) {
+    if (pli == nullptr || gelu_out == nullptr) return -1;
+  } else {
+    return -1;
+  }
+  marlin::MarlinM1Tail tail = {
+      kind,
+      reinterpret_cast<const __nv_bfloat16*>(res),
+      reinterpret_cast<const __nv_bfloat16*>(w),
+      reinterpret_cast<__nv_bfloat16*>(h_out),
+      rstd_out,
+      reinterpret_cast<const __nv_bfloat16*>(next_w),
+      reinterpret_cast<__nv_bfloat16*>(normed_out),
+      pli,
+      reinterpret_cast<__nv_bfloat16*>(gelu_out),
+      eps,
+      scale,
+      eps_next,
+      counter,
+  };
+  return marlin_gemm_w4a16_impl(stream, a_bf16, b_q_marlin, b_scales, c_out,
+                                workspace, 1, n, k, group_size, 1, 1, &tail);
 }
 
 int nv_kernels_marlin_repack_w4a16(void* stream, const void* b_q_packed,
                                    void* b_q_marlin_out, int k, int n,
                                    int num_bits) {
   if (b_q_packed == nullptr || b_q_marlin_out == nullptr) return -1;
-  if (num_bits != 4) return -1;
+  if (num_bits != 4 && num_bits != 8) return -1;
   if (k <= 0 || n <= 0) return -1;
   if (k % marlin::tile_k_size != 0) return -1;
   if (n % marlin::tile_n_size != 0) return -1;
@@ -824,9 +884,13 @@ int nv_kernels_marlin_repack_w4a16(void* stream, const void* b_q_packed,
   if (cudaGetDevice(&dev) != cudaSuccess) return -2;
   cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
 
-  int rc = marlin::gptq_marlin_repack_w4_raw(
-      reinterpret_cast<uint32_t const*>(b_q_packed),
-      reinterpret_cast<uint32_t*>(b_q_marlin_out), k, n, dev, cu_stream);
+  int rc = num_bits == 8
+      ? marlin::gptq_marlin_repack_w4_raw<8>(
+            reinterpret_cast<uint32_t const*>(b_q_packed),
+            reinterpret_cast<uint32_t*>(b_q_marlin_out), k, n, dev, cu_stream)
+      : marlin::gptq_marlin_repack_w4_raw<4>(
+            reinterpret_cast<uint32_t const*>(b_q_packed),
+            reinterpret_cast<uint32_t*>(b_q_marlin_out), k, n, dev, cu_stream);
 
   if (rc == 0) {
     cudaError_t e = cudaGetLastError();
@@ -891,7 +955,135 @@ extern "C" int nv_kernels_marlin_gemm_w4a16_ex(
       s_type, false, false, true,
       false, num_groups, group_size, dev, cu_stream,
       -1, -1, sms,
-      use_atomic_add != 0, use_fp32_reduce != 0, false);
+      use_atomic_add != 0, use_fp32_reduce != 0, false,
+      nullptr);
+
+  if (rc == 0) {
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) rc = -3;
+  }
+  return rc;
+}
+
+static const int kMarlinNvfp4CtmpFloatsPerBlock16RowsBy128ColsIsTheLargestSmallBatchTile = 16 * 128;
+
+extern "C" int nv_kernels_marlin_gemm_fp8_w8a16(
+    void* stream,
+    const void* a_bf16,
+    const void* b_q_marlin,
+    const void* b_scales_bf16_per_channel,
+    void* c_out,
+    void* c_tmp_f32,
+    long long c_tmp_floats,
+    void* workspace,
+    int m,
+    int n,
+    int k
+) {
+  if (a_bf16 == nullptr || b_q_marlin == nullptr || b_scales_bf16_per_channel == nullptr ||
+      c_out == nullptr || c_tmp_f32 == nullptr || workspace == nullptr)
+    return -1;
+  if (m == 0) return 0;
+  if (m < 0 || n <= 0 || k <= 0) return -1;
+  if (k % marlin::tile_size != 0) return -1;
+  if (n % marlin::min_thread_n != 0) return -1;
+
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return -2;
+  int sms = 0;
+  if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) !=
+      cudaSuccess)
+    return -2;
+  if (c_tmp_floats < (long long)sms * kMarlinNvfp4CtmpFloatsPerBlock16RowsBy128ColsIsTheLargestSmallBatchTile)
+    return -5;
+
+  vllm::ScalarType a_type = vllm::kBFloat16;
+  vllm::ScalarType c_type = vllm::kBFloat16;
+  vllm::ScalarType s_type = vllm::kBFloat16;
+  vllm::ScalarType b_type = vllm::kFE4M3fn;
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+
+  int rc = marlin::marlin_mm_raw(
+      a_bf16, b_q_marlin, c_out, c_tmp_f32,
+      nullptr, nullptr, (void*)b_scales_bf16_per_channel,
+      nullptr, nullptr, nullptr, nullptr,
+      nullptr, m, n, k, k, workspace, a_type, b_type, c_type,
+      s_type, false, false, true,
+      false, 1, -1, dev, cu_stream,
+      -1, -1, sms,
+      false, true, false,
+      nullptr);
+
+  if (rc == 0) {
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) rc = -3;
+  }
+  return rc;
+}
+
+extern "C" int nv_kernels_marlin_nvfp4_c_tmp_floats(long long* out_floats) {
+  if (out_floats == nullptr) return -1;
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return -2;
+  int sms = 0;
+  if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) !=
+      cudaSuccess)
+    return -2;
+  *out_floats = (long long)sms * kMarlinNvfp4CtmpFloatsPerBlock16RowsBy128ColsIsTheLargestSmallBatchTile;
+  return 0;
+}
+
+extern "C" int nv_kernels_marlin_gemm_nvfp4_w4a16(
+    void* stream,
+    const void* a_bf16,
+    const void* b_q_marlin,
+    const void* b_scales_e5m3_bytes,
+    const float* global_scale_dev,
+    void* c_out,
+    void* c_tmp_f32,
+    long long c_tmp_floats,
+    void* workspace,
+    int m,
+    int n,
+    int k
+) {
+  if (a_bf16 == nullptr || b_q_marlin == nullptr || b_scales_e5m3_bytes == nullptr ||
+      global_scale_dev == nullptr || c_out == nullptr || c_tmp_f32 == nullptr ||
+      workspace == nullptr)
+    return -1;
+  if (m == 0) return 0;
+  if (m < 0 || n <= 0 || k <= 0) return -1;
+  if (k % marlin::tile_size != 0) return -1;
+  if (n % marlin::min_thread_n != 0) return -1;
+  const int group_size = 16;
+  if (k % group_size != 0) return -1;
+
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return -2;
+  int sms = 0;
+  if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) !=
+      cudaSuccess)
+    return -2;
+  if (c_tmp_floats < (long long)sms * kMarlinNvfp4CtmpFloatsPerBlock16RowsBy128ColsIsTheLargestSmallBatchTile)
+    return -5;
+
+  vllm::ScalarType a_type = vllm::kBFloat16;
+  vllm::ScalarType c_type = vllm::kBFloat16;
+  vllm::ScalarType s_type = vllm::kFE4M3fn;
+  vllm::ScalarType b_type = vllm::kFE2M1f;
+  int num_groups = k / group_size;
+  cudaStream_t cu_stream = reinterpret_cast<cudaStream_t>(stream);
+
+  int rc = marlin::marlin_mm_raw(
+      a_bf16, b_q_marlin, c_out, c_tmp_f32,
+      nullptr, nullptr, (void*)b_scales_e5m3_bytes,
+      (void*)global_scale_dev, nullptr, nullptr, nullptr,
+      nullptr, m, n, k, k, workspace, a_type, b_type, c_type,
+      s_type, false, false, true,
+      false, num_groups, group_size, dev, cu_stream,
+      -1, -1, sms,
+      false, true, false,
+      nullptr);
 
   if (rc == 0) {
     cudaError_t e = cudaGetLastError();
@@ -986,7 +1178,8 @@ extern "C" int nv_kernels_marlin_gemm_w4a8_fp8(
       s_type, false, false, true,
       false, num_groups, group_size, dev, cu_stream,
       -1, -1, sms, true,
-      false, false);
+      false, false,
+      nullptr);
 
   if (rc == 0) {
     cudaError_t e = cudaGetLastError();

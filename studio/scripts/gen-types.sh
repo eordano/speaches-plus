@@ -33,8 +33,12 @@ export TS_RS_LARGE_INT=number
 cargo test -p speaches-plus --lib --features ts-bindings export_bindings
 cargo test -p nv-ocr --lib --features ts-bindings export_bindings
 
-[ -n "$(find "$out_dir" -name '*.ts' -newer "$stamp" -print -quit)" ] \
-  || { echo "no bindings regenerated — the export_bindings test filter matched nothing" >&2; rm -f "$stamp"; exit 1; }
+[ -n "$(find "$out_dir" -name '*.ts' -newer "$stamp" -print -quit)" ] ||
+  {
+    echo "no bindings regenerated — the export_bindings test filter matched nothing" >&2
+    rm -f "$stamp"
+    exit 1
+  }
 find "$out_dir" -name '*.ts' ! -newer "$stamp" -delete
 rm -f "$stamp"
 

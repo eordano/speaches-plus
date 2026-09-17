@@ -21,11 +21,11 @@ __device__ __forceinline__ float decode_e2m1_dev(uint8_t nib) {
     return kE2M1[nib & 0xF];
 }
 
-__device__ __forceinline__ float decode_ue4m3_ldexp_exact_dev(uint8_t b) {
+__device__ __forceinline__ float decode_ue4m3_dev(uint8_t b) {
     int biased = (int)(b >> 3) & 0x0F;
     float mant = (float)(b & 0x07);
     if (biased == 0) return mant * NV_UE4M3_SUBNORMAL_STEP;
-    return ldexpf(1.f + mant * 0.125f, biased - 7);
+    return (1.f + mant / 8.f) * exp2f((float)(biased - 7));
 }
 
 __device__ __forceinline__ int swizzled_scale_src(int m, int kb, int k_blocks) {
@@ -69,7 +69,7 @@ __global__ void dequant_weight_nvfp4_swizzled_bf16_kernel(
         int j = (int)(idx % bytes_per_row);
         int kb = j / 8;
         uint8_t sb = w_scales_swizzled[swizzled_scale_src(r, kb, k_blocks)];
-        float scale = decode_ue4m3_ldexp_exact_dev(sb) * alpha;
+        float scale = decode_ue4m3_dev(sb) * alpha;
         uint8_t b = w_packed[idx];
         long long o = (long long)r * k + (long long)j * 2;
         out[o] = __float2bfloat16(decode_e2m1_dev(b & 0xF) * scale);

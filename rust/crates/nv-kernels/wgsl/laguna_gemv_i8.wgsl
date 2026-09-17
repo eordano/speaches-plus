@@ -9,7 +9,7 @@ struct Lg8Params {
     use_sel: u32,
     groups_per_row: u32,
     group_shift: u32,
-    pad0: u32,
+    x_slot_div: u32,
     pad1: u32,
     pad2: u32,
 };
@@ -40,7 +40,7 @@ fn lgw_gemv_i8g_experts(
     let wbase = select(0u, e * lg8_p.w_e_stride_words + row * (lg8_p.k_elems >> 2u), live);
     let sbase = select(0u, (e * lg8_p.n_rows + row) * lg8_p.groups_per_row, live);
     let gshift = lg8_p.group_shift;
-    let xw_base = (slot * lg8_p.x_slot_stride_elems) >> 1u;
+    let xw_base = ((slot / max(lg8_p.x_slot_div, 1u)) * lg8_p.x_slot_stride_elems) >> 1u;
     var acc = 0.0;
     for (var i = lane; i < words; i = i + 32u) {
         let w = lg8_w[wbase + i];
@@ -86,7 +86,7 @@ fn lgw_gemv_i8_experts(
     let live = row < lg8_p.n_rows;
     let words = select(0u, lg8_p.k_elems >> 2u, live);
     let wbase = select(0u, e * lg8_p.w_e_stride_words + row * (lg8_p.k_elems >> 2u), live);
-    let xw_base = (slot * lg8_p.x_slot_stride_elems) >> 1u;
+    let xw_base = ((slot / max(lg8_p.x_slot_div, 1u)) * lg8_p.x_slot_stride_elems) >> 1u;
     var acc = 0.0;
     for (var i = lane; i < words; i = i + 32u) {
         let w = lg8_w[wbase + i];

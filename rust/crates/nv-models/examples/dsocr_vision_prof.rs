@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use nv_models::deepseek_ocr::{
 
 use nv_models::deepseek_ocr::default_snapshot_dir as default_dir;
 
-fn load_rgb(path: &PathBuf) -> Result<RgbImage> {
+fn load_rgb(path: &Path) -> Result<RgbImage> {
     RgbImage::decode_file(path)
 }
 

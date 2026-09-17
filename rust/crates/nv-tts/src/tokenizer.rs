@@ -217,7 +217,7 @@ impl Qwen3TtsTokenizer {
 }
 
 pub const QWEN3_TTS_SNAPSHOTS_UNDER_HOME: &str =
-    ".cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots";
+    ".cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-Base/snapshots";
 
 pub const QWEN3_TTS_SNAPSHOT_KEY_FILE: &str = "vocab.json";
 

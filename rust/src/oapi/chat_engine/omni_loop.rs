@@ -13,13 +13,13 @@ use nv_omni::{
 
 use crate::oapi::chat::{ChatEvent, ChatGenerateRequest};
 use crate::oapi::chat_engine::sampling::ChatSampler;
+use crate::oapi::chat_engine::spec_env::acquire_chat_permit;
 use crate::oapi::chat_engine::spec_window::kv_window;
 use crate::oapi::chat_engine::stream::{
     effective_max_new, push_event_async, push_event_blocking, sse_send_timeout,
     yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot, IncrementalDetok,
     StreamEmitter,
 };
-use crate::oapi::chat_engine::spec_env::acquire_chat_permit;
 
 pub(crate) const OMNI_IMAGE_MARKER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
 pub(crate) const OMNI_AUDIO_MARKER: &str = "<|audio_start|><|audio_pad|><|audio_end|>";
@@ -77,7 +77,11 @@ struct MmExpansion {
     deepstack: Option<OmniDeepstack>,
 }
 
-fn expand_media(model: &OmniShared, tokens: &[u32], req: &ChatGenerateRequest) -> Result<MmExpansion> {
+fn expand_media(
+    model: &OmniShared,
+    tokens: &[u32],
+    req: &ChatGenerateRequest,
+) -> Result<MmExpansion> {
     let ids = &model.ids;
     let device = &model.device;
     let empty_images: Vec<image::RgbImage> = Vec::new();
@@ -110,7 +114,9 @@ fn expand_media(model: &OmniShared, tokens: &[u32], req: &ChatGenerateRequest) -
                 h1 as u32,
                 image::imageops::FilterType::CatmullRom,
             );
-            let (patches, grid) = model.vision.patchify_rgb(resized.as_raw(), w1, h1, device)?;
+            let (patches, grid) = model
+                .vision
+                .patchify_rgb(resized.as_raw(), w1, h1, device)?;
             let (emb, deep) = model.vision.forward(&patches, grid)?;
             let n = emb.dim(0)?;
             let pos = out.len();
@@ -125,7 +131,10 @@ fn expand_media(model: &OmniShared, tokens: &[u32], req: &ChatGenerateRequest) -
                 ds_layers[li].push(d);
             }
             image_grids.push((1, grid.1 / 2, grid.2 / 2));
-            splices.push(ModalitySplice { position: pos, embedding: emb });
+            splices.push(ModalitySplice {
+                position: pos,
+                embedding: emb,
+            });
         } else if tok == ids.audio_pad {
             let samples = audios
                 .get(aud_i)
@@ -141,16 +150,25 @@ fn expand_media(model: &OmniShared, tokens: &[u32], req: &ChatGenerateRequest) -
             let pos = out.len();
             out.extend(std::iter::repeat_n(ids.audio_pad, n));
             audio_lens.push(n);
-            splices.push(ModalitySplice { position: pos, embedding: emb });
+            splices.push(ModalitySplice {
+                position: pos,
+                embedding: emb,
+            });
         } else {
             out.push(tok);
         }
     }
     if img_i != images.len() {
-        anyhow::bail!("request carries {} images but prompt has {img_i} image markers", images.len());
+        anyhow::bail!(
+            "request carries {} images but prompt has {img_i} image markers",
+            images.len()
+        );
     }
     if aud_i != audios.len() {
-        anyhow::bail!("request carries {} audios but prompt has {aud_i} audio markers", audios.len());
+        anyhow::bail!(
+            "request carries {} audios but prompt has {aud_i} audio markers",
+            audios.len()
+        );
     }
 
     let deepstack = if ds_rows.is_empty() {
@@ -219,8 +237,12 @@ pub(crate) async fn run_sampling_omni(
     let mut sampler = ChatSampler::for_request(&req, &tokenizer, eos_ids, max_new)?;
     sampler.seed_prompt(&tokens);
 
-    let (positions, mut next_pos) =
-        build_mrope_positions(&tokens, &model.ids, &expansion.image_grids, &expansion.audio_lens)?;
+    let (positions, mut next_pos) = build_mrope_positions(
+        &tokens,
+        &model.ids,
+        &expansion.image_grids,
+        &expansion.audio_lens,
+    )?;
 
     let _permit = acquire_chat_permit().await?;
     let send_timeout = sse_send_timeout();
@@ -233,13 +255,14 @@ pub(crate) async fn run_sampling_omni(
     let mut aborted = false;
 
     tokio::task::block_in_place(|| -> Result<()> {
-        let x = model.thinker.embed_with_splices(&tokens, &expansion.splices)?.unsqueeze(0)?;
-        let logits = model.thinker.forward_step(
-            &x,
-            &positions,
-            &mut cache,
-            expansion.deepstack.as_ref(),
-        )?;
+        let x = model
+            .thinker
+            .embed_with_splices(&tokens, &expansion.splices)?
+            .unsqueeze(0)?;
+        let logits =
+            model
+                .thinker
+                .forward_step(&x, &positions, &mut cache, expansion.deepstack.as_ref())?;
         let last_row: Vec<f32> = logits.to_vec1()?;
         let mut sampled = sampler.sample(&last_row);
         if sampled.exhausted {
@@ -274,7 +297,10 @@ pub(crate) async fn run_sampling_omni(
                 break;
             }
 
-            let xi = model.thinker.embed_with_splices(&[last], &[])?.unsqueeze(0)?;
+            let xi = model
+                .thinker
+                .embed_with_splices(&[last], &[])?
+                .unsqueeze(0)?;
             let pi = OmniPositions::uniform(&[next_pos]);
             next_pos += 1;
             let logits = model.thinker.forward_step(&xi, &pi, &mut cache, None)?;

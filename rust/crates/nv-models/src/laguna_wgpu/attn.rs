@@ -2,7 +2,8 @@ use anyhow::Result;
 
 use super::config::{window_start, GateKind, LagunaShapes, LayerShape, MAX_HEAD_DIM};
 use super::gpu::{
-    alloc_lin_scratch, push_lin_gemv, upload_lin, Builder, Sources, StepBuffers, W8Scope,
+    alloc_lin_scratch, alloc_lin_scratch_rows, push_lin_gemv, push_lin_gemv_rows, upload_lin,
+    Builder, LinGpu, MRows, Sources, StepBuffers, W8Scope,
 };
 use super::lora::LoraSiteCtx;
 use super::weights::{bf16_val, pack_pairs, HostAttention};
@@ -20,7 +21,7 @@ pub struct NormRopeParams {
     pub eps: f32,
     pub out_scale: f32,
     pub rope_table_half: u32,
-    pub pad0: u32,
+    pub tok_stride_words: u32,
 }
 
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -47,6 +48,34 @@ pub struct AttnDecodeParams {
 
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
+pub struct AttnSplitParams {
+    pub n_slices: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
+}
+
+pub const ATTN_SPLIT_MAX_SLICES_KEEPS_PARTIALS_SMALL_AND_GRID_Z_SANE: u32 = 32;
+
+pub fn attn_split_slices() -> u32 {
+    std::env::var("NV_LAGUNA_WGPU_ATTN_SPLIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|s| *s >= 2)
+        .map(|s| s.min(ATTN_SPLIT_MAX_SLICES_KEEPS_PARTIALS_SMALL_AND_GRID_Z_SANE))
+        .unwrap_or(0)
+}
+
+pub fn attn_abl_arm() -> u32 {
+    std::env::var("NV_LAGUNA_ATTN_ABL")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|a| (1..=3).contains(a))
+        .unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 pub struct AttnGateParams {
     pub n_words: u32,
     pub head_dim: u32,
@@ -58,6 +87,18 @@ pub struct RopeTablesGpu {
     pub cos: wgpu::Buffer,
     pub sin: wgpu::Buffer,
     pub half: usize,
+}
+
+pub struct AttnGpu {
+    pub qw: LinGpu,
+    pub kw: LinGpu,
+    pub vw: LinGpu,
+    pub ow: LinGpu,
+    pub gw: Option<LinGpu>,
+    pub qn: wgpu::Buffer,
+    pub kn: wgpu::Buffer,
+    pub kc: wgpu::Buffer,
+    pub vc: wgpu::Buffer,
 }
 
 pub fn gate_code(kind: GateKind) -> u32 {
@@ -84,7 +125,7 @@ pub fn build_attn_layer(
     step: &StepBuffers,
     rope: &RopeTablesGpu,
     lora: Option<&LoraSiteCtx>,
-) -> Result<()> {
+) -> Result<AttnGpu> {
     let li = layer.idx;
     let hidden = shapes.hidden_size;
     let hd = layer.head_dim;
@@ -202,7 +243,7 @@ pub fn build_attn_layer(
         }
     }
 
-    let gate = match (&w.g, shapes.gate_kind) {
+    let (gate_w, gate) = match (&w.g, shapes.gate_kind) {
         (Some(g), GateKind::PerHead) | (Some(g), GateKind::PerElement) => {
             let gw = upload_lin(b, &format!("lgw-l{li}-gw"), g, W8Scope::Attn);
             let gs = alloc_lin_scratch(b, &format!("lgw-l{li}-gs"), &gw);
@@ -221,9 +262,9 @@ pub fn build_attn_layer(
                     lc.push_site(b, site, x_normed_packed, &[&g_buf]);
                 }
             }
-            Some(g_buf)
+            (Some(gw), Some(g_buf))
         }
-        _ => None,
+        _ => (None, None),
     };
 
     let qn = b.upload_u32(&format!("lgw-l{li}-qn"), &pack_pairs(&w.q_norm));
@@ -243,7 +284,7 @@ pub fn build_attn_layer(
                 eps: shapes.rms_norm_eps,
                 out_scale: layer.rope_out_scale,
                 rope_table_half: rope.half as u32,
-                pad0: 0,
+                tok_stride_words: 0,
             },
         );
         let grid = b.grid1(n_rows as u64, 1);
@@ -305,20 +346,64 @@ pub fn build_attn_layer(
         },
     );
     let grid = b.grid1(n_q as u64, 1);
-    b.push(
-        &format!("lgw-l{li}-attn"),
-        &s.attn,
-        "lgw_attn_decode",
-        &[
-            (20, &q_rot),
-            (21, &kc),
-            (22, &vc),
-            (23, &step.uni),
-            (24, &dp),
-            (25, &heads),
-        ],
-        grid,
-    )?;
+    let split = attn_split_slices();
+    if split >= 2 {
+        let part = b.zeros(
+            &format!("lgw-l{li}-apart"),
+            (n_q * split as usize * (hd + 2) * 4) as u64,
+        );
+        let sp = b.uni(
+            &format!("lgw-l{li}-asp"),
+            AttnSplitParams {
+                n_slices: split,
+                pad0: 0,
+                pad1: 0,
+                pad2: 0,
+            },
+        );
+        b.push(
+            &format!("lgw-l{li}-attn-split"),
+            &s.attn,
+            "lgw_attn_decode_split",
+            &[
+                (20, &q_rot),
+                (21, &kc),
+                (22, &vc),
+                (23, &step.uni),
+                (24, &dp),
+                (26, &part),
+                (27, &sp),
+            ],
+            (grid.0, grid.1, split),
+        )?;
+        b.push(
+            &format!("lgw-l{li}-attn-sred"),
+            &s.attn,
+            "lgw_attn_split_reduce",
+            &[(24, &dp), (25, &heads), (26, &part), (27, &sp)],
+            grid,
+        )?;
+    } else {
+        let entry = if attn_abl_arm() == 0 {
+            "lgw_attn_decode"
+        } else {
+            "lgw_attn_decode_abl"
+        };
+        b.push(
+            &format!("lgw-l{li}-attn"),
+            &s.attn,
+            entry,
+            &[
+                (20, &q_rot),
+                (21, &kc),
+                (22, &vc),
+                (23, &step.uni),
+                (24, &dp),
+                (25, &heads),
+            ],
+            grid,
+        )?;
+    }
 
     let mixed = match &gate {
         Some(g_buf) => {
@@ -359,7 +444,253 @@ pub fn build_attn_layer(
             lc.push_site(b, site, &mixed, &[out_packed]);
         }
     }
-    Ok(())
+    Ok(AttnGpu {
+        qw,
+        kw,
+        vw,
+        ow,
+        gw: gate_w,
+        qn,
+        kn,
+        kc,
+        vc,
+    })
+}
+
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+pub struct AttnGateRowsParams {
+    pub n_words: u32,
+    pub head_dim: u32,
+    pub gate_kind: u32,
+    pub g_stride_elems: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_attn_layer_rows(
+    b: &mut Builder,
+    s: &Sources,
+    shapes: &LagunaShapes,
+    layer: &LayerShape,
+    g: &AttnGpu,
+    x_rows_packed: &wgpu::Buffer,
+    out_rows_packed: &wgpu::Buffer,
+    mp: &MRows,
+    rope: &RopeTablesGpu,
+) -> Result<()> {
+    let li = layer.idx;
+    let m = mp.m;
+    let hd = layer.head_dim;
+    let n_q = layer.num_q_heads;
+    let n_kv = layer.num_kv_heads;
+    let q_rows = layer.q_rows;
+    let kv_rows = layer.kv_rows;
+    let words = hd / 2;
+    anyhow::ensure!(
+        q_rows.is_multiple_of(2) && kv_rows.is_multiple_of(2),
+        "layer {li}: rows prefill packs per-token bf16 words, q_rows {q_rows} and kv_rows \
+         {kv_rows} must be even"
+    );
+
+    let qs = alloc_lin_scratch_rows(b, &format!("lgw-l{li}-mqs"), &g.qw, m);
+    let ks = alloc_lin_scratch_rows(b, &format!("lgw-l{li}-mks"), &g.kw, m);
+    let vs = alloc_lin_scratch_rows(b, &format!("lgw-l{li}-mvs"), &g.vw, m);
+    let os = alloc_lin_scratch_rows(b, &format!("lgw-l{li}-mos"), &g.ow, m);
+
+    let mrow = |elems: usize| (m * elems.div_ceil(2).max(1) * 4) as u64;
+    let q_buf = b.zeros(&format!("lgw-l{li}-mq"), mrow(q_rows));
+    let k_buf = b.zeros(&format!("lgw-l{li}-mk"), mrow(kv_rows));
+    let v_buf = b.zeros(&format!("lgw-l{li}-mv"), mrow(kv_rows));
+    let q_rot = b.zeros(&format!("lgw-l{li}-mqrot"), mrow(q_rows));
+    let k_rot = b.zeros(&format!("lgw-l{li}-mkrot"), mrow(kv_rows));
+    let heads = b.zeros(&format!("lgw-l{li}-mheads"), mrow(q_rows));
+
+    push_lin_gemv_rows(
+        b,
+        s,
+        &format!("lgw-l{li}-mqproj"),
+        &g.qw,
+        &qs,
+        x_rows_packed,
+        &q_buf,
+        mp,
+    )?;
+    push_lin_gemv_rows(
+        b,
+        s,
+        &format!("lgw-l{li}-mkproj"),
+        &g.kw,
+        &ks,
+        x_rows_packed,
+        &k_buf,
+        mp,
+    )?;
+    push_lin_gemv_rows(
+        b,
+        s,
+        &format!("lgw-l{li}-mvproj"),
+        &g.vw,
+        &vs,
+        x_rows_packed,
+        &v_buf,
+        mp,
+    )?;
+
+    let gate = match &g.gw {
+        Some(gw) => {
+            let gs = alloc_lin_scratch_rows(b, &format!("lgw-l{li}-mgs"), gw, m);
+            let g_buf = b.zeros(&format!("lgw-l{li}-mg"), mrow(layer.gate_rows));
+            push_lin_gemv_rows(
+                b,
+                s,
+                &format!("lgw-l{li}-mgproj"),
+                gw,
+                &gs,
+                x_rows_packed,
+                &g_buf,
+                mp,
+            )?;
+            Some(g_buf)
+        }
+        None => None,
+    };
+
+    for (label, n_rows, tok_words, src, nw, dst) in [
+        (
+            format!("lgw-l{li}-mqnr"),
+            n_q,
+            q_rows / 2,
+            &q_buf,
+            &g.qn,
+            &q_rot,
+        ),
+        (
+            format!("lgw-l{li}-mknr"),
+            n_kv,
+            kv_rows / 2,
+            &k_buf,
+            &g.kn,
+            &k_rot,
+        ),
+    ] {
+        let p = b.uni(
+            &format!("{label}-p"),
+            NormRopeParams {
+                n_rows: n_rows as u32,
+                head_dim: hd as u32,
+                src_stride: words as u32,
+                rot_half: (layer.rotary_dim / 2) as u32,
+                eps: shapes.rms_norm_eps,
+                out_scale: layer.rope_out_scale,
+                rope_table_half: rope.half as u32,
+                tok_stride_words: tok_words as u32,
+            },
+        );
+        b.push(
+            &label,
+            &s.attn,
+            "lgw_norm_rope_rows",
+            &[
+                (0, src),
+                (1, nw),
+                (2, &rope.cos),
+                (3, &rope.sin),
+                (5, &p),
+                (6, dst),
+                (7, &mp.list),
+            ],
+            (n_rows as u32, 1, m as u32),
+        )?;
+    }
+
+    let cap = layer.kv_capacity_tokens;
+    let kv_words = kv_rows / 2;
+    for (label, src, dst) in [
+        (format!("lgw-l{li}-mkwrite"), &k_rot, &g.kc),
+        (format!("lgw-l{li}-mvwrite"), &v_buf, &g.vc),
+    ] {
+        let p = b.uni(
+            &format!("{label}-p"),
+            KvWriteParams {
+                kv_words: kv_words as u32,
+                kv_capacity: cap as u32,
+                pad0: 0,
+                pad1: 0,
+            },
+        );
+        let grid = b.grid1(kv_words as u64, 64);
+        b.push(
+            &label,
+            &s.attn,
+            "lgw_kv_write_rows",
+            &[(10, src), (12, &p), (13, dst), (14, &mp.list)],
+            (grid.0, m as u32, 1),
+        )?;
+    }
+
+    let dp = b.uni(
+        &format!("lgw-l{li}-madp"),
+        AttnDecodeParams {
+            n_q_heads: n_q as u32,
+            n_kv_heads: n_kv as u32,
+            head_dim: hd as u32,
+            gqa_group: layer.gqa_group as u32,
+            kv_capacity: cap as u32,
+            is_sliding: u32::from(layer.is_sliding()),
+            scale: layer.attn_softmax_scale,
+            pad0: 0,
+        },
+    );
+    b.push(
+        &format!("lgw-l{li}-mattn"),
+        &s.attn,
+        "lgw_attn_decode_rows",
+        &[
+            (20, &q_rot),
+            (21, &g.kc),
+            (22, &g.vc),
+            (24, &dp),
+            (25, &heads),
+            (28, &mp.list),
+        ],
+        (n_q as u32, 1, m as u32),
+    )?;
+
+    let mixed = match &gate {
+        Some(g_buf) => {
+            let gated = b.zeros(&format!("lgw-l{li}-mgated"), mrow(q_rows));
+            let gp = b.uni(
+                &format!("lgw-l{li}-magp"),
+                AttnGateRowsParams {
+                    n_words: (q_rows / 2) as u32,
+                    head_dim: hd as u32,
+                    gate_kind: gate_code(shapes.gate_kind),
+                    g_stride_elems: (layer.gate_rows.div_ceil(2) * 2) as u32,
+                },
+            );
+            let grid = b.grid1((q_rows / 2) as u64, 64);
+            b.push(
+                &format!("lgw-l{li}-mgate"),
+                &s.attn,
+                "lgw_attn_gate_rows",
+                &[(30, &heads), (31, g_buf), (33, &gated), (34, &gp)],
+                (grid.0, m as u32, 1),
+            )?;
+            gated
+        }
+        None => heads,
+    };
+
+    push_lin_gemv_rows(
+        b,
+        s,
+        &format!("lgw-l{li}-moproj"),
+        &g.ow,
+        &os,
+        &mixed,
+        out_rows_packed,
+        mp,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

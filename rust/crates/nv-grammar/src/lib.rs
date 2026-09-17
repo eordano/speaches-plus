@@ -924,7 +924,7 @@ mod tests {
             "a forced close that never finishes the sequence is a grammar that never arms"
         );
         assert!(
-            !d.mask_to_defer_token(&mut vec![0.0f32; 8]),
+            !d.mask_to_defer_token(&mut [0.0f32; 8]),
             "nothing is left to force once the grammar is live"
         );
         assert_eq!(

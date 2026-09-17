@@ -1218,7 +1218,7 @@ fn q3w_attn_flash_m_pk(
         let inv = 1.0 / max(afm_mz[r + 8u], 1e-30);
         let o0 = afm_acc[r * hd + p * 2u] * inv;
         let o1 = afm_acc[r * hd + p * 2u + 1u] * inv;
-        afm_y[(row0 + r) * afm_p.y_row_words + (h * hd >> 1u) + p] = bf16_pack(o0, o1);
+        afm_y[(row0 + r) * afm_p.y_row_words + ((h * hd) >> 1u) + p] = bf16_pack(o0, o1);
     }
 }
 
@@ -1285,7 +1285,7 @@ fn q3w_attn_decode_m(
     let tid = lid.x;
     let hd = pad_p.head_dim;
     let p = pad_ck.base + tk;
-    let total = p + 1u;
+    let total = min(p + 1u, pad_p.max_seq);
     let kv = h / pad_p.group;
     let srow = (tk * pad_p.n_heads + h) * pad_p.max_seq;
     let qrow = tk * pad_p.n_heads * hd;

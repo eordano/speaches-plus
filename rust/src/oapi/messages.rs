@@ -14,12 +14,11 @@ use crate::oapi::send_sse_event as send_event;
 
 use crate::oapi::chat::{
     engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed,
-    parse_model_tool_calls, rand_seed, render_chat_checked_kwargs,
-    resolve_guided_think_close, resolve_tool_policy, split_thinking, template_required_for,
-    ChatAppState, ChatEngine,
-    ChatEvent, ChatGenerateRequest, ChatMessageIn, ClientDeadline, FunctionCall,
-    FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess, ThinkingStream, Tool, ToolCall,
-    ToolChoice, ToolPolicy, THINK_OPEN,
+    parse_model_tool_calls, rand_seed, render_chat_checked_kwargs, resolve_guided_think_close,
+    resolve_tool_policy, retryable_message, retryable_response, split_thinking,
+    template_required_for, ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn,
+    ClientDeadline, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess,
+    ThinkingStream, Tool, ToolCall, ToolChoice, ToolPolicy, ENGINE_INTERRUPTED, THINK_OPEN,
 };
 
 pub mod akind {
@@ -52,11 +51,11 @@ pub fn anthropic_error(status: StatusCode, err_type: &str, message: impl Into<St
 }
 
 fn overloaded(message: impl Into<String>) -> Response {
-    anthropic_error(
+    retryable_response(anthropic_error(
         StatusCode::from_u16(OVERLOADED_STATUS).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
         akind::OVERLOADED,
-        message,
-    )
+        retryable_message(message.into()),
+    ))
 }
 
 fn invalid(message: impl Into<String>) -> Response {
@@ -147,14 +146,12 @@ pub struct MessageParam {
     pub role: String,
     #[cfg_attr(
         feature = "ts-bindings",
-        ts(
-            type = "string | Array<{ type: \"text\", text: string } \
+        ts(type = "string | Array<{ type: \"text\", text: string } \
                     | { type: \"tool_use\", id: string, name: string, input: unknown } \
                     | { type: \"tool_result\", tool_use_id: string, content?: string \
                         | Array<{ type: \"text\", text: string }>, is_error?: boolean | null } \
                     | { type: \"thinking\", thinking: string, signature?: string | null } \
-                    | { type: \"redacted_thinking\", data?: string | null }>"
-        )
+                    | { type: \"redacted_thinking\", data?: string | null }>")
     )]
     pub content: Value,
 }
@@ -232,7 +229,9 @@ fn text_of_blocks(v: &Value, loc: &str) -> Result<String, String> {
             }
             Ok(out)
         }
-        _ => Err(format!("{loc}: expected a string or an array of content blocks")),
+        _ => Err(format!(
+            "{loc}: expected a string or an array of content blocks"
+        )),
     }
 }
 
@@ -273,9 +272,10 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                         for b in blocks {
                             match b.get("type").and_then(Value::as_str) {
                                 Some("text") => {
-                                    let t = b.get("text").and_then(Value::as_str).ok_or_else(
-                                        || invalid(format!("{loc}: text block missing `text`")),
-                                    )?;
+                                    let t =
+                                        b.get("text").and_then(Value::as_str).ok_or_else(|| {
+                                            invalid(format!("{loc}: text block missing `text`"))
+                                        })?;
                                     if !text.is_empty() {
                                         text.push('\n');
                                     }
@@ -291,9 +291,7 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                                         .get("name")
                                         .and_then(Value::as_str)
                                         .ok_or_else(|| {
-                                            invalid(format!(
-                                                "{loc}: tool_use block missing `name`"
-                                            ))
+                                            invalid(format!("{loc}: tool_use block missing `name`"))
                                         })?
                                         .to_string();
                                     let input = b.get("input").cloned().unwrap_or(json!({}));
@@ -335,83 +333,76 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                     ..Default::default()
                 });
             }
-            role @ ("user" | "system") => {
-                match &m.content {
-                    Value::String(s) => {
-                        let mut buf = s.clone();
-                        push_text(&mut messages, role, &mut buf);
-                    }
-                    Value::Array(blocks) => {
-                        let mut buf = String::new();
-                        for b in blocks {
-                            match b.get("type").and_then(Value::as_str) {
-                                Some("text") => {
-                                    let t = b.get("text").and_then(Value::as_str).ok_or_else(
-                                        || invalid(format!("{loc}: text block missing `text`")),
-                                    )?;
-                                    if !buf.is_empty() {
-                                        buf.push('\n');
+            role @ ("user" | "system") => match &m.content {
+                Value::String(s) => {
+                    let mut buf = s.clone();
+                    push_text(&mut messages, role, &mut buf);
+                }
+                Value::Array(blocks) => {
+                    let mut buf = String::new();
+                    for b in blocks {
+                        match b.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                let t = b.get("text").and_then(Value::as_str).ok_or_else(|| {
+                                    invalid(format!("{loc}: text block missing `text`"))
+                                })?;
+                                if !buf.is_empty() {
+                                    buf.push('\n');
+                                }
+                                buf.push_str(t);
+                            }
+                            Some("tool_result") => {
+                                push_text(&mut messages, role, &mut buf);
+                                let id = b
+                                    .get("tool_use_id")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        invalid(format!(
+                                            "{loc}: tool_result block missing `tool_use_id`"
+                                        ))
+                                    })?
+                                    .to_string();
+                                let body = match b.get("content") {
+                                    None => String::new(),
+                                    Some(c) => {
+                                        text_of_blocks(c, &format!("{loc}.content (tool_result)"))
+                                            .map_err(invalid)?
                                     }
-                                    buf.push_str(t);
-                                }
-                                Some("tool_result") => {
-                                    push_text(&mut messages, role, &mut buf);
-                                    let id = b
-                                        .get("tool_use_id")
-                                        .and_then(Value::as_str)
-                                        .ok_or_else(|| {
-                                            invalid(format!(
-                                                "{loc}: tool_result block missing `tool_use_id`"
-                                            ))
-                                        })?
-                                        .to_string();
-                                    let body = match b.get("content") {
-                                        None => String::new(),
-                                        Some(c) => text_of_blocks(
-                                            c,
-                                            &format!("{loc}.content (tool_result)"),
-                                        )
-                                        .map_err(invalid)?,
-                                    };
-                                    let is_error = b
-                                        .get("is_error")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false);
-                                    let body = if is_error {
-                                        format!("Error: {body}")
-                                    } else {
-                                        body
-                                    };
-                                    messages.push(ChatMessageIn {
-                                        role: "tool".into(),
-                                        content: Some(MessageContent::Text(body)),
-                                        tool_call_id: Some(id),
-                                        ..Default::default()
-                                    });
-                                }
-                                Some(other) => {
-                                    return Err(invalid(format!(
-                                        "{loc}: `{other}` content blocks are not supported by \
+                                };
+                                let is_error =
+                                    b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                                let body = if is_error {
+                                    format!("Error: {body}")
+                                } else {
+                                    body
+                                };
+                                messages.push(ChatMessageIn {
+                                    role: "tool".into(),
+                                    content: Some(MessageContent::Text(body)),
+                                    tool_call_id: Some(id),
+                                    ..Default::default()
+                                });
+                            }
+                            Some(other) => {
+                                return Err(invalid(format!(
+                                    "{loc}: `{other}` content blocks are not supported by \
                                          this server; only `text` and `tool_result` are accepted \
                                          in {role} messages"
-                                    )))
-                                }
-                                None => {
-                                    return Err(invalid(format!(
-                                        "{loc}: content block missing `type`"
-                                    )))
-                                }
+                                )))
+                            }
+                            None => {
+                                return Err(invalid(format!("{loc}: content block missing `type`")))
                             }
                         }
-                        push_text(&mut messages, role, &mut buf);
                     }
-                    _ => {
-                        return Err(invalid(format!(
-                            "{loc}.content: expected a string or an array of content blocks"
-                        )))
-                    }
+                    push_text(&mut messages, role, &mut buf);
                 }
-            }
+                _ => {
+                    return Err(invalid(format!(
+                        "{loc}.content: expected a string or an array of content blocks"
+                    )))
+                }
+            },
             other => {
                 return Err(invalid(format!(
                     "{loc}.role: expected `user` or `assistant`, got {other:?}"
@@ -470,9 +461,10 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
             "any" => ToolChoice::Required,
             "none" => ToolChoice::None,
             "tool" => {
-                let name = tc.name.clone().ok_or_else(|| {
-                    invalid("tool_choice: `tool` requires a `name`".to_string())
-                })?;
+                let name = tc
+                    .name
+                    .clone()
+                    .ok_or_else(|| invalid("tool_choice: `tool` requires a `name`".to_string()))?;
                 ToolChoice::Function(name)
             }
             other => {
@@ -523,11 +515,7 @@ fn tool_input_value(arguments: &str) -> Value {
         .unwrap_or(json!({}))
 }
 
-fn content_blocks(
-    reasoning: Option<&str>,
-    text: Option<&str>,
-    calls: &[ToolCall],
-) -> Vec<Value> {
+fn content_blocks(reasoning: Option<&str>, text: Option<&str>, calls: &[ToolCall]) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(r) = reasoning {
         if !r.is_empty() {
@@ -550,8 +538,7 @@ fn content_blocks(
     out
 }
 
-const MESSAGES_SHED_NOTE: &str =
-    "shed an anthropic messages request: the surface was at capacity";
+const MESSAGES_SHED_NOTE: &str = "shed an anthropic messages request: the surface was at capacity";
 
 fn engine_start_error(err: &anyhow::Error) -> Response {
     engine_start_error_by_surface(err, MESSAGES_SHED_NOTE, overloaded, |m| {
@@ -587,11 +574,8 @@ async fn first_event(
         None => rx.recv().await,
     };
     match ev {
-        Some(ChatEvent::Error(msg))
-            if is_busy_shed(&msg) || crate::oapi::chat::is_prompt_overflow(&msg) =>
-        {
-            Err(engine_event_error(msg))
-        }
+        Some(ChatEvent::Error(msg)) => Err(engine_event_error(msg)),
+        None => Err(engine_event_error(ENGINE_INTERRUPTED.into())),
         other => Ok(other),
     }
 }
@@ -775,11 +759,15 @@ async fn run_non_streaming(
                 finish = finish_reason;
                 output_tokens = completion_tokens;
                 saw_done = true;
+                break;
             }
             ChatEvent::Error(msg) => return engine_event_error(msg),
         }
     }
 
+    if !saw_done {
+        return engine_event_error(ENGINE_INTERRUPTED.into());
+    }
     if let Some(prompt) = traj_prompt.filter(|_| saw_done) {
         crate::oapi::trajectory::append(crate::oapi::trajectory::TrajectoryRecord {
             ts: crate::oapi::trajectory::TrajectoryRecord::now_secs(),
@@ -979,11 +967,19 @@ async fn run_streaming(
         let mut input_tokens: u32 = 0;
         let mut cached: Option<u32> = None;
         if pre.is_none() {
-            pre = rx_ev.recv().await;
+            pre = tokio::select! {
+                biased;
+                _ = tx_bytes.closed() => return,
+                event = rx_ev.recv() => event,
+            };
         }
         if let Some(ChatEvent::PromptCached { cached_tokens }) = pre {
             cached = Some(cached_tokens);
-            pre = rx_ev.recv().await;
+            pre = tokio::select! {
+                biased;
+                _ = tx_bytes.closed() => return,
+                event = rx_ev.recv() => event,
+            };
         }
         if let Some(ChatEvent::Started { prompt_tokens }) = pre {
             input_tokens = prompt_tokens;
@@ -1007,7 +1003,10 @@ async fn run_streaming(
                 },
             },
         });
-        if send_event(&tx_bytes, "message_start", &start).await.is_err() {
+        if send_event(&tx_bytes, "message_start", &start)
+            .await
+            .is_err()
+        {
             return;
         }
         if send_event(&tx_bytes, "ping", &json!({"type": "ping"}))
@@ -1030,7 +1029,11 @@ async fn run_streaming(
         loop {
             let Some(ev) = (match pre.take() {
                 Some(ev) => Some(ev),
-                None => rx_ev.recv().await,
+                None => tokio::select! {
+                    biased;
+                    _ = tx_bytes.closed() => return,
+                    event = rx_ev.recv() => event,
+                },
             }) else {
                 break;
             };
@@ -1066,12 +1069,13 @@ async fn run_streaming(
                     finish = finish_reason;
                     output_tokens = completion_tokens;
                     saw_done = true;
+                    break;
                 }
                 ChatEvent::Error(msg) => {
-                    let kind = if is_busy_shed(&msg) {
-                        akind::OVERLOADED
+                    let (kind, msg) = if is_busy_shed(&msg) {
+                        (akind::OVERLOADED, retryable_message(msg))
                     } else {
-                        akind::API
+                        (akind::API, msg)
                     };
                     let _ = send_event(&tx_bytes, "error", &anthropic_error_body(kind, &msg)).await;
                     return;
@@ -1079,6 +1083,15 @@ async fn run_streaming(
             }
         }
 
+        if !saw_done {
+            let _ = send_event(
+                &tx_bytes,
+                "error",
+                &anthropic_error_body(akind::OVERLOADED, ENGINE_INTERRUPTED),
+            )
+            .await;
+            return;
+        }
         let raw_finish_before_tool_parse = finish.clone();
 
         if tools_active {
@@ -1152,7 +1165,10 @@ async fn run_streaming(
                 "cache_read_input_tokens": cached.unwrap_or(0),
             },
         });
-        if send_event(&tx_bytes, "message_delta", &delta).await.is_err() {
+        if send_event(&tx_bytes, "message_delta", &delta)
+            .await
+            .is_err()
+        {
             return;
         }
         let _ = send_event(&tx_bytes, "message_stop", &json!({"type": "message_stop"})).await;
@@ -1186,10 +1202,7 @@ fn tokenizer_for(model_id: &str) -> Option<Arc<tokenizers::Tokenizer>> {
     loaded
 }
 
-pub async fn handle_count_tokens(
-    State(state): State<ChatAppState>,
-    body: Bytes,
-) -> Response {
+pub async fn handle_count_tokens(State(state): State<ChatAppState>, body: Bytes) -> Response {
     let req: MessagesRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(err) => return invalid(format!("{err}")),
@@ -1317,9 +1330,7 @@ mod ts_wire {
         role: (),
         model: String,
         content: Vec<AnthropicContentBlock>,
-        #[ts(
-            type = "\"end_turn\" | \"max_tokens\" | \"tool_use\" | \"stop_sequence\" | null"
-        )]
+        #[ts(type = "\"end_turn\" | \"max_tokens\" | \"tool_use\" | \"stop_sequence\" | null")]
         stop_reason: (),
         stop_sequence: Option<String>,
         usage: AnthropicUsage,
@@ -1612,7 +1623,10 @@ mod tests {
     fn thinking_param_maps() {
         for (v, want) in [
             (json!({"type": "adaptive"}), Some(true)),
-            (json!({"type": "enabled", "budget_tokens": 1024}), Some(true)),
+            (
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                Some(true),
+            ),
             (json!({"type": "disabled"}), Some(false)),
         ] {
             let r = req(json!({

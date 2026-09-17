@@ -463,7 +463,9 @@ mod tests {
             cols,
             weights: Weights::Float(w.clone()),
         };
-        let act: Vec<f32> = (0..cols - 1).map(|i| ((i * 13 % 7) as f32 / 6.0) - 0.5).collect();
+        let act: Vec<f32> = (0..cols - 1)
+            .map(|i| ((i * 13 % 7) as f32 / 6.0) - 0.5)
+            .collect();
         let mut f_out = vec![0f32; rows];
         matvec_f32_scalar(rows, cols, &w, &act, &mut f_out);
         m.quantize_to_int8();

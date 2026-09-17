@@ -1,9 +1,9 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dequant::bytes_to_words;
+use crate::wgpu_backend::device::WgpuContext;
+use crate::wgpu_backend::pack::pack_u16_odd_tail_zeroed_min_one_word as pack_bf16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_odd_tail_zeroed_min_one_word as pack_bf16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/attn_decode_small_m.wgsl");
 
@@ -64,7 +64,12 @@ pub enum SmallMKv<'a> {
 }
 
 fn check_device(ctx: &WgpuContext) -> Result<()> {
-    dispatch::require_workgroup_and_scratch(ctx, "attn_decode_small_m", WORKGROUP_SIZE, SCRATCH_BYTES)
+    dispatch::require_workgroup_and_scratch(
+        ctx,
+        "attn_decode_small_m",
+        WORKGROUP_SIZE,
+        SCRATCH_BYTES,
+    )
 }
 
 fn check_m_rows(m_rows: usize) -> Result<()> {

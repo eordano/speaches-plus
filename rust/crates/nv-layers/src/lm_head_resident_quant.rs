@@ -42,7 +42,7 @@ fn rowquant_dev<Q: cudarc::driver::DeviceRepr>(
         launch(
             stream.cu_stream() as *mut _,
             wp as *const u16,
-            qp as u64,
+            qp,
             sp as *mut f32,
             n as i32,
             k as i32,

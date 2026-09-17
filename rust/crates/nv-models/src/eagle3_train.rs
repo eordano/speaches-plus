@@ -70,8 +70,8 @@ impl Eagle3TrainConfig {
         }
         let raw = std::fs::read_to_string(&cfg_path)
             .with_context(|| format!("read {}", cfg_path.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", cfg_path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", cfg_path.display()))?;
         let kind = v
             .get("speculators_model_type")
             .and_then(|x| x.as_str())
@@ -195,7 +195,12 @@ impl Eagle3TrainHead {
         &self.cfg
     }
 
-    pub fn load(cfg: &Eagle3TrainConfig, dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
+    pub fn load(
+        cfg: &Eagle3TrainConfig,
+        dir: &Path,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
         if cfg.norm_before_fc {
             bail!(
                 "eagle3 drafter at {}: norm_before_fc=true is not supported (the RedHatAI \
@@ -220,7 +225,13 @@ impl Eagle3TrainHead {
             &[cfg.target_vocab_size, cfg.hidden_size],
             dtype,
         )?;
-        let fc = load_linear(&weights, "fc.weight", cfg.hidden_size, cfg.fc_in_dim(), dtype)?;
+        let fc = load_linear(
+            &weights,
+            "fc.weight",
+            cfg.hidden_size,
+            cfg.fc_in_dim(),
+            dtype,
+        )?;
         let input_layernorm = load_rmsnorm(
             &weights,
             "layers.0.input_layernorm.weight",
@@ -432,10 +443,7 @@ impl Eagle3TrainHead {
         let wdt = self.fc.weight().context("fc weight")?.dtype();
         let ids_t = Tensor::from_vec(ids[1..].to_vec(), seq, &self.device)?;
         let token_embed = self.embed_tokens.detach().index_select(&ids_t, 0)?;
-        let aux = aux_cat_detached
-            .detach()
-            .narrow(0, 0, seq)?
-            .to_dtype(wdt)?;
+        let aux = aux_cat_detached.detach().narrow(0, 0, seq)?.to_dtype(wdt)?;
         let aux_proj = self.fc.forward(&aux)?;
 
         let token_normed = self.input_layernorm.forward_candle(&token_embed)?;

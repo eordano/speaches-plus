@@ -7,6 +7,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from . import audio_defaults
 from .audio_out import OutboundPushError
 
@@ -14,6 +16,15 @@ log = logging.getLogger("realtime.audio_out_ws")
 
 KOKORO_HZ = audio_defaults.TTS_SAMPLE_RATE
 FRAME_MS = audio_defaults.FRAME_MS
+
+def _pcm16le_bytes(frame: list[float]) -> bytes:
+    x = np.asarray(frame)
+    if x.dtype != np.float32 and frame and type(frame[0]) is np.float32:
+        x = x.astype(np.float32)
+    elif x.dtype.kind != "f":
+        x = x.astype(np.float64)
+    x = np.where(np.isnan(x), 1.0, x)
+    return (np.clip(x, -1.0, 1.0) * 32_767.0).astype("<i2").tobytes()
 
 def _wire_for(format: str) -> tuple[str, int]:
     table = {
@@ -80,16 +91,9 @@ class WsAudioPacer:
 
     async def _emit_one_frame(self) -> None:
         frame = self.carry[: self.frame_samples]
-        self.carry = self.carry[self.frame_samples :]
+        del self.carry[: self.frame_samples]
         if self.codec == "pcm16le":
-            buf = bytearray(self.frame_samples * 2)
-            for i, s in enumerate(frame):
-                v = int(max(-1.0, min(1.0, s)) * 32_767.0)
-                if v < 0:
-                    v += 0x10000
-                buf[i * 2] = v & 0xFF
-                buf[i * 2 + 1] = (v >> 8) & 0xFF
-            payload = bytes(buf)
+            payload = _pcm16le_bytes(frame)
         elif self.codec in ("ulaw", "alaw"):
             from audio.g711 import alaw_encode_sample, ulaw_encode_sample
 

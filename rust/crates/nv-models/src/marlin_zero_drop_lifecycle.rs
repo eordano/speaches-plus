@@ -11,7 +11,12 @@ const SYNTHETIC_OUT_256_IN_256_GROUPS_2_IS_THE_SMALLEST_LN_SUPPORTED_SHAPE: (usi
     (256, 256, 2);
 const SAME_SIZE_ALLOC_ATTEMPTS_BEFORE_DECLARING_THE_REUSE_ARM_VACUOUS: usize = 64;
 
-fn synthetic_marlin(device: &Device, out: usize, inp: usize, ngroups: usize) -> Result<MarlinLinear> {
+fn synthetic_marlin(
+    device: &Device,
+    out: usize,
+    inp: usize,
+    ngroups: usize,
+) -> Result<MarlinLinear> {
     let pbytes = vec![0u8; out * (inp / 8) * 4];
     let scale = Tensor::ones((out, ngroups), DType::BF16, device)?;
     MarlinLinear::from_raw(&pbytes, scale, out, inp, device)
@@ -40,7 +45,10 @@ fn dropping_the_first_model_after_an_m1_use_must_pull_its_persist_row_out_of_the
 
     let (entries, dev_list, count) =
         marlin_zero_snapshot_host_entries_uploaded_device_list_and_count(&stream)?;
-    assert!(count >= 1, "m==1 use must have populated the zero-launch list");
+    assert!(
+        count >= 1,
+        "m==1 use must have populated the zero-launch list"
+    );
     let ptr_a = entries
         .chunks(2)
         .rev()
@@ -76,7 +84,7 @@ fn dropping_the_first_model_after_an_m1_use_must_pull_its_persist_row_out_of_the
                 unsafe { stream.alloc::<bf16>(elems) }.map_err(|e| anyhow::anyhow!(e))?;
             let p = {
                 let (p, _g) = b.device_ptr_mut(&stream);
-                p as u64
+                p
             };
             let (lo, hi) = (p, p + 2 * elems as u64);
             if lo < freed_hi && freed_lo < hi {

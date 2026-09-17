@@ -375,7 +375,14 @@ func (p *sessionPipeline) waitChannel() bool {
 	select {
 	case <-p.chReady:
 		return true
-	case <-time.After(2 * time.Second):
+	default:
+	}
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-p.chReady:
+		return true
+	case <-timer.C:
 		return false
 	}
 }

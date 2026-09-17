@@ -88,7 +88,8 @@ impl DFlashRopeYarn {
         let half = head_dim / 2;
         let dim = head_dim as f64;
         let orig = self.original_max_position_embeddings as f64;
-        let corr = |beta: f64| dim * (orig / (beta * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln());
+        let corr =
+            |beta: f64| dim * (orig / (beta * 2.0 * std::f64::consts::PI)).ln() / (2.0 * base.ln());
         let low = corr(self.beta_fast).floor();
         let high = corr(self.beta_slow).ceil();
         let span = if (high - low).abs() < 1e-3 {
@@ -840,7 +841,13 @@ impl LoadedDFlashDrafter {
         device: &Device,
         target_embed: Option<&Tensor>,
     ) -> Result<Self> {
-        Self::load_from_safetensors_with_target_heads(cfg, safetensors_path, device, target_embed, None)
+        Self::load_from_safetensors_with_target_heads(
+            cfg,
+            safetensors_path,
+            device,
+            target_embed,
+            None,
+        )
     }
 
     pub fn load_from_safetensors_with_target_heads(
@@ -1034,10 +1041,8 @@ impl LoadedDFlashDrafter {
             )?,
             Some(yarn) => {
                 let inv_freq = yarn.inv_freq(cfg.head_dim, cfg.rope_theta as f64);
-                let (mut cos, mut sin) = nv_layers::rope::build_rope_tables_f64(
-                    &inv_freq,
-                    cfg.max_position_embeddings,
-                );
+                let (mut cos, mut sin) =
+                    nv_layers::rope::build_rope_tables_f64(&inv_freq, cfg.max_position_embeddings);
                 let mscale = yarn.attention_factor() as f32;
                 for v in cos.iter_mut().chain(sin.iter_mut()) {
                     *v *= mscale;
@@ -1542,7 +1547,7 @@ fn nvfp4_quantizable(l: &Linear) -> bool {
     use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
     l.weight().is_some()
         && l.bias().is_none()
-        && l.in_features() % BLOCK_SIZE == 0
+        && l.in_features().is_multiple_of(BLOCK_SIZE)
         && l.in_features() >= MIN_TILE
         && l.out_features() >= MIN_TILE
 }
@@ -1699,7 +1704,7 @@ impl LoadedDFlashDrafter {
         if !self.embed_tokens.is_contiguous() {
             bail!("block graph: embed_tokens must be contiguous");
         }
-        if self.cfg.head_dim % 2 != 0 {
+        if !self.cfg.head_dim.is_multiple_of(2) {
             bail!("block graph: head_dim must be even");
         }
         let mut flags: Option<[bool; 7]> = None;

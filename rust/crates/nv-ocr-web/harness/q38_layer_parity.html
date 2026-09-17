@@ -1,0 +1,496 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>q38 single-layer browser parity</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background:#111; color:#ddd; margin:1.5em; }
+  pre { white-space: pre-wrap; word-break: break-all; background:#181818; padding:0.8em; border:1px solid #333; }
+  #status { color:#fc6; }
+</style>
+<h1>q38 single-layer browser parity (GDN + full-attn, real W4)</h1>
+<div id="status">running...</div>
+<pre id="report"></pre>
+<script type="module">
+'use strict';
+const out = [];
+const J = { started: new Date().toISOString(), ua: navigator.userAgent };
+function log(s) {
+  out.push(s);
+  document.getElementById('report').textContent = out.join('\n');
+  console.log('Q38P|' + s);
+}
+function finish(tag) {
+  if (J.done) return;
+  J.done = tag;
+  J.finished = new Date().toISOString();
+  const c = JSON.stringify(J);
+  document.getElementById('status').textContent = 'DONE (' + tag + ')';
+  fetch('/q38-result-' + arm + '.json', { method: 'PUT', body: c })
+    .catch(() => {})
+    .finally(() => {
+      console.log('Q38P_DONE');
+      document.title = 'Q38P_DONE';
+    });
+}
+window.addEventListener('error', e => { J.page_error = String(e.message) + '\n' + String(e.error && e.error.stack || ''); log('PAGE_ERROR|' + J.page_error); finish('page-error'); });
+window.addEventListener('unhandledrejection', e => {
+  J.page_error = String(e.reason && e.reason.stack || e.reason);
+  finish('page-error');
+});
+
+const arm = new URLSearchParams(location.search).get('arm') || 'sg';
+J.arm = arm;
+
+async function probe() {
+  if (!navigator.gpu) { J.probe = 'navigator.gpu missing'; return finish('probe-no-webgpu'); }
+  const a = await navigator.gpu.requestAdapter();
+  if (!a) { J.probe = 'requestAdapter returned null'; return finish('probe-no-adapter'); }
+  const info = a.info || {};
+  J.probe_adapter = { vendor: info.vendor, architecture: info.architecture, device: info.device, description: info.description,
+    features: [...a.features], limits: { maxComputeWorkgroupSizeX: a.limits.maxComputeWorkgroupSizeX,
+    maxComputeInvocationsPerWorkgroup: a.limits.maxComputeInvocationsPerWorkgroup,
+    maxComputeWorkgroupStorageSize: a.limits.maxComputeWorkgroupStorageSize,
+    maxStorageBuffersPerShaderStage: a.limits.maxStorageBuffersPerShaderStage,
+    maxStorageBufferBindingSize: a.limits.maxStorageBufferBindingSize, maxBufferSize: a.limits.maxBufferSize } };
+  log('adapter: ' + JSON.stringify(J.probe_adapter));
+  const d = await a.requestDevice();
+  log('device ok');
+  const mod = d.createShaderModule({ code: '@group(0) @binding(0) var<storage, read_write> o: array<u32>; @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) { o[g.x] = g.x * 3u + 1u; }' });
+  const pipe = d.createComputePipeline({ layout: 'auto', compute: { module: mod, entryPoint: 'main' } });
+  const buf = d.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const rb = d.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const bg = d.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] });
+  const enc = d.createCommandEncoder(); const p = enc.beginComputePass(); p.setPipeline(pipe); p.setBindGroup(0, bg); p.dispatchWorkgroups(1); p.end();
+  enc.copyBufferToBuffer(buf, 0, rb, 0, 256); d.queue.submit([enc.finish()]);
+  await rb.mapAsync(GPUMapMode.READ);
+  const out = Array.from(new Uint32Array(rb.getMappedRange()));
+  J.probe_out = out.slice(0, 4);
+  const ok = out[0] === 1 && out[63] === 190;
+  log('dispatch ' + (ok ? 'ok' : 'WRONG') + ' out[0..4]=' + out.slice(0, 4).join(','));
+  finish(ok ? 'probe-ok' : 'probe-wrong-result');
+}
+
+function parseSafetensors(buf) {
+  const dv = new DataView(buf);
+  const n = Number(dv.getBigUint64(0, true));
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, n)));
+  const base = 8 + n;
+  const tensor = (name, ctor) => {
+    const t = header[name];
+    if (!t) throw new Error('safetensors lacks ' + name);
+    const [a, b] = t.data_offsets;
+    return { shape: t.shape, data: new ctor(buf.slice(base + a, base + b)) };
+  };
+  return { header, tensor };
+}
+
+async function pushFile(mod, push, url, name, reserve) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('fetch ' + url + ': HTTP ' + resp.status);
+  const size = Number(resp.headers.get('content-length') || 0);
+  if (reserve && size > 0) reserve(name, size);
+  const reader = resp.body.getReader();
+  let total = 0;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    push(name, value);
+    total += value.length;
+  }
+  log('staged ' + name + ': ' + total + ' bytes');
+  return total;
+}
+
+async function pushSafetensorsFiltered(mod, url, name, keep) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('fetch ' + url + ': HTTP ' + resp.status);
+  const reader = resp.body.getReader();
+  let head = new Uint8Array(0);
+  let headerLen = -1;
+  let fileOff = 0;
+  while (headerLen < 0 || head.length < 8 + headerLen) {
+    const { value, done } = await reader.read();
+    if (done) throw new Error(url + ': truncated safetensors header');
+    const next = new Uint8Array(head.length + value.length);
+    next.set(head); next.set(value, head.length);
+    head = next;
+    if (headerLen < 0 && head.length >= 8) headerLen = Number(new DataView(head.buffer).getBigUint64(0, true));
+  }
+  const header = JSON.parse(new TextDecoder().decode(head.subarray(8, 8 + headerLen)));
+  const base = 8 + headerLen;
+  const entries = Object.entries(header).filter(([k]) => k !== '__metadata__' && keep(k))
+    .sort((a, b) => a[1].data_offsets[0] - b[1].data_offsets[0]);
+  const rebuilt = header.__metadata__ ? { __metadata__: header.__metadata__ } : {};
+  const spans = [];
+  let cur = 0;
+  for (const [k, v] of entries) {
+    const [a, b] = v.data_offsets;
+    rebuilt[k] = { dtype: v.dtype, shape: v.shape, data_offsets: [cur, cur + (b - a)] };
+    spans.push([base + a, base + b]);
+    cur += b - a;
+  }
+  let hb = new TextEncoder().encode(JSON.stringify(rebuilt));
+  const pad = (8 - hb.length % 8) % 8;
+  if (pad) { const p = new Uint8Array(hb.length + pad); p.fill(0x20); p.set(hb); hb = p; }
+  const lenBuf = new Uint8Array(8);
+  new DataView(lenBuf.buffer).setBigUint64(0, BigInt(hb.length), true);
+  mod.train_weights_reserve(name, 8 + hb.length + cur);
+  mod.train_weights_push(name, lenBuf);
+  mod.train_weights_push(name, hb);
+  let si = 0;
+  let pushed = 8 + hb.length;
+  const feed = (chunk, off) => {
+    let cOff = off;
+    const cEnd = off + chunk.length;
+    while (si < spans.length && cOff < cEnd) {
+      const [a, b] = spans[si];
+      if (b <= cOff) { si++; continue; }
+      if (a >= cEnd) break;
+      const s = Math.max(a, cOff), e = Math.min(b, cEnd);
+      mod.train_weights_push(name, chunk.subarray(s - off, e - off));
+      pushed += e - s;
+      cOff = e;
+      if (e === b) si++;
+    }
+  };
+  feed(head, 0);
+  fileOff = head.length;
+  let streamed = head.length;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (si < spans.length) feed(value, fileOff);
+    fileOff += value.length;
+    streamed += value.length;
+  }
+  if (si < spans.length) throw new Error(url + ': stream ended with ' + (spans.length - si) + ' kept tensors unread');
+  log('staged ' + name + ': kept ' + entries.length + '/' + (Object.keys(header).length) + ' tensors, ' + pushed + ' of ' + streamed + ' streamed bytes');
+  return pushed;
+}
+
+async function kokoro() {
+  const q = new URLSearchParams(location.search);
+  const budget = Number(q.get('budget') || 2), population = Number(q.get('population') || 2);
+  const nStock = Number(q.get('stock') || 6), nTrain = Number(q.get('train') || 1), nHeld = Number(q.get('heldout') || 1);
+  const epochs = Number(q.get('epochs') || 1), nRefs = Number(q.get('refs') || 3);
+  const wmix = q.get('wmix') === null ? 0.5 : Number(q.get('wmix'));
+  const trainSeconds = q.get('window') === null ? null : Number(q.get('window'));
+  const wasmUrl = './web/nv_ocr_web_bg.wasm';
+  const mod = await import('./web/nv_ocr_web.js');
+  await mod.default({ module_or_path: wasmUrl });
+  mod.q38_install_panic_hook();
+  const t0 = performance.now();
+  mod.kokoro_stage_clear();
+  J.staged_bytes = 0;
+  for (const name of ['kokoro.safetensors', 'wespeaker/graph.json', 'wespeaker/weights.safetensors', 'qwen-spk/config.json', 'qwen-spk/model.safetensors']) {
+    J.staged_bytes += await pushFile(mod, (n, c) => mod.kokoro_stage_push(n, c), './kokoro/' + name, name,
+      (n, s) => mod.kokoro_stage_reserve(n, s));
+  }
+  const refs = (await (await fetch('./kokoro/refs.json')).json()).slice(0, nRefs);
+  for (const r of refs) {
+    const buf = await (await fetch('./kokoro/' + r.file)).arrayBuffer();
+    mod.kokoro_stage_ref(r.file, new Float32Array(buf));
+  }
+  J.stage_ms = performance.now() - t0;
+  const t1 = performance.now();
+  J.init = JSON.parse(mod.kokoro_init());
+  J.init_ms = performance.now() - t1;
+  log('kokoro init ' + JSON.stringify(J.init) + ' in ' + Math.round(J.init_ms) + ' ms');
+  const stockAll = await (await fetch('./kokoro/stock.json')).json();
+  const tok = await (await fetch('./kokoro/tokens.json')).json();
+  const set = q.get('set');
+  const train = (set ? tok[set] : tok.train).slice(0, nTrain).map(r => r.tokens);
+  const heldout = (set ? tok[set].slice(nTrain, nTrain + nHeld) : tok.heldout.slice(0, nHeld)).map(r => r.tokens);
+  J.sentences = { set: set || 'train/heldout', train: train.map(t => t.length), heldout: heldout.map(t => t.length) };
+  const stock = {};
+  for (const k of Object.keys(stockAll).slice(0, nStock)) stock[k] = stockAll[k];
+  const t2 = performance.now();
+  const audio = mod.kokoro_synth(new Uint32Array(train[0]), new Float32Array(stockAll['af_heart']), 1.0, BigInt(11), false);
+  J.synth_ms = performance.now() - t2;
+  J.synth_samples = audio.length;
+  log('synth ' + audio.length + ' samples (' + (audio.length / 24000).toFixed(2) + ' s) in ' + Math.round(J.synth_ms) + ' ms');
+  const opts = JSON.stringify({ stock, train_tokens: train, heldout_tokens: heldout, budget, population, patience: 8, seed: 1, epochs, wmix,
+    ...(trainSeconds === null ? {} : { train_seconds: trainSeconds }) });
+  J.fit_opts = { budget, population, epochs, wmix, train_seconds: trainSeconds, stock: Object.keys(stock).length };
+  const t3 = performance.now();
+  J.style = JSON.parse(mod.kokoro_fit_style(opts, ev => log('style ' + JSON.stringify(ev))));
+  J.style_ms = performance.now() - t3;
+  delete J.style.weights;
+  const styleVec = new Float32Array(J.style.style);
+  delete J.style.style;
+  log('style fit ' + JSON.stringify(J.style) + ' in ' + Math.round(J.style_ms) + ' ms');
+  const t4 = performance.now();
+  J.adapter = JSON.parse(mod.kokoro_fit_adapter(opts, styleVec, ev => log('adapter ' + JSON.stringify(ev))));
+  J.adapter_ms = performance.now() - t4;
+  log('adapter fit ' + JSON.stringify(J.adapter) + ' in ' + Math.round(J.adapter_ms) + ' ms');
+  const st = mod.kokoro_adapter_safetensors();
+  J.adapter_safetensors_bytes = st ? st.length : 0;
+  const adapted = mod.kokoro_synth(new Uint32Array(heldout[0]), styleVec, 1.0, BigInt(11), true);
+  J.adapted_samples = adapted.length;
+  let finite = true;
+  for (let i = 0; i < adapted.length; i++) if (!Number.isFinite(adapted[i])) { finite = false; break; }
+  J.verdict = finite && Number.isFinite(J.style.validation) && J.adapter_safetensors_bytes > 1000000 ? 'KOKORO-FITS' : 'KOKORO-BAD';
+  log('adapted synth ' + adapted.length + ' samples finite=' + finite);
+  finish(J.verdict === 'KOKORO-FITS' ? 'kokoro-ok' : 'kokoro-bad');
+}
+
+async function train() {
+  const steps = Number(new URLSearchParams(location.search).get('steps') || 6);
+  const maxSamples = Number(new URLSearchParams(location.search).get('samples') || 6);
+  const wasmUrl = './web/nv_ocr_web_bg.wasm';
+  const mod = await import('./web/nv_ocr_web.js');
+  await mod.default({ module_or_path: wasmUrl });
+  mod.q38_install_panic_hook();
+  const t0 = performance.now();
+  mod.train_weights_clear();
+  J.staged_bytes = 0;
+  J.staged_bytes += await pushFile(mod, (n, c) => mod.train_weights_push(n, c), './train-model/config.json', 'config.json',
+    (n, s) => mod.train_weights_reserve(n, s));
+  J.staged_bytes += await pushSafetensorsFiltered(mod, './train-model/model.safetensors', 'model.safetensors',
+    k => !k.startsWith('vision'));
+  const index = (await (await fetch('./dump/index.jsonl')).text()).split('\n').filter(l => l.trim()).map(l => JSON.parse(l))
+    .slice(0, maxSamples);
+  let staged = 0;
+  for (const row of index) {
+    const file = row.file || row.path || row.safetensors;
+    const st = parseSafetensors(await (await fetch('./dump/' + file)).arrayBuffer());
+    const ids = Array.from(st.tensor('ids', Uint32Array).data);
+    const rows = st.tensor('rows', Float32Array);
+    const meta = { ids, vision_start: st.tensor('vision_start', Uint32Array).data[0],
+      completion_start: st.tensor('completion_start', Uint32Array).data[0], n_vis: rows.shape[0] };
+    mod.train_sample_stage_rows(JSON.stringify(meta), new Uint8Array(rows.data.buffer));
+    staged++;
+  }
+  J.samples = staged;
+  log('staged ' + staged + ' dump samples in ' + Math.round(performance.now() - t0) + ' ms');
+  const losses = [];
+  const t1 = performance.now();
+  const rep = JSON.parse(await mod.engine_train(JSON.stringify({ steps, rank: 16, grad_layers: 8, seed: 7 }), f => {
+    if (f && f.type === 'train_step') { losses.push(f.loss); log('step ' + f.step + ' loss ' + f.loss); }
+  }));
+  J.train_ms = performance.now() - t1;
+  J.train = rep;
+  J.adapter_bytes = (mod.train_adapter_safetensors() || new Uint8Array()).length;
+  const finite = rep.losses.every(x => Number.isFinite(x));
+  const fell = rep.losses.length > 1 && rep.losses[rep.losses.length - 1] < rep.losses[0];
+  J.verdict = finite && rep.all_grads_finite && fell ? 'QLORA-TRAINS' : 'QLORA-DID-NOT-TRAIN';
+  log('train: losses=' + rep.losses.map(x => x.toFixed(6)).join(',') + ' grads_finite=' + rep.all_grads_finite + ' adapter=' + J.adapter_bytes + ' bytes in ' + Math.round(J.train_ms) + ' ms');
+  finish(finite && rep.all_grads_finite && fell ? 'train-ok' : 'train-bad');
+}
+
+async function e4b() {
+  const q = new URLSearchParams(location.search);
+  const steps = Number(q.get('steps') || 6);
+  const maxSamples = Number(q.get('samples') || 6);
+  const wasmUrl = './web/nv_ocr_web_bg.wasm';
+  const mod = await import('./web/nv_ocr_web.js');
+  await mod.default({ module_or_path: wasmUrl });
+  mod.q38_install_panic_hook();
+  const t0 = performance.now();
+  mod.train_weights_clear();
+  mod.e4b_samples_clear();
+  const win = await (await fetch('./e4b-dump/e4b-window.json')).json();
+  J.e4b_window = win;
+  J.staged_bytes = 0;
+  for (const name of ['config.json', win.layers_shard || 'e4b-window-layers.safetensors', win.head_shard || 'e4b-window-head.safetensors']) {
+    J.staged_bytes += await pushFile(mod, (n, c) => mod.train_weights_push(n, c), './e4b-dump/' + name, name,
+      (n, s) => mod.train_weights_reserve(n, s));
+  }
+  const index = (await (await fetch('./e4b-dump/index.jsonl')).text()).split('\n').filter(l => l.trim()).map(l => JSON.parse(l))
+    .slice(0, maxSamples);
+  let sampleBytes = 0;
+  for (const row of index) {
+    const buf = await (await fetch('./e4b-dump/' + row.file)).arrayBuffer();
+    sampleBytes += buf.byteLength;
+    mod.e4b_sample_stage(new Uint8Array(buf));
+  }
+  J.samples = mod.e4b_samples_staged();
+  J.sample_bytes = sampleBytes;
+  J.stage_ms = performance.now() - t0;
+  log('staged ' + J.samples + ' window samples (' + sampleBytes + ' bytes) + ' + J.staged_bytes + ' shard bytes in ' + Math.round(J.stage_ms) + ' ms');
+  const t1 = performance.now();
+  const rep = JSON.parse(await mod.e4b_train(JSON.stringify({ steps, rank: 16, grad_layers: win.grad_layers || 8, seed: 7 }), f => {
+    if (f && f.type === 'train_step') log('step ' + f.step + ' loss ' + f.loss + ' at ' + Math.round(performance.now() - t1) + ' ms');
+  }));
+  J.train_ms = performance.now() - t1;
+  J.train = rep;
+  J.adapter_bytes = (mod.train_adapter_safetensors() || new Uint8Array()).length;
+  const finite = rep.losses.every(x => Number.isFinite(x));
+  const fell = rep.losses.length > 1 && rep.losses[rep.losses.length - 1] < rep.losses[0];
+  J.verdict = finite && rep.all_grads_finite && fell ? 'E4B-QLORA-TRAINS' : 'E4B-QLORA-DID-NOT-TRAIN';
+  log('e4b: losses=' + rep.losses.map(x => x.toFixed(6)).join(',') + ' grads_finite=' + rep.all_grads_finite + ' adapter=' + J.adapter_bytes + ' bytes in ' + Math.round(J.train_ms) + ' ms');
+  finish(finite && rep.all_grads_finite && fell ? 'e4b-ok' : 'e4b-bad');
+}
+
+async function main() {
+  if (arm === 'probe') return probe();
+  if (arm === 'train') return train();
+  if (arm === 'e4b') return e4b();
+if (arm === 'kokoro') return kokoro();
+  const wasmUrl = './web/nv_ocr_web_bg.wasm';
+  const head = await fetch(wasmUrl, { method: 'HEAD' });
+  J.wasm_bytes = Number(head.headers.get('content-length'));
+  log('wasm module: ' + J.wasm_bytes + ' bytes');
+  const mod = await import('./web/nv_ocr_web.js');
+  await mod.default({ module_or_path: wasmUrl });
+  mod.q38_install_panic_hook();
+
+  if (arm === 'tint') {
+    J.tint = JSON.parse(await mod.q38_tint_probe());
+    J.verdict = J.tint.failures.length === 0 ? 'ALL-MODULES-VALIDATE' : 'TINT-REJECTIONS';
+    log('adapter: ' + J.tint.adapter + ' limits=' + JSON.stringify(J.tint.limits));
+    log('entries this device cannot build (over its limits, the engine routes around them): ' + (J.tint.limited || []).length);
+    log('tint probe: ' + JSON.stringify(J.tint).slice(0, 4000));
+    finish(J.tint.failures.length === 0 ? 'tint-clean' : 'tint-rejections');
+    return;
+  }
+
+  const ref = await (await fetch('./slice/ref-' + arm + '.json')).json();
+  J.ref = { arm: ref.arm, slice_bytes: ref.slice_bytes, shards: (ref.shards || []).length };
+
+  mod.q38_weights_clear();
+  const t0 = performance.now();
+  let staged = 0;
+  const names = ['config.json'].concat(ref.shards || []);
+  for (const name of names) {
+    const resp = await fetch('./slice/' + name);
+    if (!resp.ok) throw new Error('fetch ' + name + ': ' + resp.status);
+    const len = Number(resp.headers.get('content-length') || 0);
+    if (len > 0) mod.q38_weights_reserve(name, len);
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      mod.q38_weights_push(name, value);
+      staged += value.length;
+    }
+    log('staged ' + name);
+  }
+  J.shard_load_ms = performance.now() - t0;
+  J.staged_bytes = staged;
+  log('staged ' + staged + ' bytes in ' + J.shard_load_ms.toFixed(0) + ' ms');
+
+  const opts = JSON.stringify({
+    prompt_len: ref.prompt ? ref.prompt.length : 12,
+    steps: ref.steps || 3,
+    subgroups_ungranted: arm === 'nosg',
+  });
+
+  if (arm === 'nosg') {
+    let refusal = null;
+    const tb = performance.now();
+    try {
+      await mod.q38_parity_boot(opts);
+      J.boot_resolved_so_validation_was_deferred = true;
+      await mod.q38_parity_prefill(new Uint32Array(ref.prompt));
+    } catch (e) {
+      refusal = String(e);
+    }
+    J.boot_ms = performance.now() - tb;
+    J.browser_refusal = refusal;
+    J.native_refusal = ref.structural_refusal || null;
+    if (refusal === null) {
+      J.verdict = 'UNEXPECTED-BOOT: the affine gemv grew a subgroup-free twin; graduate nosg to a logits gate';
+      finish('nosg-unexpected-boot');
+      return;
+    }
+    const cls = /subgroup/i.test(refusal);
+    J.verdict = cls && J.native_refusal
+      ? 'STRUCTURAL-REFUSAL-MATCHED (no subgroup-free affine gemv twin, both sides refuse at pipeline build)'
+      : 'REFUSAL-CLASS-MISMATCH';
+    log('nosg refusal: ' + refusal.slice(0, 400));
+    finish(cls ? 'nosg-refusal-matched' : 'nosg-refusal-mismatch');
+    return;
+  }
+
+  const tb = performance.now();
+  const boot = JSON.parse(await mod.q38_parity_boot(opts));
+  J.boot_ms = performance.now() - tb;
+  J.caps_summary = boot.caps_summary;
+  log('boot ' + J.boot_ms.toFixed(0) + ' ms; caps: ' + boot.caps_summary);
+
+  const tp = performance.now();
+  const first = await mod.q38_parity_prefill(new Uint32Array(ref.prompt));
+  J.prefill_ms = performance.now() - tp;
+  const tokens = [];
+  J.step_ms = [];
+  for (let i = 0; i < ref.steps; i++) {
+    const ts = performance.now();
+    tokens.push(await mod.q38_parity_step());
+    J.step_ms.push(performance.now() - ts);
+  }
+  J.first = first;
+  J.tokens = tokens;
+  const labels = JSON.parse(mod.q38_parity_labels());
+  const logits = mod.q38_logits_bin();
+  log('forward done: first=' + first + ' tokens=' + tokens.join(',') +
+      ' prefill=' + J.prefill_ms.toFixed(1) + 'ms steps=' + J.step_ms.map(x => x.toFixed(1)).join(','));
+
+  const refBin = new Uint8Array(await (await fetch('./slice/ref-' + arm + '-logits.bin')).arrayBuffer());
+  J.token_match = first === ref.first && tokens.length === ref.tokens.length &&
+    tokens.every((t, i) => t === ref.tokens[i]);
+  J.labels_match = labels.length === ref.labels.length && labels.every((l, i) => l === ref.labels[i]);
+  if (!J.labels_match) {
+    J.labels_browser = labels;
+    J.labels_native = ref.labels;
+  }
+  J.logits_len_match = logits.length === refBin.length;
+  let nDiff = 0, firstDiff = -1, maxAbs = 0, maxUlp = 0;
+  const perStep = [];
+  if (J.logits_len_match) {
+    const a = new Uint32Array(logits.buffer, logits.byteOffset, logits.length >> 2);
+    const bCopy = refBin.slice();
+    const b = new Uint32Array(bCopy.buffer, 0, bCopy.length >> 2);
+    const af = new Float32Array(a.buffer, a.byteOffset, a.length);
+    const bf = new Float32Array(b.buffer, 0, b.length);
+    const vocab = ref.vocab;
+    const ord16 = w => { const h = w >>> 16; return (h & 0x8000) ? (0x8000 - (h & 0x7fff)) - 0x8000 : h; };
+    for (let s = 0; s < ref.steps; s++) {
+      let sn = 0, sMax = 0, sSum = 0, sBig = 0, sUlpLe4 = 0, sArgA = 0, sArgB = 0;
+      let sBf16Ulp1 = 0, sBf16UlpGt1 = 0, sBf16UlpMax = 0;
+      for (let k = 0; k < vocab; k++) {
+        const i = s * vocab + k;
+        if (af[i] > af[s * vocab + sArgA]) sArgA = k;
+        if (bf[i] > bf[s * vocab + sArgB]) sArgB = k;
+        if (a[i] !== b[i]) {
+          sn++; nDiff++;
+          if (firstDiff < 0) firstDiff = i;
+          const d = Math.abs(af[i] - bf[i]);
+          if (d > sMax) sMax = d;
+          if (d > maxAbs) maxAbs = d;
+          sSum += d;
+          if (d > 1e-2) sBig++;
+          const u = Math.abs((a[i] | 0) - (b[i] | 0));
+          if (u > maxUlp) maxUlp = u;
+          if (u <= 4 && (a[i] >>> 31) === (b[i] >>> 31)) sUlpLe4++;
+          const bu = Math.abs(ord16(a[i]) - ord16(b[i]));
+          if (bu === 1) sBf16Ulp1++; else if (bu > 1) sBf16UlpGt1++;
+          if (bu > sBf16UlpMax) sBf16UlpMax = bu;
+        }
+      }
+      perStep.push({
+        n_diff: sn, max_abs: sMax, mean_abs: sn ? sSum / sn : 0,
+        n_gt_1e2: sBig, n_ulp_le4: sUlpLe4,
+        n_bf16_ulp1: sBf16Ulp1, n_bf16_ulp_gt1: sBf16UlpGt1, bf16_ulp_max: sBf16UlpMax,
+        argmax_browser: sArgA, argmax_native: sArgB,
+      });
+    }
+  }
+  J.census = {
+    values: (logits.length >> 2), n_bit_diff: nDiff, first_diff_index: firstDiff,
+    max_abs_diff: maxAbs, max_ulp_diff: maxUlp, vocab: ref.vocab, steps: ref.steps,
+    per_step: perStep,
+  };
+  const bitEqual = J.logits_len_match && nDiff === 0;
+  const characterized = !bitEqual && J.token_match && J.labels_match && J.logits_len_match;
+  J.verdict = bitEqual && J.token_match && J.labels_match
+    ? 'BIT-EQUAL (logits, tokens, pass labels)'
+    : characterized
+      ? 'CHARACTERIZED-DRIFT (tokens and pass labels bit-match; logits drift within the census; mechanism: Tint/Dawn vs naga WGSL-to-MSL codegen under Metal fast-math)'
+      : 'DIVERGED';
+  log('parity: ' + J.verdict + ' census=' + JSON.stringify(J.census) +
+      ' token_match=' + J.token_match + ' labels_match=' + J.labels_match);
+  finish(bitEqual ? 'sg-bit-equal' : characterized ? 'sg-characterized' : 'sg-diverged');
+}
+
+main().catch(e => { J.error = String(e && e.stack || e); log('ERROR: ' + J.error); finish('error'); });
+</script>

@@ -4,9 +4,6 @@ import json
 import threading
 from typing import Any
 
-import xgrammar
-from xgrammar.contrib.hf import LogitsProcessor as XGrammarLogitsProcessor
-
 from audio import normalize_parts, process_mm_info
 
 def move_inputs_to(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +75,8 @@ class GrammarCompilerCache:
         with self._lock:
             if self._compiler is not None:
                 return self._compiler
+            import xgrammar
+
             info = xgrammar.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
             self._compiler = xgrammar.GrammarCompiler(info)
         return self._compiler
@@ -109,4 +108,6 @@ def transcribe_conversation(audio_spec: str, prompt: str) -> list[dict[str, Any]
     }]
 
 def xgrammar_logits_processor(compiled: xgrammar.CompiledGrammar) -> XGrammarLogitsProcessor:
+    from xgrammar.contrib.hf import LogitsProcessor as XGrammarLogitsProcessor
+
     return XGrammarLogitsProcessor(compiled)

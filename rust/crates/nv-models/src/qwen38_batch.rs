@@ -14,10 +14,20 @@ pub const Q38_BATCH_GRAPH_SHAPE_TOKEN_BASE_KEEPS_SOLO_KEY_1_AND_VERIFY_BASE_0X51
 
 pub const Q38_BATCH_DEFAULT_BUCKETS: &str = "1,2,4";
 
+fn batch_prefill_chunk_tokens_explicit_setting_preserves_unset_one_shot(
+    raw: Option<&str>,
+    prompt_tokens: usize,
+) -> Option<usize> {
+    raw.and_then(|v| q38_prefill_chunk_tokens(Some(v)))
+        .filter(|&chunk| prompt_tokens > chunk)
+}
+
 pub const A_PADDED_LANE_IS_CLOBBERED_AND_MUST_REPREFILL_BEFORE_REUSE_BECAUSE_THE_FLAT_FP8_CACHE_AND_GDN_STATE_ARE_BOUND_BY_POINTER_NOT_BY_TABLE:
     () = ();
 
-pub fn rowwise_group_env_nv_q38_batch_rowwise_per_row_m1_twins_set_ffn_for_bit_exactness_because_the_nvfp4_mlp_m_row_route_is_the_sole_non_twin(g: &str) -> bool {
+pub fn rowwise_group_env_nv_q38_batch_rowwise_per_row_m1_twins_set_ffn_for_bit_exactness_because_the_nvfp4_mlp_m_row_route_is_the_sole_non_twin(
+    g: &str,
+) -> bool {
     std::env::var("NV_Q38_BATCH_ROWWISE")
         .map(|v| v.split(',').any(|t| t.trim() == g || t.trim() == "all"))
         .unwrap_or(false)
@@ -152,7 +162,9 @@ pub const Q38_BATCH_BOOT_HEADROOM_MIN_FREE_BYTES_512MB_BECAUSE_16_LANES_OF_8K_KV
 
 pub fn batch_gemm_fp8lt_subarm_default_on_kill_nv_q38_batch_gemm_fp8lt_0_it_rowquants_activations_to_e4m3_unlike_the_bf16_exact_mk_gemv(
 ) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_BATCH_GEMM_FP8LT")
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_Q38_BATCH_GEMM_FP8LT",
+    )
 }
 
 pub const LANE_CONCURRENT_ATTN_AND_GDN_ARE_BIT_IDENTICAL_TO_THE_SERIAL_LOOP_ONLY_THE_MROW_AB_GEMM_AND_FP8_LT_ROUTES_CHANGE_NUMERIC_ROUTE:
@@ -167,7 +179,8 @@ pub const B1_SOLO_TRUNK_TAKES_A_STABLE_ZERO_POSITIONS_TENSOR_AND_A_CAPTURE_TIME_
 pub const A_LAYER_WHOSE_ROTARY_GEOMETRY_MISSES_THE_M1_FUSED_GATE_WOULD_FALL_BACK_TO_THE_POSITIONS_TENSOR_AND_A_CAPTURED_GRAPH_WOULD_THEN_REPLAY_A_FROZEN_POSITION_SO_THE_ARM_REFUSES_INSTEAD_OF_ENGAGING_PARTIALLY:
     () = ();
 
-pub const THE_B1_SOLO_TRUNK_REFUSES_UNDER_ANY_NV_Q38_BATCH_ROWWISE_PIN_FOR_A_REASON_AND_A_DEFECT: &str =
+pub const THE_B1_SOLO_TRUNK_REFUSES_UNDER_ANY_NV_Q38_BATCH_ROWWISE_PIN_FOR_A_REASON_AND_A_DEFECT:
+    &str =
     "the reason: a rowwise pin exists to make the group a per-row m=1 TWIN of the eager solo \
      body, and routing b=1 through a second, different m=1 route defeats exactly what the pin \
      is asserting. the defect: with NV_Q38_BATCH_ROWWISE=all and this arm on, a process that \
@@ -296,7 +309,7 @@ impl Qwen38BatchLanes {
         let cfg = model.config();
         let hd = cfg.head_dim;
         anyhow::ensure!(
-            hd % 32 == 0 && hd <= 1024 && model.rope.cos().dtype() == DType::F32,
+            hd.is_multiple_of(32) && hd <= 1024 && model.rope.cos().dtype() == DType::F32,
             "Qwen38BatchLanes: fused qkv decode geometry contract broken (head_dim {hd})"
         );
         for (li, layer) in model.layers.iter().enumerate() {
@@ -333,8 +346,7 @@ impl Qwen38BatchLanes {
         nv_quant::nvfp4::ensure_workspace_for_stream(&stream)?;
         let _ = nv_quant::matmul::TensorCoreGemm::new(stream.clone())?;
 
-        let mut ctor_guard =
-            crate::gemma4_batch_graph::graph_teardown::CtorForkGuard::new();
+        let mut ctor_guard = crate::gemma4_batch_graph::graph_teardown::CtorForkGuard::new();
         let mut lane_streams = vec![stream.clone()];
         for _ in 1..b_max {
             lane_streams.push(
@@ -416,7 +428,9 @@ impl Qwen38BatchLanes {
     ) -> Result<()> {
         if !self.capture_supported
             || nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_OFF")
-            || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_BATCH_BOOT_WARM")
+            || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+                "NV_Q38_BATCH_BOOT_WARM",
+            )
         {
             return Ok(());
         }
@@ -476,7 +490,10 @@ impl Qwen38BatchLanes {
     }
 
     pub fn reset_lane(&mut self, lane: usize) -> Result<()> {
-        anyhow::ensure!(lane < self.caches.len(), "reset_lane: lane {lane} out of range");
+        anyhow::ensure!(
+            lane < self.caches.len(),
+            "reset_lane: lane {lane} out of range"
+        );
         self.invalidate_graphs_synced_because_eager_work_after_capture_faults_like_the_solo_engines_prefill()?;
         self.caches[lane].reset();
         self.lane_pos[lane] = 0;
@@ -560,7 +577,10 @@ impl Qwen38BatchLanes {
         prompt: &[u32],
     ) -> Result<Tensor> {
         anyhow::ensure!(!prompt.is_empty(), "prefill_lane: empty prompt");
-        anyhow::ensure!(lane < self.caches.len(), "prefill_lane: lane {lane} out of range");
+        anyhow::ensure!(
+            lane < self.caches.len(),
+            "prefill_lane: lane {lane} out of range"
+        );
         self.invalidate_graphs_synced_because_eager_work_after_capture_faults_like_the_solo_engines_prefill()?;
         self.reset_lane(lane)?;
         let seq = prompt.len();
@@ -569,16 +589,33 @@ impl Qwen38BatchLanes {
             "prefill_lane: {seq} tokens leave no decode slot in max_seq_len {}",
             self.caches[lane].max_seq_len()
         );
-        let tokens = Tensor::from_vec(prompt.to_vec(), (1usize, seq), &self.device)?;
-        let positions_v: Vec<i32> = (0..seq as i32).collect();
-        let positions = Tensor::from_vec(positions_v, seq, &self.device)?;
-        let logits = self.model.forward_with_cache_dispatched_rows(
-            &tokens,
-            &positions,
-            &mut self.caches[lane],
-            None,
-            Some(1),
-        )?;
+        let chunk_raw = std::env::var(NV_Q38_PREFILL_CHUNK_ENV_DEFAULT_4096_SET_0_FOR_THE_ONE_SHOT_FORWARD_WHOSE_TRANSIENTS_MEASURED_0_21_MIB_PER_TOKEN).ok();
+        nv_layers::linear::nvfp4_cfx_set_prefill_total_tokens_hint(seq);
+        let logits = match batch_prefill_chunk_tokens_explicit_setting_preserves_unset_one_shot(
+            chunk_raw.as_deref(),
+            seq,
+        ) {
+            Some(chunk) => self
+                .model
+                .prefill_chunks_dispatched_serving_last_row_logits_bounding_transients_to_one_chunk(
+                    prompt,
+                    chunk,
+                    &mut self.caches[lane],
+                    None,
+                )?,
+            None => {
+                let tokens = Tensor::from_vec(prompt.to_vec(), (1usize, seq), &self.device)?;
+                let positions_v: Vec<i32> = (0..seq as i32).collect();
+                let positions = Tensor::from_vec(positions_v, seq, &self.device)?;
+                self.model.forward_with_cache_dispatched_rows(
+                    &tokens,
+                    &positions,
+                    &mut self.caches[lane],
+                    None,
+                    Some(1),
+                )?
+            }
+        };
         self.lane_pos[lane] = seq;
         let (_b, s, _v) = logits.dims3()?;
         Ok(logits
@@ -593,7 +630,10 @@ impl Qwen38BatchLanes {
         k_chunk: &Tensor,
         v_chunk: &Tensor,
     ) -> Result<()> {
-        anyhow::ensure!(lane < self.caches.len(), "prime_lane: lane {lane} out of range");
+        anyhow::ensure!(
+            lane < self.caches.len(),
+            "prime_lane: lane {lane} out of range"
+        );
         let t = k_chunk.dims().get(1).copied().unwrap_or(0);
         let pos = self.lane_pos[lane];
         anyhow::ensure!(
@@ -630,9 +670,18 @@ impl Qwen38BatchLanes {
         );
         let mut seen = std::collections::HashSet::new();
         for &(lane, prompt) in joins {
-            anyhow::ensure!(lane < self.caches.len(), "packed prefill: lane {lane} out of range");
-            anyhow::ensure!(seen.insert(lane), "packed prefill: lane {lane} joined twice");
-            anyhow::ensure!(!prompt.is_empty(), "packed prefill: empty prompt on lane {lane}");
+            anyhow::ensure!(
+                lane < self.caches.len(),
+                "packed prefill: lane {lane} out of range"
+            );
+            anyhow::ensure!(
+                seen.insert(lane),
+                "packed prefill: lane {lane} joined twice"
+            );
+            anyhow::ensure!(
+                !prompt.is_empty(),
+                "packed prefill: empty prompt on lane {lane}"
+            );
             anyhow::ensure!(
                 prompt.len() < self.caches[lane].max_seq_len(),
                 "packed prefill: {} tokens leave no decode slot in max_seq_len {}",
@@ -701,11 +750,12 @@ impl Qwen38BatchLanes {
                             )?
                         }
                         LayerMixer::Linear(la) => {
-                            let slot = caches[lane].lin_attn_slot_for_layer(li).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "packed prefill: layer {li} has no linear-attention slot"
-                                )
-                            })?;
+                            let slot =
+                                caches[lane].lin_attn_slot_for_layer(li).ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "packed prefill: layer {li} has no linear-attention slot"
+                                    )
+                                })?;
                             caches[lane].lin_attn_step(slot, la, &seg)?
                         }
                     };
@@ -871,12 +921,15 @@ impl Qwen38BatchLanes {
             .map(|i| i + 1)
             .unwrap();
         let b_bucket = self.plan.bucket_for(need).ok_or_else(|| {
-            anyhow::anyhow!("step_batch: {need} lanes exceed max bucket {}", self.plan.max_bucket())
+            anyhow::anyhow!(
+                "step_batch: {need} lanes exceed max bucket {}",
+                self.plan.max_bucket()
+            )
         })?;
         for (i, t) in tokens.iter().enumerate() {
             if t.is_some() {
                 anyhow::ensure!(
-                    self.lane_pos[i] + 1 <= self.caches[i].max_seq_len(),
+                    self.lane_pos[i] < self.caches[i].max_seq_len(),
                     "step_batch: lane {i} cache full at {}",
                     self.lane_pos[i]
                 );
@@ -1059,9 +1112,7 @@ impl Qwen38BatchLanes {
         if need_capture {
             if let Err(e) = self.runner.probe_capture() {
                 self.capture_failed = true;
-                eprintln!(
-                    "[qwen38_batch] graph capture unavailable; batching uncaptured: {e:#}"
-                );
+                eprintln!("[qwen38_batch] graph capture unavailable; batching uncaptured: {e:#}");
                 self.step_batch_eager(b_bucket)?;
                 return Ok(false);
             }
@@ -1247,6 +1298,7 @@ fn batch_step_body_inner(
     b: usize,
     lane_streams: &[Arc<CudaStream>],
 ) -> Result<()> {
+    let _batch_e4m3_group_scope = nv_layers::linear::Qwen38BatchE4m3GroupScopeGuard::enter(b);
     let dev = match &model.device {
         Device::Cuda(d) => d.clone(),
         _ => anyhow::bail!("cuda device required"),
@@ -1274,10 +1326,11 @@ fn batch_step_body_inner(
         )
     };
 
-    let mut prof: BatchProf =
-        nv_layers::linear_attn::gdn_step_prof::SyncLaps::begin_if_armed(&dev);
+    let mut prof: BatchProf = nv_layers::linear_attn::gdn_step_prof::SyncLaps::begin_if_armed(&dev);
 
-    let gemm_arm = batch_gemm_env_opt_in_nv_q38_batch_gemm_1_lane_concurrent_attn_gdn_mrow_ab_and_fp8_lt_arms();
+    let gemm_arm =
+        batch_gemm_env_opt_in_nv_q38_batch_gemm_1_lane_concurrent_attn_gdn_mrow_ab_and_fp8_lt_arms(
+        );
     let lanes_conc: Option<&[Arc<CudaStream>]> = if gemm_arm && b > 1 && lane_streams.len() >= b {
         Some(&lane_streams[..b])
     } else {
@@ -1395,9 +1448,7 @@ fn batch_step_body_inner(
             LayerMixer::Full(attn) => {
                 batch_full_attention(model, attn, li, &normed, caches, b, &mut prof, lanes_conc)?
             }
-            LayerMixer::Linear(la) => {
-                batch_gdn(la, li, &normed, caches, b, &mut prof, lanes_conc)?
-            }
+            LayerMixer::Linear(la) => batch_gdn(la, li, &normed, caches, b, &mut prof, lanes_conc)?,
         };
         let (normed_post, residual_after_attn) =
             norm_residual_rows(&layer.post_norm, &mixed, &residual)?;
@@ -1659,9 +1710,7 @@ fn batch_full_attention_lanes_concurrent(
                     scaling,
                     lanes_for_the_attention_split_pick,
                 )?;
-            let copy_into = |src: &Tensor,
-                                 dst: &mut CudaSlice<bf16>|
-             -> Result<()> {
+            let copy_into = |src: &Tensor, dst: &mut CudaSlice<bf16>| -> Result<()> {
                 let c = src.contiguous()?;
                 let (st, l) = c.storage_and_layout();
                 let cu = match &*st {
@@ -1744,9 +1793,9 @@ fn batch_gdn(
         return one_zeroing_node_where_a_stages_launches_were(normed, normed.dims3()?);
     }
     let slot_of = |cache: &Qwen3MoeKvCache| -> Result<usize> {
-        cache.lin_attn_slot_for_layer(li).ok_or_else(|| {
-            anyhow::anyhow!("batch_gdn: layer {li} has no linear-attention slot")
-        })
+        cache
+            .lin_attn_slot_for_layer(li)
+            .ok_or_else(|| anyhow::anyhow!("batch_gdn: layer {li} has no linear-attention slot"))
     };
     let rowwise =
         rowwise_group_env_nv_q38_batch_rowwise_per_row_m1_twins_set_ffn_for_bit_exactness_because_the_nvfp4_mlp_m_row_route_is_the_sole_non_twin("gdnproj")
@@ -1789,4 +1838,35 @@ fn batch_gdn(
     let refs: Vec<&Tensor> = rows.iter().collect();
     lap(prof, "b.gdn.rowwise_lanes");
     Ok(Tensor::cat(&refs, 1)?)
+}
+
+#[cfg(test)]
+mod batch_prefill_chunk_policy_tests {
+    use super::batch_prefill_chunk_tokens_explicit_setting_preserves_unset_one_shot as chunk;
+
+    #[test]
+    fn unset_disabled_or_invalid_setting_keeps_the_existing_one_shot_route() {
+        for raw in [
+            None,
+            Some("0"),
+            Some(""),
+            Some(" "),
+            Some("bad"),
+            Some("-1"),
+        ] {
+            assert_eq!(chunk(raw, 168000), None, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_positive_chunk_only_changes_prompts_crossing_its_boundary() {
+        for tokens in [0, 1, 4095, 4096] {
+            assert_eq!(chunk(Some("4096"), tokens), None);
+        }
+        for tokens in [4097, 8192, 168000] {
+            assert_eq!(chunk(Some("4096"), tokens), Some(4096));
+        }
+        assert_eq!(chunk(Some(" 1 "), 2), Some(1));
+        assert_eq!(chunk(Some("168000"), 168000), None);
+    }
 }

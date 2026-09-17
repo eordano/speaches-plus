@@ -110,6 +110,36 @@ impl DotsOcrMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DotsTierHint {
+    #[default]
+    Auto,
+    Off,
+    Force,
+    Screen,
+}
+
+impl DotsTierHint {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" | "" => Some(DotsTierHint::Auto),
+            "off" | "0" => Some(DotsTierHint::Off),
+            "force" | "1" => Some(DotsTierHint::Force),
+            "screen" => Some(DotsTierHint::Screen),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DotsTierHint::Auto => "auto",
+            DotsTierHint::Off => "off",
+            DotsTierHint::Force => "force",
+            DotsTierHint::Screen => "screen",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "ts-bindings",
@@ -163,6 +193,17 @@ pub trait DotsOcrModel: Send + Sync {
     ) -> Result<DotsPageResult, Error> {
         let _ = max_new_override;
         self.recognize_layout(image_bytes, mode)
+    }
+
+    fn recognize_layout_hinted(
+        &self,
+        image_bytes: &[u8],
+        mode: DotsOcrMode,
+        max_new_override: Option<usize>,
+        tier_hint: DotsTierHint,
+    ) -> Result<DotsPageResult, Error> {
+        let _ = tier_hint;
+        self.recognize_layout_budgeted(image_bytes, mode, max_new_override)
     }
 
     fn reload_adapter(&self, adapter_dir: Option<&std::path::Path>) -> Result<bool, Error> {
@@ -414,6 +455,21 @@ impl OcrEngine {
         match &self.inner {
             EngineInner::DotsOcr(model) => {
                 model.recognize_layout_budgeted(image_bytes, mode, max_new_override)
+            }
+            _ => self.recognize_dots_layout(image_bytes, mode),
+        }
+    }
+
+    pub fn recognize_dots_layout_hinted(
+        &self,
+        image_bytes: &[u8],
+        mode: DotsOcrMode,
+        max_new_override: Option<usize>,
+        tier_hint: DotsTierHint,
+    ) -> Result<DotsPageResult, Error> {
+        match &self.inner {
+            EngineInner::DotsOcr(model) => {
+                model.recognize_layout_hinted(image_bytes, mode, max_new_override, tier_hint)
             }
             _ => self.recognize_dots_layout(image_bytes, mode),
         }

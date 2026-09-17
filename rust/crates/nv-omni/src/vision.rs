@@ -8,7 +8,7 @@ use nv_layers::linear::Linear;
 use crate::qwen3_vision::Qwen3VisionConfig;
 
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 const ROPE_THETA_VISION: f32 = 10_000.0;
 const SMART_RESIZE_MIN_PIXELS: usize = 3136;
 const SMART_RESIZE_MAX_PIXELS: usize = 12_845_056;
@@ -69,7 +69,9 @@ impl VisionBlock {
         let x = (x + self.proj.forward(&attn)?).map_err(|e| anyhow::anyhow!(e))?;
 
         let normed = self.norm2.forward(&x)?;
-        let ff = self.fc2.forward(&gelu_pytorch_tanh(&self.fc1.forward(&normed)?)?)?;
+        let ff = self
+            .fc2
+            .forward(&gelu_pytorch_tanh(&self.fc1.forward(&normed)?)?)?;
         (x + ff).map_err(|e| anyhow::anyhow!(e))
     }
 }
@@ -113,7 +115,7 @@ impl Merger {
         };
         let y = self.mlp0.forward(&hidden)?;
         let y = y.gelu_erf()?;
-        Ok(self.mlp2.forward(&y)?)
+        self.mlp2.forward(&y)
     }
 }
 
@@ -131,9 +133,17 @@ pub struct OmniVisionEncoder {
 }
 
 impl OmniVisionEncoder {
-    pub fn new(cfg: Qwen3VisionConfig, deepstack_indexes: Vec<usize>, device: &Device) -> Result<Self> {
+    pub fn new(
+        cfg: Qwen3VisionConfig,
+        deepstack_indexes: Vec<usize>,
+        device: &Device,
+    ) -> Result<Self> {
         if !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
-            anyhow::bail!("vision hidden {} not divisible by heads {}", cfg.hidden_size, cfg.num_heads);
+            anyhow::bail!(
+                "vision hidden {} not divisible by heads {}",
+                cfg.hidden_size,
+                cfg.num_heads
+            );
         }
         let dtype = cfg.dtype;
         let c = cfg.in_channels;
@@ -159,7 +169,11 @@ impl OmniVisionEncoder {
                 Tensor::zeros((cfg.hidden_size, patch_in), dtype, device)?,
                 Some(Tensor::zeros(cfg.hidden_size, dtype, device)?),
             )?,
-            pos_embed: Tensor::zeros((cfg.num_position_embeddings, cfg.hidden_size), dtype, device)?,
+            pos_embed: Tensor::zeros(
+                (cfg.num_position_embeddings, cfg.hidden_size),
+                dtype,
+                device,
+            )?,
             rot_inv_freq,
             blocks,
             merger: Merger::new(&cfg, false, device)?,
@@ -180,24 +194,43 @@ impl OmniVisionEncoder {
             .and_then(|t| t.get("vision_config"))
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("config.json: missing thinker_config.vision_config"))?;
-        if vc.get("num_position_embeddings").and_then(|x| x.as_u64()).is_none() {
+        if vc
+            .get("num_position_embeddings")
+            .and_then(|x| x.as_u64())
+            .is_none()
+        {
             let image_size = vc
                 .get("image_size")
                 .and_then(|x| x.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("vision_config: no num_position_embeddings and no image_size to derive it"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "vision_config: no num_position_embeddings and no image_size to derive it"
+                    )
+                })?;
             let patch_size = vc
                 .get("patch_size")
                 .and_then(|x| x.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("vision_config: no num_position_embeddings and no patch_size to derive it"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "vision_config: no num_position_embeddings and no patch_size to derive it"
+                    )
+                })?;
             let side = image_size / patch_size;
             vc.as_object_mut()
                 .expect("vision_config is an object")
-                .insert("num_position_embeddings".to_string(), serde_json::json!(side * side));
+                .insert(
+                    "num_position_embeddings".to_string(),
+                    serde_json::json!(side * side),
+                );
         }
         let deepstack: Vec<usize> = vc
             .get("deepstack_visual_indexes")
             .and_then(|d| d.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_u64().map(|v| v as usize))
+                    .collect()
+            })
             .unwrap_or_else(|| vec![8, 16, 24]);
         let cfg = Qwen3VisionConfig::from_hf_value(&vc)?;
         Self::new(cfg, deepstack, device)
@@ -211,7 +244,13 @@ impl OmniVisionEncoder {
     }
 
     pub fn smart_resize(&self, height: usize, width: usize) -> (usize, usize) {
-        smart_resize(height, width, 32, SMART_RESIZE_MIN_PIXELS, SMART_RESIZE_MAX_PIXELS)
+        smart_resize(
+            height,
+            width,
+            32,
+            SMART_RESIZE_MIN_PIXELS,
+            SMART_RESIZE_MAX_PIXELS,
+        )
     }
 
     pub fn patchify_rgb(
@@ -225,14 +264,20 @@ impl OmniVisionEncoder {
         let m = self.cfg.spatial_merge_size;
         let c = self.cfg.in_channels;
         let tp = self.cfg.temporal_patch_size;
-        if width % (p * m) != 0 || height % (p * m) != 0 {
+        if !width.is_multiple_of(p * m) || !height.is_multiple_of(p * m) {
             anyhow::bail!(
                 "patchify_rgb: {width}x{height} must be multiples of patch*merge={}",
                 p * m
             );
         }
         if rgb.len() != width * height * c {
-            anyhow::bail!("patchify_rgb: rgb len {} != {}*{}*{}", rgb.len(), width, height, c);
+            anyhow::bail!(
+                "patchify_rgb: rgb len {} != {}*{}*{}",
+                rgb.len(),
+                width,
+                height,
+                c
+            );
         }
         let gh = height / p;
         let gw = width / p;
@@ -270,7 +315,11 @@ impl OmniVisionEncoder {
         Ok((t, (1, gh, gw)))
     }
 
-    pub fn forward(&self, patches: &Tensor, grid: (usize, usize, usize)) -> Result<(Tensor, Vec<Tensor>)> {
+    pub fn forward(
+        &self,
+        patches: &Tensor,
+        grid: (usize, usize, usize),
+    ) -> Result<(Tensor, Vec<Tensor>)> {
         let (t, gh, gw) = grid;
         let (seq, _feat) = patches.dims2().map_err(|e| anyhow::anyhow!(e))?;
         if seq != t * gh * gw {
@@ -305,14 +354,16 @@ impl OmniVisionEncoder {
             if n <= 1 {
                 vec![0.0; n]
             } else {
-                (0..n).map(|i| i as f32 * (side as f32 - 1.0) / (n as f32 - 1.0)).collect()
+                (0..n)
+                    .map(|i| i as f32 * (side as f32 - 1.0) / (n as f32 - 1.0))
+                    .collect()
             }
         };
         let h_grid = lin(gh);
         let w_grid = lin(gw);
 
-        let mut idx: Vec<Vec<u32>> = vec![Vec::with_capacity(seq); 4];
-        let mut wgt: Vec<Vec<f32>> = vec![Vec::with_capacity(seq); 4];
+        let mut idx: Vec<Vec<u32>> = (0..4).map(|_| Vec::with_capacity(seq)).collect();
+        let mut wgt: Vec<Vec<f32>> = (0..4).map(|_| Vec::with_capacity(seq)).collect();
         for _t in 0..t {
             for hb in 0..gh / m {
                 for wb in 0..gw / m {
@@ -405,7 +456,11 @@ impl OmniVisionEncoder {
             .get("thinker.visual.patch_embed.proj.weight", dtype)
             .context("load patch_embed.proj.weight")?;
         if pw.elem_count() != h * patch_in {
-            anyhow::bail!("patch_embed.proj.weight has {} elems, expected {}", pw.elem_count(), h * patch_in);
+            anyhow::bail!(
+                "patch_embed.proj.weight has {} elems, expected {}",
+                pw.elem_count(),
+                h * patch_in
+            );
         }
         let pw = pw.reshape((h, patch_in))?;
         let pb = load_1d(weights, "thinker.visual.patch_embed.proj.bias", h, dtype)?;
@@ -415,8 +470,20 @@ impl OmniVisionEncoder {
 
         for (i, block) in self.blocks.iter_mut().enumerate() {
             let bp = format!("thinker.visual.blocks.{i}");
-            block.norm1 = load_ln(weights, &format!("{bp}.norm1"), h, dtype, self.cfg.layer_norm_eps)?;
-            block.norm2 = load_ln(weights, &format!("{bp}.norm2"), h, dtype, self.cfg.layer_norm_eps)?;
+            block.norm1 = load_ln(
+                weights,
+                &format!("{bp}.norm1"),
+                h,
+                dtype,
+                self.cfg.layer_norm_eps,
+            )?;
+            block.norm2 = load_ln(
+                weights,
+                &format!("{bp}.norm2"),
+                h,
+                dtype,
+                self.cfg.layer_norm_eps,
+            )?;
             block.qkv = load_lin_bias(weights, &format!("{bp}.attn.qkv"), 3 * h, h, dtype)?;
             block.proj = load_lin_bias(weights, &format!("{bp}.attn.proj"), h, h, dtype)?;
             block.fc1 = load_lin_bias(weights, &format!("{bp}.mlp.linear_fc1"), inter, h, dtype)?;
@@ -425,8 +492,15 @@ impl OmniVisionEncoder {
         }
 
         self.merger.ln_q = load_ln(weights, "thinker.visual.merger.ln_q", h, dtype, 1e-6)?;
-        self.merger.mlp0 = load_lin_bias(weights, "thinker.visual.merger.mlp.0", merged, merged, dtype)?;
-        self.merger.mlp2 = load_lin_bias(weights, "thinker.visual.merger.mlp.2", out, merged, dtype)?;
+        self.merger.mlp0 = load_lin_bias(
+            weights,
+            "thinker.visual.merger.mlp.0",
+            merged,
+            merged,
+            dtype,
+        )?;
+        self.merger.mlp2 =
+            load_lin_bias(weights, "thinker.visual.merger.mlp.2", out, merged, dtype)?;
         count += 6;
 
         for (k, mg) in self.merger_list.iter_mut().enumerate() {
@@ -478,7 +552,9 @@ fn rotate(x: &Tensor, cos: &Tensor, sin: &Tensor, half: usize) -> Result<Tensor>
     let head_dim = *dims.last().unwrap();
     let n_heads = dims[dims.len() - 2];
     let tokens: usize = dims[..dims.len() - 2].iter().product();
-    let xf = x.to_dtype(DType::F32)?.reshape((tokens, n_heads, head_dim))?;
+    let xf = x
+        .to_dtype(DType::F32)?
+        .reshape((tokens, n_heads, head_dim))?;
     let cos = cos.unsqueeze(1)?;
     let sin = sin.unsqueeze(1)?;
     let lo = xf.narrow(2, 0, half)?;
@@ -515,8 +591,15 @@ fn lin_bias_zeros(out_f: usize, in_f: usize, dtype: DType, device: &Device) -> R
     )
 }
 
-fn load_1d(weights: &nv_weights::WeightLoader, name: &str, dim: usize, dtype: DType) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+fn load_1d(
+    weights: &nv_weights::WeightLoader,
+    name: &str,
+    dim: usize,
+    dtype: DType,
+) -> Result<Tensor> {
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 1 || d[0] != dim {
         anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
@@ -524,8 +607,15 @@ fn load_1d(weights: &nv_weights::WeightLoader, name: &str, dim: usize, dtype: DT
     Ok(w)
 }
 
-fn load_2d(weights: &nv_weights::WeightLoader, name: &str, shape: (usize, usize), dtype: DType) -> Result<Tensor> {
-    let w = weights.get(name, dtype).with_context(|| format!("load {name}"))?;
+fn load_2d(
+    weights: &nv_weights::WeightLoader,
+    name: &str,
+    shape: (usize, usize),
+    dtype: DType,
+) -> Result<Tensor> {
+    let w = weights
+        .get(name, dtype)
+        .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
         anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
@@ -580,7 +670,13 @@ mod tests {
 
     #[test]
     fn smart_resize_multiple_of_factor() {
-        let (h, w) = smart_resize(100, 200, 32, SMART_RESIZE_MIN_PIXELS, SMART_RESIZE_MAX_PIXELS);
+        let (h, w) = smart_resize(
+            100,
+            200,
+            32,
+            SMART_RESIZE_MIN_PIXELS,
+            SMART_RESIZE_MAX_PIXELS,
+        );
         assert_eq!(h % 32, 0);
         assert_eq!(w % 32, 0);
         assert!(h * w >= SMART_RESIZE_MIN_PIXELS);

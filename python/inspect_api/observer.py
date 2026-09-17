@@ -4,6 +4,8 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 from realtime.observer import SessionObserver
 
 from . import registry
@@ -14,6 +16,14 @@ from .retention import session_dir
 log = logging.getLogger(__name__)
 
 _UNSET = object()
+
+def _audio_sequence(samples: Any):
+    if isinstance(samples, np.ndarray):
+        return samples if samples.size else None
+    seq = samples if isinstance(samples, (list, bytes, bytearray)) else list(samples)
+    if isinstance(seq, list) and not seq:
+        return None
+    return seq
 
 class InspectObserver:
     def __init__(self, sid: str = "") -> None:
@@ -133,8 +143,8 @@ class InspectObserver:
         if store is None:
             return
         try:
-            seq = samples if isinstance(samples, (list, bytes, bytearray)) else list(samples)
-            if isinstance(seq, list) and not seq:
+            seq = _audio_sequence(samples)
+            if seq is None:
                 return
             store.append_mic_in_f32(seq)
         except Exception as err:
@@ -145,8 +155,8 @@ class InspectObserver:
         if store is None:
             return
         try:
-            seq = samples if isinstance(samples, (list, bytes, bytearray)) else list(samples)
-            if isinstance(seq, list) and not seq:
+            seq = _audio_sequence(samples)
+            if seq is None:
                 return
             store.append_tts_out_f32(seq)
         except Exception as err:

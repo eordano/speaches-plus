@@ -1,0 +1,229 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>q38 N-layer browser splice</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background:#111; color:#ddd; margin:1.5em; }
+  pre { white-space: pre-wrap; word-break: break-all; background:#181818; padding:0.8em; border:1px solid #333; }
+  #status { color:#fc6; }
+</style>
+<h1>q38 N-layer browser splice (first-N layers, real W4, kv 4096)</h1>
+<div id="status">running...</div>
+<pre id="report"></pre>
+<script type="module">
+'use strict';
+const out = [];
+const J = { started: new Date().toISOString(), ua: navigator.userAgent };
+function log(s) {
+  out.push(s);
+  document.getElementById('report').textContent = out.join('\n');
+  console.log('Q38S|' + s);
+}
+function finish(tag) {
+  if (J.done) return;
+  J.done = tag;
+  J.finished = new Date().toISOString();
+  J.mem_device = snapMem();
+  const c = JSON.stringify(J);
+  document.getElementById('status').textContent = 'DONE (' + tag + ')';
+  fetch('/q38-result-splice-n' + nLayers + '.json', { method: 'PUT', body: c })
+    .catch(() => {})
+    .finally(() => {
+      console.log('Q38S_DONE');
+      document.title = 'Q38S_DONE';
+    });
+}
+window.addEventListener('error', e => { J.page_error = String(e.message); finish('page-error'); });
+window.addEventListener('unhandledrejection', e => {
+  J.page_error = String(e.reason && e.reason.stack || e.reason);
+  finish('page-error');
+});
+
+const nLayers = Number(new URLSearchParams(location.search).get('n') || '8');
+J.n_layers = nLayers;
+const sliceDir = './slice-n' + nLayers;
+
+const mem = { created: 0, freed: 0, live: 0, peak: 0, count: 0, live_count: 0, by_usage: {} };
+function snapMem() {
+  return {
+    created_bytes: mem.created, freed_bytes: mem.freed, live_bytes: mem.live,
+    peak_live_bytes: mem.peak, buffers_created: mem.count, buffers_live: mem.live_count,
+    by_usage_live: Object.assign({}, mem.by_usage),
+    wasm_memory_bytes: wasmMemory ? wasmMemory.buffer.byteLength : null,
+  };
+}
+const origCreate = GPUDevice.prototype.createBuffer;
+GPUDevice.prototype.createBuffer = function (desc) {
+  const buf = origCreate.call(this, desc);
+  const size = Number(desc.size) || 0;
+  mem.created += size; mem.live += size; mem.count++; mem.live_count++;
+  if (mem.live > mem.peak) mem.peak = mem.live;
+  const key = '0x' + (Number(desc.usage) >>> 0).toString(16);
+  mem.by_usage[key] = (mem.by_usage[key] || 0) + size;
+  const origDestroy = buf.destroy.bind(buf);
+  buf.destroy = () => {
+    mem.freed += size; mem.live -= size; mem.live_count--;
+    mem.by_usage[key] -= size;
+    return origDestroy();
+  };
+  return buf;
+};
+
+let wasmMemory = null;
+
+async function main() {
+  const wasmUrl = './web/nv_ocr_web_bg.wasm';
+  const head = await fetch(wasmUrl, { method: 'HEAD' });
+  J.wasm_bytes = Number(head.headers.get('content-length'));
+  const mod = await import('./web/nv_ocr_web.js');
+  const inited = await mod.default({ module_or_path: wasmUrl });
+  wasmMemory = inited.memory;
+  mod.q38_install_panic_hook();
+  log('wasm module: ' + J.wasm_bytes + ' bytes; n=' + nLayers);
+
+  const ref = await (await fetch(sliceDir + '/ref-splice.json')).json();
+  if (ref.n_layers !== nLayers) throw new Error('ref n_layers ' + ref.n_layers + ' != ' + nLayers);
+  J.ref = { slice_bytes: ref.slice_bytes, shards: (ref.shards || []).length, kv_span: ref.kv_span };
+
+  mod.q38_weights_clear();
+  const t0 = performance.now();
+  let staged = 0;
+  const names = ['config.json'].concat(ref.shards || []);
+  try {
+    for (const name of names) {
+      const resp = await fetch(sliceDir + '/' + name);
+      if (!resp.ok) throw new Error('fetch ' + name + ': ' + resp.status);
+      const len = Number(resp.headers.get('content-length') || 0);
+      if (len > 0) mod.q38_weights_reserve(name, len);
+      const reader = resp.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        mod.q38_weights_push(name, value);
+        staged += value.length;
+      }
+      J.staged_bytes = staged;
+      J.wasm_memory_after_stage = wasmMemory.buffer.byteLength;
+      log('staged ' + name + ' (total ' + staged + ' B, wasm mem ' + wasmMemory.buffer.byteLength + ' B)');
+    }
+  } catch (e) {
+    J.stage_error = String(e && e.stack || e);
+    J.verdict = 'STAGE-WALL: shard staging failed at ' + staged + ' of ' + ref.slice_bytes +
+      ' bytes with wasm memory at ' + (wasmMemory ? wasmMemory.buffer.byteLength : -1) + ' bytes';
+    log(J.verdict + '\n' + J.stage_error.slice(0, 600));
+    finish('stage-wall');
+    return;
+  }
+  J.shard_load_ms = performance.now() - t0;
+  log('staged ' + staged + ' bytes in ' + J.shard_load_ms.toFixed(0) + ' ms');
+
+  const opts = JSON.stringify({
+    prompt_len: ref.prompt.length,
+    steps: ref.steps,
+    kv_span: ref.kv_span,
+  });
+  const tb = performance.now();
+  const boot = JSON.parse(await mod.q38_parity_boot(opts));
+  J.boot_ms = performance.now() - tb;
+  J.caps_summary = boot.caps_summary;
+  J.mem_after_boot = snapMem();
+  log('boot ' + J.boot_ms.toFixed(0) + ' ms; caps: ' + boot.caps_summary);
+  log('device after boot: live=' + J.mem_after_boot.live_bytes + ' peak=' + J.mem_after_boot.peak_live_bytes +
+      ' buffers=' + J.mem_after_boot.buffers_live + ' wasm=' + J.mem_after_boot.wasm_memory_bytes);
+
+  const tp = performance.now();
+  const first = await mod.q38_parity_prefill(new Uint32Array(ref.prompt));
+  J.prefill_ms = performance.now() - tp;
+  const tokens = [];
+  J.step_ms = [];
+  for (let i = 0; i < ref.steps; i++) {
+    const ts = performance.now();
+    tokens.push(i < ref.census_steps
+      ? await mod.q38_parity_step()
+      : await mod.q38_parity_step_quiet());
+    J.step_ms.push(performance.now() - ts);
+  }
+  J.first = first;
+  J.tokens = tokens;
+  const labels = JSON.parse(mod.q38_parity_labels());
+  const logits = mod.q38_logits_bin();
+  const quiet = J.step_ms.slice(ref.census_steps);
+  J.quiet_step_ms_mean = quiet.reduce((a, b) => a + b, 0) / quiet.length;
+  const sorted = quiet.slice().sort((a, b) => a - b);
+  J.quiet_step_ms_median = sorted[sorted.length >> 1];
+  J.tok_per_s = 1000 / J.quiet_step_ms_mean;
+  log('forward done: first=' + first + ' prefill=' + J.prefill_ms.toFixed(1) +
+      'ms quiet mean=' + J.quiet_step_ms_mean.toFixed(2) + 'ms median=' + J.quiet_step_ms_median.toFixed(2) +
+      'ms -> ' + J.tok_per_s.toFixed(1) + ' tok/s');
+
+  const refBin = new Uint8Array(await (await fetch(sliceDir + '/ref-splice-logits.bin')).arrayBuffer());
+  J.token_match = first === ref.first && tokens.length === ref.tokens.length &&
+    tokens.every((t, i) => t === ref.tokens[i]);
+  if (!J.token_match) {
+    J.tokens_native = ref.tokens;
+  }
+  J.labels_match = labels.length === ref.labels.length && labels.every((l, i) => l === ref.labels[i]);
+  if (!J.labels_match) {
+    J.labels_browser = labels;
+    J.labels_native = ref.labels;
+  }
+  J.logits_len_match = logits.length === refBin.length;
+  let nDiff = 0, firstDiff = -1, maxAbs = 0, maxUlp = 0;
+  const perStep = [];
+  if (J.logits_len_match) {
+    const a = new Uint32Array(logits.buffer, logits.byteOffset, logits.length >> 2);
+    const bCopy = refBin.slice();
+    const b = new Uint32Array(bCopy.buffer, 0, bCopy.length >> 2);
+    const af = new Float32Array(a.buffer, a.byteOffset, a.length);
+    const bf = new Float32Array(b.buffer, 0, b.length);
+    const vocab = ref.vocab;
+    const ord16 = w => { const h = w >>> 16; return (h & 0x8000) ? (0x8000 - (h & 0x7fff)) - 0x8000 : h; };
+    for (let s = 0; s < ref.census_steps; s++) {
+      let sn = 0, sMax = 0, sSum = 0, sBig = 0, sUlpLe4 = 0, sArgA = 0, sArgB = 0;
+      let sBf16Ulp1 = 0, sBf16UlpGt1 = 0, sBf16UlpMax = 0;
+      for (let k = 0; k < vocab; k++) {
+        const i = s * vocab + k;
+        if (af[i] > af[s * vocab + sArgA]) sArgA = k;
+        if (bf[i] > bf[s * vocab + sArgB]) sArgB = k;
+        if (a[i] !== b[i]) {
+          sn++; nDiff++;
+          if (firstDiff < 0) firstDiff = i;
+          const d = Math.abs(af[i] - bf[i]);
+          if (d > sMax) sMax = d;
+          if (d > maxAbs) maxAbs = d;
+          sSum += d;
+          if (d > 1e-2) sBig++;
+          const u = Math.abs((a[i] | 0) - (b[i] | 0));
+          if (u > maxUlp) maxUlp = u;
+          if (u <= 4 && (a[i] >>> 31) === (b[i] >>> 31)) sUlpLe4++;
+          const bu = Math.abs(ord16(a[i]) - ord16(b[i]));
+          if (bu === 1) sBf16Ulp1++; else if (bu > 1) sBf16UlpGt1++;
+          if (bu > sBf16UlpMax) sBf16UlpMax = bu;
+        }
+      }
+      perStep.push({
+        n_diff: sn, max_abs: sMax, mean_abs: sn ? sSum / sn : 0,
+        n_gt_1e2: sBig, n_ulp_le4: sUlpLe4,
+        n_bf16_ulp1: sBf16Ulp1, n_bf16_ulp_gt1: sBf16UlpGt1, bf16_ulp_max: sBf16UlpMax,
+        argmax_browser: sArgA, argmax_native: sArgB,
+      });
+    }
+  }
+  J.census = {
+    values: (logits.length >> 2), n_bit_diff: nDiff, first_diff_index: firstDiff,
+    max_abs_diff: maxAbs, max_ulp_diff: maxUlp, vocab: ref.vocab, census_steps: ref.census_steps,
+    per_step: perStep,
+  };
+  const bitEqual = J.logits_len_match && nDiff === 0;
+  const characterized = !bitEqual && J.token_match && J.labels_match && J.logits_len_match;
+  J.verdict = bitEqual && J.token_match && J.labels_match
+    ? 'BIT-EQUAL (logits, tokens, pass labels)'
+    : characterized
+      ? 'CHARACTERIZED-DRIFT (all ' + ref.steps + ' greedy tokens and pass labels bit-match; census-step logits drift within the census; mechanism: Tint/Dawn vs naga WGSL-to-MSL codegen under Metal fast-math)'
+      : 'DIVERGED';
+  log('parity: ' + J.verdict + ' census=' + JSON.stringify(J.census) +
+      ' token_match=' + J.token_match + ' labels_match=' + J.labels_match);
+  finish(bitEqual ? 'splice-bit-equal' : characterized ? 'splice-characterized' : 'splice-diverged');
+}
+
+main().catch(e => { J.error = String(e && e.stack || e); log('ERROR: ' + J.error); finish('error'); });
+</script>

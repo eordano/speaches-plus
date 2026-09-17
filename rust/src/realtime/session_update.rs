@@ -27,6 +27,7 @@ const SESSION_APPLIED_KEYS: &[&str] = &[
     "turn_detection",
     "session_max_duration_s",
     "voice",
+    "language",
     "speed",
     "input_audio_transcription",
     "min_speech_ms",
@@ -134,6 +135,7 @@ pub(super) struct StagedSessionUpdate {
     pub turn_detection: Option<StagedTurnDetection>,
     pub session_max_duration_s: Option<u64>,
     pub voice: Option<Option<String>>,
+    pub language: Option<Option<String>>,
     pub speed: Option<f32>,
     pub input_audio_transcription: Option<StagedInputAudioTranscription>,
     pub min_speech_ms: Option<u64>,
@@ -246,6 +248,24 @@ pub(super) fn parse_session_update(
         });
     }
 
+    if let Some(v) = session_obj.get("language") {
+        staged.language = Some(match v {
+            Value::String(s) => {
+                crate::tts::http::espeak_voice_for(s)
+                    .map_err(|message| ("session.language", message.to_string()))?;
+                Some(s.clone())
+            }
+            Value::Null => None,
+            _ => {
+                return Err((
+                    "session.language",
+                    "language: must be a string or null".into(),
+                )
+                    .into())
+            }
+        });
+    }
+
     if let Some(v) = session_obj.get("speed") {
         let f = v.as_f64().ok_or((
             "session.speed",
@@ -255,7 +275,8 @@ pub(super) fn parse_session_update(
                 crate::tts::text::SPEED_MAX
             ),
         ))? as f32;
-        if !f.is_finite() || !(crate::tts::text::SPEED_MIN..=crate::tts::text::SPEED_MAX).contains(&f)
+        if !f.is_finite()
+            || !(crate::tts::text::SPEED_MIN..=crate::tts::text::SPEED_MAX).contains(&f)
         {
             return Err((
                 "session.speed",
@@ -784,6 +805,32 @@ mod tests {
 
     fn parse(v: serde_json::Value) -> Result<StagedSessionUpdate, FieldErr> {
         parse_session_update(&v, CAPS)
+    }
+
+    #[test]
+    fn output_language_preserves_locale_separately_from_transcription_language() {
+        let s = parse(json!({"language":"es-AR", "input_audio_transcription":{"language":"es"}}))
+            .unwrap();
+        assert_eq!(s.language, Some(Some("es-AR".into())));
+        assert_eq!(
+            s.input_audio_transcription.unwrap().language.as_deref(),
+            Some("es")
+        );
+        assert_eq!(parse(json!({})).unwrap().language, None);
+        assert_eq!(
+            parse(json!({"language":null})).unwrap().language,
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn output_language_rejects_invalid_values_before_applying_voice() {
+        for language in [json!("es-XX"), json!(""), json!(3), json!({})] {
+            let err = parse(json!({"voice":"em_alex", "language":language}))
+                .err()
+                .unwrap();
+            assert_eq!(err.param, "session.language");
+        }
     }
 
     #[test]

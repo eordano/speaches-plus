@@ -227,11 +227,13 @@ mod tests {
 
     #[test]
     fn a_full_cache_hit_still_recomputes_one_token() {
-
         let mut s = seq(&[1, 2, 3, 4], 8);
         s.transition_to_prefill_with_cache(usize::MAX).unwrap();
         assert_eq!(s.num_computed_tokens, 4 - MIN_RECOMPUTED_PREFILL_TOKENS);
-        assert!(!s.prefill_complete(), "a clamped prefill still has work to do");
+        assert!(
+            !s.prefill_complete(),
+            "a clamped prefill still has work to do"
+        );
         assert_eq!(s.remaining_uncomputed(), MIN_RECOMPUTED_PREFILL_TOKENS);
 
         let mut s = seq(&[1, 2, 3, 4], 8);
@@ -246,18 +248,30 @@ mod tests {
     #[test]
     fn the_state_machine_refuses_every_transition_it_does_not_name() {
         let mut s = seq(&[1, 2], 4);
-        assert!(s.transition_to_decode().is_err(), "Waiting -> Decode skips prefill");
-        assert!(s.append_token(7).is_err(), "a token before Decode has no KV behind it");
+        assert!(
+            s.transition_to_decode().is_err(),
+            "Waiting -> Decode skips prefill"
+        );
+        assert!(
+            s.append_token(7).is_err(),
+            "a token before Decode has no KV behind it"
+        );
 
         s.transition_to_prefill().unwrap();
-        assert!(s.transition_to_prefill().is_err(), "Prefill -> Prefill would rewind progress");
+        assert!(
+            s.transition_to_prefill().is_err(),
+            "Prefill -> Prefill would rewind progress"
+        );
         s.transition_to_decode().unwrap();
         s.transition_to_decode().unwrap();
         s.append_token(7).unwrap();
 
         s.finish(FinishReason::Eos);
         assert!(s.is_finished());
-        assert!(s.append_token(8).is_err(), "a finished sequence must not grow");
+        assert!(
+            s.append_token(8).is_err(),
+            "a finished sequence must not grow"
+        );
         assert!(s.transition_to_prefill().is_err());
     }
 
@@ -294,16 +308,31 @@ mod tests {
             s.append_token(t).unwrap();
         }
         assert_eq!(s.tokens(), vec![1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(s.block_tokens(0, 4), vec![1, 2, 3, 4], "the seam is inside this block");
-        assert_eq!(s.block_tokens(1, 4), vec![5, 6, 7], "the tail block is short, not padded");
+        assert_eq!(
+            s.block_tokens(0, 4),
+            vec![1, 2, 3, 4],
+            "the seam is inside this block"
+        );
+        assert_eq!(
+            s.block_tokens(1, 4),
+            vec![5, 6, 7],
+            "the tail block is short, not padded"
+        );
         assert_eq!(s.num_blocks_needed(4), 2);
-        assert_eq!(s.num_blocks_needed(7), 1, "an exact fit is one block, not two");
-        assert_eq!(seq(&[], 4).num_blocks_needed(4), 0, "nothing needs no block");
+        assert_eq!(
+            s.num_blocks_needed(7),
+            1,
+            "an exact fit is one block, not two"
+        );
+        assert_eq!(
+            seq(&[], 4).num_blocks_needed(4),
+            0,
+            "nothing needs no block"
+        );
     }
 
     #[test]
     fn last_token_falls_back_to_the_prompt_before_anything_is_generated() {
-
         let s = seq(&[1, 2, 3], 4);
         assert_eq!(s.last_token(), Some(3));
         let mut s = decoding(&[1, 2, 3], 4);
@@ -319,8 +348,15 @@ mod tests {
         s.record_computed(1);
         assert_eq!(s.num_computed_tokens, 3);
         s.reset_for_recompute();
-        assert_eq!(s.num_computed_tokens, 0, "kept progress would skip real work");
-        assert_eq!(s.state, SequenceState::Waiting, "and it must be schedulable again");
+        assert_eq!(
+            s.num_computed_tokens, 0,
+            "kept progress would skip real work"
+        );
+        assert_eq!(
+            s.state,
+            SequenceState::Waiting,
+            "and it must be schedulable again"
+        );
         s.transition_to_prefill().unwrap();
     }
 
@@ -334,7 +370,10 @@ mod tests {
         assert!(!s.has_drafts() && s.draft_len() == 0);
 
         s.abort();
-        assert!(s.is_finished(), "aborted counts as finished for the scheduler");
+        assert!(
+            s.is_finished(),
+            "aborted counts as finished for the scheduler"
+        );
         assert_eq!(s.finish_reason, Some(FinishReason::Aborted));
     }
 }

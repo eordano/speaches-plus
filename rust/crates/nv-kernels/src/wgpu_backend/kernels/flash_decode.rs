@@ -1,9 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::wgpu_backend::device::WgpuContext;
+use crate::wgpu_backend::pack::unpack_u16_by_element as unpack_u16;
+pub(crate) use crate::wgpu_backend::pack::{
+    pack_u16_odd_tail_zeroed_min_one_word as pack_u16, pack_u8_min_one_word as pack_u8,
+};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-pub(crate) use crate::wgpu_backend::pack::{pack_u16_odd_tail_zeroed_min_one_word as pack_u16, pack_u8_min_one_word as pack_u8};
-use crate::wgpu_backend::pack::{unpack_u16_by_element as unpack_u16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/flash_decode.wgsl");
 
@@ -156,7 +158,7 @@ pub fn splits_env() -> usize {
         return DEFAULT_SPLITS;
     };
     assert!(
-        n >= 1 && n <= MAX_SPLITS,
+        (1..=MAX_SPLITS).contains(&n),
         "{SPLITS_ENV}={n} must be 1..={MAX_SPLITS}; the split-k scratch is provisioned for \
          {MAX_SPLITS} partials per head and stage2 reduces them serially"
     );
@@ -277,7 +279,9 @@ fn stage1_twin_sd(entry: &str, k_scale_anchor: &str, v_scale_anchor: &str) -> St
     let folded = |anchor: &str| {
         format!(
             "{}{SD_SCALE_FOLD_2POW120};",
-            anchor.strip_suffix(';').expect("scale anchors end the statement")
+            anchor
+                .strip_suffix(';')
+                .expect("scale anchors end the statement")
         )
     };
     let sd = block
@@ -302,21 +306,33 @@ fn decl_of(entry: &str) -> String {
 }
 
 pub fn mk_stage1_source_sd() -> String {
-    stage1_twin_sd(ENTRY_STAGE1_FP8_MK, MK_SD_K_SCALE_ANCHOR, MK_SD_V_SCALE_ANCHOR)
+    stage1_twin_sd(
+        ENTRY_STAGE1_FP8_MK,
+        MK_SD_K_SCALE_ANCHOR,
+        MK_SD_V_SCALE_ANCHOR,
+    )
 }
 
 pub fn mk_u_stage1_source_sd() -> String {
-    stage1_twin_sd(ENTRY_STAGE1_FP8_MK_U, MK_SD_K_SCALE_ANCHOR, MK_SD_V_SCALE_ANCHOR)
+    stage1_twin_sd(
+        ENTRY_STAGE1_FP8_MK_U,
+        MK_SD_K_SCALE_ANCHOR,
+        MK_SD_V_SCALE_ANCHOR,
+    )
 }
 
 pub fn smv2_stage1_source_sd() -> String {
-    stage1_twin_sd(ENTRY_SMV2_STAGE1_FP8, MK_SD_K_SCALE_ANCHOR, SMV2_SD_V_SCALE_ANCHOR)
+    stage1_twin_sd(
+        ENTRY_SMV2_STAGE1_FP8,
+        MK_SD_K_SCALE_ANCHOR,
+        SMV2_SD_V_SCALE_ANCHOR,
+    )
 }
 
 pub fn fold_stage1_source(hd_max: u32, sg: bool, fold: u32) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max as usize <= MAX_HEAD_DIM,
         "fold stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
     );
     assert!(
@@ -401,8 +417,16 @@ pub fn fold_stage1_source(hd_max: u32, sg: bool, fold: u32) -> String {
             writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
             writeln!(b, "                        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
             writeln!(b, "                        t = fma({p}_qsh[qo], e0, t);").unwrap();
-            writeln!(b, "                        t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
-            writeln!(b, "                        t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+            writeln!(
+                b,
+                "                        t = fma({p}_qsh[qo + 2u], e2, t);"
+            )
+            .unwrap();
+            writeln!(
+                b,
+                "                        t = fma({p}_qsh[qo + 3u], e3, t);"
+            )
+            .unwrap();
             writeln!(b, "                        pt{j} = pt{j} + t;").unwrap();
             writeln!(b, "                    }}").unwrap();
         }
@@ -468,11 +492,7 @@ pub fn fold_stage1_source(hd_max: u32, sg: bool, fold: u32) -> String {
             writeln!(b, "    {{").unwrap();
             writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
             writeln!(b, "        if (d < hd) {{").unwrap();
-            writeln!(
-                b,
-                "            {p}_sacc[warp * {hd_max}u + d] = a{j}_{i};"
-            )
-            .unwrap();
+            writeln!(b, "            {p}_sacc[warp * {hd_max}u + d] = a{j}_{i};").unwrap();
             writeln!(b, "        }}").unwrap();
             writeln!(b, "    }}").unwrap();
         }
@@ -486,7 +506,6 @@ pub fn fold_stage1_source(hd_max: u32, sg: bool, fold: u32) -> String {
     writeln!(b, "}}").unwrap();
     b
 }
-
 
 pub fn fold_prefix_blksm(hd_max: u32, fold: u32) -> String {
     format!("fdb{hd_max}sg{fold}")
@@ -505,7 +524,7 @@ const BLKSM_POSITIONS_PER_ROUND_4_AMORTIZES_THE_SERIAL_SOFTMAX_CHAIN_AND_QUADRUP
 pub fn fold_stage1_source_blksm(hd_max: u32, fold: u32) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max as usize <= MAX_HEAD_DIM,
         "blksm stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
     );
     assert!(
@@ -549,10 +568,18 @@ pub fn fold_stage1_source_blksm(hd_max: u32, fold: u32) -> String {
     writeln!(b, "    let rblk = (rounds + {bq}u - 1u) / {bq}u;").unwrap();
     writeln!(b, "    for (var rb = 0u; rb < rblk; rb = rb + 1u) {{").unwrap();
     for q in 0..bq {
-        writeln!(b, "        let p{q} = base + warp + (rb * {bq}u + {q}u) * stride;").unwrap();
+        writeln!(
+            b,
+            "        let p{q} = base + warp + (rb * {bq}u + {q}u) * stride;"
+        )
+        .unwrap();
         writeln!(b, "        let live{q} = p{q} < total;").unwrap();
         writeln!(b, "        var sp{q} = p{q};").unwrap();
-        writeln!(b, "        if (fd_params.ring > 0u) {{ sp{q} = p{q} % fd_params.ring; }}").unwrap();
+        writeln!(
+            b,
+            "        if (fd_params.ring > 0u) {{ sp{q} = p{q} % fd_params.ring; }}"
+        )
+        .unwrap();
     }
     for q in 0..bq {
         for j in 0..fold {
@@ -564,7 +591,11 @@ pub fn fold_stage1_source_blksm(hd_max: u32, fold: u32) -> String {
         writeln!(b, "            ks{q} = fd_k_scales[sp{q} * nkv + kvh];").unwrap();
         if hd_max == 64 {
             writeln!(b, "            let n2 = hd >> 1u;").unwrap();
-            writeln!(b, "            for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{").unwrap();
+            writeln!(
+                b,
+                "            for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{"
+            )
+            .unwrap();
             writeln!(b, "                let qb = jp * 2u;").unwrap();
             writeln!(b, "                let kb = kbase + qb;").unwrap();
             writeln!(b, "                let kw = fd_k_word(kb);").unwrap();
@@ -581,7 +612,11 @@ pub fn fold_stage1_source_blksm(hd_max: u32, fold: u32) -> String {
             writeln!(b, "            }}").unwrap();
         } else {
             writeln!(b, "            let n4 = hd >> 2u;").unwrap();
-            writeln!(b, "            for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{").unwrap();
+            writeln!(
+                b,
+                "            for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{"
+            )
+            .unwrap();
             writeln!(b, "                let qb = jv * 4u;").unwrap();
             writeln!(b, "                let kb = kbase + qb;").unwrap();
             writeln!(b, "                let kw = fd_k_word(kb);").unwrap();
@@ -646,7 +681,11 @@ pub fn fold_stage1_source_blksm(hd_max: u32, fold: u32) -> String {
             writeln!(b, "                if (d < hd) {{").unwrap();
             for q in 0..bq {
                 writeln!(b, "                    var vx{q} = 0.0;").unwrap();
-                writeln!(b, "                    if (live{q}) {{ vx{q} = fd_v_fp8(vbase{q} + d); }}").unwrap();
+                writeln!(
+                    b,
+                    "                    if (live{q}) {{ vx{q} = fd_v_fp8(vbase{q} + d); }}"
+                )
+                .unwrap();
             }
             writeln!(b, "                    var av = a{j}_{i} * cr{j};").unwrap();
             for q in 0..bq {
@@ -731,7 +770,6 @@ pub fn fold_stage1_source_blksm_sd(hd_max: u32, fold: u32) -> String {
     sd
 }
 
-
 pub fn fold_prefix_lanepos(hd_max: u32, fold: u32) -> String {
     format!("fdl{hd_max}sg{fold}")
 }
@@ -747,7 +785,7 @@ pub fn fold_stage1_entry_lanepos_sd(hd_max: u32, fold: u32) -> String {
 pub fn fold_stage1_source_lanepos(hd_max: u32, fold: u32) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max as usize <= MAX_HEAD_DIM,
         "lanepos stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
     );
     assert!(
@@ -790,7 +828,11 @@ pub fn fold_stage1_source_lanepos(hd_max: u32, fold: u32) -> String {
     writeln!(b, "        let pl = blockstart + lane;").unwrap();
     writeln!(b, "        let livel = pl < total;").unwrap();
     writeln!(b, "        var spl = pl;").unwrap();
-    writeln!(b, "        if (fd_params.ring > 0u) {{ spl = pl % fd_params.ring; }}").unwrap();
+    writeln!(
+        b,
+        "        if (fd_params.ring > 0u) {{ spl = pl % fd_params.ring; }}"
+    )
+    .unwrap();
     for j in 0..fold {
         writeln!(b, "        var sc{j} = 0.0;").unwrap();
     }
@@ -838,7 +880,11 @@ pub fn fold_stage1_source_lanepos(hd_max: u32, fold: u32) -> String {
     writeln!(b, "            let pv = blockstart + i;").unwrap();
     writeln!(b, "            if (pv >= total) {{ break; }}").unwrap();
     writeln!(b, "            var spv = pv;").unwrap();
-    writeln!(b, "            if (fd_params.ring > 0u) {{ spv = pv % fd_params.ring; }}").unwrap();
+    writeln!(
+        b,
+        "            if (fd_params.ring > 0u) {{ spv = pv % fd_params.ring; }}"
+    )
+    .unwrap();
     writeln!(b, "            let vrow = (spv * nkv + kvh) * hd;").unwrap();
     for j in 0..fold {
         writeln!(b, "            let wvi{j} = subgroupShuffle(wv{j}, i);").unwrap();
@@ -849,7 +895,11 @@ pub fn fold_stage1_source_lanepos(hd_max: u32, fold: u32) -> String {
         writeln!(b, "                if (d < hd) {{").unwrap();
         writeln!(b, "                    let vx = fd_v_fp8(vrow + d);").unwrap();
         for j in 0..fold {
-            writeln!(b, "                    a{j}_{i} = fma(wvi{j}, vx, a{j}_{i});").unwrap();
+            writeln!(
+                b,
+                "                    a{j}_{i} = fma(wvi{j}, vx, a{j}_{i});"
+            )
+            .unwrap();
         }
         writeln!(b, "                }}").unwrap();
         writeln!(b, "            }}").unwrap();
@@ -916,16 +966,32 @@ pub fn fold_stage1_source_lanepos_h2(hd_max: u32, fold: u32) -> String {
     b = b.replacen(&head_fill, &head_fill_h2, 1);
     let mut old_dot = String::new();
     for i in 0..4 {
-        writeln!(old_dot, "                let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
+        writeln!(
+            old_dot,
+            "                let e{i} = fd_k_byte(kw, kb + {i}u);"
+        )
+        .unwrap();
     }
     writeln!(old_dot, "                let q4 = w * 4u;").unwrap();
     for j in 0..fold {
         writeln!(old_dot, "                {{").unwrap();
         writeln!(old_dot, "                    let qo = {j}u * hd + q4;").unwrap();
-        writeln!(old_dot, "                    var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+        writeln!(
+            old_dot,
+            "                    var t = {p}_qsh[qo + 1u] * e1;"
+        )
+        .unwrap();
         writeln!(old_dot, "                    t = fma({p}_qsh[qo], e0, t);").unwrap();
-        writeln!(old_dot, "                    t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
-        writeln!(old_dot, "                    t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+        writeln!(
+            old_dot,
+            "                    t = fma({p}_qsh[qo + 2u], e2, t);"
+        )
+        .unwrap();
+        writeln!(
+            old_dot,
+            "                    t = fma({p}_qsh[qo + 3u], e3, t);"
+        )
+        .unwrap();
         writeln!(old_dot, "                    sc{j} = sc{j} + t;").unwrap();
         writeln!(old_dot, "                }}").unwrap();
     }
@@ -935,7 +1001,11 @@ pub fn fold_stage1_source_lanepos_h2(hd_max: u32, fold: u32) -> String {
     );
     let mut new_dot = String::new();
     for i in 0..4 {
-        writeln!(new_dot, "                let e{i} = fd_k_byte(kw, kb + {i}u);").unwrap();
+        writeln!(
+            new_dot,
+            "                let e{i} = fd_k_byte(kw, kb + {i}u);"
+        )
+        .unwrap();
     }
     writeln!(
         new_dot,
@@ -965,16 +1035,8 @@ pub fn fold_stage1_source_lanepos_h2(hd_max: u32, fold: u32) -> String {
             "                    let qh23 = vec2<f16>(unpack2x16float({p}_qshh[qo2 + 1u]));"
         )
         .unwrap();
-        writeln!(
-            new_dot,
-            "                    sh{j} = sh{j} + qh01 * eh01;"
-        )
-        .unwrap();
-        writeln!(
-            new_dot,
-            "                    sh{j} = sh{j} + qh23 * eh23;"
-        )
-        .unwrap();
+        writeln!(new_dot, "                    sh{j} = sh{j} + qh01 * eh01;").unwrap();
+        writeln!(new_dot, "                    sh{j} = sh{j} + qh23 * eh23;").unwrap();
         writeln!(new_dot, "                }}").unwrap();
     }
     b = b.replacen(&old_dot, &new_dot, 1);
@@ -1003,7 +1065,7 @@ pub fn fold_stage1_source_lanepos_h2(hd_max: u32, fold: u32) -> String {
         )
         .unwrap();
     }
-    let old_first = format!("        var scm0 = (sc0 * ksl) * fd_params.scaling;");
+    let old_first = "        var scm0 = (sc0 * ksl) * fd_params.scaling;".to_owned();
     assert!(b.contains(&old_first), "lanepos h2: scm anchor moved");
     for j in 0..fold {
         let o = format!("        var scm{j} = (sc{j} * ksl) * fd_params.scaling;");
@@ -1093,11 +1155,11 @@ pub fn fold_stage1_entry_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> St
 pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max as usize <= MAX_HEAD_DIM,
         "nvfp4 fold stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
     );
     assert!(
-        hd_max % 8 == 0,
+        hd_max.is_multiple_of(8),
         "nvfp4 fold stage1 reads 8 e2m1 nibbles per u32 word; hd {hd_max} % 8 != 0 has no word tiling"
     );
     assert!(
@@ -1105,7 +1167,8 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
         "nvfp4 fold stage1 folds {fold} query heads per workgroup; 1..={MAX_GQA_FOLD} keeps the \
          per-thread accumulator file bounded"
     );
-    let sink = crate::wgpu_backend::kernels::kv_nvfp4::KV_NVFP4_SINK_SLOTS_STAY_FP8_TO_ANCHOR_SOFTMAX;
+    let sink =
+        crate::wgpu_backend::kernels::kv_nvfp4::KV_NVFP4_SINK_SLOTS_STAY_FP8_TO_ANCHOR_SOFTMAX;
     let bt =
         crate::wgpu_backend::kernels::kv_nvfp4::KV_NVFP4_K_BLOCK_TOKENS_A_BLOCK_FINALIZES_THE_STEP_ITS_LAST_TOKEN_LANDS;
     let accs = hd_max / 32;
@@ -1122,11 +1185,27 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
             .replace("{HD}", &hd_max.to_string())
     };
     let mut b = String::with_capacity(24576);
-    writeln!(b, "@group(0) @binding(15) var<storage, read> fd_v4_words: array<u32>;").unwrap();
-    writeln!(b, "@group(0) @binding(17) var<storage, read> fd_v4_scales: array<f32>;").unwrap();
+    writeln!(
+        b,
+        "@group(0) @binding(15) var<storage, read> fd_v4_words: array<u32>;"
+    )
+    .unwrap();
+    writeln!(
+        b,
+        "@group(0) @binding(17) var<storage, read> fd_v4_scales: array<f32>;"
+    )
+    .unwrap();
     if k4 {
-        writeln!(b, "@group(0) @binding(14) var<storage, read> fd_k4_words: array<u32>;").unwrap();
-        writeln!(b, "@group(0) @binding(16) var<storage, read> fd_k4_scales: array<f32>;").unwrap();
+        writeln!(
+            b,
+            "@group(0) @binding(14) var<storage, read> fd_k4_words: array<u32>;"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "@group(0) @binding(16) var<storage, read> fd_k4_scales: array<f32>;"
+        )
+        .unwrap();
     }
     writeln!(b, "fn {p}_e2m1x2(nib: u32) -> f32 {{").unwrap();
     writeln!(b, "    let n = nib & 15u;").unwrap();
@@ -1159,7 +1238,11 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
     let emit_k_fp8_vec4 = |b: &mut String, indent: &str| {
         if hd_max == 64 {
             writeln!(b, "{indent}let n2 = hd >> 1u;").unwrap();
-            writeln!(b, "{indent}for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{").unwrap();
+            writeln!(
+                b,
+                "{indent}for (var jp = lane; jp < n2; jp = jp + FD_LANES) {{"
+            )
+            .unwrap();
             writeln!(b, "{indent}    let qb = jp * 2u;").unwrap();
             writeln!(b, "{indent}    let kb = kbase + qb;").unwrap();
             writeln!(b, "{indent}    let kw = fd_k_word(kb);").unwrap();
@@ -1177,7 +1260,11 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
             return;
         }
         writeln!(b, "{indent}let n4 = hd >> 2u;").unwrap();
-        writeln!(b, "{indent}for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{").unwrap();
+        writeln!(
+            b,
+            "{indent}for (var jv = lane; jv < n4; jv = jv + FD_LANES) {{"
+        )
+        .unwrap();
         writeln!(b, "{indent}    let qb = jv * 4u;").unwrap();
         writeln!(b, "{indent}    let kb = kbase + qb;").unwrap();
         writeln!(b, "{indent}    let kw = fd_k_word(kb);").unwrap();
@@ -1204,10 +1291,22 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
         emit_k_fp8_vec4(&mut b, "                ");
         writeln!(b, "            }} else {{").unwrap();
         writeln!(b, "                ks = 1.0;").unwrap();
-        writeln!(b, "                let ksb = ((sp / {bt}u) * nkv + kvh) * hd;").unwrap();
+        writeln!(
+            b,
+            "                let ksb = ((sp / {bt}u) * nkv + kvh) * hd;"
+        )
+        .unwrap();
         writeln!(b, "                let n8 = hd >> 3u;").unwrap();
-        writeln!(b, "                for (var jw = lane; jw < n8; jw = jw + FD_LANES) {{").unwrap();
-        writeln!(b, "                    let w = fd_k4_words[(kbase >> 3u) + jw];").unwrap();
+        writeln!(
+            b,
+            "                for (var jw = lane; jw < n8; jw = jw + FD_LANES) {{"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "                    let w = fd_k4_words[(kbase >> 3u) + jw];"
+        )
+        .unwrap();
         writeln!(b, "                    let qb = jw * 8u;").unwrap();
         for i in 0..8u32 {
             writeln!(
@@ -1252,7 +1351,11 @@ pub fn fold_stage1_source_nvfp4(hd_max: u32, sg: bool, fold: u32, k4: bool) -> S
     writeln!(b, "            if (snk) {{").unwrap();
     writeln!(b, "                vsc = fd_v_scales[sp * nkv + kvh];").unwrap();
     writeln!(b, "            }} else {{").unwrap();
-    writeln!(b, "                vsc = fd_v4_scales[sp * nkv + kvh] * 0.5;").unwrap();
+    writeln!(
+        b,
+        "                vsc = fd_v4_scales[sp * nkv + kvh] * 0.5;"
+    )
+    .unwrap();
     writeln!(b, "            }}").unwrap();
     for j in 0..fold {
         writeln!(b, "            let mn{j} = max(m{j}, sc{j});").unwrap();
@@ -1348,11 +1451,11 @@ pub fn fold_stage1_entry_sd_tiled(hd_max: u32, fold: u32, tile: u32) -> String {
 pub fn fold_stage1_source_sd_tiled(hd_max: u32, fold: u32, tile: u32) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max as usize <= MAX_HEAD_DIM,
         "tiled fold stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
     );
     assert!(
-        hd_max % 4 == 0,
+        hd_max.is_multiple_of(4),
         "tiled fold stage1 emits only the vec4 lane-owns-word K path; hd {hd_max} % 4 != 0 \
          would read one u32 from four lanes redundantly (the v1 defect)"
     );
@@ -1390,7 +1493,11 @@ pub fn fold_stage1_source_sd_tiled(hd_max: u32, fold: u32, tile: u32) -> String 
         }
     }
     writeln!(b, "    let total = fd_params.total;").unwrap();
-    writeln!(b, "    let base = fd_params.start + split * (FD_WARPS * {tile}u);").unwrap();
+    writeln!(
+        b,
+        "    let base = fd_params.start + split * (FD_WARPS * {tile}u);"
+    )
+    .unwrap();
     writeln!(b, "    let stride = fd_params.splits * FD_WARPS * {tile}u;").unwrap();
     writeln!(b, "    var rounds = 0u;").unwrap();
     writeln!(b, "    if (total > base) {{").unwrap();
@@ -1402,7 +1509,11 @@ pub fn fold_stage1_source_sd_tiled(hd_max: u32, fold: u32, tile: u32) -> String 
         writeln!(b, "        let pp{t} = p0 + {t}u;").unwrap();
         writeln!(b, "        let lv{t} = pp{t} < total;").unwrap();
         writeln!(b, "        var sp{t} = pp{t};").unwrap();
-        writeln!(b, "        if (fd_params.ring > 0u) {{ sp{t} = pp{t} % fd_params.ring; }}").unwrap();
+        writeln!(
+            b,
+            "        if (fd_params.ring > 0u) {{ sp{t} = pp{t} % fd_params.ring; }}"
+        )
+        .unwrap();
     }
     writeln!(b, "        if (lv0) {{").unwrap();
     for t in 0..tile {
@@ -1439,8 +1550,16 @@ pub fn fold_stage1_source_sd_tiled(hd_max: u32, fold: u32, tile: u32) -> String 
             writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
             writeln!(b, "                        var tt = {p}_qsh[qo + 1u] * e1;").unwrap();
             writeln!(b, "                        tt = fma({p}_qsh[qo], e0, tt);").unwrap();
-            writeln!(b, "                        tt = fma({p}_qsh[qo + 2u], e2, tt);").unwrap();
-            writeln!(b, "                        tt = fma({p}_qsh[qo + 3u], e3, tt);").unwrap();
+            writeln!(
+                b,
+                "                        tt = fma({p}_qsh[qo + 2u], e2, tt);"
+            )
+            .unwrap();
+            writeln!(
+                b,
+                "                        tt = fma({p}_qsh[qo + 3u], e3, tt);"
+            )
+            .unwrap();
             writeln!(b, "                        pt{j}_{t} = pt{j}_{t} + tt;").unwrap();
             writeln!(b, "                    }}").unwrap();
         }
@@ -1573,11 +1692,11 @@ pub const K_TRANSPOSED_BINDING_MUST_BE_EXACT: &str =
 pub fn fold_stage1_source_sd_tp(hd_max: u32, fold: u32) -> String {
     use std::fmt::Write;
     assert!(
-        hd_max > 0 && hd_max % 32 == 0 && hd_max as usize <= MAX_HEAD_DIM,
+        hd_max > 0 && hd_max.is_multiple_of(32) && hd_max as usize <= MAX_HEAD_DIM,
         "tp fold stage1 hd_max {hd_max} must be a positive multiple of 32 up to {MAX_HEAD_DIM}"
     );
     assert!(
-        hd_max % 4 == 0,
+        hd_max.is_multiple_of(4),
         "tp fold stage1 reads K one whole u32 word per lane; hd {hd_max} % 4 != 0 has no word tiling"
     );
     assert!(
@@ -1672,8 +1791,16 @@ pub fn fold_stage1_source_sd_tp(hd_max: u32, fold: u32) -> String {
         writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
         writeln!(b, "                        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
         writeln!(b, "                        t = fma({p}_qsh[qo], e0, t);").unwrap();
-        writeln!(b, "                        t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
-        writeln!(b, "                        t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
+        writeln!(
+            b,
+            "                        t = fma({p}_qsh[qo + 2u], e2, t);"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "                        t = fma({p}_qsh[qo + 3u], e3, t);"
+        )
+        .unwrap();
         writeln!(b, "                        s{j} = s{j} + t;").unwrap();
         writeln!(b, "                    }}").unwrap();
     }
@@ -1760,9 +1887,250 @@ pub fn fold_stage1_source_sd_tp(hd_max: u32, fold: u32) -> String {
     b
 }
 
-pub fn k_transposed_word_index(slots: usize, n_kv: usize, head_dim: usize, kvh: usize, pos: usize, d4: usize) -> usize {
-    assert!(head_dim % 4 == 0 && d4 < head_dim / 4 && kvh < n_kv && pos < slots);
+pub fn k_transposed_word_index(
+    slots: usize,
+    n_kv: usize,
+    head_dim: usize,
+    kvh: usize,
+    pos: usize,
+    d4: usize,
+) -> usize {
+    assert!(head_dim.is_multiple_of(4) && d4 < head_dim / 4 && kvh < n_kv && pos < slots);
     (kvh * (head_dim / 4) + d4) * slots + pos
+}
+
+pub fn fold_stage1_entry_sd_tpw(hd_max: u32, fold: u32) -> String {
+    format!("fdf{hd_max}tpw{fold}_stage1_fp8_sd")
+}
+
+pub const TPW_IS_THE_TP_ARM_WITH_LANE_OWNED_V_WORDS_BITWISE_IDENTICAL_BY_CONSTRUCTION: &str =
+    "the tp V accumulation fetches one whole u32 word per ELEMENT (fd_v_fp8_sd), so the four \
+     lanes sharing a word each issue their own load: 8 redundant word fetches per lane per \
+     position, 4x the K stream. tpw gives each lane whole V words (hd/128 loads, 4 bytes \
+     decoded per load) and keeps every per-element fma in the same position order with the \
+     same decode, rescale and epilogue arithmetic, so its stage-1 scratch and stage-2 output \
+     are bit-identical to tp -- only which lane holds which element changes, and the sacc \
+     write indexes by element. The rate ladder prices both; the graph arms stay selectable.";
+
+pub fn fold_stage1_source_sd_tpw(hd_max: u32, fold: u32) -> String {
+    use std::fmt::Write;
+    assert!(
+        hd_max > 0 && hd_max.is_multiple_of(128) && hd_max as usize <= MAX_HEAD_DIM,
+        "tpw fold stage1 hd_max {hd_max} must be a positive multiple of 128 so each lane owns \
+         whole V words per 32-lane subgroup"
+    );
+    assert!(
+        fold >= 1 && fold as usize <= MAX_GQA_FOLD,
+        "tpw fold stage1 folds {fold} query heads; 1..={MAX_GQA_FOLD} keeps score+acc registers bounded"
+    );
+    let accs = hd_max / 32;
+    let vwords = hd_max / 128;
+    let p = format!("fdf{hd_max}tpw{fold}");
+    let entry = fold_stage1_entry_sd_tpw(hd_max, fold);
+    let sub = |s: &str| {
+        s.replace("{P}", &p)
+            .replace("{E}", &entry)
+            .replace("{F}", &fold.to_string())
+            .replace("{HD}", &hd_max.to_string())
+    };
+    let mut b = String::with_capacity(24576);
+    writeln!(b, "var<workgroup> {p}_qsh: array<f32, {}>;", hd_max * fold).unwrap();
+    writeln!(b, "var<workgroup> {p}_sacc: array<f32, {}>;", hd_max * 8).unwrap();
+    writeln!(b, "var<workgroup> {p}_sm: array<f32, 8>;").unwrap();
+    writeln!(b, "var<workgroup> {p}_sl: array<f32, 8>;").unwrap();
+    b.push_str(&sub(FOLD_EPILOGUE));
+    b.push_str(&sub(FOLD_HEAD));
+    for j in 0..fold {
+        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
+        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        for i in 0..accs {
+            writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
+        }
+    }
+    writeln!(b, "    let total = fd_params.total;").unwrap();
+    writeln!(
+        b,
+        "    let kt_slots = (arrayLength(&fd_k_words) * 4u) / (nkv * hd);"
+    )
+    .unwrap();
+    writeln!(b, "    let kplane = kvh * (hd >> 2u);").unwrap();
+    writeln!(b, "    let base = fd_params.start + split * FD_BLOCK;").unwrap();
+    writeln!(b, "    let stride = fd_params.splits * FD_BLOCK;").unwrap();
+    writeln!(b, "    var rounds = 0u;").unwrap();
+    writeln!(b, "    if (total > base) {{").unwrap();
+    writeln!(b, "        rounds = (total - base + stride - 1u) / stride;").unwrap();
+    writeln!(b, "    }}").unwrap();
+    writeln!(b, "    for (var r = 0u; r < rounds; r = r + 1u) {{").unwrap();
+    writeln!(b, "        let pw = base + warp * FD_LANES + r * stride;").unwrap();
+    writeln!(b, "        if (pw < total) {{").unwrap();
+    writeln!(b, "            let pp = pw + lane;").unwrap();
+    writeln!(b, "            let live = pp < total;").unwrap();
+    writeln!(b, "            var sp = pp;").unwrap();
+    writeln!(
+        b,
+        "            if (fd_params.ring > 0u) {{ sp = pp % fd_params.ring; }}"
+    )
+    .unwrap();
+    writeln!(b, "            var ks = 0.0;").unwrap();
+    writeln!(b, "            var vs = 0.0;").unwrap();
+    writeln!(b, "            if (live) {{").unwrap();
+    writeln!(
+        b,
+        "                ks = fd_k_scales[sp * nkv + kvh] * bitcast<f32>(0x7B800000u);"
+    )
+    .unwrap();
+    writeln!(
+        b,
+        "                vs = fd_v_scales[sp * nkv + kvh] * bitcast<f32>(0x7B800000u);"
+    )
+    .unwrap();
+    writeln!(b, "            }}").unwrap();
+    for j in 0..fold {
+        writeln!(b, "            var s{j} = 0.0;").unwrap();
+    }
+    writeln!(b, "            if (live) {{").unwrap();
+    writeln!(
+        b,
+        "                for (var d4 = 0u; d4 < (hd >> 2u); d4 = d4 + 1u) {{"
+    )
+    .unwrap();
+    writeln!(
+        b,
+        "                    let kw = fd_k_words[(kplane + d4) * kt_slots + sp];"
+    )
+    .unwrap();
+    for i in 0..4u32 {
+        writeln!(
+            b,
+            "                    let e{i} = e4m3_shift_decode_scale_must_carry_2pow120(byte_at(kw, {i}u));"
+        )
+        .unwrap();
+    }
+    writeln!(b, "                    let qb = d4 << 2u;").unwrap();
+    for j in 0..fold {
+        writeln!(b, "                    {{").unwrap();
+        writeln!(b, "                        let qo = {j}u * hd + qb;").unwrap();
+        writeln!(b, "                        var t = {p}_qsh[qo + 1u] * e1;").unwrap();
+        writeln!(b, "                        t = fma({p}_qsh[qo], e0, t);").unwrap();
+        writeln!(
+            b,
+            "                        t = fma({p}_qsh[qo + 2u], e2, t);"
+        )
+        .unwrap();
+        writeln!(
+            b,
+            "                        t = fma({p}_qsh[qo + 3u], e3, t);"
+        )
+        .unwrap();
+        writeln!(b, "                        s{j} = s{j} + t;").unwrap();
+        writeln!(b, "                    }}").unwrap();
+    }
+    writeln!(b, "                }}").unwrap();
+    writeln!(b, "            }}").unwrap();
+    for j in 0..fold {
+        writeln!(
+            b,
+            "            let sc{j} = select(fd_neg_inf(), (s{j} * ks) * fd_params.scaling, live);"
+        )
+        .unwrap();
+        writeln!(b, "            let mn{j} = max(m{j}, subgroupMax(sc{j}));").unwrap();
+        writeln!(b, "            let cr{j} = fd_exp(m{j} - mn{j});").unwrap();
+        writeln!(
+            b,
+            "            let w{j} = select(0.0, fd_exp(sc{j} - mn{j}), live);"
+        )
+        .unwrap();
+        writeln!(b, "            l{j} = fma(l{j}, cr{j}, subgroupAdd(w{j}));").unwrap();
+        writeln!(b, "            m{j} = mn{j};").unwrap();
+        writeln!(b, "            let wv{j} = w{j} * vs;").unwrap();
+    }
+    for i in 0..accs {
+        for j in 0..fold {
+            writeln!(b, "            a{j}_{i} = a{j}_{i} * cr{j};").unwrap();
+        }
+    }
+    writeln!(
+        b,
+        "            for (var pi = 0u; pi < FD_LANES; pi = pi + 1u) {{"
+    )
+    .unwrap();
+    writeln!(b, "                let spv = subgroupShuffle(sp, pi);").unwrap();
+    for j in 0..fold {
+        writeln!(b, "                let bw{j} = subgroupShuffle(wv{j}, pi);").unwrap();
+    }
+    let mut bsum = "bw0".to_string();
+    for j in 1..fold {
+        bsum = format!("({bsum} + bw{j})");
+    }
+    writeln!(b, "                if ({bsum} > 0.0) {{").unwrap();
+    writeln!(
+        b,
+        "                    let vwb = ((spv * nkv + kvh) * hd) >> 2u;"
+    )
+    .unwrap();
+    for wi in 0..vwords {
+        writeln!(b, "                    {{").unwrap();
+        writeln!(
+            b,
+            "                        let wo = lane + {wi}u * FD_LANES;"
+        )
+        .unwrap();
+        writeln!(b, "                        if (wo < (hd >> 2u)) {{").unwrap();
+        writeln!(
+            b,
+            "                            let vw = fd_v_words[vwb + wo];"
+        )
+        .unwrap();
+        for bi in 0..4u32 {
+            writeln!(
+                b,
+                "                            let vx{wi}_{bi} = e4m3_shift_decode_scale_must_carry_2pow120(byte_at(vw, {bi}u));"
+            )
+            .unwrap();
+        }
+        for j in 0..fold {
+            for bi in 0..4u32 {
+                let i = wi * 4 + bi;
+                writeln!(
+                    b,
+                    "                            a{j}_{i} = fma(bw{j}, vx{wi}_{bi}, a{j}_{i});"
+                )
+                .unwrap();
+            }
+        }
+        writeln!(b, "                        }}").unwrap();
+        writeln!(b, "                    }}").unwrap();
+    }
+    writeln!(b, "                }}").unwrap();
+    writeln!(b, "            }}").unwrap();
+    writeln!(b, "        }}").unwrap();
+    writeln!(b, "    }}\n").unwrap();
+    for j in 0..fold {
+        writeln!(b, "    workgroupBarrier();").unwrap();
+        for wi in 0..vwords {
+            for bi in 0..4u32 {
+                let i = wi * 4 + bi;
+                writeln!(b, "    {{").unwrap();
+                writeln!(
+                    b,
+                    "        let d = ((lane + {wi}u * FD_LANES) << 2u) + {bi}u;"
+                )
+                .unwrap();
+                writeln!(b, "        if (d < hd) {{").unwrap();
+                writeln!(b, "            {p}_sacc[warp * {hd_max}u + d] = a{j}_{i};").unwrap();
+                writeln!(b, "        }}").unwrap();
+                writeln!(b, "    }}").unwrap();
+            }
+        }
+        writeln!(
+            b,
+            "    {p}_epilogue(lid, lane, warp, hd, ((h0 + {j}u) * fd_params.splits + split) * (hd + \
+             2u), m{j}, l{j});"
+        )
+        .unwrap();
+    }
+    writeln!(b, "}}").unwrap();
+    b
 }
 
 pub const SPLITS_MEASURED_BEST_SHORT_KV: usize = 16;

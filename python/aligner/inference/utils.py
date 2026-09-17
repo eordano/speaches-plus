@@ -5,7 +5,6 @@ import urllib.request
 from typing import Any, Union
 from urllib.parse import urlparse
 
-import librosa
 import numpy as np
 import soundfile as sf
 
@@ -39,6 +38,7 @@ def decode_base64_bytes(b64: str) -> bytes:
     return base64.b64decode(b64)
 
 def load_audio_any(x: str) -> tuple[np.ndarray, int]:
+    import librosa
     if is_url(x):
         with urllib.request.urlopen(x) as resp:
             audio_bytes = resp.read()
@@ -74,6 +74,7 @@ def float_range_normalize(audio: np.ndarray) -> np.ndarray:
     return np.clip(audio, -1.0, 1.0)
 
 def normalize_audio_input(a: AudioLike) -> np.ndarray:
+    import librosa
     if isinstance(a, str):
         audio, sr = load_audio_any(a)
     elif isinstance(a, tuple) and len(a) == 2 and isinstance(a[0], np.ndarray):

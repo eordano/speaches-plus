@@ -13,8 +13,8 @@ pub mod vgsl;
 
 pub use api::{
     BackendKind, ClassicalAnalyzer, ClassicalBackend, DeepSeekMode, DeepSeekOcr2Model, DotsOcrMode,
-    DotsOcrModel, DotsPageResult, LayoutBox, LayoutPageResult, LineRecognizer, OcrBackend,
-    OcrEngine, PageAnalyzer, ResolutionHint,
+    DotsOcrModel, DotsPageResult, DotsTierHint, LayoutBox, LayoutPageResult, LineRecognizer,
+    OcrBackend, OcrEngine, PageAnalyzer, ResolutionHint,
 };
 pub use ctc::DecodedChar;
 pub use model::{

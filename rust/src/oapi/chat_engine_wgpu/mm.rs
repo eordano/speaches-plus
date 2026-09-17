@@ -70,7 +70,9 @@ pub fn refuse_media(
     }
     let label = kind.label();
     if let Err(reason) = embed_row_route(kind) {
-        return Some(format!("image and audio parts cannot be served here: {reason}"));
+        return Some(format!(
+            "image and audio parts cannot be served here: {reason}"
+        ));
     }
     let Some(caps) = caps else {
         return Some(format!(
@@ -326,9 +328,7 @@ mod tests {
                 "{kind:?} refusal does not name the kind: {reason}"
             );
             assert!(
-                reason.contains("decoder")
-                    || reason.contains("tower")
-                    || reason.contains("config"),
+                reason.contains("decoder") || reason.contains("tower") || reason.contains("config"),
                 "{kind:?} refusal does not say which half is missing: {reason}"
             );
         }

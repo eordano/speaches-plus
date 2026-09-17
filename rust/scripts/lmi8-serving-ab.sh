@@ -78,9 +78,9 @@ print((chat or ids)[0])'
 : >"$LOGDIR/RESULTS.txt"
 echo "# lmi8-serving-ab $(date -Is) HEAD=$(git -C ../.. rev-parse --short HEAD 2>/dev/null || echo '?')" >>"$LOGDIR/RESULTS.txt"
 run_arm on-1 NV_VERIFY_LMHEAD_INT8=1
-run_arm off-1
+run_arm off-1 NV_VERIFY_LMHEAD_INT8=0
 run_arm on-2 NV_VERIFY_LMHEAD_INT8=1
-run_arm off-2
+run_arm off-2 NV_VERIFY_LMHEAD_INT8=0
 
 echo
 echo "=== RESULTS ($LOGDIR/RESULTS.txt) ==="

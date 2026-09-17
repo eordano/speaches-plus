@@ -328,6 +328,17 @@ kernel returns non-zero when `K*2` bytes exceeds the portable 48 KiB dynamic-sme
 limit so the caller falls back to the unfused pair. Eligibility also requires no
 bias and no attached LoRA.
 
+**M=1 norm shape.** The CUDA rmsnorm's M=1 launch defaults to the wide-256
+rung: `NV_NORM_M1_WIDE` unset resolves to 256 (bitwise vs the stock shape;
+user sign-off 2026-09-04 — the
+`kNormM1WideUnsetResolvesTo256TheBitwiseRungUserSignedOff20260904...`
+constant in `cuda/rmsnorm.cu` carries the per-call cost it removes), `=0`
+restores the stock 256-thread single-CTA-per-row shape, and the resolver
+clamps unsupported block values back to stock. The sibling `NV_NORM_M1_SPLIT`
+stays default-off. The gate is
+`norm_m1_wide_unset_resolves_to_the_bitwise_256_rung_user_signed_off_2026_09_04_and_split_stays_default_off`
+in `nv-kernels/tests/rmsnorm.rs`.
+
 ## FP8, INT8 and INT4 outside the Linear path
 
 `nv-quant/src/fp8.rs` defines `E4M3_MAX = 448.0` and `scale = amax/448`, with
@@ -412,7 +423,10 @@ with `-1` for pad rows, `inv_perm` its inverse); `gather_rows_bf16` materialises
 the sorted padded activation with `-1` rows zero-filled;
 `quantize_nvfp4_bf16_per_expert` quantizes each 128-row tile with *that* expert's
 `input_global_scale`; three grouped CUTLASS GEMMs run through
-`grouped_gemm_chunked` at most `MAX_A_PER_GROUPED_CALL = 8` experts per launch;
+`grouped_gemm_chunked`, `NV_LAGUNA_PREFILL_GROUP` tiles per launch (1..=1024, default 256 =
+one launch per GEMM stage; `=8` restores the pre-2026-09-12 width, `NV_LAGUNA_PREFILL_GROUP32=1`
+is the older alias for 32; every tile is an independent problem, so the width is bitwise-neutral
+and only moves launch count and the per-launch descriptor uploads);
 `silu_mul_quantize_nvfp4_bf16_per_expert` fuses `SiLU(gate) * up` with
 re-quantization so the intermediate never lands in HBM as bf16; and
 `moe_unpermute_scatter` applies the routing weights and scatters back to token

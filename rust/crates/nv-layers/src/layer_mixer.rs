@@ -204,7 +204,13 @@ mod tests {
     fn kinds_of(plan: &LayerMixPlan) -> String {
         plan.kinds()
             .iter()
-            .map(|k| if *k == MixerKind::FullAttention { 'F' } else { 'L' })
+            .map(|k| {
+                if *k == MixerKind::FullAttention {
+                    'F'
+                } else {
+                    'L'
+                }
+            })
             .collect()
     }
 
@@ -219,36 +225,64 @@ mod tests {
             match plan.kind(layer).unwrap() {
                 MixerKind::FullAttention => {
                     assert_eq!(plan.full_slot_for_layer(layer), Some(next_full));
-                    assert_eq!(plan.linear_slot_for_layer(layer), None, "layer {layer} is full");
+                    assert_eq!(
+                        plan.linear_slot_for_layer(layer),
+                        None,
+                        "layer {layer} is full"
+                    );
                     next_full += 1;
                 }
                 MixerKind::LinearAttention => {
                     assert_eq!(plan.linear_slot_for_layer(layer), Some(next_linear));
-                    assert_eq!(plan.full_slot_for_layer(layer), None, "layer {layer} is linear");
+                    assert_eq!(
+                        plan.full_slot_for_layer(layer),
+                        None,
+                        "layer {layer} is linear"
+                    );
                     next_linear += 1;
                 }
             }
         }
-        assert_eq!((next_full, next_linear), (plan.n_full_layers(), plan.n_linear_layers()));
-        assert_eq!(next_full + next_linear, plan.len(), "every layer got exactly one slot");
+        assert_eq!(
+            (next_full, next_linear),
+            (plan.n_full_layers(), plan.n_linear_layers())
+        );
+        assert_eq!(
+            next_full + next_linear,
+            plan.len(),
+            "every layer got exactly one slot"
+        );
         assert_eq!(plan.full_layer_indices(), vec![2, 5]);
         assert_eq!(plan.linear_layer_indices(), vec![0, 1, 3, 4, 6, 7]);
     }
 
     #[test]
     fn the_interval_counts_from_one_so_the_first_layer_is_never_full() {
-        assert_eq!(kinds_of(&LayerMixPlan::from_full_attention_interval(6, 2).unwrap()), "LFLFLF");
-        assert_eq!(kinds_of(&LayerMixPlan::from_full_attention_interval(6, 3).unwrap()), "LLFLLF");
-        assert_eq!(kinds_of(&LayerMixPlan::from_full_attention_interval(4, 1).unwrap()), "FFFF");
+        assert_eq!(
+            kinds_of(&LayerMixPlan::from_full_attention_interval(6, 2).unwrap()),
+            "LFLFLF"
+        );
+        assert_eq!(
+            kinds_of(&LayerMixPlan::from_full_attention_interval(6, 3).unwrap()),
+            "LLFLLF"
+        );
+        assert_eq!(
+            kinds_of(&LayerMixPlan::from_full_attention_interval(4, 1).unwrap()),
+            "FFFF"
+        );
 
-        assert_eq!(kinds_of(&LayerMixPlan::from_full_attention_interval(3, 9).unwrap()), "LLL");
+        assert_eq!(
+            kinds_of(&LayerMixPlan::from_full_attention_interval(3, 9).unwrap()),
+            "LLL"
+        );
     }
 
     #[test]
     fn recognising_an_interval_is_the_exact_inverse_of_building_from_one() {
         for num_layers in 1..=12usize {
             for interval in 1..=6usize {
-                let plan = LayerMixPlan::from_full_attention_interval(num_layers, interval).unwrap();
+                let plan =
+                    LayerMixPlan::from_full_attention_interval(num_layers, interval).unwrap();
                 assert!(
                     plan.matches_full_attention_interval(interval),
                     "{num_layers}/{interval}: built from an interval it does not recognise"
@@ -306,11 +340,23 @@ mod tests {
 
     #[test]
     fn the_error_cases_are_refused_rather_than_defaulted() {
-        assert!(LayerMixPlan::from_full_attention_interval(4, 0).is_err(), "interval 0");
-        assert!(LayerMixPlan::from_full_attention_interval(0, 4).is_err(), "no layers");
-        assert!(LayerMixPlan::from_layer_type_strs(Vec::<&str>::new()).is_err(), "empty types");
+        assert!(
+            LayerMixPlan::from_full_attention_interval(4, 0).is_err(),
+            "interval 0"
+        );
+        assert!(
+            LayerMixPlan::from_full_attention_interval(0, 4).is_err(),
+            "no layers"
+        );
+        assert!(
+            LayerMixPlan::from_layer_type_strs(Vec::<&str>::new()).is_err(),
+            "empty types"
+        );
         assert!(LayerMixPlan::from_layer_type_strs(["full_attention", "nope"]).is_err());
-        assert!(MixerKind::parse("FullAttention").is_err(), "the wire name is snake_case");
+        assert!(
+            MixerKind::parse("FullAttention").is_err(),
+            "the wire name is snake_case"
+        );
     }
 
     #[test]
@@ -326,7 +372,11 @@ mod tests {
         .unwrap();
         assert_eq!(kinds_of(&plan), "LLF");
         assert_eq!(plan.n_full_layers(), 1);
-        assert_eq!(plan.kind(3), None, "past the end is None, not a default kind");
+        assert_eq!(
+            plan.kind(3),
+            None,
+            "past the end is None, not a default kind"
+        );
         assert_eq!(plan.full_slot_for_layer(99), None);
     }
 }

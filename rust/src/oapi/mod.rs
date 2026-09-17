@@ -9,6 +9,7 @@ pub mod backend_select;
 pub mod batch_chat;
 pub mod chat;
 pub mod chat_engine;
+pub mod cold_tier;
 #[cfg(feature = "wgpu")]
 pub mod chat_engine_wgpu;
 pub mod chat_multimodal;
@@ -18,25 +19,28 @@ pub mod completions;
 pub mod deadline;
 pub mod fine_tuning;
 pub mod gate;
+pub mod generation_limits;
+pub mod laguna_capture;
 pub mod lora;
 pub mod lora_runtime;
 pub mod messages;
 pub mod model_family_tags;
 pub mod model_ids;
-pub mod responses;
 pub mod models_handler;
 pub mod ocr;
 pub mod ocr_batch;
+#[cfg(feature = "cuda")]
+pub mod ocr_batch_n;
 pub mod ocr_orient;
 pub mod ocr_stream;
 pub mod ocr_suspect;
-#[cfg(feature = "cuda")]
-pub mod ocr_batch_n;
+pub mod responses;
 pub mod text_embeddings;
 pub mod tool_parse;
 pub mod trajectory;
 pub mod transcriptions;
 pub mod voice_profiles;
+pub mod voices;
 pub mod vram_plan;
 
 use axum::http::StatusCode;
@@ -138,7 +142,9 @@ pub async fn send_sse_event(
         .map_err(|_| ())
 }
 
-pub fn sse_response(rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Response {
+pub fn sse_response(
+    rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+) -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
@@ -274,7 +280,10 @@ mod tests {
         assert!(!request_key_ok(&empty, "k"));
 
         let mut bearer = axum::http::HeaderMap::new();
-        bearer.insert(axum::http::header::AUTHORIZATION, "Bearer k".parse().unwrap());
+        bearer.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer k".parse().unwrap(),
+        );
         assert!(request_key_ok(&bearer, "k"));
 
         let mut xkey = axum::http::HeaderMap::new();
@@ -282,7 +291,10 @@ mod tests {
         assert!(request_key_ok(&xkey, "k"));
 
         let mut wrong = axum::http::HeaderMap::new();
-        wrong.insert(axum::http::header::AUTHORIZATION, "Bearer nope".parse().unwrap());
+        wrong.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer nope".parse().unwrap(),
+        );
         wrong.insert("x-api-key", "nope".parse().unwrap());
         assert!(!request_key_ok(&wrong, "k"));
     }

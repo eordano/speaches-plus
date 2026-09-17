@@ -1,5 +1,6 @@
 pub mod gguf;
 pub mod lora_adapter;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod lora_merge;
 
 #[macro_export]
@@ -13,7 +14,9 @@ macro_rules! hf_json_from_file {
         }
     };
     ($file_fn:ident, $str_fn:ident, as_ref) => {
-        pub fn $file_fn(p: impl ::std::convert::AsRef<::std::path::Path>) -> ::anyhow::Result<Self> {
+        pub fn $file_fn(
+            p: impl ::std::convert::AsRef<::std::path::Path>,
+        ) -> ::anyhow::Result<Self> {
             let raw =
                 ::anyhow::Context::with_context(::std::fs::read_to_string(p.as_ref()), || {
                     format!("read {}", p.as_ref().display())
@@ -36,9 +39,70 @@ pub use candle_core::{DType, Device, Tensor};
 pub use safetensors::tensor::{Dtype as StDtype, TensorView};
 pub use safetensors::SafeTensors;
 
+#[cfg(target_arch = "wasm32")]
+pub type ExternReadFn = Box<dyn Fn(u64, &mut [u8]) -> Result<()>>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type ExternReadFn = Box<dyn Fn(u64, &mut [u8]) -> Result<()> + Send + Sync>;
+
+pub struct ExternBytes {
+    pub len: u64,
+    pub read: ExternReadFn,
+}
+
+enum ShardBytes {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+    Extern(ExternBytes),
+}
+
+impl std::ops::Deref for ShardBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.resident()
+            .expect("extern shard bytes are fetch-only: use range_cow, never a resident slice")
+    }
+}
+
+impl ShardBytes {
+    fn resident(&self) -> Result<&[u8]> {
+        match self {
+            ShardBytes::Mapped(m) => Ok(m),
+            ShardBytes::Owned(v) => Ok(v),
+            ShardBytes::Extern(_) => {
+                bail!("extern shard bytes are fetch-only: use range_cow, never a resident slice")
+            }
+        }
+    }
+
+    fn len_bytes(&self) -> u64 {
+        match self {
+            ShardBytes::Mapped(m) => m.len() as u64,
+            ShardBytes::Owned(v) => v.len() as u64,
+            ShardBytes::Extern(e) => e.len,
+        }
+    }
+
+    fn range_cow(&self, start: usize, end: usize) -> Result<std::borrow::Cow<'_, [u8]>> {
+        anyhow::ensure!(
+            start <= end && end as u64 <= self.len_bytes(),
+            "byte range [{start}, {end}) overruns a {}-byte shard",
+            self.len_bytes()
+        );
+        match self {
+            ShardBytes::Mapped(m) => Ok(std::borrow::Cow::Borrowed(&m[start..end])),
+            ShardBytes::Owned(v) => Ok(std::borrow::Cow::Borrowed(&v[start..end])),
+            ShardBytes::Extern(e) => {
+                let mut buf = vec![0u8; end - start];
+                (e.read)(start as u64, &mut buf)?;
+                Ok(std::borrow::Cow::Owned(buf))
+            }
+        }
+    }
+}
+
 struct Shard {
     path: PathBuf,
-    bytes: Mmap,
+    bytes: ShardBytes,
     headers: HashMap<String, TensorHeader>,
 }
 
@@ -80,6 +144,68 @@ impl WeightLoader {
         }
         Ok(Self {
             shards: vec![shard],
+            name_to_shard,
+            device: device.clone(),
+        })
+    }
+
+    pub fn open_from_named_bytes(
+        named: impl IntoIterator<Item = (String, Vec<u8>)>,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut shards: Vec<Shard> = Vec::new();
+        let mut name_to_shard: HashMap<String, usize> = HashMap::new();
+        for (label, bytes) in named {
+            let idx = shards.len();
+            let shard = shard_from_bytes(PathBuf::from(&label), ShardBytes::Owned(bytes))?;
+            for name in shard.headers.keys() {
+                if let Some(prev) = name_to_shard.insert(name.clone(), idx) {
+                    bail!(
+                        "duplicate tensor {} in byte shards {} and {}",
+                        name,
+                        shards[prev].path.display(),
+                        label
+                    );
+                }
+            }
+            shards.push(shard);
+        }
+        if shards.is_empty() {
+            bail!("open_from_named_bytes: no shards given");
+        }
+        Ok(Self {
+            shards,
+            name_to_shard,
+            device: device.clone(),
+        })
+    }
+
+    pub fn open_extern_shards(
+        named: impl IntoIterator<Item = (String, ExternBytes)>,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut shards: Vec<Shard> = Vec::new();
+        let mut name_to_shard: HashMap<String, usize> = HashMap::new();
+        for (label, ext) in named {
+            let idx = shards.len();
+            let shard = shard_from_extern(PathBuf::from(&label), ext)?;
+            for name in shard.headers.keys() {
+                if let Some(prev) = name_to_shard.insert(name.clone(), idx) {
+                    bail!(
+                        "duplicate tensor {} in extern shards {} and {}",
+                        name,
+                        shards[prev].path.display(),
+                        label
+                    );
+                }
+            }
+            shards.push(shard);
+        }
+        if shards.is_empty() {
+            bail!("open_extern_shards: no shards given");
+        }
+        Ok(Self {
+            shards,
             name_to_shard,
             device: device.clone(),
         })
@@ -182,7 +308,11 @@ impl WeightLoader {
             .headers
             .get(name)
             .ok_or_else(|| anyhow!("tensor not found in shard: {name}"))?;
-        let bytes = &shard.bytes[header.offset_start..header.offset_end];
+        let bytes = shard
+            .bytes
+            .range_cow(header.offset_start, header.offset_end)
+            .with_context(|| format!("fetch bytes of {name}"))?;
+        let bytes = &*bytes;
 
         if header.dtype == StDtype::BOOL {
             let tensor = Tensor::from_raw_buffer(bytes, DType::U8, &header.shape, &self.device)
@@ -241,6 +371,123 @@ impl WeightLoader {
 fn load_shard(path: &Path) -> Result<Shard> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let bytes = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+    shard_from_bytes(path.to_path_buf(), ShardBytes::Mapped(bytes))
+}
+
+pub const WASM32_PARSES_THE_SAFETENSORS_HEADER_ITSELF_BECAUSE_UPSTREAM_BIT_COUNTS_OVERFLOW_32BIT_USIZE:
+    &str =
+    "SafeTensors::deserialize validates every tensor as element_count * dtype.bitsize() in \
+     usize, so any tensor past 512 MiB (4 Gibit -- q38's 606 MiB embed_tokens and lm_head rows) \
+     fails with ValidationOverflow on wasm32; the wasm twin reads the same header fields \
+     (dtype, shape, data_offsets) with u64 arithmetic and the same byte-range and size checks, \
+     while the native arm keeps the upstream parse byte-identical";
+
+#[derive(serde::Deserialize)]
+struct U64HeaderEntry {
+    dtype: StDtype,
+    shape: Vec<usize>,
+    data_offsets: (u64, u64),
+}
+
+fn headers_from_u64_header_json(
+    path: &Path,
+    header_json: &[u8],
+    base: u64,
+    total: u64,
+) -> Result<HashMap<String, TensorHeader>> {
+    anyhow::ensure!(
+        usize::try_from(total).is_ok(),
+        "{}: a {total}-byte shard overruns this target's usize offsets",
+        path.display()
+    );
+    let raw: HashMap<String, serde_json::Value> = serde_json::from_slice(header_json)
+        .with_context(|| format!("parse safetensors header json in {}", path.display()))?;
+    let mut headers: HashMap<String, TensorHeader> = HashMap::with_capacity(raw.len());
+    for (name, v) in raw {
+        if name == "__metadata__" {
+            continue;
+        }
+        let e: U64HeaderEntry = serde_json::from_value(v)
+            .with_context(|| format!("parse header entry {name} in {}", path.display()))?;
+        let (s, t) = e.data_offsets;
+        let elems = e
+            .shape
+            .iter()
+            .try_fold(1u64, |a, &d| a.checked_mul(d as u64));
+        let bits = elems.and_then(|x| x.checked_mul(e.dtype.bitsize() as u64));
+        anyhow::ensure!(
+            t >= s && base + t <= total && bits.is_some_and(|b| b == (t - s) * 8),
+            "{}: tensor {name} offsets [{s}, {t}) disagree with shape {:?} dtype {:?} in a \
+             {total}-byte shard",
+            path.display(),
+            e.shape,
+            e.dtype
+        );
+        headers.insert(
+            name,
+            TensorHeader {
+                dtype: e.dtype,
+                shape: e.shape,
+                offset_start: (base + s) as usize,
+                offset_end: (base + t) as usize,
+            },
+        );
+    }
+    Ok(headers)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn shard_from_bytes(path: PathBuf, bytes: ShardBytes) -> Result<Shard> {
+    let _ = WASM32_PARSES_THE_SAFETENSORS_HEADER_ITSELF_BECAUSE_UPSTREAM_BIT_COUNTS_OVERFLOW_32BIT_USIZE;
+    let total = bytes.len() as u64;
+    if bytes.len() < 8 {
+        bail!(
+            "{}: shorter than the safetensors length prefix",
+            path.display()
+        );
+    }
+    let n = u64::from_le_bytes(bytes[..8].try_into().expect("8-byte prefix"));
+    let base = n
+        .checked_add(8)
+        .filter(|b| *b <= total)
+        .with_context(|| format!("{}: header length {n} overruns the shard", path.display()))?;
+    let headers = headers_from_u64_header_json(&path, &bytes[8..base as usize], base, total)?;
+    Ok(Shard {
+        path,
+        bytes,
+        headers,
+    })
+}
+
+fn shard_from_extern(path: PathBuf, ext: ExternBytes) -> Result<Shard> {
+    let total = ext.len;
+    if total < 8 {
+        bail!(
+            "{}: shorter than the safetensors length prefix",
+            path.display()
+        );
+    }
+    let mut prefix = [0u8; 8];
+    (ext.read)(0, &mut prefix)
+        .with_context(|| format!("read the length prefix of {}", path.display()))?;
+    let n = u64::from_le_bytes(prefix);
+    let base = n
+        .checked_add(8)
+        .filter(|b| *b <= total)
+        .with_context(|| format!("{}: header length {n} overruns the shard", path.display()))?;
+    let mut header_json = vec![0u8; n as usize];
+    (ext.read)(8, &mut header_json)
+        .with_context(|| format!("read the safetensors header of {}", path.display()))?;
+    let headers = headers_from_u64_header_json(&path, &header_json, base, total)?;
+    Ok(Shard {
+        path,
+        bytes: ShardBytes::Extern(ext),
+        headers,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn shard_from_bytes(path: PathBuf, bytes: ShardBytes) -> Result<Shard> {
     let view = SafeTensors::deserialize(&bytes)
         .with_context(|| format!("parse safetensors header in {}", path.display()))?;
     let buf_ptr = bytes.as_ptr() as usize;
@@ -259,7 +506,7 @@ fn load_shard(path: &Path) -> Result<Shard> {
         );
     }
     Ok(Shard {
-        path: path.to_path_buf(),
+        path,
         bytes,
         headers,
     })
@@ -406,7 +653,10 @@ impl QuantizationConfig {
         if obj.get("mode").and_then(|x| x.as_str()) == Some("affine")
             && obj.get("bits").and_then(|x| x.as_u64()) == Some(4)
         {
-            let group_size = obj.get("group_size").and_then(|x| x.as_u64()).map(|g| g as usize);
+            let group_size = obj
+                .get("group_size")
+                .and_then(|x| x.as_u64())
+                .map(|g| g as usize);
             return Ok(Self {
                 scheme: QuantScheme::MlxAffineW4,
                 ignored_modules,
@@ -595,7 +845,7 @@ pub fn fp8_row_scales_from(
 }
 
 impl WeightLoader {
-    pub fn raw_bytes(&self, name: &str) -> Result<&[u8]> {
+    fn header_of(&self, name: &str) -> Result<(&Shard, &TensorHeader)> {
         let shard_idx = *self
             .name_to_shard
             .get(name)
@@ -605,7 +855,50 @@ impl WeightLoader {
             .headers
             .get(name)
             .ok_or_else(|| anyhow!("tensor not found in shard: {name}"))?;
-        Ok(&shard.bytes[header.offset_start..header.offset_end])
+        Ok((shard, header))
+    }
+
+    pub fn raw_bytes(&self, name: &str) -> Result<&[u8]> {
+        let (shard, header) = self.header_of(name)?;
+        Ok(&shard
+            .bytes
+            .resident()
+            .with_context(|| format!("{name}: raw_bytes on an extern shard (use raw_bytes_cow)"))?
+            [header.offset_start..header.offset_end])
+    }
+
+    pub fn raw_len(&self, name: &str) -> Result<usize> {
+        let (_, header) = self.header_of(name)?;
+        Ok(header.offset_end - header.offset_start)
+    }
+
+    pub fn raw_bytes_cow(&self, name: &str) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let (shard, header) = self.header_of(name)?;
+        shard
+            .bytes
+            .range_cow(header.offset_start, header.offset_end)
+            .with_context(|| format!("fetch bytes of {name}"))
+    }
+
+    pub fn raw_range_cow(
+        &self,
+        name: &str,
+        offset: usize,
+        len: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let (shard, header) = self.header_of(name)?;
+        let tensor_len = header.offset_end - header.offset_start;
+        anyhow::ensure!(
+            offset.checked_add(len).is_some_and(|e| e <= tensor_len),
+            "{name}: range [{offset}, {offset}+{len}) overruns the {tensor_len}-byte tensor"
+        );
+        shard
+            .bytes
+            .range_cow(
+                header.offset_start + offset,
+                header.offset_start + offset + len,
+            )
+            .with_context(|| format!("fetch a range of {name}"))
     }
 
     pub fn st_dtype_of(&self, name: &str) -> Option<StDtype> {
@@ -622,13 +915,19 @@ impl WeightLoader {
         match scheme {
             QuantScheme::None => bail!("load_quantized_weight called with scheme None"),
             QuantScheme::MlxAffineW4 => {
-                let packed_bytes = self.raw_bytes(base_name)?.to_vec();
+                let packed_bytes = self.raw_bytes_cow(base_name)?.into_owned();
                 let shape = self
                     .shape_of(base_name)
                     .ok_or_else(|| anyhow!("missing shape for {base_name}"))?;
                 let module = strip_weight_suffix(base_name);
-                let weight_scale_bytes = Some(self.raw_bytes(&format!("{module}.scales"))?.to_vec());
-                let weight_bias_bytes = Some(self.raw_bytes(&format!("{module}.biases"))?.to_vec());
+                let weight_scale_bytes = Some(
+                    self.raw_bytes_cow(&format!("{module}.scales"))?
+                        .into_owned(),
+                );
+                let weight_bias_bytes = Some(
+                    self.raw_bytes_cow(&format!("{module}.biases"))?
+                        .into_owned(),
+                );
                 let packed_dtype = self
                     .st_dtype_of(base_name)
                     .ok_or_else(|| anyhow!("missing dtype for {base_name}"))?;
@@ -644,7 +943,7 @@ impl WeightLoader {
                 })
             }
             QuantScheme::Fp8E4m3 => {
-                let weight_bytes = self.raw_bytes(base_name)?.to_vec();
+                let weight_bytes = self.raw_bytes_cow(base_name)?.into_owned();
                 let shape = self
                     .shape_of(base_name)
                     .ok_or_else(|| anyhow!("missing shape for {base_name}"))?;
@@ -695,7 +994,7 @@ impl WeightLoader {
                 Ok(qw)
             }
             QuantScheme::Nvfp4 => {
-                let packed_bytes = self.raw_bytes(base_name)?.to_vec();
+                let packed_bytes = self.raw_bytes_cow(base_name)?.into_owned();
                 let shape = self
                     .shape_of(base_name)
                     .ok_or_else(|| anyhow!("missing shape for {base_name}"))?;
@@ -706,7 +1005,7 @@ impl WeightLoader {
                 let mut weight_scale_bytes = None;
                 for cand in &scale_name_candidates {
                     if self.has(cand) {
-                        weight_scale_bytes = Some(self.raw_bytes(cand)?.to_vec());
+                        weight_scale_bytes = Some(self.raw_bytes_cow(cand)?.into_owned());
                         break;
                     }
                 }
@@ -730,6 +1029,107 @@ impl WeightLoader {
 
 fn strip_weight_suffix(name: &str) -> &str {
     name.strip_suffix(".weight").unwrap_or(name)
+}
+
+pub const RECUT_SHARD_CAP_BYTES_STREAMS_ANY_CHECKPOINT_THROUGH_WASM32_ONE_SHARD_AT_A_TIME: usize =
+    1 << 30;
+
+const RECUT_PER_TENSOR_HEADER_ALLOWANCE_BYTES: usize = 192;
+
+impl WeightLoader {
+    pub fn recut_groups(&self, cap_bytes: usize) -> Result<Vec<Vec<String>>> {
+        let mut names = self.names();
+        names.sort();
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut cur_bytes = 0usize;
+        for name in names {
+            let cost = self.raw_len(&name)? + name.len() + RECUT_PER_TENSOR_HEADER_ALLOWANCE_BYTES;
+            if cost > cap_bytes {
+                bail!(
+                    "tensor {name} alone costs {cost} bytes against the {cap_bytes}-byte shard \
+                     cap; a single tensor cannot be recut"
+                );
+            }
+            if !cur.is_empty() && cur_bytes + cost > cap_bytes {
+                groups.push(std::mem::take(&mut cur));
+                cur_bytes = 0;
+            }
+            cur_bytes += cost;
+            cur.push(name);
+        }
+        if !cur.is_empty() {
+            groups.push(cur);
+        }
+        Ok(groups)
+    }
+
+    pub fn recut_shard_bytes(&self, group: &[String]) -> Result<Vec<u8>> {
+        let mut views: Vec<(&str, TensorView<'_>)> = Vec::with_capacity(group.len());
+        for name in group {
+            let dtype = self
+                .st_dtype_of(name)
+                .ok_or_else(|| anyhow!("missing dtype for {name}"))?;
+            let shape = self
+                .shape_of(name)
+                .ok_or_else(|| anyhow!("missing shape for {name}"))?;
+            let view = TensorView::new(dtype, shape, self.raw_bytes(name)?)
+                .with_context(|| format!("recut view for {name}"))?;
+            views.push((name.as_str(), view));
+        }
+        safetensors::serialize(views, None)
+            .with_context(|| format!("serialize a recut shard of {} tensors", group.len()))
+    }
+
+    pub fn recut_named_shards(&self, cap_bytes: usize) -> Result<Vec<(String, Vec<u8>)>> {
+        let groups = self.recut_groups(cap_bytes)?;
+        let total = groups.len();
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let bytes = self.recut_shard_bytes(g)?;
+                anyhow::ensure!(
+                    bytes.len() <= cap_bytes,
+                    "recut shard {i} serialized to {} bytes over the {cap_bytes}-byte cap",
+                    bytes.len()
+                );
+                Ok((recut_shard_name(i, total), bytes))
+            })
+            .collect()
+    }
+}
+
+pub fn recut_shard_name(index: usize, total: usize) -> String {
+    format!("recut-{:05}-of-{:05}.safetensors", index + 1, total)
+}
+
+pub fn recut_dir_to_dir(src: &Path, out: &Path, cap_bytes: usize) -> Result<Vec<String>> {
+    let loader = WeightLoader::open_dir(src, &Device::Cpu)?;
+    std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
+    let groups = loader.recut_groups(cap_bytes)?;
+    let total = groups.len();
+    let mut names = Vec::with_capacity(total + 2);
+    for (i, g) in groups.iter().enumerate() {
+        let name = recut_shard_name(i, total);
+        let bytes = loader.recut_shard_bytes(g)?;
+        anyhow::ensure!(
+            bytes.len() <= cap_bytes,
+            "recut shard {name} serialized to {} bytes over the {cap_bytes}-byte cap",
+            bytes.len()
+        );
+        std::fs::write(out.join(&name), &bytes)
+            .with_context(|| format!("write {}", out.join(&name).display()))?;
+        names.push(name);
+    }
+    for side in ["config.json", "tokenizer.json"] {
+        let p = src.join(side);
+        if p.is_file() {
+            std::fs::copy(&p, out.join(side)).with_context(|| format!("copy {}", p.display()))?;
+            names.push(side.to_string());
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -1052,5 +1452,154 @@ mod tests {
         assert_eq!(got, bytes);
 
         assert!(got.iter().all(|b| *b == 0 || *b == 1));
+    }
+
+    fn synth_named_shard(tensors: &[(&str, usize)]) -> (String, Vec<u8>) {
+        let payloads: Vec<(String, Vec<u8>)> = tensors
+            .iter()
+            .map(|(n, len)| {
+                let bytes: Vec<u8> = (0..*len).map(|i| (i % 251) as u8).collect();
+                (n.to_string(), bytes)
+            })
+            .collect();
+        let views: Vec<(&str, TensorView<'_>)> = payloads
+            .iter()
+            .map(|(n, b)| {
+                (
+                    n.as_str(),
+                    TensorView::new(StDtype::U8, vec![b.len()], b).unwrap(),
+                )
+            })
+            .collect();
+        (
+            "synth.safetensors".to_string(),
+            safetensors::serialize(views, None).unwrap(),
+        )
+    }
+
+    #[test]
+    fn extern_shards_serve_every_tensor_bit_equal_to_the_resident_load_and_refuse_borrows() {
+        let (label, bytes) =
+            synth_named_shard(&[("a.weight", 700), ("b.scales", 96), ("c.biases", 40)]);
+        let resident =
+            WeightLoader::open_from_named_bytes([(label.clone(), bytes.clone())], &Device::Cpu)
+                .unwrap();
+        let backing = std::sync::Arc::new(bytes);
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (b2, f2) = (backing.clone(), fetches.clone());
+        let read: ExternReadFn = Box::new(move |off, dst: &mut [u8]| {
+            f2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let start = off as usize;
+            dst.copy_from_slice(&b2[start..start + dst.len()]);
+            Ok(())
+        });
+        let ext = WeightLoader::open_extern_shards(
+            [(
+                label,
+                ExternBytes {
+                    len: backing.len() as u64,
+                    read,
+                },
+            )],
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert_eq!(resident.names(), ext.names());
+        for n in &resident.names() {
+            assert_eq!(
+                resident.st_dtype_of(n),
+                ext.st_dtype_of(n),
+                "{n} dtype drifted"
+            );
+            assert_eq!(resident.shape_of(n), ext.shape_of(n), "{n} shape drifted");
+            assert_eq!(resident.raw_len(n).unwrap(), ext.raw_len(n).unwrap());
+            assert_eq!(
+                &*resident.raw_bytes_cow(n).unwrap(),
+                &*ext.raw_bytes_cow(n).unwrap(),
+                "{n} bytes drifted through the extern fetch"
+            );
+            let t_res = resident.get(n, DType::U8).unwrap().flatten_all().unwrap();
+            let t_ext = ext.get(n, DType::U8).unwrap().flatten_all().unwrap();
+            assert_eq!(
+                t_res.to_vec1::<u8>().unwrap(),
+                t_ext.to_vec1::<u8>().unwrap(),
+                "{n} tensor values drifted"
+            );
+        }
+        assert_eq!(
+            &*resident.raw_range_cow("a.weight", 13, 100).unwrap(),
+            &*ext.raw_range_cow("a.weight", 13, 100).unwrap(),
+            "ranged fetch drifted"
+        );
+        assert!(
+            ext.raw_range_cow("a.weight", 690, 20).is_err(),
+            "a range past the tensor end must refuse"
+        );
+        let err = ext.raw_bytes("a.weight").unwrap_err().to_string();
+        assert!(
+            err.contains("raw_bytes on an extern shard"),
+            "extern raw_bytes must refuse loudly, got: {err}"
+        );
+        assert!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the extern arm never exercised its fetch closure"
+        );
+    }
+
+    #[test]
+    fn recut_shards_respect_the_cap_and_round_trip_every_tensor_bit_for_bit() {
+        let shard = synth_named_shard(&[
+            ("a.weight", 700),
+            ("b.weight", 700),
+            ("c.scales", 700),
+            ("d.biases", 40),
+            ("e.weight", 700),
+        ]);
+        let loader = WeightLoader::open_from_named_bytes([shard], &Device::Cpu).unwrap();
+        let cap = 2048;
+        let recut = loader.recut_named_shards(cap).unwrap();
+        assert!(
+            recut.len() >= 2,
+            "a 2 KiB cap over 2.8 KiB of tensors must split into multiple shards"
+        );
+        for (name, bytes) in &recut {
+            assert!(
+                bytes.len() <= cap,
+                "{name} serialized to {} bytes over the {cap}-byte cap",
+                bytes.len()
+            );
+        }
+        let names: Vec<String> = recut.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names[0], recut_shard_name(0, recut.len()));
+        let re = WeightLoader::open_from_named_bytes(recut, &Device::Cpu).unwrap();
+        let mut all = loader.names();
+        all.sort();
+        let mut re_names = re.names();
+        re_names.sort();
+        assert_eq!(all, re_names, "the recut lost or invented tensors");
+        for n in &all {
+            assert_eq!(
+                loader.raw_bytes(n).unwrap(),
+                re.raw_bytes(n).unwrap(),
+                "{n} bytes drifted"
+            );
+            assert_eq!(
+                loader.st_dtype_of(n),
+                re.st_dtype_of(n),
+                "{n} dtype drifted"
+            );
+            assert_eq!(loader.shape_of(n), re.shape_of(n), "{n} shape drifted");
+        }
+    }
+
+    #[test]
+    fn recut_refuses_a_tensor_over_the_cap_instead_of_emitting_an_oversized_shard() {
+        let shard = synth_named_shard(&[("big.weight", 4096)]);
+        let loader = WeightLoader::open_from_named_bytes([shard], &Device::Cpu).unwrap();
+        let err = loader.recut_named_shards(1024).unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be recut"),
+            "oversized tensor must refuse loudly, got: {err}"
+        );
     }
 }

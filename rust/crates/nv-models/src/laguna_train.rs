@@ -17,11 +17,14 @@ use nv_weights::WeightLoader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::dense_train::naive_sdpa;
 use crate::gemma4::LayerType;
 use crate::laguna::{softplus_f32, yarn_inv_freq, LagunaConfig, LagunaGating, LagunaMoe};
 use crate::train_runner::select_device;
 use nv_layers::mlp::Mlp;
+use nv_layers::train_attn::gqa_sdpa_recompute;
+
+#[path = "laguna_train_routing.rs"]
+mod routing;
 
 pub const LAGUNA_TRAINS_FULL_DEPTH_WITHOUT_WINDOWING_BECAUSE_THE_TRUNK_IS_2048_HIDDEN_BY_40_LAYERS:
     &str =
@@ -29,13 +32,6 @@ pub const LAGUNA_TRAINS_FULL_DEPTH_WITHOUT_WINDOWING_BECAUSE_THE_TRUNK_IS_2048_H
      activation memory forced that family's grad_layers window; laguna's full-graph activations \
      at JSONL_MAX_SEQ 512 are an order of magnitude smaller per layer and the MoE expert bulk is \
      frozen, so this trainer takes the whole depth in one graph and exposes no window knob";
-
-pub const LAGUNA_PACKED_BASES_ARE_REFUSED_BECAUSE_THE_PACKED_TENSORS_ARE_THE_30B_OF_NVFP4_EXPERTS:
-    &str =
-    "the shipped Laguna-XS-2.1-NVFP4 checkpoint packs only its MoE experts (about 30B params) as \
-     compressed-tensors nvfp4 weight_packed; a trainable forward needs them dense, which is \
-     roughly 60 GiB dequantized, and no laguna host-dequant path exists, so this trainer takes \
-     only dense (unpacked) laguna checkpoints";
 
 pub const LAGUNA_LORA_SITES_ARE_THE_ATTENTION_PROJECTIONS_BECAUSE_MLP_MEANS_PACKED_EXPERTS: &str =
     "laguna LoRA targets are q, k, v, o and g, the per-layer attention projections that stay \
@@ -59,7 +55,10 @@ pub struct LagunaTrainArgs {
 
 impl LagunaTrainArgs {
     pub fn default_targets() -> Vec<String> {
-        ["q", "k", "v", "o", "g"].iter().map(|s| s.to_string()).collect()
+        ["q", "k", "v", "o", "g"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -74,6 +73,8 @@ pub struct LagunaTrainSummary {
     pub num_examples: usize,
     pub num_eval_examples: usize,
     pub base_dtype: String,
+    pub packed_linears: usize,
+    pub grouped_moe_copies: usize,
     pub device: String,
     pub config_layers: usize,
     pub moe_layers: usize,
@@ -119,6 +120,7 @@ pub struct LagunaTrainModel {
     full_attn_factor: f32,
     dtype: DType,
     device: Device,
+    packed_linears: usize,
 }
 
 fn open_base_weights(path: &Path, device: &Device) -> Result<WeightLoader> {
@@ -132,28 +134,19 @@ fn open_base_weights(path: &Path, device: &Device) -> Result<WeightLoader> {
     }
 }
 
-fn refuse_packed_base(weights: &WeightLoader, base: &Path) -> Result<()> {
-    if let Some(name) = weights.names().iter().find(|n| {
-        n.ends_with(".weight_packed")
-            || n.ends_with(".weight_scale_2")
-            || n.ends_with(".weight_global_scale")
-    }) {
-        bail!(
-            "base {} is quantized (found {name}): {}",
-            base.display(),
-            LAGUNA_PACKED_BASES_ARE_REFUSED_BECAUSE_THE_PACKED_TENSORS_ARE_THE_30B_OF_NVFP4_EXPERTS
-        );
-    }
-    Ok(())
-}
-
-fn load_linear(
+fn load_dense_linear(
     weights: &WeightLoader,
     name: &str,
     out_features: usize,
     in_features: usize,
     dtype: DType,
 ) -> Result<Linear> {
+    let module = name.strip_suffix(".weight").unwrap_or(name);
+    anyhow::ensure!(
+        !["weight_scale", "weight_scale_2", "weight_global_scale"]
+            .iter().any(|suffix| weights.has(&format!("{module}.{suffix}"))),
+        "Laguna training cannot load scaled {module} as dense; supported quantized weights use native NVFP4 weight_packed"
+    );
     let w = weights
         .get(name, dtype)
         .with_context(|| format!("load {name}"))?;
@@ -166,8 +159,39 @@ fn load_linear(
 
 impl LagunaTrainModel {
     pub fn load(base: &Path, device: &Device) -> Result<Self> {
-        let dtype = if device.is_cuda() { DType::BF16 } else { DType::F32 };
-        Self::load_with_dtype(base, device, dtype)
+        let dtype = if device.is_cuda() {
+            DType::BF16
+        } else {
+            DType::F32
+        };
+        let mut model = Self::load_with_dtype(base, device, dtype)?;
+        model.build_grouped_expert_stacks_and_free_the_per_expert_copies();
+        Ok(model)
+    }
+
+    pub const GROUPED_STACKS_REPLACE_THE_PER_EXPERT_LINEARS_AT_LOAD_SO_THE_EXPERT_WEIGHTS_ARE_RESIDENT_ONCE_NOT_TWICE: usize = 1;
+
+    fn build_grouped_expert_stacks_and_free_the_per_expert_copies(&mut self) {
+        #[cfg(feature = "cuda")]
+        {
+            let hidden = self.config.hidden_size;
+            let device = self.device.clone();
+            let mut built = 0usize;
+            for layer in self.layers.iter_mut() {
+                if let TrainFfn::Moe(moe) = &mut layer.ffn {
+                    if routing::grouped_train_stacks(moe, hidden, &device).is_some() {
+                        moe.experts = Vec::new();
+                        built += 1;
+                    }
+                }
+            }
+            if built > 0 {
+                let _ = Self::GROUPED_STACKS_REPLACE_THE_PER_EXPERT_LINEARS_AT_LOAD_SO_THE_EXPERT_WEIGHTS_ARE_RESIDENT_ONCE_NOT_TWICE;
+                eprintln!(
+                    "[moe_train] {built} MoE layers hold grouped stacks; per-expert Linears freed"
+                );
+            }
+        }
     }
 
     pub fn load_with_dtype(base: &Path, device: &Device, dtype: DType) -> Result<Self> {
@@ -175,7 +199,67 @@ impl LagunaTrainModel {
         let config = LagunaConfig::from_hf_json_file(&cfg_path)
             .with_context(|| format!("read laguna config {}", cfg_path.display()))?;
         let weights = open_base_weights(base, device)?;
-        refuse_packed_base(&weights, base)?;
+        let has_packed = weights
+            .names()
+            .iter()
+            .any(|n| n.ends_with(".weight_packed"));
+        if has_packed {
+            anyhow::ensure!(
+                device.is_cuda() && cfg!(feature = "cuda") && dtype == DType::BF16,
+                "Laguna nvfp4 weight_packed training requires the CUDA backend with BF16 activations; the frozen base stays packed"
+            );
+            anyhow::ensure!(
+                std::env::var("NV_ALLOW_LEAF_GRADIENT_LOSS").as_deref() != Ok("1"),
+                "Laguna NVFP4 training requires input gradients through frozen experts; unset NV_ALLOW_LEAF_GRADIENT_LOSS"
+            );
+            let quant = nv_weights::QuantizationConfig::from_hf_json_file(&cfg_path)?;
+            anyhow::ensure!(
+                quant.scheme == nv_weights::QuantScheme::Nvfp4,
+                "Laguna weight_packed training requires an NVFP4 quantization_config"
+            );
+        }
+        #[cfg(feature = "cuda")]
+        let nvfp4_runner = if has_packed {
+            let Device::Cuda(dev) = device else {
+                unreachable!()
+            };
+            Some(Arc::new(std::sync::Mutex::new(
+                nv_quant::nvfp4::Nvfp4GemmRunner::new(dev.cuda_stream())?,
+            )))
+        } else {
+            None
+        };
+        let packed_linears = std::cell::Cell::new(0usize);
+        let load_linear = |weights: &WeightLoader,
+                           name: &str,
+                           out_features: usize,
+                           in_features: usize,
+                           dtype| {
+            #[cfg(feature = "cuda")]
+            if let Some(runner) = &nvfp4_runner {
+                let module = name.strip_suffix(".weight").unwrap_or(name);
+                if weights.has(&format!("{module}.weight_packed")) {
+                    anyhow::ensure!(
+                        in_features > 0 && out_features > 0 && in_features.is_multiple_of(16)
+                            && weights.shape_of(&format!("{module}.weight_scale"))
+                                == Some(vec![out_features, in_features / 16]),
+                        "Laguna NVFP4 {module}: expected one block scale per 16 input values and output row"
+                    );
+                    let linear = nv_layers::moe::nvfp4_linear_from_disk_pub(
+                        weights,
+                        module,
+                        out_features,
+                        in_features,
+                        runner.clone(),
+                        device,
+                    )
+                    .with_context(|| format!("load resident Laguna NVFP4 {module}"))?;
+                    packed_linears.set(packed_linears.get() + 1);
+                    return Ok(linear);
+                }
+            }
+            load_dense_linear(weights, name, out_features, in_features, dtype)
+        };
 
         let embed_weight = weights
             .get("model.embed_tokens.weight", dtype)
@@ -295,6 +379,8 @@ impl LagunaTrainModel {
                     shared_expert,
                     #[cfg(feature = "cuda")]
                     grouped: std::sync::Mutex::new(None),
+                    #[cfg(feature = "cuda")]
+                    train_stacks: std::sync::Mutex::new(None),
                 })
             } else {
                 TrainFfn::Dense {
@@ -437,6 +523,7 @@ impl LagunaTrainModel {
             full_attn_factor,
             dtype,
             device: device.clone(),
+            packed_linears: packed_linears.get(),
         })
     }
 
@@ -450,6 +537,31 @@ impl LagunaTrainModel {
 
     pub fn dtype(&self) -> DType {
         self.dtype
+    }
+
+    pub fn packed_linears(&self) -> usize {
+        self.packed_linears
+    }
+
+    pub fn grouped_moe_copies(&self) -> Result<usize> {
+        #[cfg(feature = "cuda")]
+        {
+            let mut copies = 0;
+            for layer in &self.layers {
+                if let TrainFfn::Moe(moe) = &layer.ffn {
+                    copies += usize::from(
+                        moe.grouped
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("Laguna grouped weights lock poisoned"))?
+                            .as_ref()
+                            .is_some_and(Option::is_some),
+                    );
+                }
+            }
+            Ok(copies)
+        }
+        #[cfg(not(feature = "cuda"))]
+        Ok(0)
     }
 
     pub fn moe_and_dense_mlp_layer_counts(&self) -> (usize, usize) {
@@ -483,33 +595,47 @@ impl LagunaTrainModel {
             .index_select(&tokens_flat, 0)?
             .reshape((1usize, seq, self.config.hidden_size))?
             .to_dtype(self.dtype)?;
+        let dev = hidden.device().clone();
         for layer in &self.layers {
-            let normed = layer.input_layernorm.forward_candle(&hidden)?;
-            let attn_out = self.attention_forward(layer, &normed, positions, seq)?;
-            let after_attn = hidden.add(&attn_out.to_dtype(hidden.dtype())?)?;
-            let normed_mlp = layer.post_attention_layernorm.forward_candle(&after_attn)?;
-            let ffn_out = match &layer.ffn {
-                TrainFfn::Dense {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                } => {
-                    let gate = gate_proj.forward(&normed_mlp)?;
-                    let up = up_proj.forward(&normed_mlp)?;
-                    down_proj.forward(&candle_nn::ops::silu(&gate)?.mul(&up)?)?
-                }
-                TrainFfn::Moe(moe) => {
-                    let flat = normed_mlp
-                        .reshape((seq, self.config.hidden_size))?
-                        .contiguous()?;
-                    moe.forward(&flat)?
-                        .reshape((1usize, seq, self.config.hidden_size))?
-                }
+            let after_attn = nv_train::train_prof::phase(&dev, "fwd_attention_layer", || {
+                let normed = layer.input_layernorm.forward_candle(&hidden)?;
+                let attn_out = self.attention_forward(layer, &normed, positions, seq)?;
+                Ok(hidden.add(&attn_out.to_dtype(hidden.dtype())?)?)
+            })?;
+            let ffn_phase = match &layer.ffn {
+                TrainFfn::Dense { .. } => "fwd_dense_mlp_layer",
+                TrainFfn::Moe(_) => "fwd_moe_layer",
             };
-            hidden = after_attn.add(&ffn_out.to_dtype(after_attn.dtype())?)?;
+            hidden = nv_train::train_prof::phase(&dev, ffn_phase, || {
+                let normed_mlp = layer.post_attention_layernorm.forward_candle(&after_attn)?;
+                let ffn_out = match &layer.ffn {
+                    TrainFfn::Dense {
+                        gate_proj,
+                        up_proj,
+                        down_proj,
+                    } => {
+                        let gate = gate_proj.forward(&normed_mlp)?;
+                        let up = up_proj.forward(&normed_mlp)?;
+                        down_proj.forward(&candle_nn::ops::silu(&gate)?.mul(&up)?)?
+                    }
+                    TrainFfn::Moe(moe) => {
+                        let flat = normed_mlp
+                            .reshape((seq, self.config.hidden_size))?
+                            .contiguous()?;
+                        routing::forward(moe, &flat)?.reshape((
+                            1usize,
+                            seq,
+                            self.config.hidden_size,
+                        ))?
+                    }
+                };
+                Ok(after_attn.add(&ffn_out.to_dtype(after_attn.dtype())?)?)
+            })?;
         }
-        let normed = self.final_norm.forward_candle(&hidden)?;
-        Ok(self.lm_head.forward(&normed)?.to_dtype(DType::F32)?)
+        nv_train::train_prof::phase(&dev, "fwd_final_norm_and_lm_head", || {
+            let normed = self.final_norm.forward_candle(&hidden)?;
+            Ok(self.lm_head.forward(&normed)?.to_dtype(DType::F32)?)
+        })
     }
 
     fn attention_forward(
@@ -522,6 +648,7 @@ impl LagunaTrainModel {
         let head_dim = self.config.head_dim;
         let n_q = layer.num_heads;
         let n_kv = self.config.num_key_value_heads;
+        let proj_span = fwd_span(x, "fwd_attn_qkv_projections_with_lora");
 
         let q = layer
             .q_proj
@@ -537,6 +664,8 @@ impl LagunaTrainModel {
             .v_proj
             .forward(x)?
             .reshape((1usize, seq, n_kv, head_dim))?;
+        drop(proj_span);
+        let rope_span = fwd_span(x, "fwd_attn_norms_rope_casts");
 
         let (rope, rotary_dim, rot_scale) = match layer.kind {
             LayerType::SlidingAttention => {
@@ -555,12 +684,24 @@ impl LagunaTrainModel {
         let k_rot = k_rot.to_dtype(self.dtype)?.contiguous()?;
         let v = v.contiguous()?;
 
+        drop(rope_span);
         let window = match layer.kind {
             LayerType::SlidingAttention => Some(self.config.sliding_window),
             LayerType::FullAttention => None,
         };
-        let attn_out = naive_sdpa(&q_rot, &k_rot, &v, 1, n_q, n_kv, head_dim, seq, window)?;
+        let _ = nv_layers::train_attn::GQA_SDPA_RECOMPUTE_KEEPS_ONLY_Q_K_V_AND_O_ON_THE_GRAPH_AND_REBUILDS_THE_PROBABILITIES_IN_THE_BACKWARD;
+        let attn_out = if std::env::var("NV_TRAIN_ATTN_PROBE").as_deref() == Ok("naive") {
+            crate::dense_train::naive_sdpa(&q_rot, &k_rot, &v, 1, n_q, n_kv, head_dim, seq, window)?
+        } else {
+            let q_rot = if attention_output_stays_f32_like_the_expanded_head_path_did() {
+                q_rot.to_dtype(DType::F32)?
+            } else {
+                q_rot
+            };
+            gqa_sdpa_recompute(&q_rot, &k_rot, &v, 1, n_q, n_kv, head_dim, seq, window)?
+        };
 
+        let gate_span = fwd_span(x, "fwd_attn_gate_softplus_and_o_proj");
         let gated = match (&layer.g_proj, self.config.gating) {
             (Some(g_proj), LagunaGating::PerHead) => {
                 let g = softplus_f32(&g_proj.forward(x)?.to_dtype(DType::F32)?)?;
@@ -582,12 +723,14 @@ impl LagunaTrainModel {
         let attn_flat = gated
             .reshape((1usize, seq, n_q * head_dim))?
             .to_dtype(self.dtype)?;
-        layer.o_proj.forward(&attn_flat)
+        let out = layer.o_proj.forward(&attn_flat);
+        drop(gate_span);
+        out
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn partial_rope_scaled_matching_serving_apply_partial_rope_scaled(
+pub fn partial_rope_scaled_matching_serving_apply_partial_rope_scaled(
     q: &Tensor,
     k: &Tensor,
     rope: &Rope,
@@ -596,6 +739,12 @@ fn partial_rope_scaled_matching_serving_apply_partial_rope_scaled(
     head_dim: usize,
     rot_scale: f32,
 ) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if nv_layers::rope::train_rope_op_serves(q) && q.dtype() == k.dtype() {
+        let q_out = rope.apply_train_partial_scaled(q, positions, rotary_dim.min(head_dim), head_dim, rot_scale)?;
+        let k_out = rope.apply_train_partial_scaled(k, positions, rotary_dim.min(head_dim), head_dim, rot_scale)?;
+        return Ok((q_out, k_out));
+    }
     let scale_rot = |t: Tensor| -> Result<Tensor> {
         if (rot_scale - 1.0).abs() < f32::EPSILON {
             Ok(t)
@@ -720,18 +869,41 @@ fn per_row_eval_ce(model: &LagunaTrainModel, rows: &[TokenRow]) -> Result<Vec<f3
         .collect()
 }
 
+fn attention_output_stays_f32_like_the_expanded_head_path_did() -> bool {
+    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+        "NV_TRAIN_ATTN_OUT_F32",
+    )
+}
+
+pub const ONE_ROW_ON_THE_GRAPH_AT_A_TIME_BECAUSE_SUMMING_EVERY_ROW_LOSS_BEFORE_ONE_BACKWARD_HELD_EVERY_ROW_GRAPH_AT_ONCE: usize = 1;
+
 pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
-    let device = select_device()?;
+    let device = if std::env::var_os("NV_TRAIN_DEVICE").is_none()
+        && open_base_weights(&args.base, &Device::Cpu)?
+            .names()
+            .iter()
+            .any(|n| n.ends_with(".weight_packed"))
+    {
+        #[cfg(feature = "cuda")]
+        {
+            Device::new_cuda(0).context("open CUDA device for resident Laguna NVFP4 training")?
+        }
+        #[cfg(not(feature = "cuda"))]
+        bail!("Laguna nvfp4 weight_packed training requires a build with the CUDA feature")
+    } else {
+        select_device()?
+    };
     let device_label = if device.is_cuda() { "cuda" } else { "cpu" };
     let model = LagunaTrainModel::load(&args.base, &device)?;
     let (moe_layers, dense_mlp_layers) = model.moe_and_dense_mlp_layer_counts();
     eprintln!(
         "LAGUNA_BASE 1  layers {}  hidden {}  vocab {}  moe_layers {moe_layers}  device \
-         {device_label}  base_dtype {:?}",
+         {device_label}  base_dtype {:?}  packed_linears {}",
         model.config.num_hidden_layers,
         model.config.hidden_size,
         model.config.vocab_size,
-        model.dtype()
+        model.dtype(),
+        model.packed_linears()
     );
 
     let sites = build_sites(&model, &args.targets, args.seed)?;
@@ -743,12 +915,13 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
     let mut loras: Vec<Arc<LoraTrainable>> = Vec::new();
     let mut vars: Vec<Var> = Vec::new();
     for s in &sites {
-        let base = s
-            .lin
-            .weight()
-            .context("laguna target Linear has no materialised weight")?
-            .clone();
-        let lora = Arc::new(LoraTrainable::new(&base, cfg, s.seed, &device)?);
+        let lora = Arc::new(LoraTrainable::from_features(
+            s.lin.out_features(),
+            s.lin.in_features(),
+            cfg,
+            s.seed,
+            &device,
+        )?);
         vars.extend(lora.trainable_vars());
         let hook: Arc<dyn LoraDeltaHook> = Arc::new(TrainingLoraHook::new(lora.clone(), true));
         s.lin.attach_lora(hook)?;
@@ -763,7 +936,7 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
     )?;
 
     let mut losses = Vec::with_capacity(args.steps);
-    let mut all_grads_finite = true;
+    let all_grads_finite = true;
     if args.steps > 0 {
         let mut opt = AdamW::new(
             vars.clone(),
@@ -774,26 +947,54 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
             },
         )?;
         for step in 0..args.steps {
-            let mut total: Option<Tensor> = None;
+            let dev = model.device().clone();
+            let _ = ONE_ROW_ON_THE_GRAPH_AT_A_TIME_BECAUSE_SUMMING_EVERY_ROW_LOSS_BEFORE_ONE_BACKWARD_HELD_EVERY_ROW_GRAPH_AT_ONCE;
+            let mut lv = 0f32;
+            let mut grads: Option<candle_core::backprop::GradStore> = None;
+            anyhow::ensure!(!dataset.is_empty(), "empty laguna training batch");
             for row in &dataset {
-                let loss = solo_row_ce(&model, row)?;
-                total = Some(match total {
-                    Some(t) => (t + loss)?,
-                    None => loss,
+                let loss =
+                    nv_train::train_prof::phase(&dev, "forward_row", || solo_row_ce(&model, row))?;
+                lv += loss.to_scalar::<f32>()?;
+                let row_grads = nv_train::train_prof::phase(&dev, "backward_row", || {
+                    loss.backward().map_err(Into::into)
+                })?;
+                grads = Some(match grads {
+                    None => row_grads,
+                    Some(mut acc) => {
+                        for v in vars.iter() {
+                            if let Some(g) = row_grads.get(v) {
+                                let summed = match acc.get(v) {
+                                    Some(a) => (a + g)?,
+                                    None => g.clone(),
+                                };
+                                acc.insert(v, summed);
+                            }
+                        }
+                        acc
+                    }
                 });
             }
-            let loss = total.context("empty laguna training batch")?;
-            let lv = loss.to_scalar::<f32>()?;
-            let grads = loss.backward()?;
-            for v in &vars {
-                if let Some(g) = grads.get(v) {
-                    if !grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum(g)?
-                    {
-                        all_grads_finite = false;
-                    }
+            anyhow::ensure!(
+                lv.is_finite(),
+                "Laguna training step {step}: non-finite loss"
+            );
+            let grads = grads.context("empty laguna training batch")?;
+            nv_train::train_prof::phase(&dev, "grad_finite_readbacks", || {
+                for (index, v) in vars.iter().enumerate() {
+                    let g = grads.get(v).with_context(|| {
+                        format!("Laguna training step {step}: missing gradient for adapter variable {index}")
+                    })?;
+                    anyhow::ensure!(
+                        grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum(g)?,
+                        "Laguna training step {step}: non-finite gradient for adapter variable {index}"
+                    );
                 }
-            }
-            opt.step(&grads)?;
+                Ok(())
+            })?;
+            nv_train::train_prof::phase(&dev, "optimizer_step", || {
+                opt.step(&grads).map_err(Into::into)
+            })?;
             losses.push(lv);
             if step < 3 || step % 10 == 0 || step == args.steps - 1 {
                 eprintln!("step {step:4}  loss = {lv:.6e}");
@@ -803,12 +1004,8 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
 
     let (eval_ce_adapter, eval_ce_base) = match &args.eval_data {
         Some(path) => {
-            let eval_set = load_jsonl_token_dataset(
-                path,
-                &args.base,
-                model.config.vocab_size,
-                JSONL_MAX_SEQ,
-            )?;
+            let eval_set =
+                load_jsonl_token_dataset(path, &args.base, model.config.vocab_size, JSONL_MAX_SEQ)?;
             let with_adapter = per_row_eval_ce(&model, &eval_set)?;
             for s in &sites {
                 s.lin.detach_lora();
@@ -863,7 +1060,13 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
         trainable_vars: vars.len(),
         num_examples: dataset.len(),
         num_eval_examples,
-        base_dtype: format!("{:?}", model.dtype()),
+        base_dtype: if model.packed_linears() > 0 {
+            format!("NVFP4+{:?}", model.dtype())
+        } else {
+            format!("{:?}", model.dtype())
+        },
+        packed_linears: model.packed_linears(),
+        grouped_moe_copies: model.grouped_moe_copies()?,
         device: device_label.to_string(),
         config_layers: model.config.num_hidden_layers,
         moe_layers,
@@ -955,7 +1158,7 @@ pub fn write_tiny_laguna_checkpoint(dir: &Path) -> LagunaConfig {
     std::fs::write(dir.join("config.json"), &cfg_json).unwrap();
     let cfg = LagunaConfig::from_hf_json_str(&cfg_json).unwrap();
 
-    let mut rng = LagunaFixtureLcg(0x1A6_00A5_EED);
+    let mut rng = LagunaFixtureLcg(0x001A_600A_5EED);
     let mut t: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
     let h = cfg.hidden_size;
     let hd = cfg.head_dim;
@@ -1056,4 +1259,19 @@ pub fn write_tiny_laguna_checkpoint(dir: &Path) -> LagunaConfig {
     }
     candle_core::safetensors::save(&t, dir.join("model.safetensors")).unwrap();
     cfg
+}
+
+#[cfg(feature = "cuda")]
+fn fwd_span(x: &Tensor, name: &'static str) -> Option<nv_layers::prof_events::Span> {
+    match x.device() {
+        Device::Cuda(d) => {
+            nv_layers::prof_events::span(name, &nv_layers::cuda_stream::current_stream(d))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fwd_span(_x: &Tensor, _name: &'static str) -> Option<()> {
+    None
 }

@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::wgpu_backend::device::WgpuContext;
+use crate::wgpu_backend::pack::pack_u16_odd_tail_zeroed_min_one_word as pack_bf16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
-use crate::wgpu_backend::pack::{pack_u16_odd_tail_zeroed_min_one_word as pack_bf16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/moe_unpermute_scatter.wgsl");
 

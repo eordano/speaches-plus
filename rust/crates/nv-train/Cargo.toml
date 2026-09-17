@@ -5,18 +5,27 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+cudarc = { workspace = true, optional = true }
 anyhow = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 nv-config = { workspace = true }
 nv-layers = { workspace = true }
+nv-kernels = { workspace = true, optional = true }
 nv-quant = { workspace = true }
 nv-tokenizer = { workspace = true }
 nv-weights = { workspace = true }
 serde_json = { workspace = true }
 half = { workspace = true }
+candle-metal-kernels = { version = "0.11", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"] }
 
 [features]
 default = []
@@ -24,6 +33,8 @@ metal = [
     "candle-core/metal",
     "candle-nn/metal",
     "nv-layers/metal",
+    "dep:candle-metal-kernels",
+    "dep:objc2-metal",
 ]
 cuda = [
     "candle-core/cuda",
@@ -31,6 +42,9 @@ cuda = [
     "nv-layers/cuda",
     "nv-quant/cuda",
     "nv-weights/cuda",
+    "dep:cudarc",
+    "dep:nv-kernels",
+    "nv-kernels/cuda",
 ]
 
 [dev-dependencies]

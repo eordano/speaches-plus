@@ -47,8 +47,18 @@ pub unsafe fn lora_m1_expand_tiles(
     win_len: i32,
 ) -> i32 {
     crate::nv_kernels_lora_m1_expand_tiles(
-        stream, partials, b_ptrs, y_bf16, slice_n, slice_start, n_slices, rank, n_tiles, max_n,
-        win_off, win_len,
+        stream,
+        partials,
+        b_ptrs,
+        y_bf16,
+        slice_n,
+        slice_start,
+        n_slices,
+        rank,
+        n_tiles,
+        max_n,
+        win_off,
+        win_len,
     )
 }
 

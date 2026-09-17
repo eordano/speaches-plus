@@ -73,7 +73,9 @@ pub(crate) mod h2d {
     }
 
     pub fn enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_H2D_PINNED")
+        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
+            "NV_DSOCR_H2D_PINNED",
+        )
     }
 
     pub(crate) fn cache_budget_bytes() -> usize {

@@ -30,6 +30,10 @@ int nv_kernels_rmsnorm_bf16(
     float eps
 );
 
+int nv_kernels_gather_rows_e4m3_bf16(void* stream, const uint8_t* weight, const float* row_scale, const int32_t* token_ids, uint16_t* out, int tokens, int hidden, int vocab);
+int nv_kernels_rmsnorm_e4m3_weight_bf16(void* stream, const uint16_t* x, const uint8_t* weight, const float* weight_scale, uint16_t* out, size_t batch, size_t hidden, float eps);
+int nv_kernels_rmsnorm_residual_e4m3_weight_bf16(void* stream, const uint16_t* x, uint16_t* residual, const uint8_t* weight, const float* weight_scale, uint16_t* out, size_t batch, size_t hidden, float eps);
+
 int nv_kernels_rope_f32(
     void* stream,
     float* q,
@@ -182,6 +186,44 @@ int nv_kernels_marlin_gemm_w4a16_prezeroed(
     int a_is_bf16
 );
 
+int nv_kernels_marlin_gemm_w4a16_m1_tail(
+    void* stream,
+    const void* a_bf16,
+    const void* b_q_marlin,
+    const void* b_scales,
+    void* c_out,
+    void* workspace,
+    int n,
+    int k,
+    int group_size,
+    int kind,
+    const uint16_t* res,
+    const uint16_t* w,
+    uint16_t* h_out,
+    float* rstd_out,
+    const uint16_t* next_w,
+    uint16_t* normed_out,
+    const float* pli,
+    uint16_t* gelu_out,
+    float eps,
+    float scale,
+    float eps_next,
+    unsigned int* counter);
+
+int nv_kernels_marlin_gemm_fp8_w8a16(void* stream, const void* a_bf16, const void* b_q_marlin, const void* b_scales_bf16_per_channel, void* c_out, void* c_tmp_f32, long long c_tmp_floats, void* workspace, int m, int n, int k);
+int nv_kernels_marlin_nvfp4_c_tmp_floats(long long* out_floats);
+int nv_kernels_marlin_gemm_nvfp4_w4a16(void* stream, const void* a_bf16, const void* b_q_marlin, const void* b_scales_e5m3_bytes, const float* global_scale_dev, void* c_out, void* c_tmp_f32, long long c_tmp_floats, void* workspace, int m, int n, int k);
+
+int nv_kernels_marlin_moe_nvfp4_c_tmp_floats(long long* out_floats);
+int nv_kernels_marlin_moe_workspace_ints(int* out_ints);
+int nv_kernels_marlin_moe_nvfp4_w4a16(void* stream, const void* a_bf16, const void* b_q_stacked, const void* b_scales_stacked, const float* global_scales_per_expert, void* c_out, void* c_tmp_f32, long long c_tmp_floats, void* workspace, const int* sorted_token_ids, const int* expert_ids, const int* num_tokens_past_padded, const float* topk_weights, int num_experts, int top_k, int mul_topk_weights, int size_m, int size_n, int size_k);
+
+int nv_kernels_marlin_moe_align_block8_small(void* stream, const int32_t* topk_ids, int assignments, int num_experts, int32_t* sorted_ids, int32_t* expert_ids, int32_t* num_tokens_past_padded);
+int nv_kernels_marlin_moe_place_rows_by_inv_perm(void* stream, const uint16_t* rows_bf16, const int32_t* inv_perm, uint16_t* y_down, int n_rows, int hidden);
+int nv_kernels_marlin_moe_silu_mul_halves(void* stream, const uint16_t* gate_up_bf16, uint16_t* act_bf16, int rows, int inter);
+int nv_kernels_split_rows_bf16_four(void* stream, const uint16_t* src, uint16_t* a, uint16_t* b, uint16_t* c, uint16_t* d, int rows, int na, int nb, int nc, int nd, int n_src);
+int nv_kernels_marlin_moe_sum_slots_into_f32(void* stream, const uint16_t* rows_bf16, float* out, int n_tokens, int slots, int hidden);
+
 int nv_kernels_marlin_int4_fp8_preprocess(
     void* stream,
     const void* qweight,
@@ -307,6 +349,64 @@ int nv_kernels_gemv_e4m3_group(
     int K,
     int M,
     int rows_per_warp
+);
+
+int nv_kernels_gemm_e4m3_mrows_f16mma(
+    void* stream,
+    const uint8_t* wq,
+    const float* row_scale,
+    const uint16_t* x,
+    uint16_t* y,
+    int N,
+    int K,
+    int M
+);
+
+int nv_kernels_gemm_nvfp4_mrows_f16mma(
+    void* stream,
+    const uint8_t* wq,
+    const uint8_t* sc,
+    const uint16_t* x,
+    uint16_t* y,
+    float alpha,
+    int M,
+    int N,
+    int K
+);
+
+int nv_kernels_gemm_nvfp4_mrows_f16mma_dual(
+    void* stream,
+    const uint8_t* wq_a,
+    const uint8_t* sc_a,
+    const uint8_t* wq_b,
+    const uint8_t* sc_b,
+    const uint16_t* x,
+    uint16_t* y_a,
+    uint16_t* y_b,
+    float alpha_a,
+    float alpha_b,
+    int M,
+    int N,
+    int N_b,
+    int K
+);
+
+int nv_kernels_batched_copy_u32(
+    void* stream,
+    const uint64_t* dsts,
+    const uint64_t* srcs,
+    const uint32_t* nwords,
+    int count
+);
+
+int nv_kernels_gemv_bf16_rows(
+    void* stream,
+    const uint16_t* W,
+    const uint16_t* x,
+    uint16_t* y,
+    int N,
+    int K,
+    int rows
 );
 
 int nv_kernels_gemv_e4m3_group_tile_v(int M, int K);
@@ -527,6 +627,30 @@ int nv_kernels_flash_decode_kvshare_fp8kv_paged(
     int hole_lo_delta,
     int hole_hi_delta
 );
+int nv_kernels_flash_decode_kvshare_fp8kv_paged_qk_tc(
+    void* stream,
+    const uint16_t* q,
+    const uint8_t* k_fp8,
+    const uint8_t* v_fp8,
+    const float* k_scales,
+    const float* v_scales,
+    uint16_t* out,
+    const int* n_total_dev,
+    float* scratch,
+    unsigned int* fan_in,
+    int NH,
+    int NKV,
+    int HD,
+    int WINDOW,
+    int RING,
+    int splits,
+    float scaling,
+    const int* block_table,
+    int block_size,
+    int delta,
+    int hole_lo_delta,
+    int hole_hi_delta
+);
 
 int nv_kernels_flash_decode_rowshared_tctile_fp8kv_mk_paged(
     void* stream,
@@ -556,7 +680,7 @@ int nv_kernels_flash_decode_rowshared_tctile_fp8kv_mk_paged(
     int hole_hi_delta
 );
 
-int nv_kernels_flash_decode_rowshared_fp8kv_mk_paged(
+int nv_kernels_flash_decode_fused_tc_fp8kv_mk_paged(
     void* stream,
     const uint16_t* q,
     const uint8_t* k_fp8,
@@ -583,6 +707,7 @@ int nv_kernels_flash_decode_rowshared_fp8kv_mk_paged(
     int hole_lo_delta,
     int hole_hi_delta
 );
+
 
 int nv_kernels_flash_decode_derivev_fp8kv_paged(
     void* stream,
@@ -638,38 +763,6 @@ int nv_kernels_flash_decode_fused_fp8kv_lane_group(
     unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
     float scaling, int lanes_in_flight);
 
-int nv_kernels_flash_decode_fused_fp8kv_ilp4_paged(
-    void* stream, const uint16_t* q, const uint8_t* k_fp8, const uint8_t* v_fp8,
-    const float* k_scales, const float* v_scales, uint16_t* out,
-    const int* n_total_dev, float* scratch, unsigned int* fan_in,
-    int NH, int NKV, int HD, int WINDOW, int RING, float scaling,
-    const int* block_table, int block_size
-);
-
-int nv_kernels_flash_decode_fused_fp8kv_ilp4(
-    void* stream, const uint16_t* q, const uint8_t* k_fp8,
-    const uint8_t* v_fp8, const float* k_scales, const float* v_scales,
-    uint16_t* out, const int* n_total_dev, float* scratch,
-    unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
-    float scaling);
-
-int nv_kernels_flash_gshare_scratch_elems(int NH, int HD);
-
-int nv_kernels_flash_decode_fused_fp8kv_gshare_paged(
-    void* stream, const uint16_t* q, const uint8_t* k_fp8, const uint8_t* v_fp8,
-    const float* k_scales, const float* v_scales, uint16_t* out,
-    const int* n_total_dev, float* scratch, unsigned int* fan_in,
-    int NH, int NKV, int HD, int WINDOW, int RING, float scaling,
-    const int* block_table, int block_size
-);
-
-int nv_kernels_flash_decode_fused_fp8kv_gshare(
-    void* stream, const uint16_t* q, const uint8_t* k_fp8,
-    const uint8_t* v_fp8, const float* k_scales, const float* v_scales,
-    uint16_t* out, const int* n_total_dev, float* scratch,
-    unsigned int* fan_in, int NH, int NKV, int HD, int WINDOW, int RING,
-    float scaling);
-
 int nv_kernels_flash_splitk_scratch_elems_mk(int NH, int HD, int M);
 
 int nv_kernels_flash_decode_fused_bf16kv_mk(
@@ -711,6 +804,18 @@ int nv_kernels_nvfp4_gemv_bf16act(
     float alpha,
     int N,
     int K
+);
+
+int nv_kernels_nvfp4_gemv_bf16act_mrows(
+    void* stream,
+    const uint8_t* W_packed,
+    const uint8_t* W_scales,
+    const uint16_t* x_bf16,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K,
+    int M
 );
 
 int nv_kernels_nvfp4_gemv_prenorm_fused(void);
@@ -760,6 +865,18 @@ int nv_kernels_quantize_kv_fp8(
     int ring
 );
 
+int nv_kernels_quantize_kv_fp8_unit_scale(
+    void* stream,
+    const uint16_t* x_bf16,
+    uint8_t* x_fp8_base,
+    float* scales_base,
+    const int* start_dev,
+    int n_tokens,
+    int n_kv,
+    int head_dim,
+    int ring
+);
+
 int nv_kernels_dequantize_kv_fp8(
     void* stream,
     const uint8_t* x_fp8,
@@ -786,6 +903,59 @@ int nv_kernels_gemv_nvfp4_w4a16_dual_m1(
     int N,
     int K
 );
+
+int nv_kernels_gemv_nvfp4_w4a16_dual_m1_v2(
+    void* stream,
+    const uint8_t* wq_a,
+    const uint8_t* sc_a,
+    const uint8_t* wq_b,
+    const uint8_t* sc_b,
+    const uint16_t* x,
+    uint16_t* y_a,
+    uint16_t* y_b,
+    float alpha_a,
+    float alpha_b,
+    int N,
+    int K
+);
+
+int nv_kernels_gemv_nvfp4_w4a16_silu_gate_up_in_m1_v2(
+    void* stream,
+    const uint8_t* wq,
+    const uint8_t* sc,
+    const uint16_t* gate,
+    const uint16_t* up,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K
+);
+
+int nv_kernels_gemv_nvfp4_w4a16_gateup_pair_silu_out_m1_v3(
+    void* stream,
+    const uint8_t* wq_g,
+    const uint8_t* sc_g,
+    const uint8_t* wq_u,
+    const uint8_t* sc_u,
+    const uint16_t* x,
+    uint16_t* act,
+    float alpha_g,
+    float alpha_u,
+    int N,
+    int K
+);
+
+int nv_kernels_gemv_nvfp4_w4a16_down_act_in_m1_v3(
+    void* stream,
+    const uint8_t* wq,
+    const uint8_t* sc,
+    const uint16_t* act,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K
+);
+
 
 int nv_kernels_gemm_nvfp4_w4a16_mk_dual(
     void* stream,
@@ -935,24 +1105,6 @@ int nv_kernels_rmsnorm_residual_writeout_rowquant_i8_m1(
     float* out_dequant_scale,
     int hidden,
     float eps
-);
-
-int nv_kernels_gemv_e4m3_qkv_one_m1(
-    void* stream,
-    const uint8_t* wq_q,
-    const float* rs_q,
-    const uint8_t* wq_k,
-    const float* rs_k,
-    const uint8_t* wq_v,
-    const float* rs_v,
-    const uint16_t* x,
-    uint16_t* y_q,
-    uint16_t* y_k,
-    uint16_t* y_v,
-    int n_q,
-    int n_k,
-    int n_v,
-    int K
 );
 
 int nv_kernels_gemv_nvfp4_w4a8_dual_mk(
@@ -1334,6 +1486,62 @@ int nv_kernels_gdn_recurrent_f32(
     int V
 );
 
+int nv_kernels_gdn_train_scan_fwd_f32(
+    void* stream,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* g_exp,
+    const float* beta,
+    float* out,
+    float* ckpt,
+    int bn,
+    int t,
+    int dk,
+    int dv,
+    int chunk);
+
+int nv_kernels_gdn_train_scan_bwd_f32(
+    void* stream,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* g_exp,
+    const float* beta,
+    const float* d_out,
+    const float* ckpt,
+    float* scratch,
+    float* dq,
+    float* dk,
+    float* dv,
+    float* dg,
+    float* dbeta,
+    int bn,
+    int t,
+    int dkd,
+    int dvd,
+    int chunk);
+
+int nv_kernels_moe_slot_weighted_sum_bf16_f32(void* stream, const uint16_t* rows, const float* w, float* out, int tokens, int top_k, int hidden);
+int nv_kernels_moe_slot_weight_grad_bf16_f32(void* stream, const uint16_t* rows, const float* d_out, float* dw, int tokens, int top_k, int hidden);
+int nv_kernels_moe_slot_scatter_grad_f32_bf16(void* stream, const float* d_out, const float* w, uint16_t* d_rows, int tokens, int top_k, int hidden);
+int nv_kernels_moe_slot_sum_pairs_bf16_f32(void* stream, const uint16_t* a, const uint16_t* b, float* out, int tokens, int top_k, int hidden);
+
+int nv_kernels_attn_masked_softmax_rows_bf16(void* stream, const float* s, uint16_t* p, long rows, int t, int window, float scale);
+int nv_kernels_attn_masked_softmax_bwd_rows_bf16(void* stream, const float* s, const float* dp, const float* delta, uint16_t* p, uint16_t* ds, long rows, int t, int window, float scale);
+
+int nv_kernels_gdn_train_head_fwd(void* stream, const uint16_t* x, const float* w, float* packed, int b, int t, int conv_dim, int key_dim, int n_v, int v_per_k, int conv_k, float q_scale);
+int nv_kernels_gdn_train_head_bwd(void* stream, const uint16_t* x, const float* w, const float* g_packed, float* dy_scratch, uint16_t* dx, int b, int t, int conv_dim, int key_dim, int n_v, int v_per_k, int conv_k, float q_scale);
+
+int nv_kernels_ce_rows_bf16_fwd_dlogits(void* stream, const uint16_t* logits, const uint32_t* targets, const float* weights, float* loss_rows, uint16_t* dlogits, long rows, int vocab);
+int nv_kernels_ce_rows_scale_dlogits(void* stream, uint16_t* dlogits, const float* row_scale, long rows, int vocab);
+
+int nv_kernels_rmsnorm_train_fwd(void* stream, const void* x, const float* w, void* y, float* rstd_out, long rows, int dim, float eps, int x_is_bf16);
+int nv_kernels_rmsnorm_train_bwd(void* stream, const void* x, const float* w, const float* rstd, const void* g, void* dx, long rows, int dim, int x_is_bf16);
+
+int nv_kernels_rope_train_fwd(void* stream, const void* x, void* y, const float* cos_tbl, const float* sin_tbl, const uint32_t* pos, long tokens, int heads, int head_dim, int rotary_dim, float scale, int x_is_bf16);
+int nv_kernels_rope_train_bwd(void* stream, const void* g, void* dx, const float* cos_tbl, const float* sin_tbl, const uint32_t* pos, long tokens, int heads, int head_dim, int rotary_dim, float scale, int x_is_bf16);
+
 int nv_kernels_gdn_prefill_qk_l2norm_from_mixed(
     void* stream,
     const uint16_t* mixed,
@@ -1413,11 +1621,52 @@ int nv_kernels_gdn_chunk_gemm_scan_f32(
     int v_channel_offset
 );
 
+long long nv_kernels_gdn_scan_tree_compose_floor_workspace_elems(int n, int H);
+
+int nv_kernels_gdn_scan_tree_compose_floor(
+    void* stream,
+    float* workspace,
+    long long workspace_elems,
+    int n,
+    int H
+);
+
+long long nv_kernels_gdn_prefill_tc_head_launches_total(void);
+
+int nv_kernels_gdn_prefill_tc_fused_head(
+    void* stream,
+    const uint16_t* kr,
+    const uint16_t* qr,
+    const uint16_t* rhs,
+    const float* beta,
+    const float* cg,
+    uint16_t* attn,
+    uint16_t* wu,
+    int T,
+    int H,
+    int HK,
+    int n
+);
+
 int nv_kernels_gdn_conv1d_silu_bt_bf16(
     void* stream,
     const uint16_t* x,
     const uint16_t* state_in,
     const uint16_t* w,
+    uint16_t* y,
+    uint16_t* state_out,
+    int B,
+    int T,
+    int C,
+    int K
+);
+
+int nv_kernels_gdn_conv1d_silu_bt_fp8_weights(
+    void* stream,
+    const uint16_t* x,
+    const uint16_t* state_in,
+    const uint8_t* w,
+    const float* weight_scales,
     uint16_t* y,
     uint16_t* state_out,
     int B,
@@ -1438,6 +1687,10 @@ int nv_kernels_gdn_prefill_rmsnorm_gate_bf16(
 );
 
 int nv_kernels_norm_m1_wide_block(void);
+
+int nv_kernels_norm_m1_wide_batch_cap(void);
+
+int nv_kernels_norm_m1_wide_batch_cap_force(int rows);
 
 int nv_kernels_norm_m1_wide_force(int block);
 
@@ -1481,11 +1734,36 @@ int nv_kernels_gdn_conv_decode_silu_bf16(
     int k
 );
 
+int nv_kernels_gdn_conv_decode_silu_fp8_weights(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* conv_state,
+    const uint8_t* w,
+    const float* weight_scales,
+    uint16_t* y,
+    int conv_dim,
+    int k
+);
+
 int nv_kernels_gdn_conv_decode_silu_group_bf16(
     void* stream,
     const uint16_t* x_new,
     uint16_t* const* conv_states,
     const uint16_t* w,
+    uint16_t* y,
+    int conv_dim,
+    int k,
+    int lanes,
+    int x_lane_stride,
+    int y_lane_stride
+);
+
+int nv_kernels_gdn_conv_decode_silu_group_fp8_weights(
+    void* stream,
+    const uint16_t* x_new,
+    uint16_t* const* conv_states,
+    const uint8_t* w,
+    const float* weight_scales,
     uint16_t* y,
     int conv_dim,
     int k,
@@ -1513,6 +1791,8 @@ int nv_kernels_gdn_decode_step_bf16(
 );
 
 int nv_kernels_gdn_decode_step_group_vec4_arm_set(int arm);
+
+int nv_kernels_gdn_decode_step_single_lane_arms_set(int vec4_arm, int one_launch);
 
 int nv_kernels_gdn_decode_step_split_group_bf16(
     void* stream,
@@ -1585,6 +1865,33 @@ int nv_kernels_gdn_decode_step_split_bf16(
     float rms_eps
 );
 
+int nv_kernels_gdn_decode_step_split_overlap_bf16(
+    void* stream,
+    const uint16_t* mixed,
+    const uint16_t* z,
+    const uint16_t* a_in,
+    const uint16_t* b_in,
+    const uint16_t* A_log,
+    const uint16_t* dt_bias,
+    const uint16_t* norm_w,
+    float* state,
+    uint16_t* out,
+    float* qn_scratch,
+    float* kn_scratch,
+    float* g_exp_scratch,
+    float* beta_scratch,
+    uint16_t* core_scratch,
+    int n_k,
+    int n_v,
+    int d_k,
+    int d_v,
+    float rms_eps
+);
+
+int nv_kernels_gdn_state_overlap_join_pending(void* stream);
+
+int nv_kernels_gdn_state_overlap_pending_clear(void);
+
 int nv_kernels_rmsnorm_residual_writeout_bf16(
     void* stream,
     const uint16_t* x,
@@ -1637,6 +1944,19 @@ int nv_kernels_gdn_conv_decode_chunk_silu_bf16(
     const uint16_t* x_seq,
     const uint16_t* conv_state,
     const uint16_t* w,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    int conv_dim,
+    int k,
+    int t
+);
+
+int nv_kernels_gdn_conv_decode_chunk_silu_fp8_weights(
+    void* stream,
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const uint8_t* w,
+    const float* weight_scales,
     uint16_t* y,
     uint16_t* ckpt_conv,
     int conv_dim,
@@ -1697,6 +2017,20 @@ int nv_kernels_gdn_conv_decode_chunk_silu_tree_bf16(
     const uint16_t* x_seq,
     const uint16_t* conv_state,
     const uint16_t* w,
+    uint16_t* y,
+    uint16_t* ckpt_conv,
+    const int* parents,
+    int conv_dim,
+    int k,
+    int t
+);
+
+int nv_kernels_gdn_conv_decode_chunk_silu_tree_fp8_weights(
+    void* stream,
+    const uint16_t* x_seq,
+    const uint16_t* conv_state,
+    const uint8_t* w,
+    const float* weight_scales,
     uint16_t* y,
     uint16_t* ckpt_conv,
     const int* parents,
@@ -1841,6 +2175,15 @@ int nv_kernels_depthwise_conv1d_silu_bf16(
     void* stream,
     const uint16_t* x_bf16,
     const uint16_t* w_bf16,
+    uint16_t* y_bf16,
+    int B, int C, int T, int K
+);
+
+int nv_kernels_depthwise_conv1d_silu_fp8_weights(
+    void* stream,
+    const uint16_t* x_bf16,
+    const uint8_t* w_fp8,
+    const float* weight_scales,
     uint16_t* y_bf16,
     int B, int C, int T, int K
 );
@@ -2061,6 +2404,21 @@ int nv_kernels_moe_permute(
     int num_experts
 );
 
+int nv_kernels_moe_permute_padded(
+    void* stream,
+    const int32_t* topk_ids,
+    const float* topk_weights,
+    int32_t* permuted_token_idx,
+    int32_t* expert_offsets,
+    int32_t* inv_perm,
+    int32_t* scratch_counts,
+    int n_tokens,
+    int k,
+    int num_experts,
+    int tile_rows,
+    int padded_capacity
+);
+
 int nv_kernels_dflash_accept_f32(
     void* stream,
     const float* logits,
@@ -2122,6 +2480,15 @@ int nv_kernels_laguna_qk_normrope_bf16(
     const float* cos_tbl, const float* sin_tbl, const int* pos_base,
     int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale,
     float eps_q, float eps_k);
+int nv_kernels_laguna_qk_normrope_bf16_rows(void* stream, const uint16_t* q_in, const uint16_t* k_in, uint16_t* q_out, uint16_t* k_out, const uint16_t* qw, const uint16_t* kw, const float* cos_tbl, const float* sin_tbl, const int* positions, int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale, float eps_q, float eps_k, int rows);
+int nv_kernels_laguna_qk_normrope_fp8_weight_rows(void* stream, const uint16_t* q_in, const uint16_t* k_in, uint16_t* q_out, uint16_t* k_out, const uint8_t* qw, const float* qs, const uint8_t* kw, const float* ks, const float* cos_tbl, const float* sin_tbl, const int* positions, int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale, float eps_q, float eps_k, int rows);
+int nv_kernels_laguna_qk_normrope_bf16_base_rows(void* stream, const uint16_t* q_in, const uint16_t* k_in, uint16_t* q_out, uint16_t* k_out, const uint16_t* qw, const uint16_t* kw, const float* cos_tbl, const float* sin_tbl, const int* pos_base, int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale, float eps_q, float eps_k, int rows);
+int nv_kernels_laguna_qk_normrope_fp8_weight_base_rows(void* stream, const uint16_t* q_in, const uint16_t* k_in, uint16_t* q_out, uint16_t* k_out, const uint8_t* qw, const float* qs, const uint8_t* kw, const float* ks, const float* cos_tbl, const float* sin_tbl, const int* pos_base, int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale, float eps_q, float eps_k, int rows);
+int nv_kernels_laguna_gemv_fp8_qkvg_fp8_norm_rows(void* stream, const uint8_t* wq, const float* sq, const uint8_t* wk, const float* sk, const uint8_t* wv, const float* sv, const uint8_t* wg, const float* sg, const uint16_t* x, const uint8_t* wn, const float* sn, float eps, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yg, int nq, int nk, int nv, int ng, int k, int rows);
+int nv_kernels_laguna_gemv_fp8_qkvg_rows_rstd(void* stream, const uint8_t* wq, const float* sq, const uint8_t* wk, const float* sk, const uint8_t* wv, const float* sv, const uint8_t* wg, const float* sg, const uint16_t* x, const void* wn, const float* sn, const float* rstd, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yg, int nq, int nk, int nv, int ng, int k, int rows);
+int nv_kernels_laguna_prefill_qk_normrope_bf16(void* stream, const uint16_t* q_in, const uint16_t* k_in, uint16_t* q_out, uint16_t* k_out, const uint16_t* qw, const uint16_t* kw, const float* cos_tbl, const float* sin_tbl, const int* positions, int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale, float eps_q, float eps_k, int rows);
+int nv_kernels_laguna_prefill_qk_normrope_fp8_weight(void* stream, const uint16_t* q_in, const uint16_t* k_in, uint16_t* q_out, uint16_t* k_out, const uint8_t* qw, const uint8_t* kw, const float* qs, const float* ks, const float* cos_tbl, const float* sin_tbl, const int* positions, int n_q, int n_kv, int head_dim, int rotary_dim, float rot_scale, float eps_q, float eps_k, int rows);
+int nv_kernels_laguna_prefill_gate_bf16(void* stream, const uint16_t* attn, const uint16_t* gate, uint16_t* out, int rows, int n_q, int head_dim);
 
 int nv_kernels_laguna_flash_decode_gqa_scratch_elems(int n_kv);
 int nv_kernels_laguna_flash_decode_gqa(
@@ -2140,6 +2507,42 @@ int nv_kernels_laguna_flash_decode_gqa(
     int window,
     float scale
 );
+
+int nv_kernels_laguna_flash_decode_gqa_rows(void* stream, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, const int* total_ptr, int delta, float* scratch, unsigned int* fan_in, int n_q, int n_kv, int head_dim, int rows, int window, float scale);
+int nv_kernels_laguna_flash_decode_verify(
+    void* stream,
+    const uint16_t* q,
+    const uint8_t* k,
+    const uint8_t* v,
+    const float* k_scales,
+    const float* v_scales,
+    uint16_t* out,
+    const int* committed,
+    float* scratch,
+    unsigned int* fan_in,
+    int n_q,
+    int n_kv,
+    int head_dim,
+    int rows,
+    int capacity,
+    int splits,
+    float scale,
+    int kv_is_fp8
+);
+int nv_kernels_laguna_gemv_bf16_qkvg_normed_rows(void* stream, const uint16_t* Wq, const uint16_t* Wk, const uint16_t* Wv, const uint16_t* Wg, const uint16_t* x, const uint16_t* wn, const float* rstd, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yg, int Nq, int Nk, int Nv, int Ng, int K, int rows);
+int nv_kernels_laguna_gemv_bf16_rows(void* stream, const uint16_t* W, const uint16_t* x, uint16_t* y, int N, int K, int rows);
+int nv_kernels_laguna_gemv_q8_qkvg_normed_rows(void* stream, int fp8, const void* Wq, const float* Sq, const void* Wk, const float* Sk, const void* Wv, const float* Sv, const uint16_t* Wg, const uint16_t* x, const uint16_t* wn, const float* rstd, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yg, int Nq, int Nk, int Nv, int Ng, int K, int rows);
+int nv_kernels_laguna_gemv_q8_qkvg_normed_rows_rstd_fused(void* stream, int fp8, const void* Wq, const float* Sq, const void* Wk, const float* Sk, const void* Wv, const float* Sv, const uint16_t* Wg, const uint16_t* x, const uint16_t* wn, float eps, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yg, int Nq, int Nk, int Nv, int Ng, int K, int rows);
+int nv_kernels_laguna_gemv_fp8_qkvg_normed_rows_rstd_fused(void* stream, const uint8_t* Wq, const float* Sq, const uint8_t* Wk, const float* Sk, const uint8_t* Wv, const float* Sv, const uint8_t* Wg, const float* Sg, const uint16_t* x, const uint16_t* wn, float eps, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yg, int Nq, int Nk, int Nv, int Ng, int K, int rows);
+int nv_kernels_laguna_gemv_q8_rows(void* stream, int fp8, const void* W, const float* S, const uint16_t* x, uint16_t* y, int N, int K, int rows);
+int nv_kernels_laguna_gemv_q8_rows_gated(void* stream, int fp8, const void* W, const float* S, const uint16_t* attn, const uint16_t* gate, int gate_heads, int gate_hd, uint16_t* y, int N, int K, int rows);
+int nv_kernels_laguna_flash_decode_verify_window(void* stream, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, const int* committed, float* scratch, unsigned int* fan_in, int n_q, int n_kv, int head_dim, int rows, int capacity, int window, int rows_per_block, float scale);
+int nv_kernels_laguna_flash_decode_verify_fused_tc(void* stream, const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* out, const int* committed, float* scratch, unsigned int* fan_in, int n_q, int n_kv, int head_dim, int rows, int capacity, int splits, float scale);
+int nv_kernels_laguna_flash_decode_verify_fused_tc_fp8(void* stream, const uint16_t* q, const uint8_t* k, const uint8_t* v, const float* k_scales, const float* v_scales, uint16_t* out, const int* committed, float* scratch, unsigned int* fan_in, int n_q, int n_kv, int head_dim, int rows, int capacity, int splits, float scale, int kvq);
+int nv_kernels_quantize_kv_int8(void* stream, const uint16_t* x_bf16, uint8_t* x_int8_base, float* scales_base, const int* start_dev, int n_tokens, int n_kv, int head_dim, int ring);
+int nv_kernels_dequantize_kv_int8(void* stream, const uint8_t* x_int8, const float* scales, uint16_t* x_bf16, int start, int n_tokens, int n_kv, int head_dim, int ring);
+int nv_kernels_kv_append_int8(void* stream, const uint16_t* k_new, const uint16_t* v_new, uint8_t* kc, uint8_t* vc, float* k_scale, float* v_scale, const int* n_committed, int K, int NKV, int HD, int ring);
+int nv_kernels_laguna_rstd256_bf16_rows(void* stream, const uint16_t* x, float* rstd_out, int dim, float eps, int rows);
 
 int nv_kernels_laguna_seqlens_prep(
     void* stream,
@@ -2174,6 +2577,38 @@ int nv_kernels_gemv_w4a16_m1_proto(
     int GS,
     int variant
 );
+
+int nv_kernels_gemv_w4a16_m1_proto_geglu(
+    void* stream,
+    const uint32_t* packed,
+    const uint16_t* scale,
+    const uint16_t* x,
+    uint16_t* y,
+    int n_gate_rows_then_up_rows,
+    int k,
+    int gs,
+    int variant);
+
+int nv_kernels_gemv_w4a16_m1_proto_post_norm(
+    void* stream,
+    const uint32_t* packed,
+    const uint16_t* scale,
+    const uint16_t* x,
+    uint16_t* y,
+    int n,
+    int k,
+    int gs,
+    int variant,
+    const uint16_t* res,
+    const uint16_t* w,
+    uint16_t* h_out,
+    float* rstd_out,
+    const uint16_t* next_w,
+    uint16_t* normed_out,
+    float eps,
+    float res_scale,
+    float eps_next,
+    unsigned int* counter);
 
 int nv_kernels_sampler_topk_topp(
     void* stream,
@@ -2280,6 +2715,18 @@ int nv_kernels_tree_verify_attn_fp8(
 );
 
 int nv_kernels_kv_append_fp8(
+    void* stream,
+    const uint16_t* k_new,
+    const uint16_t* v_new,
+    uint8_t* kc,
+    uint8_t* vc,
+    float* k_scale,
+    float* v_scale,
+    const int* n_committed,
+    int K, int NKV, int HD, int ring
+);
+
+int nv_kernels_kv_append_fp8_unit_scale(
     void* stream,
     const uint16_t* k_new,
     const uint16_t* v_new,
@@ -2411,6 +2858,37 @@ int nv_kernels_cutlass_fp4_gemm_sm120_bf16_streamk(
     size_t workspace_bytes,
     size_t* required_workspace
 );
+int nv_kernels_e4m3_pertensor_quant_two_segments(
+    void* stream,
+    const uint16_t* x0_bf16,
+    const uint16_t* x1_bf16,
+    long long n_each,
+    uint8_t* q0_out,
+    uint8_t* q1_out,
+    float* scale_out,
+    unsigned int* amax_scratch
+);
+int nv_kernels_dx_twin_nvfp4_requant_transposed_kmajor(
+    void* stream,
+    const uint8_t* w_packed,
+    const uint8_t* w_scales_swizzled,
+    float alpha,
+    int n_out,
+    int k_in,
+    uint32_t* kmajor_out,
+    uint8_t* scales_linear_out
+);
+int nv_kernels_dx_twin_nvfp4_scales_to_marlin(
+    void* stream,
+    const uint8_t* scales_linear,
+    int n,
+    int kb,
+    float global_scale,
+    uint8_t* bytes_e5m3_out,
+    float* global_out,
+    unsigned int* vmin_scratch,
+    int* flags_out
+);
 int nv_kernels_dequant_weight_nvfp4_swizzled_to_bf16_rowmajor(
     void* stream,
     const uint8_t* w_packed,
@@ -2453,6 +2931,63 @@ int nv_kernels_nvfp4_gemm_sm120_v192_bf16(
     void* d_bf16,
     int m, int n, int k
 );
+int nv_kernels_quantize_nvfp4_silu_candle_bf16(
+    void* stream,
+    const uint16_t* gate,
+    const uint16_t* up,
+    uint8_t* packed_out,
+    uint8_t* scales_out,
+    float stored_global,
+    int m_padded,
+    int m_logical,
+    int K,
+    int sf_blk_rows
+);
+int nv_kernels_quantize_nvfp4_bf16_sf96(
+    void* stream,
+    const uint16_t* x_bf16,
+    uint8_t* packed_out,
+    uint8_t* scales_out_swizzled,
+    float stored_global,
+    int m_logical,
+    int K
+);
+int nv_kernels_nvfp4_cfx_shape_index(int m, int n, int k);
+int nv_kernels_nvfp4_cfx_load(
+    const void* cubin,
+    size_t cubin_bytes,
+    int m, int n, int k
+);
+int nv_kernels_nvfp4_cfx_ready(int m, int n, int k);
+int nv_kernels_nvfp4_cfx_gemm_bf16(
+    void* stream,
+    const void* a_fp4,
+    const void* a_sf96,
+    const void* b_fp4,
+    const void* b_sf128,
+    const float* alpha_dev,
+    void* d_bf16,
+    int m, int n, int k
+);
+
+int nv_kernels_e4b_online_softmax_tile(
+    void* stream, const float* s, uint16_t* p, float* m_run, float* l_run, float* o_acc,
+    int rows_per_group, int groups, int n, int tile_len, int key_off, int q_pos0, int hd,
+    float scale, int first_tile);
+int nv_kernels_e4b_attn_finalize(
+    void* stream, const float* o_acc, const float* l_run, uint16_t* out, int n, int heads, int hd);
+
+int nv_kernels_flash_decode_gqa4_hd512_scratch_elems(int NH, int capacity);
+int nv_kernels_flash_decode_fused_gqa4_hd512(
+    void* stream, const float* q, const uint16_t* k, const uint16_t* v, uint16_t* out,
+    const int* pos, int delta, float* scratch, unsigned int* fan_in, int NH, int NKV, int HD,
+    int WINDOW, int capacity);
+
+int nv_kernels_e4b_prefill_qkv_prep(
+    void* stream, const uint16_t* qkv, int qkv_row_stride, const uint16_t* qw, const uint16_t* kw,
+    const float* cos_tbl, const float* sin_tbl, const int* pos, float* q_out, float* kcache,
+    float* vcache, uint16_t* ktwin, uint16_t* vtwin, int n, int write_off, int cap, int NH, int NKV,
+    int HD, float eps);
 
 #ifdef __cplusplus
 }

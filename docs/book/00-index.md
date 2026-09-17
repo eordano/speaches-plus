@@ -15,7 +15,7 @@ Read the chapters in order the first time. Each chapter names the files that
 implement what it describes, so it doubles as a map of the tree.
 
 > **There is no provenance register, and a number cites its own basis or is
-> marked UNVERIFIED.** `docs/measurements/` holds dated per-round pages and
+> marked UNVERIFIED.** the private measurement records hold dated per-round pages and
 > nothing else -- no `INDEX.md`, no `§`-numbered sections, no `F-NN` flag ids --
 > so a citation naming any of those is citing something that does not exist and
 > reads as evidence while being none. A number earns its place one of two ways:
@@ -42,7 +42,6 @@ implement what it describes, so it doubles as a map of the tree.
 **1 -- Architecture**
 
 - [1.1 Charter](01.1-native-rust-port-prd.md) -- the normative goals, the acceptance bar, and the T0-T5 numerics contract
-- [1.4 STATUS](01.4-STATUS.md) -- the canonical implementation-status snapshot against the PRD
 
 **2 -- Model loading**
 
@@ -89,17 +88,20 @@ implement what it describes, so it doubles as a map of the tree.
 - [6.10 dots.ocr QLoRA](06.10-dots-qlora.md) -- handwriting adaptation over the served
   4-bit snapshot: frozen affine-u4 base, fp32 adapters, serving-exact vision-row dumps,
   and the open items to full completion
+- [6.11 dots.ocr in the browser](06.11-ocr-browser.md) -- the wasm32 carve of the
+  serving arm: OPFS model delivery, the wasm surface and its parity gates, and the
+  readback-pump / wasm-memory limits that still gate in-tab execution
 
 **7 -- Speech stack**
 
 - [7.1 Realtime session RFC v3](07.1-barge-turn-spec-rfc-v3.md) -- the `/v1/realtime` session state machine, normative constants
+- [7.2 Voices](07.2-voices.md) -- recordings to named speakers to a fitted Kokoro voice: workspace manifest, local/remote sync, fit tiers with early stopping, measured cost, runtime voice store
+- [7.3 Kokoro in candle](07.3-kokoro-candle.md) -- porting Kokoro-82M to candle so adapted voices train and serve without torch: architecture table, staged parity gates, autograd plan
 
 **8 -- Build and testing**
 
 - [8.1 Quality harness](08.1-quality-harness.md) -- the only sanctioned way to measure output quality, and what each model's prompt framing costs
 - [8.2 Quality verdicts](08.2-quality-verdicts.md) -- how an arm is decided SHIP / REJECT / UNRESOLVED, and why a band is meaningless without its measured noise floor
-- [8.3 Rocq proof notes](08.3-rocq-proof-notes.md) -- what code each proof mirrors and what is deliberately not claimed
-- [8.4 PERFORMANCE](08.4-PERFORMANCE.md) -- how to quote a number: the basis-tuple rule
 
 ## Reading paths
 
@@ -108,7 +110,7 @@ implement what it describes, so it doubles as a map of the tree.
 - **Porting to non-CUDA hardware** -- 5, then 4.
 - **Changing a kernel** -- 4, then 8 for how to build and verify it.
 - **Touching audio** -- 7, then 6.
-- **"What state is X in?"** -- the subchapters of X's chapter, starting from [1.4 STATUS](01.4-STATUS.md).
+- **"What state is X in?"** -- the subchapters of X's chapter.
 
 ## Two conventions worth knowing before you edit
 

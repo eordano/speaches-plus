@@ -51,7 +51,7 @@ pub struct GemvBf16ExpertParams {
     pub x_slot_stride_words: u32,
     pub y_slot_stride_words: u32,
     pub alpha: f32,
-    pub pad0: u32,
+    pub x_slot_div: u32,
     pub pad1: u32,
     pub pad2: u32,
 }
@@ -68,7 +68,7 @@ pub struct GemvI8Params {
     pub use_sel: u32,
     pub groups_per_row: u32,
     pub group_shift: u32,
-    pub pad0: u32,
+    pub x_slot_div: u32,
     pub pad1: u32,
     pub pad2: u32,
 }
@@ -87,7 +87,7 @@ pub struct GemvNvfp4Params {
     pub xsf_slot_stride_bytes: u32,
     pub y_slot_stride_words: u32,
     pub per_expert_alpha: u32,
-    pub pad0: u32,
+    pub x_slot_div: u32,
 }
 
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -97,6 +97,10 @@ pub struct QuantRowsParams {
     pub n_slots: u32,
     pub use_sel: u32,
     pub x_slot_stride_elems: u32,
+    pub x_slot_div: u32,
+    pub pad0: u32,
+    pub pad1: u32,
+    pub pad2: u32,
 }
 
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -170,9 +174,23 @@ pub fn staging_flush_enabled() -> bool {
     )
 }
 
+pub fn qshare_enabled() -> bool {
+    std::env::var("NV_LAGUNA_WGPU_QSHARE").ok().as_deref() != Some("0")
+}
+
+pub fn mprefill_enabled() -> bool {
+    std::env::var("NV_LAGUNA_WGPU_MPREFILL").ok().as_deref() != Some("0")
+}
+
+pub fn mprefill_forced() -> bool {
+    std::env::var("NV_LAGUNA_WGPU_MPREFILL").ok().as_deref() == Some("1")
+}
+
 pub struct Builder {
     pub core: crate::wgpu_ledger::VramLedger,
     pub passes: Vec<Pass>,
+    pub mpf_passes: Vec<Pass>,
+    pub emit_mpf: bool,
     pub state_buffers: Vec<(wgpu::Buffer, u64)>,
 }
 
@@ -199,6 +217,8 @@ impl Builder {
                 STAGING_FLUSH_BYTES,
             ),
             passes: Vec::new(),
+            mpf_passes: Vec::new(),
+            emit_mpf: false,
             state_buffers: Vec::new(),
         }
     }
@@ -220,12 +240,17 @@ impl Builder {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
             .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
-        self.passes.push(Pass {
+        let p = Pass {
             pipeline,
             bind,
             grid,
             entry: entry.to_string(),
-        });
+        };
+        if self.emit_mpf {
+            self.mpf_passes.push(p);
+        } else {
+            self.passes.push(p);
+        }
         Ok(())
     }
 
@@ -314,6 +339,24 @@ pub struct Sources {
     pub dense: String,
 }
 
+pub const ATTN_ABL_CONST_LINE: &str = "const LGA_ABL: u32 = 0u;";
+
+pub fn attn_source_with_abl_arm(arm: u32) -> String {
+    let src = compose(super::attn::ATTN_WGSL);
+    if arm == 0 {
+        return src;
+    }
+    assert!(
+        src.contains(ATTN_ABL_CONST_LINE),
+        "NV_LAGUNA_ATTN_ABL={arm} needs the LGA_ABL const in laguna_attn.wgsl; a silent \
+         no-replace would wall the shipped kernel while claiming a deletion arm"
+    );
+    src.replace(
+        ATTN_ABL_CONST_LINE,
+        &format!("const LGA_ABL: u32 = {arm}u;"),
+    )
+}
+
 impl Sources {
     pub fn new() -> Self {
         Self {
@@ -325,7 +368,7 @@ impl Sources {
             rms: compose(wk::rmsnorm::WGSL),
             rmsres: compose(wk::rmsnorm_residual::WGSL),
             resscale: compose(wk::residual_scale::WGSL),
-            attn: compose(super::attn::ATTN_WGSL),
+            attn: attn_source_with_abl_arm(super::attn::attn_abl_arm()),
             moe: compose(super::moe::MOE_WGSL),
             dense: compose(super::dense::DENSE_WGSL),
         }
@@ -358,6 +401,7 @@ pub struct Nvfp4ExpertGpu {
     pub scales: wgpu::Buffer,
     pub alphas: wgpu::Buffer,
     pub globals: wgpu::Buffer,
+    pub globals_uniform: bool,
     pub e: usize,
     pub n: usize,
     pub k: usize,
@@ -498,6 +542,7 @@ pub fn push_gemv_i8_experts(
     slots: usize,
     use_sel: bool,
     x_per_slot: bool,
+    x_slot_div: usize,
 ) -> Result<()> {
     anyhow::ensure!(
         ex.k.is_multiple_of(4),
@@ -512,6 +557,7 @@ pub fn push_gemv_i8_experts(
             k_elems: ex.k as u32,
             groups_x: groups,
             x_slot_stride_elems: if x_per_slot { ex.k as u32 } else { 0 },
+            x_slot_div: x_slot_div as u32,
             w_e_stride_words: (ex.n * ex.k / 4) as u32,
             y_slot_stride_words: (ex.n.div_ceil(2)) as u32,
             use_sel: u32::from(use_sel),
@@ -578,6 +624,10 @@ pub fn upload_nvfp4_experts(
         scales: b.upload_u32(&format!("{label}-sf"), &bytes_to_words(&st.scales_swizzled)),
         alphas: b.upload_f32(&format!("{label}-a"), &st.alphas),
         globals: b.upload_f32(&format!("{label}-g"), &st.input_globals),
+        globals_uniform: st
+            .input_globals
+            .first()
+            .is_some_and(|g0| st.input_globals.iter().all(|g| g.to_bits() == g0.to_bits())),
         e: st.e,
         n: st.n,
         k: st.k,
@@ -649,6 +699,7 @@ pub fn push_gemv_bf16_experts(
     sel: &wgpu::Buffer,
     slots: usize,
     x_per_slot: bool,
+    x_slot_div: usize,
 ) -> Result<()> {
     let pairs = w.n.div_ceil(2);
     let grid = b.grid1(pairs as u64, 1);
@@ -664,6 +715,7 @@ pub fn push_gemv_bf16_experts(
             x_slot_stride_words: if x_per_slot { (w.k / 2) as u32 } else { 0 },
             y_slot_stride_words: (w.n / 2) as u32,
             alpha: 1.0,
+            x_slot_div: x_slot_div as u32,
             ..Default::default()
         },
     );
@@ -690,6 +742,7 @@ pub fn push_quant_rows(
     slots: usize,
     use_sel: bool,
     x_per_slot: bool,
+    x_slot_div: usize,
 ) -> Result<()> {
     let k_blocks = k_elems / NVFP4_BLOCK;
     anyhow::ensure!(
@@ -703,6 +756,8 @@ pub fn push_quant_rows(
             n_slots: slots as u32,
             use_sel: u32::from(use_sel),
             x_slot_stride_elems: if x_per_slot { k_elems as u32 } else { 0 },
+            x_slot_div: x_slot_div as u32,
+            ..Default::default()
         },
     );
     let gx = (k_blocks as u32).div_ceil(256).max(1);
@@ -738,9 +793,16 @@ pub fn push_gemv_nvfp4(
     k_elems: usize,
     slots: usize,
     per_expert: bool,
+    x_shared: bool,
     alpha: f32,
+    x_slot_div: usize,
 ) -> Result<()> {
     let k_blocks = k_elems / NVFP4_BLOCK;
+    let x_stride = if slots > 1 && !x_shared {
+        k_blocks as u32
+    } else {
+        0
+    };
     let pairs = n_rows.div_ceil(2);
     let grid = b.grid1(pairs as u64, 1);
     let p = b.uni(
@@ -761,11 +823,11 @@ pub fn push_gemv_nvfp4(
             } else {
                 0
             },
-            x_slot_stride_vec2: if slots > 1 { k_blocks as u32 } else { 0 },
-            xsf_slot_stride_bytes: if slots > 1 { k_blocks as u32 } else { 0 },
+            x_slot_stride_vec2: x_stride,
+            xsf_slot_stride_bytes: x_stride,
             y_slot_stride_words: (n_rows / 2) as u32,
             per_expert_alpha: u32::from(per_expert),
-            pad0: 0,
+            x_slot_div: x_slot_div as u32,
         },
     );
     b.push(
@@ -838,6 +900,7 @@ pub fn push_lin_gemv(
             1,
             false,
             false,
+            1,
         ),
         LinGpu::Nvfp4(w) => {
             push_quant_rows(
@@ -853,6 +916,7 @@ pub fn push_lin_gemv(
                 1,
                 false,
                 false,
+                1,
             )?;
             push_gemv_nvfp4(
                 b,
@@ -869,10 +933,432 @@ pub fn push_lin_gemv(
                 w.k,
                 1,
                 false,
+                false,
                 w.alpha,
+                1,
             )
         }
     }
+}
+
+pub fn lin_pair_shares_quant(a: &LinGpu, b: &LinGpu) -> bool {
+    match (a, b) {
+        (LinGpu::Nvfp4(x), LinGpu::Nvfp4(y)) => {
+            x.k == y.k && x.input_global.to_bits() == y.input_global.to_bits()
+        }
+        _ => false,
+    }
+}
+
+pub enum PairScratch {
+    SharedQuant(LinScratch),
+    PerLin(LinScratch, LinScratch),
+}
+
+pub fn alloc_pair_scratch(
+    b: &mut Builder,
+    label_a: &str,
+    lin_a: &LinGpu,
+    label_b: &str,
+    lin_b: &LinGpu,
+) -> PairScratch {
+    if qshare_enabled() && lin_pair_shares_quant(lin_a, lin_b) {
+        PairScratch::SharedQuant(alloc_lin_scratch(b, label_a, lin_a))
+    } else {
+        PairScratch::PerLin(
+            alloc_lin_scratch(b, label_a, lin_a),
+            alloc_lin_scratch(b, label_b, lin_b),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_lin_gemv_pair(
+    b: &mut Builder,
+    s: &Sources,
+    label_a: &str,
+    lin_a: &LinGpu,
+    label_b: &str,
+    lin_b: &LinGpu,
+    scratch: &PairScratch,
+    x_packed: &wgpu::Buffer,
+    y_a: &wgpu::Buffer,
+    y_b: &wgpu::Buffer,
+) -> Result<()> {
+    match scratch {
+        PairScratch::PerLin(sa, sb) => {
+            push_lin_gemv(b, s, label_a, lin_a, sa, x_packed, y_a)?;
+            push_lin_gemv(b, s, label_b, lin_b, sb, x_packed, y_b)
+        }
+        PairScratch::SharedQuant(sh) => {
+            let (wa, wb) = match (lin_a, lin_b) {
+                (LinGpu::Nvfp4(wa), LinGpu::Nvfp4(wb)) => (wa, wb),
+                _ => anyhow::bail!(
+                    "{label_a}/{label_b}: SharedQuant scratch reached a non-nvfp4 pair; \
+                     alloc_pair_scratch shares only when lin_pair_shares_quant holds"
+                ),
+            };
+            anyhow::ensure!(
+                wa.k == wb.k && wa.input_global.to_bits() == wb.input_global.to_bits(),
+                "{label_a}/{label_b}: one shared input quant yields both consumers' bytes \
+                 bitwise only when k and input_global are bit-equal; differing globals must \
+                 fall back to per-lin quant"
+            );
+            push_quant_rows(
+                b,
+                s,
+                &format!("{label_a}-quant"),
+                x_packed,
+                &sh.xq,
+                &sh.xs,
+                &sh.sel0,
+                &sh.globals,
+                wa.k,
+                1,
+                false,
+                false,
+                1,
+            )?;
+            push_gemv_nvfp4(
+                b,
+                s,
+                label_a,
+                &wa.w,
+                &wa.scales,
+                &sh.xq,
+                &sh.xs,
+                y_a,
+                &sh.sel0,
+                &sh.alpha_dummy,
+                wa.n,
+                wa.k,
+                1,
+                false,
+                false,
+                wa.alpha,
+                1,
+            )?;
+            push_gemv_nvfp4(
+                b,
+                s,
+                label_b,
+                &wb.w,
+                &wb.scales,
+                &sh.xq,
+                &sh.xs,
+                y_b,
+                &sh.sel0,
+                &sh.alpha_dummy,
+                wb.n,
+                wb.k,
+                1,
+                false,
+                false,
+                wb.alpha,
+                1,
+            )
+        }
+    }
+}
+
+pub struct MRows {
+    pub m: usize,
+    pub list: wgpu::Buffer,
+    pub sel0: wgpu::Buffer,
+}
+
+pub fn alloc_mrows(b: &mut Builder, m: usize, list: wgpu::Buffer) -> MRows {
+    MRows {
+        m,
+        list,
+        sel0: b.upload_u32("lgw-mpf-sel0", &vec![0u32; m]),
+    }
+}
+
+pub fn alloc_lin_scratch_rows(b: &mut Builder, label: &str, lin: &LinGpu, m: usize) -> LinScratch {
+    let (input_global, xq_bytes, xs_bytes) = match lin {
+        LinGpu::Bf16(_) | LinGpu::Int8(_) => (1.0f32, 4u64, 4u64),
+        LinGpu::Nvfp4(l) => {
+            let k_blocks = l.k / NVFP4_BLOCK;
+            (
+                l.input_global,
+                (m * l.k / 2) as u64,
+                ((m * k_blocks).div_ceil(4) * 4) as u64,
+            )
+        }
+    };
+    LinScratch {
+        xq: b.zeros(&format!("{label}-mxq"), xq_bytes),
+        xs: b.zeros(&format!("{label}-mxs"), xs_bytes),
+        globals: b.upload_f32(&format!("{label}-mgin"), &[input_global]),
+        sel0: b.upload_u32(&format!("{label}-msel0"), &[0u32]),
+        alpha_dummy: b.upload_f32(&format!("{label}-madummy"), &[1.0f32]),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_gemv_bf16_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    w: &Bf16Gpu,
+    x_packed: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    mp: &MRows,
+    out_f32: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        out_f32 || w.n.is_multiple_of(2),
+        "{label}: rows gemv packs bf16 output pairs per token, n {} must be even",
+        w.n
+    );
+    let pairs = w.n.div_ceil(2);
+    let grid = b.grid1(pairs as u64, 1);
+    let p = b.uni(
+        "lgw-gemvbr-p",
+        GemvBf16ExpertParams {
+            n_rows: w.n as u32,
+            k_words: (w.k / 2) as u32,
+            groups_x: grid.0,
+            out_f32: u32::from(out_f32),
+            w_row_words: (w.k / 2) as u32,
+            w_e_stride_words: 0,
+            x_slot_stride_words: (w.k / 2) as u32,
+            y_slot_stride_words: if out_f32 {
+                w.n as u32
+            } else {
+                (w.n / 2) as u32
+            },
+            alpha: 1.0,
+            x_slot_div: 1,
+            ..Default::default()
+        },
+    );
+    b.push(
+        label,
+        &s.gemv_bf16,
+        "lgw_gemv_bf16_experts",
+        &[(0, &w.w), (1, x_packed), (2, &p), (3, y), (4, &mp.sel0)],
+        (grid.0, grid.1, mp.m as u32),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_lin_gemv_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    lin: &LinGpu,
+    scratch: &LinScratch,
+    x_packed: &wgpu::Buffer,
+    y_packed: &wgpu::Buffer,
+    mp: &MRows,
+) -> Result<()> {
+    anyhow::ensure!(
+        lin.n().is_multiple_of(2),
+        "{label}: rows gemv packs output pairs per token, n {} must be even",
+        lin.n()
+    );
+    match lin {
+        LinGpu::Bf16(w) => push_gemv_bf16_rows(b, s, label, w, x_packed, y_packed, mp, false),
+        LinGpu::Int8(w) => push_gemv_i8_experts(
+            b, s, label, w, x_packed, y_packed, &mp.sel0, mp.m, true, true, 1,
+        ),
+        LinGpu::Nvfp4(w) => {
+            push_quant_rows(
+                b,
+                s,
+                &format!("{label}-quant"),
+                x_packed,
+                &scratch.xq,
+                &scratch.xs,
+                &mp.sel0,
+                &scratch.globals,
+                w.k,
+                mp.m,
+                true,
+                true,
+                1,
+            )?;
+            push_gemv_nvfp4(
+                b,
+                s,
+                label,
+                &w.w,
+                &w.scales,
+                &scratch.xq,
+                &scratch.xs,
+                y_packed,
+                &mp.sel0,
+                &scratch.alpha_dummy,
+                w.n,
+                w.k,
+                mp.m,
+                false,
+                false,
+                w.alpha,
+                1,
+            )
+        }
+    }
+}
+
+pub fn alloc_pair_scratch_rows(
+    b: &mut Builder,
+    label_a: &str,
+    lin_a: &LinGpu,
+    label_b: &str,
+    lin_b: &LinGpu,
+    m: usize,
+) -> PairScratch {
+    if qshare_enabled() && lin_pair_shares_quant(lin_a, lin_b) {
+        PairScratch::SharedQuant(alloc_lin_scratch_rows(b, label_a, lin_a, m))
+    } else {
+        PairScratch::PerLin(
+            alloc_lin_scratch_rows(b, label_a, lin_a, m),
+            alloc_lin_scratch_rows(b, label_b, lin_b, m),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_lin_gemv_pair_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label_a: &str,
+    lin_a: &LinGpu,
+    label_b: &str,
+    lin_b: &LinGpu,
+    scratch: &PairScratch,
+    x_packed: &wgpu::Buffer,
+    y_a: &wgpu::Buffer,
+    y_b: &wgpu::Buffer,
+    mp: &MRows,
+) -> Result<()> {
+    match scratch {
+        PairScratch::PerLin(sa, sb) => {
+            push_lin_gemv_rows(b, s, label_a, lin_a, sa, x_packed, y_a, mp)?;
+            push_lin_gemv_rows(b, s, label_b, lin_b, sb, x_packed, y_b, mp)
+        }
+        PairScratch::SharedQuant(sh) => {
+            let (wa, wb) = match (lin_a, lin_b) {
+                (LinGpu::Nvfp4(wa), LinGpu::Nvfp4(wb)) => (wa, wb),
+                _ => anyhow::bail!(
+                    "{label_a}/{label_b}: SharedQuant rows scratch reached a non-nvfp4 pair; \
+                     alloc_pair_scratch_rows shares only when lin_pair_shares_quant holds"
+                ),
+            };
+            anyhow::ensure!(
+                wa.k == wb.k && wa.input_global.to_bits() == wb.input_global.to_bits(),
+                "{label_a}/{label_b}: one shared input quant per token yields both consumers' \
+                 bytes bitwise only when k and input_global are bit-equal"
+            );
+            push_quant_rows(
+                b,
+                s,
+                &format!("{label_a}-quant"),
+                x_packed,
+                &sh.xq,
+                &sh.xs,
+                &mp.sel0,
+                &sh.globals,
+                wa.k,
+                mp.m,
+                true,
+                true,
+                1,
+            )?;
+            for (label, w, y) in [(label_a, wa, y_a), (label_b, wb, y_b)] {
+                push_gemv_nvfp4(
+                    b,
+                    s,
+                    label,
+                    &w.w,
+                    &w.scales,
+                    &sh.xq,
+                    &sh.xs,
+                    y,
+                    &mp.sel0,
+                    &sh.alpha_dummy,
+                    w.n,
+                    w.k,
+                    mp.m,
+                    false,
+                    false,
+                    w.alpha,
+                    1,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_rmsnorm_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    x_packed: &wgpu::Buffer,
+    w_packed: &wgpu::Buffer,
+    y_packed: &wgpu::Buffer,
+    hidden: usize,
+    eps: f32,
+    m: usize,
+) -> Result<()> {
+    let p = b.uni(
+        "lgw-rmsr-p",
+        RmsParams {
+            hidden: hidden as u32,
+            batch: m as u32,
+            eps,
+            words_per_row: (hidden / 2) as u32,
+        },
+    );
+    b.push(
+        label,
+        &s.rms,
+        "rmsnorm_bf16",
+        &[(0, x_packed), (1, w_packed), (2, y_packed), (3, &p)],
+        (m as u32, 1, 1),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn push_rmsnorm_residual_rows(
+    b: &mut Builder,
+    s: &Sources,
+    label: &str,
+    delta_packed: &wgpu::Buffer,
+    res_packed: &wgpu::Buffer,
+    w_packed: &wgpu::Buffer,
+    y_packed: &wgpu::Buffer,
+    hidden: usize,
+    eps: f32,
+    m: usize,
+) -> Result<()> {
+    let p = b.uni(
+        "lgw-rmsresr-p",
+        RmsParams {
+            hidden: hidden as u32,
+            batch: m as u32,
+            eps,
+            words_per_row: (hidden / 2) as u32,
+        },
+    );
+    b.push(
+        label,
+        &s.rmsres,
+        "rmsnorm_residual_bf16",
+        &[
+            (0, delta_packed),
+            (1, res_packed),
+            (2, w_packed),
+            (3, y_packed),
+            (4, &p),
+        ],
+        (m as u32, 1, 1),
+    )
 }
 
 pub fn push_silu_mul(
@@ -997,4 +1483,65 @@ pub fn push_residual_add(
         &[(0, delta_packed), (1, res_packed), (2, out_packed), (3, &p)],
         grid,
     )
+}
+
+#[cfg(test)]
+mod workgroup_limit_gate {
+    use super::*;
+
+    const METAL_EXECUTES_OVER_LIMIT_WORKGROUP_PIPELINES_ABOUT_500X_SLOW_LIMIT_BYTES: u32 = 32768;
+
+    fn assert_every_entry_point_fits(name: &str, src: &str) {
+        let module = naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("{name}: wgsl parse failed: {e}"));
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        let info = validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: naga validation failed: {e:?}"));
+        for (i, ep) in module.entry_points.iter().enumerate() {
+            let fi = info.get_entry_point(i);
+            let mut bytes = 0u32;
+            for (h, gv) in module.global_variables.iter() {
+                if gv.space == naga::AddressSpace::WorkGroup && !fi[h].is_empty() {
+                    bytes += module.types[gv.ty].inner.size(module.to_ctx());
+                }
+            }
+            assert!(
+                bytes <= METAL_EXECUTES_OVER_LIMIT_WORKGROUP_PIPELINES_ABOUT_500X_SLOW_LIMIT_BYTES,
+                "{name}::{}: declares {bytes}B of workgroup memory; Metal executes pipelines \
+                 over its 32768B limit roughly 500x slow instead of refusing them, so this gate \
+                 fails at test time instead",
+                ep.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_laguna_entry_point_fits_the_metal_workgroup_memory_limit_in_every_module_variant() {
+        let s = Sources::new();
+        for (n, src) in [
+            ("gemv_bf16", &s.gemv_bf16),
+            ("gemv_i8", &s.gemv_i8),
+            ("gemv_nvfp4", &s.gemv_nvfp4),
+            ("quant", &s.quant),
+            ("common", &s.common),
+            ("rms", &s.rms),
+            ("rmsres", &s.rmsres),
+            ("resscale", &s.resscale),
+            ("attn", &s.attn),
+            ("moe", &s.moe),
+            ("dense", &s.dense),
+        ] {
+            assert_every_entry_point_fits(n, src);
+        }
+        for arm in 1u32..=3 {
+            assert_every_entry_point_fits(
+                &format!("attn(abl={arm})"),
+                &attn_source_with_abl_arm(arm),
+            );
+        }
+    }
 }

@@ -7,8 +7,20 @@ use std::sync::Arc;
 
 pub mod dots;
 pub mod dots_fixture;
+#[cfg(feature = "metal")]
+pub mod dots_rope;
+#[cfg(feature = "metal")]
+pub mod dots_w4head;
+
+pub fn w4head_requested_via_env() -> bool {
+    std::env::var("NV_DOTS_QLORA_W4HEAD").as_deref() == Ok("1")
+}
 pub mod qwen38;
 pub mod qwen38_fixture;
+pub mod qwen38_gdn_chunked;
+pub mod qwen38_gdn_head;
+pub mod qwen38_ce;
+pub mod train_prof;
 
 struct DetRng(u64);
 
@@ -297,6 +309,19 @@ pub fn save_peft(
     Ok(())
 }
 
+pub const LORA_TVIEW_DROPS_TWO_FACTOR_TRANSPOSE_COPIES_PER_APPLICATION: &str =
+    "lora_delta_raw materialized a.t().contiguous() and b.t().contiguous() on every hook \
+     application -- two copy kernels forward plus their copy backwards through autograd, paid \
+     once per projection per layer per bucket (336 applications per qlora step before the \
+     backward). NV_DOTS_LORA_TVIEW=1 feeds the transposed views straight to matmul; the mlx \
+     steel GEMM walks the identical k-order through transposed addressing, verified bitwise \
+     against the canonical 20-step trajectory before any flip";
+
+fn lora_tview_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NV_DOTS_LORA_TVIEW").as_deref() == Ok("1"))
+}
+
 fn lora_delta_raw(
     a: &Tensor,
     b: &Tensor,
@@ -311,6 +336,12 @@ fn lora_delta_raw(
         Some((off, rows)) => b.narrow(0, off, rows)?,
         None => b,
     };
+    if lora_tview_enabled() {
+        let _ = LORA_TVIEW_DROPS_TWO_FACTOR_TRANSPOSE_COPIES_PER_APPLICATION;
+        let xr = x.matmul(&a.t()?)?;
+        let delta = xr.matmul(&b.t()?)?;
+        return Ok((delta * scaling)?);
+    }
     let xr = x.matmul(&a.t()?.contiguous()?)?;
     let delta = xr.matmul(&b.t()?.contiguous()?)?;
     Ok((delta * scaling)?)
@@ -748,8 +779,10 @@ impl DatasetTokenizer {
                     .encode(s, false)
                     .map_err(|e| anyhow::anyhow!("tokenize dataset row: {e}"))?;
                 let ids: Vec<u32> = enc.get_ids().to_vec();
-                if let Some((pos, id)) =
-                    ids.iter().enumerate().find(|(_, i)| (**i as usize) >= vocab)
+                if let Some((pos, id)) = ids
+                    .iter()
+                    .enumerate()
+                    .find(|(_, i)| (**i as usize) >= vocab)
                 {
                     bail!(
                         "tokenizer produced id {id} at token position {pos} but the model config \
@@ -824,6 +857,19 @@ pub fn ce_mean_over_unmasked_positions(
         .mul(&m)?
         .sum_all()?
         .affine(-1.0 / unmasked as f64, 0.0)?)
+}
+
+pub fn ce_weighted_over_positions(
+    logits_t_vocab: &Tensor,
+    targets: &Tensor,
+    weights: &[f32],
+) -> Result<Tensor> {
+    let t = targets.dims1()?;
+    ensure_mask_shape(weights, t)?;
+    let logp = candle_nn::ops::log_softmax(logits_t_vocab, candle_core::D::Minus1)?;
+    let picked = logp.gather(&targets.unsqueeze(1)?, 1)?.squeeze(1)?;
+    let w = Tensor::from_vec(weights.to_vec(), t, logits_t_vocab.device())?;
+    Ok(picked.mul(&w)?.sum_all()?.neg()?)
 }
 
 fn ensure_mask_shape(mask: &[f32], targets: usize) -> Result<()> {
@@ -927,10 +973,18 @@ mod tests {
     fn scaling_is_alpha_over_rank_and_unit_scaling_means_exactly_one() {
         assert_eq!(LoraConfig::unit_scaling(8).scaling(), 1.0);
         assert_eq!(LoraConfig::unit_scaling(64).scaling(), 1.0);
-        let cfg = LoraConfig { r: 8, alpha: 16.0, dropout: 0.0 };
+        let cfg = LoraConfig {
+            r: 8,
+            alpha: 16.0,
+            dropout: 0.0,
+        };
         assert_eq!(cfg.scaling(), 2.0, "alpha 16 over rank 8");
 
-        let cfg = LoraConfig { r: 32, alpha: 8.0, dropout: 0.0 };
+        let cfg = LoraConfig {
+            r: 32,
+            alpha: 8.0,
+            dropout: 0.0,
+        };
         assert_eq!(cfg.scaling(), 0.25);
     }
 
@@ -938,8 +992,17 @@ mod tests {
     fn a_rank_zero_or_non_matrix_base_is_refused_rather_than_producing_an_adapter() {
         let base = Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap();
         assert!(
-            LoraTrainable::new(&base, LoraConfig { r: 0, alpha: 1.0, dropout: 0.0 }, 1, &Device::Cpu)
-                .is_err(),
+            LoraTrainable::new(
+                &base,
+                LoraConfig {
+                    r: 0,
+                    alpha: 1.0,
+                    dropout: 0.0
+                },
+                1,
+                &Device::Cpu
+            )
+            .is_err(),
             "rank 0 has no low-rank factors at all"
         );
         let rank3 = Tensor::zeros((2, 3, 4), DType::F32, &Device::Cpu).unwrap();
@@ -948,11 +1011,17 @@ mod tests {
 
     #[test]
     fn b_starts_at_zero_so_an_untrained_adapter_is_the_identity() {
-
         let lora = cpu_lora(6, 4, LoraConfig::unit_scaling(2));
         let x = Tensor::ones((3, 4), DType::F32, &Device::Cpu).unwrap();
         let delta = lora_delta(lora.a.as_tensor(), lora.b.as_tensor(), 1.0, &x, None).unwrap();
-        assert_eq!(max_abs_diff(&delta, &Tensor::zeros((3, 6), DType::F32, &Device::Cpu).unwrap()).unwrap(), 0.0);
+        assert_eq!(
+            max_abs_diff(
+                &delta,
+                &Tensor::zeros((3, 6), DType::F32, &Device::Cpu).unwrap()
+            )
+            .unwrap(),
+            0.0
+        );
 
         let a_mag = max_abs_diff(
             lora.a.as_tensor(),
@@ -979,7 +1048,6 @@ mod tests {
 
     #[test]
     fn the_window_narrows_b_from_the_offset_so_a_fused_split_writes_its_own_rows() {
-
         let dev = Device::Cpu;
         let a = Tensor::ones((2, 3), DType::F32, &dev).unwrap();
         let b = Tensor::from_vec(
@@ -992,7 +1060,10 @@ mod tests {
 
         let full = lora_delta(&a, &b, 1.0, &x, None).unwrap();
         assert_eq!(full.dims(), &[1, 4]);
-        assert_eq!(full.flatten_all().unwrap().to_vec1::<f32>().unwrap(), vec![6.0, 12.0, 18.0, 24.0]);
+        assert_eq!(
+            full.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            vec![6.0, 12.0, 18.0, 24.0]
+        );
 
         let win = lora_delta(&a, &b, 1.0, &x, Some((1, 2))).unwrap();
         assert_eq!(win.dims(), &[1, 2], "the window sets the output width");
@@ -1007,30 +1078,57 @@ mod tests {
     fn a_saved_adapter_carries_the_tensor_names_a_peft_loader_looks_for() {
         let dir = std::env::temp_dir().join(format!("nvtrain-peft-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let q = cpu_lora(4, 4, LoraConfig { r: 2, alpha: 4.0, dropout: 0.0 });
-        let k = cpu_lora(4, 4, LoraConfig { r: 2, alpha: 4.0, dropout: 0.0 });
+        let q = cpu_lora(
+            4,
+            4,
+            LoraConfig {
+                r: 2,
+                alpha: 4.0,
+                dropout: 0.0,
+            },
+        );
+        let k = cpu_lora(
+            4,
+            4,
+            LoraConfig {
+                r: 2,
+                alpha: 4.0,
+                dropout: 0.0,
+            },
+        );
         save_peft(
             &dir,
             &[
-                PeftEntry { module: "layers.0.self_attn.q_proj".into(), lora: &q },
-                PeftEntry { module: "layers.1.self_attn.k_proj".into(), lora: &k },
+                PeftEntry {
+                    module: "layers.0.self_attn.q_proj".into(),
+                    lora: &q,
+                },
+                PeftEntry {
+                    module: "layers.1.self_attn.k_proj".into(),
+                    lora: &k,
+                },
             ],
             "google/gemma-4-E4B-it",
         )
         .unwrap();
 
-        let cfg: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("adapter_config.json")).unwrap())
-                .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("adapter_config.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(cfg["peft_type"], "LORA");
         assert_eq!(cfg["r"], 2);
         assert_eq!(cfg["lora_alpha"], 4.0);
         assert_eq!(cfg["base_model_name_or_path"], "google/gemma-4-E4B-it");
 
-        assert_eq!(cfg["target_modules"], serde_json::json!(["k_proj", "q_proj"]));
+        assert_eq!(
+            cfg["target_modules"],
+            serde_json::json!(["k_proj", "q_proj"])
+        );
 
-        let st = candle_core::safetensors::load(dir.join("adapter_model.safetensors"), &Device::Cpu)
-            .unwrap();
+        let st =
+            candle_core::safetensors::load(dir.join("adapter_model.safetensors"), &Device::Cpu)
+                .unwrap();
         let mut keys: Vec<&String> = st.keys().collect();
         keys.sort();
         assert_eq!(
@@ -1047,18 +1145,50 @@ mod tests {
 
     #[test]
     fn an_adapter_whose_modules_disagree_on_r_or_alpha_is_refused() {
-
         let dir = std::env::temp_dir().join(format!("nvtrain-mixed-{}", std::process::id()));
-        let a = cpu_lora(4, 4, LoraConfig { r: 2, alpha: 4.0, dropout: 0.0 });
-        let b_diff_r = cpu_lora(4, 4, LoraConfig { r: 4, alpha: 4.0, dropout: 0.0 });
-        let b_diff_alpha = cpu_lora(4, 4, LoraConfig { r: 2, alpha: 8.0, dropout: 0.0 });
+        let a = cpu_lora(
+            4,
+            4,
+            LoraConfig {
+                r: 2,
+                alpha: 4.0,
+                dropout: 0.0,
+            },
+        );
+        let b_diff_r = cpu_lora(
+            4,
+            4,
+            LoraConfig {
+                r: 4,
+                alpha: 4.0,
+                dropout: 0.0,
+            },
+        );
+        let b_diff_alpha = cpu_lora(
+            4,
+            4,
+            LoraConfig {
+                r: 2,
+                alpha: 8.0,
+                dropout: 0.0,
+            },
+        );
 
-        assert!(save_peft(&dir, &[], "m").is_err(), "no entries is not an adapter");
+        assert!(
+            save_peft(&dir, &[], "m").is_err(),
+            "no entries is not an adapter"
+        );
         assert!(save_peft(
             &dir,
             &[
-                PeftEntry { module: "a".into(), lora: &a },
-                PeftEntry { module: "b".into(), lora: &b_diff_r },
+                PeftEntry {
+                    module: "a".into(),
+                    lora: &a
+                },
+                PeftEntry {
+                    module: "b".into(),
+                    lora: &b_diff_r
+                },
             ],
             "m"
         )
@@ -1066,8 +1196,14 @@ mod tests {
         assert!(save_peft(
             &dir,
             &[
-                PeftEntry { module: "a".into(), lora: &a },
-                PeftEntry { module: "b".into(), lora: &b_diff_alpha },
+                PeftEntry {
+                    module: "a".into(),
+                    lora: &a
+                },
+                PeftEntry {
+                    module: "b".into(),
+                    lora: &b_diff_alpha
+                },
             ],
             "m"
         )

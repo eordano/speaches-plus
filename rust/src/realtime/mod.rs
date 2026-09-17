@@ -53,6 +53,7 @@ mod pipeline;
 mod sdp_filter;
 mod session;
 mod session_update;
+pub mod speaker_id;
 pub mod state;
 mod transport;
 mod v2_compat;
@@ -334,11 +335,11 @@ mod admission_tests {
     use super::*;
     use std::sync::Barrier;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn concurrent_acquire_never_exceeds_cap() {
-        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = TEST_LOCK.blocking_lock();
         let base = active_session_count();
         let cap = base + 8;
         let threads = 64usize;
@@ -367,7 +368,7 @@ mod admission_tests {
 
     #[tokio::test]
     async fn the_slot_is_held_for_the_whole_session_not_just_the_upgrade() {
-        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = TEST_LOCK.lock().await;
         let base = active_session_count();
         let guard = ActiveSessionGuard::try_acquire(base + 1).expect("slot available");
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -404,7 +405,7 @@ mod admission_tests {
 
     #[test]
     fn session_slot_is_released_by_drop_session() {
-        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = TEST_LOCK.blocking_lock();
         let base = active_session_count();
         let id = "admission-test-session";
         let slot = ActiveSessionGuard::try_acquire(base + 1).expect("slot available");

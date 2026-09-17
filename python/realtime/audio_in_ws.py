@@ -5,6 +5,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 if TYPE_CHECKING:
     from .session import Session
 
@@ -61,11 +63,7 @@ class WsAudioIngest:
         if self.codec == "pcm16le":
             if len(payload) % 2 != 0:
                 raise IngestError(f"PCM16 payload has odd byte count: {len(payload)}")
-            out: list[float] = []
-            for i in range(0, len(payload), 2):
-                v = int.from_bytes(payload[i : i + 2], "little", signed=True)
-                out.append(v / SCALE_I16)
-            return out
+            return (np.frombuffer(payload, dtype="<i2").astype(np.float64) / SCALE_I16).tolist()
         if self.codec == "ulaw":
             from audio.g711 import ulaw_decode_byte
 

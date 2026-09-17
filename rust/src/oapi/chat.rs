@@ -12,6 +12,11 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::oapi::deadline;
+use crate::oapi::generation_limits::{
+    default_max_tokens_from, max_max_tokens_from, resolve_request_max_new_tokens,
+    DEFAULT_MAX_TOKENS_ENV_MOVES_THE_OMITTED_MAX_TOKENS_DEFAULT_OF_256,
+    MAX_MAX_TOKENS_ENV_LIFTS_THE_8192_CAP_THE_KV_WINDOW_STAYS_THE_REAL_BOUND,
+};
 use crate::oapi::{kind, openai_error};
 
 #[path = "json_ext.rs"]
@@ -43,22 +48,6 @@ pub fn oapi_phase_wall(t0: std::time::Instant, phase: &str) {
     }
 }
 
-pub const DEFAULT_MAX_TOKENS: usize = 256;
-
-pub const DEFAULT_MAX_TOKENS_ENV_MOVES_THE_OMITTED_MAX_TOKENS_DEFAULT_OF_256: &str =
-    "NV_DEFAULT_MAX_TOKENS";
-
-pub const MAX_MAX_TOKENS: usize = 8192;
-
-pub const MAX_MAX_TOKENS_ENV_LIFTS_THE_8192_CAP_THE_KV_WINDOW_STAYS_THE_REAL_BOUND: &str =
-    "NV_MAX_MAX_TOKENS";
-
-pub fn default_max_tokens_from(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_TOKENS)
-}
-
 pub fn default_max_tokens() -> usize {
     default_max_tokens_from(
         std::env::var(DEFAULT_MAX_TOKENS_ENV_MOVES_THE_OMITTED_MAX_TOKENS_DEFAULT_OF_256)
@@ -67,22 +56,12 @@ pub fn default_max_tokens() -> usize {
     )
 }
 
-pub fn max_max_tokens_from(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(MAX_MAX_TOKENS)
-}
-
 pub fn max_max_tokens() -> usize {
     max_max_tokens_from(
         std::env::var(MAX_MAX_TOKENS_ENV_LIFTS_THE_8192_CAP_THE_KV_WINDOW_STAYS_THE_REAL_BOUND)
             .ok()
             .as_deref(),
     )
-}
-
-pub fn resolve_max_new_tokens(asked: Option<usize>, omitted_default: usize, cap: usize) -> usize {
-    asked.unwrap_or(omitted_default).clamp(1, cap.max(1))
 }
 
 pub const SPEC_DECODE_HEADER: &str = "x-spec-decode";
@@ -514,6 +493,8 @@ fn build_tool_messages(
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            reasoning: None,
+            reasoning_content: None,
         });
     }
     out
@@ -846,6 +827,11 @@ pub struct ChatMessageIn {
     pub content: Option<MessageContent>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -966,10 +952,7 @@ pub(crate) fn extract_mm_media(
                         .cloned()
                         .and_then(|v| serde_json::from_value(v).ok())
                         .ok_or_else(|| {
-                            mm_part_error(
-                                idx,
-                                "image_url must be a URL string or {\"url\": ...}",
-                            )
+                            mm_part_error(idx, "image_url must be a URL string or {\"url\": ...}")
                         })?;
                     let img = decode_image_ref(spec.url())
                         .map_err(|e| mm_part_error(idx, &format!("{e:#}")))?;
@@ -1055,7 +1038,10 @@ pub(crate) async fn bridge_mm_parts(
         decode_b64, decode_data_url_bytes, ImageUrlSpec, InputAudioSpec,
     };
     let Some(addr) = crate::oapi::SELF_ADDR.get() else {
-        return Err(mm_part_error(0, "perception bridge unavailable: listen address not bound"));
+        return Err(mm_part_error(
+            0,
+            "perception bridge unavailable: listen address not bound",
+        ));
     };
     let base = format!("http://{addr}/v1");
     let client = reqwest::Client::new();
@@ -1218,11 +1204,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    pub fn totaled(
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        cached_tokens: Option<u32>,
-    ) -> Self {
+    pub fn totaled(prompt_tokens: u32, completion_tokens: u32, cached_tokens: Option<u32>) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
@@ -1345,14 +1327,15 @@ impl EngineBusy {
 }
 
 pub const ENGINE_BUSY_PREFIX: &str = "engine busy:";
+pub(crate) const ENGINE_INTERRUPTED: &str =
+    "engine busy: generation stopped before completion; try later.";
 
 impl std::fmt::Display for EngineBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{ENGINE_BUSY_PREFIX} the chat surface is at capacity ({} concurrent) and the request \
-             waited {} ms without a slot. Retry shortly, or raise NV_CHAT_CONCURRENCY / \
-             NV_CHAT_QUEUE_MS.",
+             waited {} ms without a slot; try later.",
             self.permits, self.waited_ms
         )
     }
@@ -1372,11 +1355,53 @@ impl std::fmt::Display for UnsupportedMedia {
 impl std::error::Error for UnsupportedMedia {}
 
 pub fn is_busy_shed(msg: &str) -> bool {
-    msg.contains(ENGINE_BUSY_PREFIX) || msg.contains(crate::oapi::admission::REJECT_PREFIX)
+    let lower = msg.to_ascii_lowercase();
+    msg.contains(ENGINE_BUSY_PREFIX)
+        || msg.contains(crate::oapi::admission::REJECT_PREFIX)
+        || lower.contains("cuda_error_out_of_memory")
+        || lower.contains("cudaerrormemoryallocation")
+        || lower.contains("cuda oom")
+        || (lower.contains("cuda") && lower.contains("out of memory"))
 }
 
 pub fn is_prompt_overflow(msg: &str) -> bool {
-    msg.contains("KV window") && (msg.contains("does not fit") || msg.contains("no room to generate"))
+    msg.contains("KV window")
+        && (msg.contains("does not fit") || msg.contains("no room to generate"))
+}
+
+pub(crate) fn retryable_response(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
+}
+
+pub(crate) fn retryable_message(mut message: String) -> String {
+    if !message.contains("try later") {
+        message.push_str("; try later.");
+    }
+    message
+}
+
+fn engine_stream_error(msg: String) -> serde_json::Value {
+    let msg = if is_busy_shed(&msg) {
+        retryable_message(msg)
+    } else {
+        msg
+    };
+    let (error_type, code) = if is_busy_shed(&msg) {
+        (kind::SERVICE_UNAVAIL, "engine_busy")
+    } else if is_prompt_overflow(&msg) {
+        (kind::INVALID_REQUEST, "context_length_exceeded")
+    } else {
+        (kind::SERVER, "engine_error")
+    };
+    let mut body = json!({"error": {"message": msg, "type": error_type, "code": code}});
+    if error_type == kind::SERVICE_UNAVAIL {
+        body["error"]["retry_after"] = json!(1);
+    }
+    body
 }
 
 pub(crate) fn engine_event_error_by_surface(
@@ -1392,7 +1417,7 @@ pub(crate) fn engine_event_error_by_surface(
     }
     if is_busy_shed(&msg) {
         warn!(reason = %msg, "{}", shed_note);
-        return unavailable(msg);
+        return retryable_response(unavailable(retryable_message(msg)));
     }
     server(msg)
 }
@@ -1404,8 +1429,17 @@ pub(crate) fn engine_start_error_by_surface(
     server: impl FnOnce(String) -> Response,
 ) -> Response {
     if let Some(busy) = err.downcast_ref::<EngineBusy>() {
-        warn!(permits = busy.permits, waited_ms = busy.waited_ms, "{}", shed_note);
-        return unavailable(format!("{busy}"));
+        warn!(
+            permits = busy.permits,
+            waited_ms = busy.waited_ms,
+            "{}",
+            shed_note
+        );
+        return retryable_response(unavailable(retryable_message(format!("{err:#}"))));
+    }
+    let message = format!("{err:#}");
+    if is_busy_shed(&message) {
+        return retryable_response(unavailable(retryable_message(message)));
     }
     server(format!("engine: {err}"))
 }
@@ -1450,17 +1484,16 @@ pub(crate) fn deadline_shed_response(budget_ms: u64, source: &'static str) -> Re
         source,
         "shed a chat request: the caller-supplied deadline expired before generation started"
     );
-    openai_error(
+    retryable_response(openai_error(
         StatusCode::SERVICE_UNAVAILABLE,
-        format!(
+        retryable_message(format!(
             "the chat surface did not start this request within the caller-supplied deadline of \
-             {budget_ms} ms (from the {source}); it is at capacity. Retry shortly, or send a \
-             larger deadline."
-        ),
+             {budget_ms} ms (from the {source}); it is at capacity"
+        )),
         kind::SERVICE_UNAVAIL,
         None,
         Some("surface_busy"),
-    )
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1570,6 +1603,13 @@ pub trait ChatEngine: Send + Sync + 'static {
         req: ChatGenerateRequest,
         tx: mpsc::Sender<ChatEvent>,
     ) -> anyhow::Result<()>;
+
+    async fn capture_layer(
+        &self,
+        _req: crate::oapi::laguna_capture::LayerCaptureRequest,
+    ) -> anyhow::Result<crate::oapi::laguna_capture::LayerCaptureResponse> {
+        anyhow::bail!("layer capture is not available on this engine")
+    }
 
     fn render_prompt(&self, messages: &[ChatMessageIn]) -> String {
         render_chat_prompt(messages)
@@ -1867,7 +1907,17 @@ pub(crate) fn with_system_directive(
 pub(crate) fn template_messages_json(
     messages: &[ChatMessageIn],
 ) -> anyhow::Result<serde_json::Value> {
-    let mut msgs = serde_json::to_value(messages)?;
+    let flattened: Vec<ChatMessageIn> = messages
+        .iter()
+        .map(|m| match m.content {
+            Some(MessageContent::Parts(_)) => ChatMessageIn {
+                content: Some(MessageContent::Text(m.text())),
+                ..m.clone()
+            },
+            _ => m.clone(),
+        })
+        .collect();
+    let mut msgs = serde_json::to_value(&flattened)?;
     if let Some(arr) = msgs.as_array_mut() {
         for m in arr.iter_mut() {
             let Some(calls) = m.get_mut("tool_calls").and_then(|c| c.as_array_mut()) else {
@@ -2035,6 +2085,11 @@ async fn chat_completions_impl(
         Some(e) => e,
         None => return model_not_found(req.model.as_deref().unwrap_or("")),
     };
+    crate::oapi::cold_tier::ensure_free_async(
+        crate::oapi::cold_tier::chat_min_free_bytes(),
+        "chat",
+    )
+    .await;
 
     let mm_media = if first_unsupported_part(&req.messages).is_some() {
         if engine.supports_mm_input() {
@@ -2176,8 +2231,9 @@ async fn chat_completions_impl(
         None => Vec::new(),
     };
     let max_tokens_cap = max_max_tokens();
-    let max_new_tokens = resolve_max_new_tokens(
-        req.max_completion_tokens.or(req.max_tokens),
+    let max_new_tokens = resolve_request_max_new_tokens(
+        req.max_tokens,
+        req.max_completion_tokens,
         default_max_tokens(),
         max_tokens_cap,
     );
@@ -2267,9 +2323,8 @@ async fn first_event(
         None => rx.recv().await,
     };
     match ev {
-        Some(ChatEvent::Error(msg)) if is_busy_shed(&msg) || is_prompt_overflow(&msg) => {
-            Err(engine_event_error_response(msg))
-        }
+        Some(ChatEvent::Error(msg)) => Err(engine_event_error_response(msg)),
+        None => Err(engine_event_error_response(ENGINE_INTERRUPTED.into())),
         other => Ok(other),
     }
 }
@@ -2351,11 +2406,15 @@ async fn run_non_streaming(
                     finish_reason = r;
                     completion_tokens = c;
                     saw_done = true;
+                    break;
                 }
                 ChatEvent::Error(msg) => return engine_event_error_response(msg),
             }
         }
 
+        if !saw_done {
+            return engine_event_error_response(ENGINE_INTERRUPTED.into());
+        }
         total_completion_tokens = total_completion_tokens.saturating_add(completion_tokens);
         if saw_done && crate::oapi::trajectory::enabled() {
             crate::oapi::trajectory::append(crate::oapi::trajectory::TrajectoryRecord {
@@ -2389,7 +2448,10 @@ async fn run_non_streaming(
                 Some((r, c)) => ((!r.is_empty()).then_some(r), c),
                 None => (None, text),
             },
-            false => ((!engine_reasoning.is_empty()).then_some(engine_reasoning), text),
+            false => (
+                (!engine_reasoning.is_empty()).then_some(engine_reasoning),
+                text,
+            ),
         };
         let (content, tool_calls, finish_reason) = if tpp.active {
             let parsed = parse_model_tool_calls(&text, tpp.force_name.as_deref());
@@ -2482,7 +2544,7 @@ async fn run_streaming(
                     g.seed = Some(base_seed.wrapping_add(i as u64));
                     let (tx_ev, rx_ev) = mpsc::channel::<ChatEvent>(64);
                     if let Err(err) = engine.generate(g, tx_ev).await {
-                        let body = json!({"error": {"message": format!("engine: {err}"), "type": kind::SERVER}});
+                        let body = engine_stream_error(format!("engine: {err:#}"));
                         let _ = send_sse_raw(&tx_bytes, &body.to_string()).await;
                         let _ = send_sse_raw(&tx_bytes, "[DONE]").await;
                         return;
@@ -2529,7 +2591,11 @@ async fn run_streaming(
             loop {
                 let Some(ev) = (match pre.take() {
                     Some(ev) => Some(ev),
-                    None => rx_ev.recv().await,
+                    None => tokio::select! {
+                        biased;
+                        _ = tx_bytes.closed() => return,
+                        event = rx_ev.recv() => event,
+                    },
                 }) else {
                     break;
                 };
@@ -2666,9 +2732,10 @@ async fn run_streaming(
                         finish_reason = Some(r);
                         choice_completion_tokens = c;
                         total_completion_tokens = total_completion_tokens.saturating_add(c);
+                        break;
                     }
                     ChatEvent::Error(msg) => {
-                        let body = json!({"error": {"message": msg, "type": kind::SERVER}});
+                        let body = engine_stream_error(msg);
                         let _ = send_sse_raw(&tx_bytes, &body.to_string()).await;
                         let _ = send_sse_raw(&tx_bytes, "[DONE]").await;
                         return;
@@ -2676,6 +2743,12 @@ async fn run_streaming(
                 }
             }
 
+            if finish_reason.is_none() {
+                let body = engine_stream_error(ENGINE_INTERRUPTED.into());
+                let _ = send_sse_raw(&tx_bytes, &body.to_string()).await;
+                let _ = send_sse_raw(&tx_bytes, "[DONE]").await;
+                return;
+            }
             let raw_finish_before_tool_parse = finish_reason.clone();
 
             if let Some(c) = pending_content.take() {
@@ -2895,6 +2968,9 @@ mod tests {
     use axum::body::Body;
 
     use super::*;
+    use crate::oapi::generation_limits::{
+        resolve_max_new_tokens, DEFAULT_MAX_TOKENS, MAX_MAX_TOKENS,
+    };
 
     #[test]
     fn max_tokens_resolution_with_envs_unset_is_bit_identical_to_the_old_hard_consts() {
@@ -2964,7 +3040,14 @@ mod tests {
 
     #[test]
     fn garbage_or_zero_max_tokens_envs_keep_the_shipped_defaults() {
-        for junk in [None, Some(""), Some(" "), Some("0"), Some("-1"), Some("lots")] {
+        for junk in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("0"),
+            Some("-1"),
+            Some("lots"),
+        ] {
             assert_eq!(max_max_tokens_from(junk), MAX_MAX_TOKENS, "junk {junk:?}");
             assert_eq!(
                 default_max_tokens_from(junk),
@@ -3167,7 +3250,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_non_busy_start_failure_is_still_a_500() {
-        let err = anyhow::anyhow!("cuda oom");
+        let err = anyhow::anyhow!("cuda error: an illegal memory access was encountered");
         let resp = engine_start_error_response(&err);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = error_body(resp).await;
@@ -3275,6 +3358,15 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn template_messages_json_flattens_content_parts_to_text() {
+        let body = r#"{"messages":[{"role":"system","content":"S"},{"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}"#;
+        let r: ChatCompletionRequest = serde_json::from_str(body).unwrap();
+        let v = template_messages_json(&r.messages).unwrap();
+        assert_eq!(v[0]["content"], "S");
+        assert_eq!(v[1]["content"], "a\nb");
     }
 
     #[test]
@@ -3700,6 +3792,39 @@ mod tests {
         )
         .unwrap();
         crate::oapi::chat_template::ChatTemplate::load(&d).expect("load")
+    }
+
+    #[test]
+    fn reasoning_history_survives_request_parsing_and_official_template_rendering() {
+        let d = std::env::temp_dir().join(format!("reasoning-history-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("chat_template.jinja"),
+            "{% for m in messages %}{% if m.role == 'assistant' %}<think>{{ m.reasoning if m.reasoning is string else m.reasoning_content }}</think>{{ m.content }}{% endif %}{% endfor %}").unwrap();
+        let template = crate::oapi::chat_template::ChatTemplate::load(&d).unwrap();
+        for field in ["reasoning", "reasoning_content"] {
+            let mut assistant = json!({"role":"assistant","content":"Found.",
+                "tool_calls":[{"id":"c1","type":"function","function":{
+                    "name":"grep","arguments":"{\"pattern\":\"needle\"}"}}]});
+            assistant[field] = json!("The search is complete; read the file next.");
+            let req: ChatCompletionRequest = serde_json::from_value(json!({
+                "model":"laguna", "messages":[assistant,
+                    {"role":"tool","tool_call_id":"c1","content":"file.rs:1:needle"},
+                    {"role":"user","content":"Continue."}]
+            }))
+            .unwrap();
+            let rendered =
+                render_official(&template, &req.messages, &[], &ToolChoice::Auto).unwrap();
+            assert_eq!(
+                rendered,
+                "<think>The search is complete; read the file next.</think>Found."
+            );
+            assert_eq!(req.messages[0].text(), "Found.");
+            assert_eq!(
+                template_messages_json(&req.messages).unwrap()[0][field],
+                "The search is complete; read the file next."
+            );
+        }
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

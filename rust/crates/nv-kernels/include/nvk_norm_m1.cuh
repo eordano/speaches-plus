@@ -72,13 +72,13 @@ static inline int nvk_norm_m1_wide_vpt(int block) {
 }
 
 extern "C" int nv_kernels_norm_m1_wide_block();
+extern "C" int nv_kernels_norm_m1_wide_batch_cap();
 extern "C" int nv_kernels_norm_m1_wide_force(int block);
 extern "C" int nv_kernels_norm_m1_split_ctas();
 extern "C" int nv_kernels_norm_m1_split_force(int ctas);
 
 static inline int nvk_norm_m1_wide_block_for_row(int cap, size_t batch, size_t hidden) {
-    if (batch >
-        kNormM1ArmsServeBatchOneOnlyBecauseAMultiRowNormAlreadyHasOneCtaPerRowAndWideningItMeasuredPlus12PercentOnGemma4HeadDimNormsAnd2Point6xOnQwen35PrefillNorm) {
+    if (batch > (size_t)nv_kernels_norm_m1_wide_batch_cap()) {
         return kNormM1WideOffIsTheStock256ThreadSingleCtaPerRowShape;
     }
     if (nvk_norm_m1_wide_vpt(cap) <= 0) return kNormM1WideOffIsTheStock256ThreadSingleCtaPerRowShape;

@@ -11,7 +11,7 @@ struct Lg4Params {
     xsf_slot_stride_bytes: u32,
     y_slot_stride_words: u32,
     per_expert_alpha: u32,
-    pad0: u32,
+    x_slot_div: u32,
 };
 
 @group(0) @binding(10) var<storage, read> lg4_w: array<vec2<u32>>;
@@ -67,8 +67,9 @@ fn lgw_gemv_nvfp4(
     let live = row < lg4_p.n_rows;
     let wbase = select(0u, e * lg4_p.w_e_stride_vec2 + row * lg4_p.k_blocks, live);
     let sfbase = e * lg4_p.sf_e_stride_bytes;
-    let xbase = slot * lg4_p.x_slot_stride_vec2;
-    let xsfbase = slot * lg4_p.xsf_slot_stride_bytes;
+    let xslot = slot / max(lg4_p.x_slot_div, 1u);
+    let xbase = xslot * lg4_p.x_slot_stride_vec2;
+    let xsfbase = xslot * lg4_p.xsf_slot_stride_bytes;
     let blocks = select(0u, lg4_p.k_blocks, live);
 
     var acc = 0.0;

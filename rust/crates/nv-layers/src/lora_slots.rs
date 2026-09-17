@@ -660,7 +660,7 @@ mod cuda_runtime {
             fn rw(s: &mut CudaSlice<i32>, stream: &Arc<cudarc::driver::CudaStream>) -> u64 {
                 let (p, g) = s.device_ptr_mut(stream);
                 drop(g);
-                p as u64
+                p
             }
             let map_ptr = rw(&mut map, &stream);
             let sorted_ptr = rw(&mut sorted, &stream);
@@ -799,7 +799,7 @@ mod cuda_runtime {
         let view = sl.slice(layout.start_offset()..);
         let (p, g) = view.device_ptr(stream);
         drop(g);
-        Ok(p as u64)
+        Ok(p)
     }
 
     impl LoraHook {
@@ -877,7 +877,7 @@ mod cuda_runtime {
             fn ro<T>(s: &CudaSlice<T>, stream: &Arc<cudarc::driver::CudaStream>) -> u64 {
                 let (p, g) = s.device_ptr(stream);
                 drop(g);
-                p as u64
+                p
             }
             let a_ptrs_ptr = ro(&a_ptrs_d, &stream);
             let b_ptrs_ptr = ro(&b_ptrs_d, &stream);
@@ -887,7 +887,7 @@ mod cuda_runtime {
             let buffer_ptr = {
                 let (p, g) = buffer.device_ptr_mut(&stream);
                 drop(g);
-                p as u64
+                p
             };
 
             Ok(Arc::new(Self {

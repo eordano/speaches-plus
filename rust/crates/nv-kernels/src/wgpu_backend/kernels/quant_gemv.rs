@@ -2,8 +2,8 @@
 
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
+pub use crate::wgpu_backend::pack::pack_u16_pairs as pack_x_bf16;
 use crate::wgpu_backend::{compose, Result, WgpuError};
-pub use crate::wgpu_backend::pack::{pack_u16_pairs as pack_x_bf16};
 
 pub const WGSL: &str = include_str!("../../../wgsl/quant_gemv.wgsl");
 

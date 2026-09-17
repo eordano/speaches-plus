@@ -5,7 +5,7 @@
   "input": "input.png",
   "expected_text": "NATIONAL SURVEY ARCHIVE\nPlate 47: Coastal Triangulation, 1911 Resurvey\nDigitised at 1200 dpi from the original vellum plate. The station coordinates below are transcribed from the field ledger and keep the\noriginal Clarke 1880 figure, so users comparing against the modern network must apply the published datum shift before any computation.\nStation BEACON HILL: 58 deg 12 min 41.30 sec N, 6 deg 22 min 08.71 sec W\nStation CNOC ARD:    58 deg 11 min 57.02 sec N, 6 deg 19 min 44.55 sec W\nStation SGEIR DUBH:  58 deg 13 min 22.87 sec N, 6 deg 17 min 30.12 sec W\nObserver Notes\nHeliograph signals from Beacon Hill were lost in haar on the morning rounds and all angles were repeated after noon. The theodolite,\nTroughton and Simms No. 3, read to one second of arc, and each round of angles closed the horizon within three seconds before\nacceptance.\nReduction follows Ordnance memorandum 44 of 1909. Spherical excess\ndistributed equally. Closing error of triangle 47-C: 1.88 seconds.\nConservation record: plate cleaned and rebacked March 1961; fungal foxing at NE corner\nstabilised. Access copy ASA-47-1911-R2. Original held in vault 9, humidity class B.\nBaseline Measurements\nThe Loch Roag base of 1909 was remeasured with invar tapes\nnumbers 61 and 63 under 15 pounds tension. Twelve bays gave\na mean of 3,662.114 metres with a spread of 4.1 millimetres.\nTape 61 standardisation: 30.000,42 m at 14.2 C, coefficient 0.0000006\nTape 63 standardisation: 30.000,38 m at 14.2 C, coefficient 0.0000007\nField temperatures by mercury thermometers 118 and 121, read to 0.2 C\nAdjustment Summary\nLeast squares adjustment over 31 conditions closed the network\nwith a maximum residual of 0.94 seconds on line 47-52. Side\nlengths are tabulated on plate 48 with their logarithms.\nArchivist note: the 1911 party lists J. Macleod as observer and A. Ross as recorder.\nWages ledger cross-reference WL-1911-224. Photograph album PA-19 shows camp at Cnoc Ard.\nDigitisation metadata: scanner SG-1200-IV, target IT8.7/2 batch 2026-03, delta E mean 1.1.\nFile checksum sha256 9c41...e7 recorded in accession register AR-2026-118. Scanned by K.O.\nComparison with the 1852 Primary Triangulation\nWhere the 1911 stations reoccupy primary marks, coordinate shifts stay below 0.4 metres except at Sgeir Dubh, where the cairn had been\nrebuilt seaward of the original centre mark. A buried bottle holding the 1852 centre punch was recovered at half a metre and the new\npillar was set over it directly, restoring continuity of the mark.\nGravity and Deflection Observations\nPendulum gravity at Beacon Hill agrees with the Bouguer prediction within 11 milligals. Astronomical latitude shows a deflection of the\nvertical of 4.2 seconds south, ascribed to the mass of the gneiss ridge east of the station, and the azimuth condition was therefore\ncarried on Cnoc Ard instead.\nAvailability and Citation\nHigh resolution scans of plates 44 through 52 are available on reader request under licence NLA-OG-4. Cite this plate as National\nSurvey Archive, Coastal Triangulation Resurvey of 1911, plate 47, accession AR-2026-118, digitised 2026. Derived vector data carries\nthe same licence and must reproduce this citation in full.\nRelated Holdings\nThe archive holds the computation books for divisions 44 to 52, the observer's diary for the 1911 season, and glass negatives of the\nstation cairns. Requests for the diary require a conservation review because the binding is friable along the spine.\nReader services: the search room opens Tuesday to Saturday, 09:30 to 16:45, with document ordering closing at 15:30. Photography is\npermitted without flash under permit PH-11, and bulk imaging requests route through the digitisation programme office.",
   "render": {
-    "generator": "gen_scale_fixtures.py (PIL, macOS Arial/Courier)",
+    "generator": "generate-090-scale-fixtures.py (PIL, LiberationSans-Regular.ttf + LiberationMono-Regular.ttf)",
     "page_px": [
       8400,
       11888
@@ -17,9 +17,9 @@
     {
       "bbox": [
         380,
-        459,
-        3534,
-        623
+        466,
+        3497,
+        622
       ],
       "tier": "heading",
       "text": "NATIONAL SURVEY ARCHIVE"
@@ -28,7 +28,7 @@
       "bbox": [
         380,
         858,
-        2899,
+        2879,
         970
       ],
       "tier": "heading",
@@ -37,8 +37,8 @@
     {
       "bbox": [
         380,
-        1310,
-        6513,
+        1311,
+        6488,
         1534
       ],
       "tier": "body",
@@ -47,9 +47,9 @@
     {
       "bbox": [
         380,
-        1848,
-        3980,
-        2136
+        1841,
+        4010,
+        2137
       ],
       "tier": "body",
       "text": "Station BEACON HILL: 58 deg 12 min 41.30 sec N, 6 deg 22 min 08.71 sec W\nStation CNOC ARD:    58 deg 11 min 57.02 sec N, 6 deg 19 min 44.55 sec W\nStation SGEIR DUBH:  58 deg 13 min 22.87 sec N, 6 deg 17 min 30.12 sec W"
@@ -58,7 +58,7 @@
       "bbox": [
         380,
         2501,
-        1275,
+        1274,
         2589
       ],
       "tier": "heading",
@@ -67,9 +67,9 @@
     {
       "bbox": [
         380,
-        2783,
-        6285,
-        3136
+        2784,
+        6259,
+        3137
       ],
       "tier": "body",
       "text": "Heliograph signals from Beacon Hill were lost in haar on the morning rounds and all angles were repeated after noon. The theodolite,\nTroughton and Simms No. 3, read to one second of arc, and each round of angles closed the horizon within three seconds before\nacceptance."
@@ -77,8 +77,8 @@
     {
       "bbox": [
         380,
-        3464,
-        1992,
+        3465,
+        1984,
         3576
       ],
       "tier": "fine",
@@ -88,7 +88,7 @@
       "bbox": [
         380,
         3811,
-        1670,
+        1685,
         3884
       ],
       "tier": "micro",
@@ -97,8 +97,8 @@
     {
       "bbox": [
         380,
-        4272,
-        1749,
+        4271,
+        1747,
         4359
       ],
       "tier": "heading",
@@ -107,9 +107,9 @@
     {
       "bbox": [
         380,
-        4563,
-        3240,
-        4916
+        4564,
+        3219,
+        4917
       ],
       "tier": "body",
       "text": "The Loch Roag base of 1909 was remeasured with invar tapes\nnumbers 61 and 63 under 15 pounds tension. Twelve bays gave\na mean of 3,662.114 metres with a spread of 4.1 millimetres."
@@ -117,9 +117,9 @@
     {
       "bbox": [
         380,
-        5251,
-        3830,
-        5539
+        5244,
+        3858,
+        5540
       ],
       "tier": "body",
       "text": "Tape 61 standardisation: 30.000,42 m at 14.2 C, coefficient 0.0000006\nTape 63 standardisation: 30.000,38 m at 14.2 C, coefficient 0.0000007\nField temperatures by mercury thermometers 118 and 121, read to 0.2 C"
@@ -136,9 +136,9 @@
     },
     {
       "bbox": [
-        380,
+        379,
         6217,
-        3238,
+        3227,
         6570
       ],
       "tier": "body",
@@ -146,9 +146,9 @@
     },
     {
       "bbox": [
-        379,
+        380,
         6898,
-        2551,
+        2528,
         7009
       ],
       "tier": "fine",
@@ -158,7 +158,7 @@
       "bbox": [
         380,
         7264,
-        1764,
+        1772,
         7337
       ],
       "tier": "micro",
@@ -167,8 +167,8 @@
     {
       "bbox": [
         380,
-        7680,
-        6512,
+        7681,
+        6481,
         8164
       ],
       "tier": "body",
@@ -177,8 +177,8 @@
     {
       "bbox": [
         380,
-        8520,
-        6310,
+        8521,
+        6275,
         8984
       ],
       "tier": "body",
@@ -186,10 +186,10 @@
     },
     {
       "bbox": [
-        379,
-        9360,
-        6344,
-        9843
+        380,
+        9361,
+        6290,
+        9844
       ],
       "tier": "body",
       "text": "Availability and Citation\nHigh resolution scans of plates 44 through 52 are available on reader request under licence NLA-OG-4. Cite this plate as National\nSurvey Archive, Coastal Triangulation Resurvey of 1911, plate 47, accession AR-2026-118, digitised 2026. Derived vector data carries\nthe same licence and must reproduce this citation in full."
@@ -198,7 +198,7 @@
       "bbox": [
         380,
         10201,
-        6229,
+        6195,
         10554
       ],
       "tier": "body",
@@ -207,8 +207,8 @@
     {
       "bbox": [
         380,
-        10830,
-        6399,
+        10831,
+        6359,
         11054
       ],
       "tier": "body",

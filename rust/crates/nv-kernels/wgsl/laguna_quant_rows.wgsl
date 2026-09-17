@@ -4,6 +4,10 @@ struct LgqParams {
     n_slots: u32,
     use_sel: u32,
     x_slot_stride_elems: u32,
+    x_slot_div: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(10) var<storage, read> lgq_x: array<u32>;
@@ -72,7 +76,7 @@ fn lgw_quant_rows(
     if (bad) {
         stored = 1.0;
     }
-    let x_base = slot * lgq_p.x_slot_stride_elems;
+    let x_base = (slot / max(lgq_p.x_slot_div, 1u)) * lgq_p.x_slot_stride_elems;
     let out_base = slot * (lgq_p.k_blocks * 2u);
     let sf_base_words = slot * (lgq_p.k_blocks >> 2u);
 

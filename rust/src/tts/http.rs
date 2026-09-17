@@ -31,6 +31,8 @@ pub struct CreateSpeechRequestBody {
     pub input: Option<String>,
     pub voice: Option<String>,
     #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
     pub response_format: Option<ResponseFormat>,
     #[serde(default)]
     pub speed: Option<f32>,
@@ -229,6 +231,28 @@ fn first_chunk_error_response(err: SynthError) -> Response {
     }
 }
 
+pub fn espeak_voice_for(code: &str) -> Result<&'static str, &'static str> {
+    match code {
+        "es" | "es-ES" => Ok("es"),
+        "es-AR" | "es-419" => Ok("es-419"),
+        "en" | "en-US" | "en-us" => Ok("en-us"),
+        "en-GB" | "en-gb" => Ok("en-gb"),
+        _ => Err("language must be es, es-ES, es-AR, es-419, en, en-US, en-us, en-GB or en-gb"),
+    }
+}
+
+fn speech_language<'a>(
+    voice: &str,
+    requested: Option<&str>,
+    fallback: &'a str,
+) -> Result<&'a str, &'static str> {
+    match requested {
+        Some(code) => espeak_voice_for(code),
+        None if voice.starts_with("ef_") || voice.starts_with("em_") => Ok("es"),
+        None => Ok(fallback),
+    }
+}
+
 pub async fn handle_create_speech(
     State(state): State<SpeechAppState>,
     Json(req): Json<CreateSpeechRequestBody>,
@@ -295,6 +319,19 @@ pub async fn handle_create_speech(
         return invalid_voice_response(&voice, kokoro.voice_names());
     }
 
+    let language: Arc<str> = match speech_language(&voice, req.language.as_deref(), &state.language)
+    {
+        Ok(language) => Arc::from(language),
+        Err(message) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                message,
+                kind::INVALID_REQUEST,
+                Some("language"),
+                Some("unsupported_language"),
+            )
+        }
+    };
     let input = req.input.unwrap();
     if input.trim().is_empty() {
         return openai_error(
@@ -384,7 +421,7 @@ pub async fn handle_create_speech(
         kokoro.clone(),
         first_chunk.clone(),
         voice.clone(),
-        state.language.clone(),
+        language.clone(),
         speed,
     )
     .await
@@ -403,7 +440,7 @@ pub async fn handle_create_speech(
             first,
             rest,
             voice,
-            state.language.clone(),
+            language.clone(),
             speed,
             deadline,
         ),
@@ -412,7 +449,7 @@ pub async fn handle_create_speech(
             first,
             rest,
             voice,
-            state.language.clone(),
+            language.clone(),
             speed,
             response_format,
             req.sample_rate,
@@ -867,11 +904,48 @@ mod tests {
             model: Some("speaches-ai/Kokoro-82M-v1.0-ONNX".to_string()),
             input: Some(input.to_string()),
             voice: Some("af_heart".to_string()),
+            language: None,
             response_format: None,
             speed: None,
             stream_format: None,
             sample_rate: None,
         }
+    }
+
+    #[test]
+    fn spanish_voices_select_spanish_phonemization_by_default() {
+        for voice in ["ef_dora", "em_alex", "em_santa"] {
+            assert_eq!(speech_language(voice, None, "en-us"), Ok("es"));
+        }
+        for voice in ["af_heart", "bm_george", "custom-voice"] {
+            assert_eq!(speech_language(voice, None, "en-us"), Ok("en-us"));
+        }
+    }
+
+    #[test]
+    fn explicit_speech_language_overrides_voice_and_rejects_unknown_codes() {
+        assert_eq!(speech_language("em_alex", Some("en-US"), "es"), Ok("en-us"));
+        assert_eq!(
+            speech_language("af_heart", Some("es-AR"), "en-us"),
+            Ok("es-419")
+        );
+        assert_eq!(
+            speech_language("af_heart", Some("en-GB"), "en-us"),
+            Ok("en-gb")
+        );
+        assert!(speech_language("em_alex", Some("unknown"), "en-us").is_err());
+        assert!(speech_language("em_alex", Some(""), "en-us").is_err());
+    }
+
+    #[test]
+    fn speech_request_accepts_optional_language_without_breaking_old_clients() {
+        let mut body =
+            serde_json::json!({"model":"kokoro","input":"Buenas tardes","voice":"em_alex"});
+        let original: CreateSpeechRequestBody = serde_json::from_value(body.clone()).unwrap();
+        assert!(original.language.is_none());
+        body["language"] = serde_json::json!("es");
+        let spanish: CreateSpeechRequestBody = serde_json::from_value(body).unwrap();
+        assert_eq!(spanish.language.as_deref(), Some("es"));
     }
 
     #[test]
@@ -926,7 +1000,10 @@ mod tests {
         assert_eq!(body["error"]["code"], "invalid_voice");
         let msg = body["error"]["message"].as_str().unwrap();
         assert!(msg.contains("\"default\""), "{msg}");
-        assert!(msg.contains("the 2 valid voices are: af_heart, am_adam"), "{msg}");
+        assert!(
+            msg.contains("the 2 valid voices are: af_heart, am_adam"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]

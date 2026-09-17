@@ -27,8 +27,9 @@ pub use weights::{
 use attn::RopeTablesGpu;
 use config::rope_tables_from_inv_freq as rope_tables;
 use gpu::{
-    push_residual_add, push_rmsnorm, push_rmsnorm_residual, ArgmaxParams, Builder, GatherParams,
-    GemvBf16Params, Pass, Sources, StepBuffers, StepUniform,
+    alloc_mrows, mprefill_enabled, mprefill_forced, push_residual_add, push_rmsnorm,
+    push_rmsnorm_residual, push_rmsnorm_residual_rows, push_rmsnorm_rows, ArgmaxParams, Builder,
+    GatherParams, GemvBf16Params, Pass, Sources, StepBuffers, StepUniform,
 };
 use weights::{pack_pairs, HostBf16Lin as Bf16Lin};
 
@@ -71,6 +72,9 @@ pub struct LagunaWgpu {
     pf_m: usize,
     v_tokens: Option<wgpu::Buffer>,
     pf_validated: bool,
+    mpf_passes: Vec<Pass>,
+    mpf_validated: bool,
+    mpf_chunks_run: usize,
     lora_passes: usize,
     _lora_keep: Vec<Box<dyn std::any::Any + Send>>,
 }
@@ -187,6 +191,33 @@ impl LagunaWgpu {
         let mut b = Builder::new(ctx);
         let step = StepBuffers::alloc(&mut b);
 
+        let pf_m = prefill_m();
+        let pf_list = (pf_m >= 2).then(|| {
+            dispatch::storage_zeroed(
+                ctx,
+                "lgw-pf-list",
+                (pf_m * prefill_list_bytes_per_token_charged_by_mem_fit()) as u64,
+            )
+        });
+        let v_tokens = (pf_m >= 2)
+            .then(|| dispatch::storage_zeroed(ctx, "lgw-verify-tokens", (pf_m * 4) as u64));
+        anyhow::ensure!(
+            !(mprefill_forced() && lora.is_some()),
+            "NV_LAGUNA_WGPU_MPREFILL=1 has no LoRA rows path; unset it or drop the adapter"
+        );
+        let mrows = match (&pf_list, mprefill_enabled() && lora.is_none()) {
+            (Some(list), true) => Some(alloc_mrows(&mut b, pf_m, list.clone())),
+            _ => None,
+        };
+        let mbytes = |per_tok: u64| (pf_m as u64) * per_tok;
+        let mstate = mrows.as_ref().map(|_| MpfState {
+            res: b.zeros("lgw-mres", mbytes(bytes)),
+            normed: b.zeros("lgw-mnormed", mbytes(bytes)),
+            normed_post: b.zeros("lgw-mnormed-post", mbytes(bytes)),
+            attn_out: b.zeros("lgw-mattn-out", mbytes(bytes)),
+            ffn_out: b.zeros("lgw-mffn-out", mbytes(bytes)),
+        });
+
         let res = b.zeros("lgw-res", bytes);
         let res2 = b.zeros("lgw-res2", bytes);
         let normed = b.zeros("lgw-normed", bytes);
@@ -239,6 +270,17 @@ impl LagunaWgpu {
                 &[(30, &buf), (31, &step.tok), (32, &res), (33, &p)],
                 grid,
             )?;
+            if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                b.emit_mpf = true;
+                b.push(
+                    "lgw-mgather",
+                    &s.common,
+                    "lgw_gather_embed_rows",
+                    &[(30, &buf), (32, &ms.res), (33, &p), (34, &mp.list)],
+                    (grid.0, mp.m as u32, 1),
+                )?;
+                b.emit_mpf = false;
+            }
             off += rows;
         }
         drop(embed);
@@ -249,6 +291,21 @@ impl LagunaWgpu {
             if li == 0 {
                 let ln_w = b.upload_u32("lgw-ln", &pack_pairs(&hl.input_ln));
                 push_rmsnorm(&mut b, &s, "lgw-rms0", &res, &ln_w, &normed, hidden, eps)?;
+                if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                    b.emit_mpf = true;
+                    push_rmsnorm_rows(
+                        &mut b,
+                        &s,
+                        "lgw-mrms0",
+                        &ms.res,
+                        &ln_w,
+                        &ms.normed,
+                        hidden,
+                        eps,
+                        mp.m,
+                    )?;
+                    b.emit_mpf = false;
+                }
             }
             let lctx = match (lora, lora_pl.as_ref()) {
                 (Some(l), Some(pl)) => Some(lora::LoraSiteCtx {
@@ -264,7 +321,7 @@ impl LagunaWgpu {
             } else {
                 &rope_full
             };
-            attn::build_attn_layer(
+            let ag = attn::build_attn_layer(
                 &mut b,
                 &s,
                 &shapes,
@@ -276,6 +333,21 @@ impl LagunaWgpu {
                 rope,
                 lctx.as_ref(),
             )?;
+            if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                b.emit_mpf = true;
+                attn::build_attn_layer_rows(
+                    &mut b,
+                    &s,
+                    &shapes,
+                    &layer_shape,
+                    &ag,
+                    &ms.normed,
+                    &ms.attn_out,
+                    mp,
+                    rope,
+                )?;
+                b.emit_mpf = false;
+            }
 
             let post_w = b.upload_u32("lgw-post-ln", &pack_pairs(&hl.post_attn_ln));
             push_rmsnorm_residual(
@@ -289,27 +361,74 @@ impl LagunaWgpu {
                 hidden,
                 eps,
             )?;
+            if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                b.emit_mpf = true;
+                push_rmsnorm_residual_rows(
+                    &mut b,
+                    &s,
+                    "lgw-mrmsres-post",
+                    &ms.attn_out,
+                    &ms.res,
+                    &post_w,
+                    &ms.normed_post,
+                    hidden,
+                    eps,
+                    mp.m,
+                )?;
+                b.emit_mpf = false;
+            }
 
             match &hl.ffn {
-                HostFfn::Dense(d) => dense::build_dense_mlp(
-                    &mut b,
-                    &s,
-                    &shapes,
-                    &layer_shape,
-                    d,
-                    &normed_post,
-                    &ffn_out,
-                    lctx.as_ref(),
-                )?,
-                HostFfn::Moe(m) => moe::build_moe_layer(
-                    &mut b,
-                    &s,
-                    &shapes,
-                    &layer_shape,
-                    m,
-                    &normed_post,
-                    &ffn_out,
-                )?,
+                HostFfn::Dense(d) => {
+                    let dg = dense::build_dense_mlp(
+                        &mut b,
+                        &s,
+                        &shapes,
+                        &layer_shape,
+                        d,
+                        &normed_post,
+                        &ffn_out,
+                        lctx.as_ref(),
+                    )?;
+                    if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                        b.emit_mpf = true;
+                        dense::build_dense_mlp_rows(
+                            &mut b,
+                            &s,
+                            &layer_shape,
+                            &dg,
+                            &ms.normed_post,
+                            &ms.ffn_out,
+                            mp,
+                        )?;
+                        b.emit_mpf = false;
+                    }
+                }
+                HostFfn::Moe(m) => {
+                    let mg = moe::build_moe_layer(
+                        &mut b,
+                        &s,
+                        &shapes,
+                        &layer_shape,
+                        m,
+                        &normed_post,
+                        &ffn_out,
+                    )?;
+                    if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                        b.emit_mpf = true;
+                        moe::build_moe_layer_rows(
+                            &mut b,
+                            &s,
+                            &shapes,
+                            &layer_shape,
+                            &mg,
+                            &ms.normed_post,
+                            &ms.ffn_out,
+                            mp,
+                        )?;
+                        b.emit_mpf = false;
+                    }
+                }
             }
             if let Some(lc) = lctx {
                 lora_keep.borrow_mut().push(Box::new(lc.layer));
@@ -329,6 +448,22 @@ impl LagunaWgpu {
                     hidden,
                     eps,
                 )?;
+                if let (Some(mp), Some(ms)) = (&mrows, &mstate) {
+                    b.emit_mpf = true;
+                    push_rmsnorm_residual_rows(
+                        &mut b,
+                        &s,
+                        "lgw-mrmsres-next",
+                        &ms.ffn_out,
+                        &ms.res,
+                        &nw,
+                        &ms.normed,
+                        hidden,
+                        eps,
+                        mp.m,
+                    )?;
+                    b.emit_mpf = false;
+                }
             } else {
                 push_residual_add(&mut b, &s, "lgw-resadd", &ffn_out, &res, &res2, hidden)?;
             }
@@ -423,20 +558,10 @@ impl LagunaWgpu {
             eprint!("[laguna-wgpu] {}", vram.render());
         }
 
-        let pf_m = prefill_m();
-        let pf_list = (pf_m >= 2).then(|| {
-            dispatch::storage_zeroed(
-                ctx,
-                "lgw-pf-list",
-                (pf_m * prefill_list_bytes_per_token_charged_by_mem_fit()) as u64,
-            )
-        });
-        let v_tokens = (pf_m >= 2)
-            .then(|| dispatch::storage_zeroed(ctx, "lgw-verify-tokens", (pf_m * 4) as u64));
-
         let Builder {
             core,
             passes,
+            mpf_passes,
             state_buffers,
             ..
         } = b;
@@ -465,6 +590,9 @@ impl LagunaWgpu {
             pf_m,
             v_tokens,
             pf_validated: false,
+            mpf_passes,
+            mpf_validated: false,
+            mpf_chunks_run: 0,
             lora_passes: lora.map(|l| l.total_pass_count()).unwrap_or(0),
             _lora_keep: lora_keep,
         })
@@ -541,6 +669,92 @@ impl LagunaWgpu {
         }
     }
 
+    pub fn mpf_chunk_len(&self) -> usize {
+        if self.mpf_passes.is_empty() {
+            0
+        } else {
+            self.pf_m
+        }
+    }
+
+    pub fn mpf_pass_count(&self) -> usize {
+        self.mpf_passes.len()
+    }
+
+    pub fn mpf_chunks_run(&self) -> usize {
+        self.mpf_chunks_run
+    }
+
+    fn write_pf_records(&self, chunk: &[u32]) {
+        let rec = std::mem::size_of::<StepUniform>();
+        let mut host: Vec<u8> = Vec::with_capacity(chunk.len() * rec);
+        for (i, &t) in chunk.iter().enumerate() {
+            let total = self.pos + i + 1;
+            host.extend_from_slice(bytemuck::bytes_of(&StepUniform {
+                tok: t,
+                pos: (self.pos + i) as u32,
+                total: total as u32,
+                sliding_start: window_start(total, Some(self.shapes.sliding_window)) as u32,
+            }));
+        }
+        let list = self
+            .pf_list
+            .as_ref()
+            .expect("prefill chunk without pf list");
+        self.ctx.queue.write_buffer(list, 0, &host);
+    }
+
+    fn prefill_chunk_rows(&mut self, chunk: &[u32]) -> Result<()> {
+        let m = self.mpf_chunk_len();
+        anyhow::ensure!(
+            m >= 2 && chunk.len() == m,
+            "rows prefill takes exactly full {m}-token chunks, got {}; partial chunks stay on \
+             the chunked-serial path",
+            chunk.len()
+        );
+        anyhow::ensure!(
+            self.pos + m <= self.max_seq_tokens,
+            "kv cache full at {} + {m} (max_seq_tokens {})",
+            self.pos,
+            self.max_seq_tokens
+        );
+        for &t in chunk {
+            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+        }
+        self.write_pf_records(chunk);
+        let scope = if self.mpf_validated {
+            None
+        } else {
+            Some(
+                self.ctx
+                    .device
+                    .push_error_scope(wgpu::ErrorFilter::Validation),
+            )
+        };
+        let labels: Vec<&str> = if dispatch::profile::enabled() {
+            self.mpf_passes.iter().map(|p| p.entry.as_str()).collect()
+        } else {
+            Vec::new()
+        };
+        let cb = dispatch::encode_pass_list_labeled(
+            self.ctx,
+            self.mpf_passes
+                .iter()
+                .map(|p| (&*p.pipeline, &p.bind, p.grid)),
+            &labels,
+        );
+        self.ctx.queue.submit([cb]);
+        if let Some(scope) = scope {
+            if let Some(e) = pollster::block_on(scope.pop()) {
+                anyhow::bail!("laguna_wgpu rows prefill validation: {e}");
+            }
+            self.mpf_validated = true;
+        }
+        self.mpf_chunks_run += 1;
+        self.pos += m;
+        Ok(())
+    }
+
     fn prefill_chunk_one_submission_of_per_token_passes(&mut self, chunk: &[u32]) -> Result<()> {
         let n = chunk.len();
         anyhow::ensure!(
@@ -570,22 +784,9 @@ impl LagunaWgpu {
         for &t in chunk {
             anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
+        self.write_pf_records(chunk);
         let rec = std::mem::size_of::<StepUniform>();
-        let mut host: Vec<u8> = Vec::with_capacity(n * rec);
-        for (i, &t) in chunk.iter().enumerate() {
-            let total = self.pos + i + 1;
-            host.extend_from_slice(bytemuck::bytes_of(&StepUniform {
-                tok: t,
-                pos: (self.pos + i) as u32,
-                total: total as u32,
-                sliding_start: window_start(total, Some(self.shapes.sliding_window)) as u32,
-            }));
-        }
-        let list = self
-            .pf_list
-            .clone()
-            .expect("prefill chunk without pf list");
-        self.ctx.queue.write_buffer(&list, 0, &host);
+        let list = self.pf_list.clone().expect("prefill chunk without pf list");
         let scope = if self.pf_validated {
             None
         } else {
@@ -687,7 +888,11 @@ impl LagunaWgpu {
             if take < 2 {
                 return Ok(done);
             }
-            self.prefill_chunk_one_submission_of_per_token_passes(&tokens[done..done + take])?;
+            if take == self.mpf_chunk_len() {
+                self.prefill_chunk_rows(&tokens[done..done + take])?;
+            } else {
+                self.prefill_chunk_one_submission_of_per_token_passes(&tokens[done..done + take])?;
+            }
             done += take;
         }
     }
@@ -701,6 +906,14 @@ impl LagunaWgpu {
         }
         self.decode_step(*last)
     }
+}
+
+struct MpfState {
+    res: wgpu::Buffer,
+    normed: wgpu::Buffer,
+    normed_post: wgpu::Buffer,
+    attn_out: wgpu::Buffer,
+    ffn_out: wgpu::Buffer,
 }
 
 pub struct RefState {
